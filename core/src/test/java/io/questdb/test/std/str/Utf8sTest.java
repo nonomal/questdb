@@ -27,6 +27,8 @@ package io.questdb.test.std.str;
 import io.questdb.cairo.VarcharTypeDriver;
 import io.questdb.cairo.vm.Vm;
 import io.questdb.cairo.vm.api.MemoryAR;
+import io.questdb.cairo.vm.api.MemoryCA;
+import io.questdb.cairo.vm.api.MemoryCARW;
 import io.questdb.std.*;
 import io.questdb.std.str.*;
 import io.questdb.test.tools.TestUtils;
@@ -317,6 +319,27 @@ public class Utf8sTest {
     }
 
     @Test
+    public void testIsAscii() {
+        try (DirectUtf8Sink sink = new DirectUtf8Sink(16)) {
+            sink.put("foobar");
+            Assert.assertTrue(Utf8s.isAscii(sink));
+            Assert.assertTrue(Utf8s.isAscii(sink.ptr(), sink.size()));
+            sink.clear();
+            sink.put("фубар");
+            Assert.assertFalse(Utf8s.isAscii(sink));
+            Assert.assertFalse(Utf8s.isAscii(sink.ptr(), sink.size()));
+            sink.clear();
+            sink.put("foobarfoobarfoobarfoobarфубарфубарфубарфубар");
+            Assert.assertFalse(Utf8s.isAscii(sink));
+            Assert.assertFalse(Utf8s.isAscii(sink.ptr(), sink.size()));
+            sink.clear();
+            sink.put("12345678ы87654321");
+            Assert.assertFalse(Utf8s.isAscii(sink));
+            Assert.assertFalse(Utf8s.isAscii(sink.ptr(), sink.size()));
+        }
+    }
+
+    @Test
     public void testLastIndexOfAscii() {
         Assert.assertEquals(2, Utf8s.lastIndexOfAscii(utf8("foo bar baz"), 'o'));
         Assert.assertEquals(10, Utf8s.lastIndexOfAscii(utf8("foo bar baz"), 'z'));
@@ -354,8 +377,8 @@ public class Utf8sTest {
     @Test
     public void testReadWriteVarchar() {
         try (
-                MemoryAR auxMem = Vm.getARWInstance(16 * 1024 * 1024, Integer.MAX_VALUE, MemoryTag.NATIVE_DEFAULT);
-                MemoryAR dataMem = Vm.getARWInstance(16 * 1024 * 1024, Integer.MAX_VALUE, MemoryTag.NATIVE_DEFAULT)
+                MemoryCARW auxMem = Vm.getCARWInstance(16 * 1024 * 1024, Integer.MAX_VALUE, MemoryTag.NATIVE_DEFAULT);
+                MemoryCARW dataMem = Vm.getCARWInstance(16 * 1024 * 1024, Integer.MAX_VALUE, MemoryTag.NATIVE_DEFAULT)
         ) {
             final Rnd rnd = TestUtils.generateRandom(null);
             final Utf8StringSink utf8Sink = new Utf8StringSink();
@@ -404,8 +427,8 @@ public class Utf8sTest {
     @Test
     public void testReadWriteVarcharOver2GB() {
         try (
-                MemoryAR auxMem = Vm.getARWInstance(16 * 1024 * 1024, Integer.MAX_VALUE, MemoryTag.NATIVE_DEFAULT);
-                MemoryAR dataMem = Vm.getARWInstance(16 * 1024 * 1024, Integer.MAX_VALUE, MemoryTag.NATIVE_DEFAULT)
+                MemoryCARW auxMem = Vm.getCARWInstance(16 * 1024 * 1024, Integer.MAX_VALUE, MemoryTag.NATIVE_DEFAULT);
+                MemoryCARW dataMem = Vm.getCARWInstance(16 * 1024 * 1024, Integer.MAX_VALUE, MemoryTag.NATIVE_DEFAULT)
         ) {
             final Utf8StringSink utf8Sink = new Utf8StringSink();
             int len = 1024;

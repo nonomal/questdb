@@ -44,7 +44,7 @@ public class CairoException extends RuntimeException implements Sinkable, Flywei
     public static final int METADATA_VALIDATION = -100;
     public static final int ILLEGAL_OPERATION = METADATA_VALIDATION - 1;
     private static final int TABLE_DROPPED = ILLEGAL_OPERATION - 1;
-    public static final int METADATA_VALIDATION_RECOVERABLE = METADATA_VALIDATION - 1;
+    public static final int METADATA_VALIDATION_RECOVERABLE = TABLE_DROPPED - 1;
     public static final int PARTITION_MANIPULATION_RECOVERABLE = METADATA_VALIDATION_RECOVERABLE - 1;
     public static final int NON_CRITICAL = -1;
     private static final StackTraceElement[] EMPTY_STACK_TRACE = {};
@@ -104,16 +104,20 @@ public class CairoException extends RuntimeException implements Sinkable, Flywei
         return nonCritical().setEntityDisabled(true).put("entity is disabled [name=").put(entityName).put(']');
     }
 
-    public static boolean errnoReadPathDoesNotExist(int errno) {
-        return errnoRemovePathDoesNotExist(errno) || (Os.type == Os.WINDOWS && errno == ERRNO_ACCESS_DENIED_WIN);
+    public static boolean errnoPathDoesNotExist(int errno) {
+        return errno == ERRNO_FILE_DOES_NOT_EXIST || (Os.type == Os.WINDOWS && errno == ERRNO_FILE_DOES_NOT_EXIST_WIN);
     }
 
-    public static boolean errnoRemovePathDoesNotExist(int errno) {
-        return errno == ERRNO_FILE_DOES_NOT_EXIST || (Os.type == Os.WINDOWS && errno == ERRNO_FILE_DOES_NOT_EXIST_WIN);
+    public static boolean errnoReadPathDoesNotExist(int errno) {
+        return errnoPathDoesNotExist(errno) || (Os.type == Os.WINDOWS && errno == ERRNO_ACCESS_DENIED_WIN);
     }
 
     public static CairoException invalidMetadataRecoverable(@NotNull CharSequence msg, @NotNull CharSequence columnName) {
         return critical(METADATA_VALIDATION_RECOVERABLE).put(msg).put(" [column=").put(columnName).put(']');
+    }
+
+    public static boolean isCairoOomError(Throwable t) {
+        return t instanceof CairoException && ((CairoException) t).isOutOfMemory();
     }
 
     public static CairoException nonCritical() {
@@ -329,5 +333,6 @@ public class CairoException extends RuntimeException implements Sinkable, Flywei
         authorizationError = false;
         entityDisabled = false;
         messagePosition = 0;
+        outOfMemory = false;
     }
 }

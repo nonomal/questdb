@@ -506,7 +506,7 @@ public class AlterTableAttachPartitionTest extends AbstractAlterTableAttachParti
                         Assert.fail();
                     } catch (CairoException e) {
                         TestUtils.assertContains(e.getFlyweightMessage(),
-                                "could not open read-only"
+                                "could not open, file does not exist"
                         );
                         TestUtils.assertContains(e.getFlyweightMessage(),
                                 "ts1.d"
@@ -913,7 +913,7 @@ public class AlterTableAttachPartitionTest extends AbstractAlterTableAttachParti
                     engine.clear();
                     TableToken tableToken = engine.verifyTableName(src.getName());
                     path.of(configuration.getRoot()).concat(tableToken).concat("2022-08-09").concat("s.k").$();
-            Assert.assertTrue(Files.remove(path.$()));
+                    Assert.assertTrue(Files.remove(path.$()));
                     try {
                         attachFromSrcIntoDst(src, dst, "2022-08-09");
                         Assert.fail();
@@ -997,7 +997,7 @@ public class AlterTableAttachPartitionTest extends AbstractAlterTableAttachParti
             }
         };
 
-        testSqlFailedOnFsOperation(ff, "srcTs", "dstTs", false, "could not open read-only");
+        testSqlFailedOnFsOperation(ff, "srcTs", "dstTs", false, "could not open, file does not exist");
     }
 
     @Test
@@ -1013,7 +1013,7 @@ public class AlterTableAttachPartitionTest extends AbstractAlterTableAttachParti
             }
         };
 
-        testSqlFailedOnFsOperation(ff, "srcTs2", "dstTs2", false, "could not open read-only", "ts.d");
+        testSqlFailedOnFsOperation(ff, "srcTs2", "dstTs2", false, "could not open, file does not exist", "ts.d");
     }
 
     @Test

@@ -74,7 +74,6 @@ public abstract class AbstractCairoTest extends AbstractTest {
     protected static final Log LOG = LogFactory.getLog(AbstractCairoTest.class);
     protected static final PlanSink planSink = new TextPlanSink();
     protected static final StringSink sink = new StringSink();
-    protected static final Utf8StringSink utf8Sink = new Utf8StringSink();
     private static final double EPSILON = 0.000001;
     private static final long[] SNAPSHOT = new long[MemoryTag.SIZE];
     private static final LongList rows = new LongList();
@@ -915,6 +914,8 @@ public abstract class AbstractCairoTest extends AbstractTest {
     }
 
     protected static void assertExceptionNoLeakCheck(CharSequence sql, int errorPos, CharSequence contains, boolean fullFatJoins) throws Exception {
+        Assert.assertNotNull(contains);
+        Assert.assertTrue("provide matching text", contains.length() > 0);
         try {
             assertExceptionNoLeakCheck(sql, sqlExecutionContext, fullFatJoins);
         } catch (Throwable e) {
@@ -944,7 +945,7 @@ public abstract class AbstractCairoTest extends AbstractTest {
             if (memAfterCursorClose > limit) {
                 dumpMemoryUsage();
                 printFactoryMemoryUsageDiff();
-                Assert.fail("cursor memory usage should be less or equal " + limit + " but was " + memAfterCursorClose + ". Diff " + (memAfterCursorClose - memoryUsage));
+                Assert.fail("cursor is allowed to keep up to 64 KiB of RSS after close. This cursor kept " + (memAfterCursorClose - memoryUsage) / 1024 + " KiB.");
             }
         }
     }
@@ -956,7 +957,7 @@ public abstract class AbstractCairoTest extends AbstractTest {
 
     protected static void assertMemoryLeak(long limitMiB, TestUtils.LeakProneCode code) throws Exception {
         engine.clear();
-        long lim = Unsafe.getMemUsed() + limitMiB * 1024 * 1024;
+        long lim = Unsafe.getRssMemUsed() + limitMiB * 1024 * 1024;
         Unsafe.setRssMemLimit(lim);
         try {
             assertMemoryLeak(AbstractCairoTest.ff, code);
@@ -1319,25 +1320,6 @@ public abstract class AbstractCairoTest extends AbstractTest {
         }
     }
 
-    protected static void getFirstRowFirstColumn(
-            CharSequence sql,
-            MutableUtf16Sink sink
-    ) throws SqlException {
-        try (SqlCompiler compiler = engine.getSqlCompiler()) {
-            try (RecordCursorFactory factory = compiler.compile(sql, sqlExecutionContext).getRecordCursorFactory()) {
-                try (RecordCursor cursor = factory.getCursor(sqlExecutionContext)) {
-                    RecordMetadata metadata = factory.getMetadata();
-                    sink.clear();
-
-                    final Record record = cursor.getRecord();
-                    if (cursor.hasNext()) {
-                        CursorPrinter.printColumn(record, metadata, 0, sink, false);
-                    }
-                }
-            }
-        }
-    }
-
     protected static TableReader getReader(CharSequence tableName) {
         return engine.getReader(tableName);
     }
@@ -1369,6 +1351,10 @@ public abstract class AbstractCairoTest extends AbstractTest {
 
     protected static void insert(SqlCompiler compiler, CharSequence insertSql, SqlExecutionContext sqlExecutionContext) throws SqlException {
         CairoEngine.insert(compiler, insertSql, sqlExecutionContext);
+    }
+
+    protected static QuestDBTestNode newNode(int nodeId, String root) {
+        return newNode(root, true, nodeId, new Overrides(), getEngineFactory(), getConfigurationFactory());
     }
 
     protected static QuestDBTestNode newNode(int nodeId) {
@@ -1849,7 +1835,7 @@ public abstract class AbstractCairoTest extends AbstractTest {
         }
     }
 
-    protected void assertSqlWithTypes(CharSequence sql, CharSequence expected) throws SqlException {
+    protected void assertSqlWithTypes(CharSequence expected, CharSequence sql) throws SqlException {
         try (SqlCompiler compiler = engine.getSqlCompiler()) {
             TestUtils.assertSqlWithTypes(compiler, sqlExecutionContext, sql, sink, expected);
         }

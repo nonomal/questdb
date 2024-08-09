@@ -27,9 +27,9 @@ package io.questdb.test.tools;
 import io.questdb.MessageBus;
 import io.questdb.MessageBusImpl;
 import io.questdb.Metrics;
+import io.questdb.cairo.sql.Record;
 import io.questdb.ServerMain;
 import io.questdb.cairo.*;
-import io.questdb.cairo.sql.Record;
 import io.questdb.cairo.sql.*;
 import io.questdb.cairo.vm.Vm;
 import io.questdb.cairo.vm.api.MemoryMARW;
@@ -41,6 +41,7 @@ import io.questdb.griffin.SqlException;
 import io.questdb.griffin.SqlExecutionContext;
 import io.questdb.griffin.SqlExecutionContextImpl;
 import io.questdb.griffin.engine.functions.bind.BindVariableServiceImpl;
+import io.questdb.griffin.engine.functions.str.SizePrettyFunctionFactory;
 import io.questdb.griffin.model.IntervalUtils;
 import io.questdb.log.Log;
 import io.questdb.log.LogRecord;
@@ -68,6 +69,7 @@ import java.nio.file.Paths;
 import java.sql.Timestamp;
 import java.util.Arrays;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.CyclicBarrier;
@@ -96,7 +98,11 @@ public final class TestUtils {
     }
 
     public static void assertAsciiCompliance(@Nullable Utf8Sequence utf8Sequence) {
-        Assert.assertEquals(utf8Sequence == null || utf8Sequence.isAscii(), Utf8s.isAscii(utf8Sequence));
+        if (utf8Sequence == null || utf8Sequence.isAscii() != Utf8s.isAscii(utf8Sequence)) {
+            Utf8StringSink sink = new Utf8StringSink();
+            sink.put("ascii flag set to '").put(utf8Sequence == null || utf8Sequence.isAscii()).put("' for value '").put(utf8Sequence).put("'. ");
+            Assert.assertEquals(sink.toString(), Utf8s.isAscii(utf8Sequence), utf8Sequence == null || utf8Sequence.isAscii());
+        }
     }
 
     public static void assertConnect(int fd, long sockAddr) {
@@ -432,6 +438,107 @@ public final class TestUtils {
         }
     }
 
+    public static String replaceSizeToMatchPartitionSumInOS(String expected, String tableName, List<String> partitionColumnNames,
+                                                            CairoConfiguration configuration, CairoEngine engine, StringSink sink) {
+        return replaceSizeToMatchPartitionSumInOS(expected, new Utf8String(configuration.getRoot()), tableName, engine, sink, partitionColumnNames);
+    }
+
+    public static String replaceSizeToMatchOS(String expected, String tableName,
+                                              CairoConfiguration configuration, CairoEngine engine, StringSink sink) {
+        return replaceSizeToMatchOS(expected, new Utf8String(configuration.getRoot()), tableName, engine, sink);
+    }
+
+    public static String replaceSizeToMatchOS(
+            String expected,
+            Utf8Sequence root,
+            String tableName,
+            CairoEngine engine,
+            StringSink sink
+    ) {
+        ObjObjHashMap<String, Long> sizes = findPartitionSizes(root, tableName, engine, sink);
+        String[] lines = expected.split("\n");
+        sink.clear();
+        sink.put(lines[0]).put('\n');
+        StringSink auxSink = new StringSink();
+        for (int i = 1; i < lines.length; i++) {
+            String line = lines[i];
+            String nameColumn = line.split("\t")[2];
+            Long s = sizes.get(nameColumn);
+            long size = s != null ? s : 0L;
+            SizePrettyFunctionFactory.toSizePretty(auxSink, size);
+            line = line.replaceAll("SIZE", String.valueOf(size));
+            line = line.replaceAll("HUMAN", auxSink.toString());
+            sink.put(line).put('\n');
+        }
+        return sink.toString();
+    }
+
+
+    private static String replaceSizeToMatchPartitionSumInOS(
+            String expected,
+            Utf8Sequence root,
+            String tableName,
+            CairoEngine engine,
+            StringSink sink,
+            List<String> partitionColumnNames
+    ) {
+        ObjObjHashMap<String, Long> sizes = TestUtils.findPartitionSizes(root, tableName, engine, sink);
+        String[] lines = expected.split("\n");
+        sink.clear();
+        StringSink auxSink = new StringSink();
+        long size = 0L;
+        String line = lines[0];
+        for (int i = 0; i < partitionColumnNames.size(); i++) {
+            Long s = sizes.get(partitionColumnNames.get(i));
+            long pSize = s != null ? s : 0L;
+            size += pSize;
+        }
+        line = line.replaceAll("SIZE", String.valueOf(size));
+        sink.put(line).put('\n');
+        return sink.toString();
+    }
+
+
+    private static ObjObjHashMap<String, Long> findPartitionSizes(
+            Utf8Sequence root,
+            String tableName,
+            CairoEngine engine,
+            StringSink sink
+    ) {
+        ObjObjHashMap<String, Long> sizes = new ObjObjHashMap<>();
+        TableToken tableToken = engine.verifyTableName(tableName);
+        try (Path path = new Path().of(root).concat(tableToken)) {
+            int len = path.size();
+            long pFind = Files.findFirst(path.$());
+            try {
+                do {
+                    long namePtr = Files.findName(pFind);
+                    if (Files.notDots(namePtr)) {
+                        sink.clear();
+                        Utf8s.utf8ToUtf16Z(namePtr, sink);
+                        path.trimTo(len).concat(sink).$();
+                        int n = sink.length();
+                        int limit = n;
+                        for (int i = 0; i < n; i++) {
+                            if (sink.charAt(i) == '.' && i < n - 1) {
+                                char c = sink.charAt(i + 1);
+                                if (c >= '0' && c <= '9') {
+                                    limit = i;
+                                    break;
+                                }
+                            }
+                        }
+                        sink.clear(limit);
+                        sizes.put(sink.toString(), Files.getDirSize(path));
+                    }
+                } while (Files.findNext(pFind) > 0);
+            } finally {
+                Files.findClose(pFind);
+            }
+        }
+        return sizes;
+    }
+
     public static void assertEquals(LongList expected, LongList actual) {
         Assert.assertEquals(expected.size(), actual.size());
         for (int i = 0, n = expected.size(); i < n; i++) {
@@ -574,61 +681,8 @@ public final class TestUtils {
     }
 
     public static void assertMemoryLeak(LeakProneCode runnable) throws Exception {
-        Path.clearThreadLocals();
-        long mem = Unsafe.getMemUsed();
-        long[] memoryUsageByTag = new long[MemoryTag.SIZE];
-        for (int i = MemoryTag.MMAP_DEFAULT; i < MemoryTag.SIZE; i++) {
-            memoryUsageByTag[i] = Unsafe.getMemUsedByTag(i);
-        }
-
-        Assert.assertTrue("Initial file unsafe mem should be >= 0", mem >= 0);
-        long fileCount = Files.getOpenFileCount();
-        String fileDebugInfo = Files.getOpenFdDebugInfo();
-        Assert.assertTrue("Initial file count should be >= 0", fileCount >= 0);
-
-        int addrInfoCount = Net.getAllocatedAddrInfoCount();
-        Assert.assertTrue("Initial allocated addrinfo count should be >= 0", addrInfoCount >= 0);
-
-        int sockAddrCount = Net.getAllocatedSockAddrCount();
-        Assert.assertTrue("Initial allocated sockaddr count should be >= 0", sockAddrCount >= 0);
-
-        runnable.run();
-        Path.clearThreadLocals();
-        if (fileCount != Files.getOpenFileCount()) {
-            Assert.assertEquals("file descriptors, expected: " + fileDebugInfo + ", actual: " + Files.getOpenFdDebugInfo(), fileCount, Files.getOpenFileCount());
-        }
-
-        // Checks that the same tag used for allocation and freeing native memory
-        long memAfter = Unsafe.getMemUsed();
-        long memNativeSqlCompilerDiff = 0;
-        Assert.assertTrue(memAfter > -1);
-        if (mem != memAfter) {
-            for (int i = MemoryTag.MMAP_DEFAULT; i < MemoryTag.SIZE; i++) {
-                long actualMemByTag = Unsafe.getMemUsedByTag(i);
-                if (memoryUsageByTag[i] != actualMemByTag) {
-                    if (i != MemoryTag.NATIVE_SQL_COMPILER) {
-                        Assert.assertEquals("Memory usage by tag: " + MemoryTag.nameOf(i) + ", difference: " + (actualMemByTag - memoryUsageByTag[i]), memoryUsageByTag[i], actualMemByTag);
-                        Assert.assertTrue(actualMemByTag > -1);
-                    } else {
-                        // SqlCompiler memory is not released immediately as compilers are pooled
-                        Assert.assertTrue(actualMemByTag >= memoryUsageByTag[i]);
-                        memNativeSqlCompilerDiff = actualMemByTag - memoryUsageByTag[i];
-                    }
-                }
-            }
-            Assert.assertEquals(mem + memNativeSqlCompilerDiff, memAfter);
-        }
-
-        int addrInfoCountAfter = Net.getAllocatedAddrInfoCount();
-        Assert.assertTrue(addrInfoCountAfter > -1);
-        if (addrInfoCount != addrInfoCountAfter) {
-            Assert.fail("AddrInfo allocation count before the test: " + addrInfoCount + ", after the test: " + addrInfoCountAfter);
-        }
-
-        int sockAddrCountAfter = Net.getAllocatedSockAddrCount();
-        Assert.assertTrue(sockAddrCountAfter > -1);
-        if (sockAddrCount != sockAddrCountAfter) {
-            Assert.fail("SockAddr allocation count before the test: " + sockAddrCount + ", after the test: " + sockAddrCountAfter);
+        try (LeakCheck _check = new LeakCheck()) {
+            runnable.run();
         }
     }
 
@@ -1046,7 +1100,12 @@ public final class TestUtils {
             log.info().$("random seeds: ").$(s0).$("L, ").$(s1).$('L').$();
         }
         System.out.printf("random seeds: %dL, %dL%n", s0, s1);
-        return new Rnd(s0, s1);
+        Rnd rnd = new Rnd(s0, s1);
+        // Random impl is biased on first few calls, always return same bool,
+        // so we need to make a few calls to get it going randomly
+        rnd.nextBoolean();
+        rnd.nextBoolean();
+        return rnd;
     }
 
     public static String getCsvRoot() {
@@ -1385,6 +1444,9 @@ public final class TestUtils {
             FilesFacade ff = TestFilesFacadeImpl.INSTANCE;
             path.slash();
             Assert.assertTrue("Test dir cleanup error: " + ff.errno(), !ff.exists(path.$()) || ff.rmdir(path.slash()));
+
+            path.parent().concat(RESTORE_SNAPSHOT_TRIGGER_FILE_NAME);
+            Assert.assertTrue("Snapshot trigger cleanup error: " + ff.errno(), !ff.exists(path.$()) || ff.removeQuiet(path.$()));
         }
     }
 
@@ -1726,5 +1788,74 @@ public final class TestUtils {
     @FunctionalInterface
     public interface LeakProneCode {
         void run() throws Exception;
+    }
+
+    public static class LeakCheck implements QuietCloseable {
+        private final int addrInfoCount;
+        private final long fileCount;
+        private final String fileDebugInfo;
+        private final long mem;
+        private final long[] memoryUsageByTag = new long[MemoryTag.SIZE];
+        private final int sockAddrCount;
+
+        public LeakCheck() {
+            Path.clearThreadLocals();
+            mem = Unsafe.getMemUsed();
+            for (int i = MemoryTag.MMAP_DEFAULT; i < MemoryTag.SIZE; i++) {
+                memoryUsageByTag[i] = Unsafe.getMemUsedByTag(i);
+            }
+
+            Assert.assertTrue("Initial file unsafe mem should be >= 0", mem >= 0);
+            fileCount = Files.getOpenFileCount();
+            fileDebugInfo = Files.getOpenFdDebugInfo();
+            Assert.assertTrue("Initial file count should be >= 0", fileCount >= 0);
+
+            addrInfoCount = Net.getAllocatedAddrInfoCount();
+            Assert.assertTrue("Initial allocated addrinfo count should be >= 0", addrInfoCount >= 0);
+
+            sockAddrCount = Net.getAllocatedSockAddrCount();
+            Assert.assertTrue("Initial allocated sockaddr count should be >= 0", sockAddrCount >= 0);
+        }
+
+        @Override
+        public void close() {
+            Path.clearThreadLocals();
+            if (fileCount != Files.getOpenFileCount()) {
+                Assert.assertEquals("file descriptors, expected: " + fileDebugInfo + ", actual: " + Files.getOpenFdDebugInfo(), fileCount, Files.getOpenFileCount());
+            }
+
+            // Checks that the same tag used for allocation and freeing native memory
+            long memAfter = Unsafe.getMemUsed();
+            long memNativeSqlCompilerDiff = 0;
+            Assert.assertTrue(memAfter > -1);
+            if (mem != memAfter) {
+                for (int i = MemoryTag.MMAP_DEFAULT; i < MemoryTag.SIZE; i++) {
+                    long actualMemByTag = Unsafe.getMemUsedByTag(i);
+                    if (memoryUsageByTag[i] != actualMemByTag) {
+                        if (i != MemoryTag.NATIVE_SQL_COMPILER) {
+                            Assert.assertEquals("Memory usage by tag: " + MemoryTag.nameOf(i) + ", difference: " + (actualMemByTag - memoryUsageByTag[i]), memoryUsageByTag[i], actualMemByTag);
+                            Assert.assertTrue(actualMemByTag > -1);
+                        } else {
+                            // SqlCompiler memory is not released immediately as compilers are pooled
+                            Assert.assertTrue(actualMemByTag >= memoryUsageByTag[i]);
+                            memNativeSqlCompilerDiff = actualMemByTag - memoryUsageByTag[i];
+                        }
+                    }
+                }
+                Assert.assertEquals(mem + memNativeSqlCompilerDiff, memAfter);
+            }
+
+            int addrInfoCountAfter = Net.getAllocatedAddrInfoCount();
+            Assert.assertTrue(addrInfoCountAfter > -1);
+            if (addrInfoCount != addrInfoCountAfter) {
+                Assert.fail("AddrInfo allocation count before the test: " + addrInfoCount + ", after the test: " + addrInfoCountAfter);
+            }
+
+            int sockAddrCountAfter = Net.getAllocatedSockAddrCount();
+            Assert.assertTrue(sockAddrCountAfter > -1);
+            if (sockAddrCount != sockAddrCountAfter) {
+                Assert.fail("SockAddr allocation count before the test: " + sockAddrCount + ", after the test: " + sockAddrCountAfter);
+            }
+        }
     }
 }

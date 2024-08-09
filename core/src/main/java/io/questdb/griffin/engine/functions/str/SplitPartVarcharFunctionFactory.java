@@ -51,7 +51,13 @@ public class SplitPartVarcharFunctionFactory implements FunctionFactory {
     }
 
     @Override
-    public Function newInstance(int position, ObjList<Function> args, IntList argPositions, CairoConfiguration configuration, SqlExecutionContext sqlExecutionContext) throws SqlException {
+    public Function newInstance(
+            int position,
+            ObjList<Function> args,
+            IntList argPositions,
+            CairoConfiguration configuration,
+            SqlExecutionContext sqlExecutionContext
+    ) throws SqlException {
         final Function varcharFunc = args.getQuick(0);
         final Function delimiterFunc = args.getQuick(1);
         final Function indexFunc = args.getQuick(2);
@@ -70,6 +76,54 @@ public class SplitPartVarcharFunctionFactory implements FunctionFactory {
             throw SqlException.$(indexPosition, "index must be either a constant expression or a placeholder");
         }
         return new SplitPartVarcharFunction(varcharFunc, delimiterFunc, indexFunc, indexPosition);
+    }
+
+    private static void splitToSink(Utf8Sink sink, int index, Utf8Sequence utf8Str, Utf8Sequence delimiter) {
+        if (index == 0) {
+            return;
+        }
+
+        int size = utf8Str.size();
+        int len = Utf8s.length(utf8Str);
+
+        int start;
+        int end;
+        if (index > 0) {
+            if (index == 1) {
+                start = 0;
+            } else {
+                start = Utf8s.indexOf(utf8Str, 0, size, delimiter, index - 1);
+                if (start == -1) {
+                    return;
+                }
+                start += delimiter.size();
+            }
+
+            end = Utf8s.indexOf(utf8Str, start, size, delimiter);
+
+            if (end == -1) {
+                end = len;
+            }
+        } else { // if index is negative, returns index-from-last field
+            if (index == -1) {
+                end = size;
+            } else {
+                end = Utf8s.indexOf(utf8Str, 0, size, delimiter, index + 1);
+                if (end == -1) {
+                    return;
+                }
+            }
+
+            start = Utf8s.indexOf(utf8Str, 0, end, delimiter, -1);
+
+            if (start == -1) {
+                start = 0;
+            } else {
+                start += delimiter.size();
+            }
+        }
+
+        sink.put(utf8Str, start, end);
     }
 
     private static abstract class AbstractSplitPartVarcharFunction extends VarcharFunction implements TernaryFunction {
@@ -108,17 +162,6 @@ public class SplitPartVarcharFunctionFactory implements FunctionFactory {
         }
 
         @Override
-        public void getVarchar(Record rec, Utf8Sink utf8Sink) {
-            Utf8Sequence utf8Str = varcharFunc.getVarcharA(rec);
-            Utf8Sequence delimiter = delimiterFunc.getVarcharA(rec);
-            int index = getIndex(rec);
-            if (utf8Str == null || delimiter == null || index == Numbers.INT_NULL) {
-                return;
-            }
-            splitToSink(utf8Sink, index, utf8Str, delimiter);
-        }
-
-        @Override
         public Utf8Sequence getVarcharA(Record rec) {
             return getVarcharWithClear(rec, sinkA);
         }
@@ -139,6 +182,11 @@ public class SplitPartVarcharFunctionFactory implements FunctionFactory {
             }
         }
 
+        @Override
+        public boolean isReadThreadSafe() {
+            return false;
+        }
+
         @Nullable
         private Utf8StringSink getVarcharWithClear(Record rec, Utf8StringSink sink) {
             sink.clear();
@@ -156,59 +204,16 @@ public class SplitPartVarcharFunctionFactory implements FunctionFactory {
         abstract int getIndex(Record rec);
     }
 
-    private static void splitToSink(Utf8Sink sink, int index, Utf8Sequence utf8Str, Utf8Sequence delimiter) {
-        if (index == 0) {
-            return;
-        }
-
-        int size = utf8Str.size();
-        int len = Utf8s.length(utf8Str);
-
-        int start;
-        int end;
-        if (index > 0) {
-            if (index == 1) {
-                start = 0;
-            } else {
-                start = Utf8s.indexOf(utf8Str, 0, size, delimiter, index - 1);
-                if (start == -1) {
-                    return;
-                }
-                start += delimiter.size();
-            }
-
-            end = Utf8s.indexOf(utf8Str, start, size, delimiter);
-
-            if (end == -1) {
-                end = len;
-            }
-        } else {    // if index is negative, returns index-from-last field
-            if (index == -1) {
-                end = size;
-            } else {
-                end = Utf8s.indexOf(utf8Str, 0, size, delimiter, index + 1);
-                if (end == -1) {
-                    return;
-                }
-            }
-
-            start = Utf8s.indexOf(utf8Str, 0, end, delimiter, -1);
-
-            if (start == -1) {
-                start = 0;
-            } else {
-                start += delimiter.size();
-            }
-        }
-
-        sink.put(utf8Str, start, end);
-    }
-
     private static class SplitPartVarcharConstIndexFunction extends AbstractSplitPartVarcharFunction {
         private final int index;
 
-        public SplitPartVarcharConstIndexFunction(Function strFunc, Function delimiterFunc, Function indexFunc, int indexPosition,
-                                                  int index) {
+        public SplitPartVarcharConstIndexFunction(
+                Function strFunc,
+                Function delimiterFunc,
+                Function indexFunc,
+                int indexPosition,
+                int index
+        ) {
             super(strFunc, delimiterFunc, indexFunc, indexPosition);
             this.index = index;
         }
@@ -220,7 +225,13 @@ public class SplitPartVarcharFunctionFactory implements FunctionFactory {
     }
 
     private static class SplitPartVarcharFunction extends AbstractSplitPartVarcharFunction implements TernaryFunction {
-        public SplitPartVarcharFunction(Function varcharFunc, Function delimiterFunc, Function indexFunc, int indexPosition) {
+
+        public SplitPartVarcharFunction(
+                Function varcharFunc,
+                Function delimiterFunc,
+                Function indexFunc,
+                int indexPosition
+        ) {
             super(varcharFunc, delimiterFunc, indexFunc, indexPosition);
         }
 
