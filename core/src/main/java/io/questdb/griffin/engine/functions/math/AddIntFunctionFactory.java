@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -30,26 +30,48 @@ import io.questdb.cairo.sql.Record;
 import io.questdb.griffin.FunctionFactory;
 import io.questdb.griffin.PlanSink;
 import io.questdb.griffin.SqlExecutionContext;
-import io.questdb.griffin.engine.functions.BinaryFunction;
 import io.questdb.griffin.engine.functions.IntFunction;
+import io.questdb.griffin.engine.functions.constants.IntConstant;
 import io.questdb.std.IntList;
+import io.questdb.std.Misc;
 import io.questdb.std.Numbers;
 import io.questdb.std.ObjList;
+import io.questdb.std.Transient;
 
 public class AddIntFunctionFactory implements FunctionFactory {
+
     @Override
     public String getSignature() {
         return "+(II)";
     }
 
     @Override
-    public Function newInstance(int position, ObjList<Function> args, IntList argPositions, CairoConfiguration configuration, SqlExecutionContext sqlExecutionContext) {
-        return new AddIntFunc(args.getQuick(0), args.getQuick(1));
+    public Function newInstance(
+            int position,
+            @Transient ObjList<Function> args,
+            @Transient IntList argPositions,
+            CairoConfiguration configuration,
+            SqlExecutionContext sqlExecutionContext
+    ) {
+        final Function left = args.getQuick(0);
+        final Function right = args.getQuick(1);
+        // null + x and x + null always evaluate to null. Fold to an int null constant at
+        // construction time, so the non-null operand (which may be a column reference that
+        // needs a record to evaluate) is never asked for its value with a null record.
+        if (left.isNullConstant()) {
+            Misc.free(right);
+            return IntConstant.NULL;
+        }
+        if (right.isNullConstant()) {
+            Misc.free(left);
+            return IntConstant.NULL;
+        }
+        return new AddIntFunc(left, right);
     }
 
-    private static class AddIntFunc extends IntFunction implements BinaryFunction {
-        final Function left;
-        final Function right;
+    private static class AddIntFunc extends IntFunction implements ArithmeticBinaryFunction {
+        private final Function left;
+        private final Function right;
 
         public AddIntFunc(Function left, Function right) {
             super();
@@ -61,11 +83,9 @@ public class AddIntFunctionFactory implements FunctionFactory {
         public int getInt(Record rec) {
             final int left = this.left.getInt(rec);
             final int right = this.right.getInt(rec);
-
             if (left == Numbers.INT_NULL || right == Numbers.INT_NULL) {
                 return Numbers.INT_NULL;
             }
-
             return left + right;
         }
 
@@ -77,15 +97,6 @@ public class AddIntFunctionFactory implements FunctionFactory {
         @Override
         public Function getRight() {
             return right;
-        }
-
-        @Override
-        public boolean isConstant() {
-            boolean leftIsConstant = left.isConstant();
-            boolean rightIsConstant = right.isConstant();
-            return leftIsConstant && rightIsConstant
-                    || (leftIsConstant && left.getInt(null) == Numbers.INT_NULL)
-                    || (rightIsConstant && right.getInt(null) == Numbers.INT_NULL);
         }
 
         @Override

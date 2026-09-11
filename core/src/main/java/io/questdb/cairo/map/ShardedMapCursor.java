@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,15 +24,21 @@
 
 package io.questdb.cairo.map;
 
-import io.questdb.cairo.DataUnavailableException;
+import io.questdb.cairo.arr.ArrayView;
+import io.questdb.cairo.sql.Function;
 import io.questdb.cairo.sql.Record;
 import io.questdb.cairo.sql.RecordCursor;
 import io.questdb.cairo.sql.SqlExecutionCircuitBreaker;
-import io.questdb.std.*;
+import io.questdb.std.BinarySequence;
+import io.questdb.std.Decimal128;
+import io.questdb.std.Decimal256;
+import io.questdb.std.DirectLongLongSortedList;
+import io.questdb.std.IntList;
+import io.questdb.std.Long256;
+import io.questdb.std.Misc;
+import io.questdb.std.ObjList;
 import io.questdb.std.str.CharSink;
-import io.questdb.std.str.Utf16Sink;
 import io.questdb.std.str.Utf8Sequence;
-import io.questdb.std.str.Utf8Sink;
 
 public class ShardedMapCursor implements MapRecordCursor {
     private final ShardedMapRecord recordA = new ShardedMapRecord(true);
@@ -50,7 +56,7 @@ public class ShardedMapCursor implements MapRecordCursor {
 
     @Override
     public void close() {
-        Misc.freeObjList(shardCursors);
+        Misc.freeObjListAndKeepObjects(shardCursors);
     }
 
     @Override
@@ -64,7 +70,7 @@ public class ShardedMapCursor implements MapRecordCursor {
     }
 
     @Override
-    public boolean hasNext() throws DataUnavailableException {
+    public boolean hasNext() {
         if (currentCursor.hasNext()) {
             recordA.of(currentCursor.getRecord(), currentIndex);
             return true;
@@ -80,12 +86,38 @@ public class ShardedMapCursor implements MapRecordCursor {
         return false;
     }
 
+    @Override
+    public void longTopK(DirectLongLongSortedList list, Function recordFunction) {
+        for (int i = 0, n = shardCursors.size(); i < n; i++) {
+            shardCursors.getQuick(i).longTopK(list, recordFunction);
+        }
+    }
+
     public void of(ObjList<Map> shards) {
         shardCursors.clear();
         for (int i = 0, n = shards.size(); i < n; i++) {
             shardCursors.add(shards.getQuick(i).getCursor());
         }
         toTop();
+    }
+
+    public void ofShared(ObjList<Map> shards) {
+        if (shardCursors.size() == 0) {
+            for (int i = 0, n = shards.size(); i < n; i++) {
+                shardCursors.add(shards.getQuick(i).newCursor());
+            }
+        } else {
+            assert shardCursors.size() == shards.size();
+            for (int i = 0, n = shards.size(); i < n; i++) {
+                shards.getQuick(i).initCursor(shardCursors.getQuick(i));
+            }
+        }
+        toTop();
+    }
+
+    @Override
+    public long preComputedStateSize() {
+        return 0;
     }
 
     @Override
@@ -96,7 +128,7 @@ public class ShardedMapCursor implements MapRecordCursor {
     }
 
     @Override
-    public long size() throws DataUnavailableException {
+    public long size() {
         long size = 0;
         for (int i = 0, n = shardCursors.size(); i < n; i++) {
             size += shardCursors.getQuick(i).size();
@@ -146,6 +178,11 @@ public class ShardedMapCursor implements MapRecordCursor {
         }
 
         @Override
+        public ArrayView getArray(int col, int columnType) {
+            return baseRecord.getArray(col, columnType);
+        }
+
+        @Override
         public BinarySequence getBin(int columnIndex) {
             return baseRecord.getBin(columnIndex);
         }
@@ -168,6 +205,36 @@ public class ShardedMapCursor implements MapRecordCursor {
         @Override
         public char getChar(int columnIndex) {
             return baseRecord.getChar(columnIndex);
+        }
+
+        @Override
+        public void getDecimal128(int col, Decimal128 sink) {
+            baseRecord.getDecimal128(col, sink);
+        }
+
+        @Override
+        public short getDecimal16(int columnIndex) {
+            return baseRecord.getDecimal16(columnIndex);
+        }
+
+        @Override
+        public void getDecimal256(int col, Decimal256 sink) {
+            baseRecord.getDecimal256(col, sink);
+        }
+
+        @Override
+        public int getDecimal32(int columnIndex) {
+            return baseRecord.getDecimal32(columnIndex);
+        }
+
+        @Override
+        public long getDecimal64(int columnIndex) {
+            return baseRecord.getDecimal64(columnIndex);
+        }
+
+        @Override
+        public byte getDecimal8(int columnIndex) {
+            return baseRecord.getDecimal8(columnIndex);
         }
 
         @Override
@@ -251,11 +318,6 @@ public class ShardedMapCursor implements MapRecordCursor {
         }
 
         @Override
-        public void getStr(int columnIndex, Utf16Sink utf16Sink) {
-            baseRecord.getStr(columnIndex, utf16Sink);
-        }
-
-        @Override
         public CharSequence getStrA(int columnIndex) {
             return baseRecord.getStrA(columnIndex);
         }
@@ -286,11 +348,6 @@ public class ShardedMapCursor implements MapRecordCursor {
         }
 
         @Override
-        public void getVarchar(int col, Utf8Sink utf8Sink) {
-            baseRecord.getVarchar(col, utf8Sink);
-        }
-
-        @Override
         public Utf8Sequence getVarcharA(int col) {
             return baseRecord.getVarcharA(col);
         }
@@ -308,6 +365,11 @@ public class ShardedMapCursor implements MapRecordCursor {
         @Override
         public long keyHashCode() {
             return baseRecord.keyHashCode();
+        }
+
+        @Override
+        public void of(long address) {
+            baseRecord.of(address);
         }
 
         @Override

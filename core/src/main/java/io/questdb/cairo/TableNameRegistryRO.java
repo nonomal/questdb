@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -38,10 +38,10 @@ public class TableNameRegistryRO extends AbstractTableNameRegistry {
     private ConcurrentHashMap<TableToken> tableNameToTableTokenMap1 = new ConcurrentHashMap<>(false);
     private ConcurrentHashMap<TableToken> tableNameToTableTokenMap2 = new ConcurrentHashMap<>(false);
 
-    public TableNameRegistryRO(CairoConfiguration configuration, TableFlagResolver tableFlagResolver) {
-        super(configuration, tableFlagResolver);
-        this.clockMs = configuration.getMillisecondClock();
-        long timeout = configuration.getTableRegistryAutoReloadFrequency();
+    public TableNameRegistryRO(CairoEngine engine, TableFlagResolver tableFlagResolver) {
+        super(engine, tableFlagResolver);
+        this.clockMs = engine.getConfiguration().getMillisecondClock();
+        long timeout = engine.getConfiguration().getTableRegistryAutoReloadFrequency();
         this.autoReloadTimeout = timeout > 0 ? timeout : Long.MAX_VALUE;
         setNameMaps(tableNameToTableTokenMap1, dirNameToTableTokenMap1);
     }
@@ -58,16 +58,21 @@ public class TableNameRegistryRO extends AbstractTableNameRegistry {
 
     @Override
     public TableToken getTableToken(CharSequence tableName) {
-        TableToken record = tableNameToTableTokenMap.get(tableName);
+        TableToken record = super.getTableToken(tableName);
         if (record == null && clockMs.getTicks() - lastReloadTimestampMs > autoReloadTimeout) {
             reloadThrottled();
-            return tableNameToTableTokenMap.get(tableName);
+            return super.getTableToken(tableName);
         }
         return record;
     }
 
     @Override
-    public TableToken lockTableName(String tableName, String dirName, int tableId, boolean isWal) {
+    public TableToken lockTableName(String tableName, String dirName, int tableId, boolean isView, boolean isMatView, boolean isWal) {
+        throw CairoException.critical(0).put("instance is read only");
+    }
+
+    @Override
+    public TableToken lockTableName(String tableName, String dirName, int tableId, boolean isView, boolean isMatView, boolean isLiveView, boolean isWal) {
         throw CairoException.critical(0).put("instance is read only");
     }
 
@@ -82,10 +87,10 @@ public class TableNameRegistryRO extends AbstractTableNameRegistry {
     }
 
     @Override
-    public synchronized void reload(@Nullable ObjList<TableToken> convertedTables) {
+    public synchronized boolean reload(@Nullable ObjList<TableToken> convertedTables) {
         tableNameToTableTokenMap2.clear();
         dirNameToTableTokenMap2.clear();
-        nameStore.reload(tableNameToTableTokenMap2, dirNameToTableTokenMap2, convertedTables);
+        boolean consistent = nameStore.reload(tableNameToTableTokenMap2, dirNameToTableTokenMap2, convertedTables);
 
         // Swap the maps
         setNameMaps(tableNameToTableTokenMap2, dirNameToTableTokenMap2);
@@ -99,6 +104,7 @@ public class TableNameRegistryRO extends AbstractTableNameRegistry {
         dirNameToTableTokenMap1 = tmp2;
 
         lastReloadTimestampMs = clockMs.getTicks();
+        return consistent;
     }
 
     @Override

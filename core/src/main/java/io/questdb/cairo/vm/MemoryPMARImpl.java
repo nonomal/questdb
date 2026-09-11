@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -33,26 +33,27 @@ import io.questdb.log.Log;
 import io.questdb.log.LogFactory;
 import io.questdb.std.FilesFacade;
 import io.questdb.std.str.LPSZ;
+import org.jetbrains.annotations.Nullable;
 import org.jetbrains.annotations.TestOnly;
 
-// paged mapped appendable readable 
+// paged mapped appendable readable
 public class MemoryPMARImpl extends MemoryPARWImpl implements MemoryMAR {
     private static final Log LOG = LogFactory.getLog(MemoryPMARImpl.class);
-    private final int commitMode;
-    private int fd = -1;
+    private final CairoConfiguration configuration;
+    private long fd = -1;
     private FilesFacade ff;
     private int madviseOpts = -1;
     private int mappedPage;
     private long pageAddress = 0;
 
     @TestOnly
-    public MemoryPMARImpl(FilesFacade ff, LPSZ name, long pageSize, int memoryTag, long opts) {
-        this(CommitMode.NOSYNC);
+    public MemoryPMARImpl(FilesFacade ff, LPSZ name, long pageSize, int memoryTag, int opts) {
+        this(null);
         of(ff, name, pageSize, 0, memoryTag, opts, -1);
     }
 
-    public MemoryPMARImpl(int commitMode) {
-        this.commitMode = commitMode;
+    public MemoryPMARImpl(@Nullable CairoConfiguration configuration) {
+        this.configuration = configuration;
     }
 
     public final void close(boolean truncate, byte truncateMode) {
@@ -74,14 +75,14 @@ public class MemoryPMARImpl extends MemoryPARWImpl implements MemoryMAR {
     }
 
     @Override
-    public int detachFdClose() {
-        int fd = this.fd;
+    public long detachFdClose() {
+        long fd = this.fd;
         this.fd = -1;
         close(false);
         return fd;
     }
 
-    public int getFd() {
+    public long getFd() {
         return fd;
     }
 
@@ -107,17 +108,17 @@ public class MemoryPMARImpl extends MemoryPARWImpl implements MemoryMAR {
     }
 
     @Override
-    public final void of(FilesFacade ff, LPSZ name, long extendSegmentSize, int memoryTag, long opts) {
+    public final void of(FilesFacade ff, LPSZ name, long extendSegmentSize, int memoryTag, int opts) {
         of(ff, name, extendSegmentSize, 0, memoryTag, opts, -1);
     }
 
     @Override
-    public void of(FilesFacade ff, LPSZ name, long extendSegmentSize, long size, int memoryTag, long opts) {
+    public void of(FilesFacade ff, LPSZ name, long extendSegmentSize, long size, int memoryTag, int opts) {
         of(ff, name, extendSegmentSize, memoryTag, opts);
     }
 
     @Override
-    public void of(FilesFacade ff, LPSZ name, long extendSegmentSize, long size, int memoryTag, long opts, int madviseOpts) {
+    public void of(FilesFacade ff, LPSZ name, long extendSegmentSize, long size, int memoryTag, int opts, int madviseOpts) {
         close();
         this.memoryTag = memoryTag;
         this.madviseOpts = madviseOpts;
@@ -129,7 +130,7 @@ public class MemoryPMARImpl extends MemoryPARWImpl implements MemoryMAR {
     }
 
     @Override
-    public void switchTo(FilesFacade ff, int fd, long extendSegmentSize, long offset, boolean truncate, byte truncateMode) {
+    public void switchTo(FilesFacade ff, long fd, long extendSegmentSize, long offset, boolean truncate, byte truncateMode) {
         this.ff = ff;
         setExtendSegmentSize(extendSegmentSize);
         close(truncate, truncateMode);
@@ -138,11 +139,12 @@ public class MemoryPMARImpl extends MemoryPARWImpl implements MemoryMAR {
     }
 
     public void sync(boolean async) {
-        if (pageAddress != 0 && commitMode != CommitMode.NOSYNC) {
-            ff.msync(pageAddress, getPageSize(), commitMode == CommitMode.ASYNC);
+        if (pageAddress != 0) {
+            ff.msync(pageAddress, getPageSize(), async);
         }
     }
 
+    @Override
     public void truncate() {
         if (fd == -1) {
             // are we closed ?
@@ -157,11 +159,6 @@ public class MemoryPMARImpl extends MemoryPARWImpl implements MemoryMAR {
     }
 
     @Override
-    public void wholeFile(FilesFacade ff, LPSZ name, int memoryTag) {
-        of(ff, name, ff.getMapPageSize(), 0, memoryTag, CairoConfiguration.O_NONE, -1);
-    }
-
-    @Override
     protected long mapWritePage(int page, long offset) {
         releaseCurrentPage();
         return pageAddress = mapPage(page);
@@ -169,10 +166,13 @@ public class MemoryPMARImpl extends MemoryPARWImpl implements MemoryMAR {
 
     @Override
     protected void release(long address) {
-        if (commitMode != CommitMode.NOSYNC) {
-            ff.msync(address, getPageSize(), commitMode == CommitMode.ASYNC);
+        if (address != 0) {
+            int commitMode = configuration != null ? configuration.getCommitMode() : CommitMode.NOSYNC;
+            if (commitMode != CommitMode.NOSYNC) {
+                ff.msync(address, getPageSize(), commitMode == CommitMode.ASYNC);
+            }
+            ff.munmap(address, getPageSize(), memoryTag);
         }
-        ff.munmap(address, getPageSize(), memoryTag);
     }
 
     void releaseCurrentPage() {

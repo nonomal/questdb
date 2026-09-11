@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -29,9 +29,6 @@ package io.questdb.std.histogram.org.HdrHistogram.packedarray;
  * {@link #add add()} and {@link #increment increment()} operations on the logical contents of the array.
  */
 public class PackedLongArray extends AbstractPackedLongArray {
-
-    PackedLongArray() {
-    }
 
     public PackedLongArray(final int virtualLength) {
         this(virtualLength, AbstractPackedArrayContext.MINIMUM_INITIAL_PACKED_ARRAY_CAPACITY);
@@ -63,9 +60,8 @@ public class PackedLongArray extends AbstractPackedLongArray {
             currentArrayContext.setVirtualLength(newVirtualArrayLength);
             return;
         }
-        AbstractPackedArrayContext oldArrayContext = currentArrayContext;
-        setArrayContext(new PackedArrayContext(newVirtualArrayLength, oldArrayContext, oldArrayContext.length()));
-        for (IterationValue v : oldArrayContext.nonZeroValues()) {
+        setArrayContext(new PackedArrayContext(newVirtualArrayLength, currentArrayContext, currentArrayContext.length()));
+        for (IterationValue v : currentArrayContext.nonZeroValues()) {
             set(v.getIndex(), v.getValue());
         }
     }

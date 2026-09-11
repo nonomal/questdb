@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -28,7 +28,16 @@ import io.questdb.cairo.CairoException;
 import io.questdb.cairo.ColumnType;
 import io.questdb.cairo.ColumnTypes;
 import io.questdb.cairo.sql.RecordCursor;
-import io.questdb.std.*;
+import io.questdb.griffin.engine.groupby.FlyweightPackedMapValue;
+import io.questdb.std.Decimal128;
+import io.questdb.std.Decimal256;
+import io.questdb.std.Hash;
+import io.questdb.std.IntList;
+import io.questdb.std.Long256;
+import io.questdb.std.Long256Impl;
+import io.questdb.std.Numbers;
+import io.questdb.std.Transient;
+import io.questdb.std.Unsafe;
 import io.questdb.std.str.CharSink;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
@@ -42,10 +51,9 @@ final class Unordered4MapRecord implements MapRecord {
     private final long[] columnOffsets;
     private final Long256Impl[] keyLong256A;
     private final Long256Impl[] keyLong256B;
-    private final Unordered4MapValue value;
+    private final FlyweightPackedMapValue value;
     private final long[] valueOffsets;
     private final long valueSize;
-    private long limit;
     private long startAddress;
     private IntList symbolTableIndex;
     private RecordCursor symbolTableResolver;
@@ -53,50 +61,29 @@ final class Unordered4MapRecord implements MapRecord {
     Unordered4MapRecord(
             long valueSize,
             long[] valueOffsets,
-            Unordered4MapValue value,
-            @NotNull @Transient ColumnTypes keyTypes,
+            FlyweightPackedMapValue value,
             @Nullable @Transient ColumnTypes valueTypes
     ) {
         this.valueSize = valueSize;
         this.valueOffsets = valueOffsets;
         this.value = value;
-        this.value.linkRecord(this); // provides feature to position this record at location of map value
 
         int nColumns;
         int keyIndexOffset;
         if (valueTypes != null) {
             keyIndexOffset = valueTypes.getColumnCount();
-            nColumns = keyTypes.getColumnCount() + valueTypes.getColumnCount();
+            nColumns = valueTypes.getColumnCount() + 1;
         } else {
             keyIndexOffset = 0;
-            nColumns = keyTypes.getColumnCount();
+            nColumns = 1;
         }
 
         columnOffsets = new long[nColumns];
 
         Long256Impl[] long256A = null;
         Long256Impl[] long256B = null;
-        long offset = 0;
-        for (int i = 0, n = keyTypes.getColumnCount(); i < n; i++) {
-            final int columnType = keyTypes.getColumnType(i);
-            if (ColumnType.tagOf(columnType) == ColumnType.LONG256) {
-                if (long256A == null) {
-                    long256A = new Long256Impl[nColumns];
-                    long256B = new Long256Impl[nColumns];
-                }
-                long256A[i + keyIndexOffset] = new Long256Impl();
-                long256B[i + keyIndexOffset] = new Long256Impl();
-            }
-            final int size = ColumnType.sizeOf(columnType);
-            if (size <= 0) {
-                throw CairoException.nonCritical().put("key type is not supported: ").put(ColumnType.nameOf(columnType));
-            }
-            columnOffsets[i + keyIndexOffset] = offset;
-            offset += size;
-        }
-
-        assert offset <= Unordered4Map.KEY_SIZE;
-        offset = Unordered4Map.KEY_SIZE;
+        columnOffsets[keyIndexOffset] = 0;
+        long offset = Unordered4Map.KEY_SIZE;
         if (valueTypes != null) {
             for (int i = 0, n = valueTypes.getColumnCount(); i < n; i++) {
                 int columnType = valueTypes.getColumnType(i);
@@ -131,7 +118,7 @@ final class Unordered4MapRecord implements MapRecord {
         this.valueSize = valueSize;
         this.valueOffsets = valueOffsets;
         this.columnOffsets = columnOffsets;
-        this.value = new Unordered4MapValue(valueSize, valueOffsets);
+        this.value = new FlyweightPackedMapValue(valueSize, valueOffsets);
         this.keyLong256A = keyLong256A;
         this.keyLong256B = keyLong256B;
     }
@@ -163,13 +150,13 @@ final class Unordered4MapRecord implements MapRecord {
     @Override
     public void copyToKey(MapKey destKey) {
         Unordered4Map.Key destBaseKey = (Unordered4Map.Key) destKey;
-        destBaseKey.copyFromRawKey(startAddress);
+        destBaseKey.copyFromRawKey(Unsafe.getInt(startAddress));
     }
 
     @Override
     public void copyValue(MapValue destValue) {
-        Unordered4MapValue destFastValue = (Unordered4MapValue) destValue;
-        destFastValue.copyRawValue(startAddress + Unordered4Map.KEY_SIZE);
+        FlyweightPackedMapValue destPackedValue = (FlyweightPackedMapValue) destValue;
+        destPackedValue.copyRawValue(startAddress + Unordered4Map.KEY_SIZE);
     }
 
     @Override
@@ -179,22 +166,56 @@ final class Unordered4MapRecord implements MapRecord {
 
     @Override
     public byte getByte(int columnIndex) {
-        return Unsafe.getUnsafe().getByte(addressOfColumn(columnIndex));
+        return Unsafe.getByte(addressOfColumn(columnIndex));
     }
 
     @Override
     public char getChar(int columnIndex) {
-        return Unsafe.getUnsafe().getChar(addressOfColumn(columnIndex));
+        return Unsafe.getChar(addressOfColumn(columnIndex));
+    }
+
+    @Override
+    public void getDecimal128(int col, Decimal128 sink) {
+        final long addr = addressOfColumn(col);
+        sink.ofRaw(
+                Unsafe.getLong(addr),
+                Unsafe.getLong(addr + 8L)
+        );
+    }
+
+    @Override
+    public short getDecimal16(int col) {
+        return Unsafe.getShort(addressOfColumn(col));
+    }
+
+    @Override
+    public void getDecimal256(int col, Decimal256 sink) {
+        sink.ofRawAddress(addressOfColumn(col));
+    }
+
+    @Override
+    public int getDecimal32(int col) {
+        return Unsafe.getInt(addressOfColumn(col));
+    }
+
+    @Override
+    public long getDecimal64(int col) {
+        return Unsafe.getLong(addressOfColumn(col));
+    }
+
+    @Override
+    public byte getDecimal8(int col) {
+        return Unsafe.getByte(addressOfColumn(col));
     }
 
     @Override
     public double getDouble(int columnIndex) {
-        return Unsafe.getUnsafe().getDouble(addressOfColumn(columnIndex));
+        return Unsafe.getDouble(addressOfColumn(columnIndex));
     }
 
     @Override
     public float getFloat(int columnIndex) {
-        return Unsafe.getUnsafe().getFloat(addressOfColumn(columnIndex));
+        return Unsafe.getFloat(addressOfColumn(columnIndex));
     }
 
     @Override
@@ -219,37 +240,32 @@ final class Unordered4MapRecord implements MapRecord {
 
     @Override
     public int getIPv4(int columnIndex) {
-        return Unsafe.getUnsafe().getInt(addressOfColumn(columnIndex));
+        return Unsafe.getInt(addressOfColumn(columnIndex));
     }
 
     @Override
     public int getInt(int columnIndex) {
-        return Unsafe.getUnsafe().getInt(addressOfColumn(columnIndex));
+        return Unsafe.getInt(addressOfColumn(columnIndex));
     }
 
     @Override
     public long getLong(int columnIndex) {
-        return Unsafe.getUnsafe().getLong(addressOfColumn(columnIndex));
+        return Unsafe.getLong(addressOfColumn(columnIndex));
     }
 
     @Override
     public long getLong128Hi(int columnIndex) {
-        return Unsafe.getUnsafe().getLong(addressOfColumn(columnIndex) + Long.BYTES);
+        return Unsafe.getLong(addressOfColumn(columnIndex) + Long.BYTES);
     }
 
     @Override
     public long getLong128Lo(int columnIndex) {
-        return Unsafe.getUnsafe().getLong(addressOfColumn(columnIndex));
+        return Unsafe.getLong(addressOfColumn(columnIndex));
     }
 
     @Override
     public void getLong256(int columnIndex, CharSink<?> sink) {
-        long address = addressOfColumn(columnIndex);
-        final long a = Unsafe.getUnsafe().getLong(address);
-        final long b = Unsafe.getUnsafe().getLong(address + Long.BYTES);
-        final long c = Unsafe.getUnsafe().getLong(address + Long.BYTES * 2);
-        final long d = Unsafe.getUnsafe().getLong(address + Long.BYTES * 3);
-        Numbers.appendLong256(a, b, c, d, sink);
+        Numbers.appendLong256FromUnsafe(addressOfColumn(columnIndex), sink);
     }
 
     @Override
@@ -271,7 +287,7 @@ final class Unordered4MapRecord implements MapRecord {
 
     @Override
     public short getShort(int columnIndex) {
-        return Unsafe.getUnsafe().getShort(addressOfColumn(columnIndex));
+        return Unsafe.getShort(addressOfColumn(columnIndex));
     }
 
     @Override
@@ -286,20 +302,17 @@ final class Unordered4MapRecord implements MapRecord {
 
     @Override
     public MapValue getValue() {
-        return value.of(startAddress, limit, false);
+        return value.of(startAddress, startAddress + Unordered4Map.KEY_SIZE, false);
     }
 
     @Override
     public long keyHashCode() {
-        return Hash.hashInt64(Unsafe.getUnsafe().getInt(startAddress));
+        return Hash.hashInt64(Unsafe.getInt(startAddress));
     }
 
+    @Override
     public void of(long address) {
         this.startAddress = address;
-    }
-
-    public void setLimit(long limit) {
-        this.limit = limit;
     }
 
     @Override

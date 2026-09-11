@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -26,13 +26,31 @@ package io.questdb.test.griffin;
 
 import io.questdb.cairo.CairoException;
 import io.questdb.cairo.ColumnType;
+import io.questdb.cairo.ColumnVersionReader;
+import io.questdb.cairo.CursorPrinter;
+import io.questdb.cairo.DebugUtils;
+import io.questdb.cairo.IndexType;
+import io.questdb.cairo.MicrosTimestampDriver;
+import io.questdb.cairo.TableReader;
 import io.questdb.cairo.TableToken;
+import io.questdb.cairo.TableUtils;
 import io.questdb.cairo.TableWriter;
+import io.questdb.cairo.TxReader;
+import io.questdb.cairo.sql.Record;
+import io.questdb.cairo.sql.RecordCursor;
+import io.questdb.cairo.sql.RecordCursorFactory;
+import io.questdb.cairo.sql.RecordMetadata;
 import io.questdb.cairo.wal.WalWriter;
 import io.questdb.griffin.SqlCompiler;
 import io.questdb.griffin.SqlException;
-import io.questdb.griffin.model.IntervalUtils;
-import io.questdb.std.*;
+import io.questdb.std.DirectIntList;
+import io.questdb.std.Files;
+import io.questdb.std.FilesFacade;
+import io.questdb.std.LongList;
+import io.questdb.std.MemoryTag;
+import io.questdb.std.Misc;
+import io.questdb.std.Numbers;
+import io.questdb.std.Rnd;
 import io.questdb.std.str.LPSZ;
 import io.questdb.std.str.Path;
 import io.questdb.std.str.Utf8String;
@@ -42,114 +60,796 @@ import io.questdb.test.tools.TestUtils;
 import org.junit.Assert;
 import org.junit.Assume;
 import org.junit.Test;
-import org.junit.runner.RunWith;
-import org.junit.runners.Parameterized;
 
-import java.util.Arrays;
-import java.util.Collection;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 
-@RunWith(Parameterized.class)
 public class AlterTableChangeColumnTypeTest extends AbstractCairoTest {
     private final boolean partitioned;
     private final boolean walEnabled;
 
-    public AlterTableChangeColumnTypeTest(Mode walMode) {
-        this.walEnabled = (walMode == Mode.WITH_WAL);
-        this.partitioned = (walMode != Mode.NON_PARTITIONED);
+    public AlterTableChangeColumnTypeTest() {
+        Rnd rnd = TestUtils.generateRandom(LOG);
+        this.walEnabled = TestUtils.isWal(rnd);
+        if (!walEnabled) {
+            this.partitioned = rnd.nextBoolean();
+        } else {
+            this.partitioned = true;
+        }
     }
 
-    @Parameterized.Parameters(name = "{0}")
-    public static Collection<Object[]> data() {
-        return Arrays.asList(new Object[][]{
-                {Mode.WITH_WAL}, {Mode.NO_WAL}, {Mode.NON_PARTITIONED}
+    @Test
+    public void testCannotChangeDecimalToInteger() throws Exception {
+        // DECIMAL -> {BYTE, SHORT, INT, LONG} are not supported.
+        // This is a problem to fix in the future
+        assertMemoryLeak(() -> {
+            for (String source : new String[]{
+                    "DECIMAL(2, 0)",
+                    "DECIMAL(4, 0)",
+                    "DECIMAL(9, 0)",
+                    "DECIMAL(18, 0)",
+                    "DECIMAL(38, 0)",
+                    "DECIMAL(76, 0)",
+            }) {
+                for (String target : new String[]{"BYTE", "SHORT", "INT", "LONG"}) {
+                    try {
+                        execute("CREATE TABLE x (col " + source + ", ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY WAL",
+                                sqlExecutionContext);
+                        assertException(
+                                "alter table x alter column col type " + target,
+                                36,
+                                "incompatible column type change [existing=" + source.replace(" ", "")
+                                        + ", new=" + target + "]",
+                                sqlExecutionContext
+                        );
+                    } finally {
+                        execute("drop table if exists x;");
+                    }
+                }
+            }
         });
     }
 
     @Test
     public void testCannotConvertToSameType() throws Exception {
-        assumeNonWal();
         assertFailure("alter table x alter column d type double", 34, "column 'd' type is already 'DOUBLE'");
+    }
+
+    @Test
+    public void testChangeDecimalNarrowingOverflow() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("CREATE TABLE x (ts TIMESTAMP, col DECIMAL(5, 0)) TIMESTAMP(ts) PARTITION BY DAY WAL", sqlExecutionContext);
+            // 12345 fits DECIMAL(5,0) but overflows DECIMAL(4,0) (max 9999).
+            execute("INSERT INTO x VALUES('2024-05-14T16:00:00.000000Z', 12345)", sqlExecutionContext);
+            drainWalQueue();
+
+            TableToken token = engine.verifyTableName("x");
+            Assert.assertFalse(engine.getTableSequencerAPI().isSuspended(token));
+
+            execute("ALTER TABLE x ALTER COLUMN col TYPE DECIMAL(4, 0)", sqlExecutionContext);
+            drainWalQueue();
+
+            Assert.assertFalse(engine.getTableSequencerAPI().isSuspended(token));
+        });
+    }
+
+    @Test
+    public void testChangeDecimalScaleDownRounds() throws Exception {
+        // A scale reduction rounds half away from zero (like every mainstream SQL database storing
+        // into DECIMAL(p,s)); it never NULLs on a dropped fraction. Only a magnitude overflow NULLs.
+        assertChangeDecimal("1.2m", "1", "decimal(2, 1)", "decimal(4, 0)");      // round down
+        assertChangeDecimal("1.5m", "2", "decimal(2, 1)", "decimal(4, 0)");      // tie rounds away
+        assertChangeDecimal("1.6m", "2", "decimal(2, 1)", "decimal(4, 0)");      // round up
+        assertChangeDecimal("-1.5m", "-2", "decimal(2, 1)", "decimal(4, 0)");    // negative tie away
+        assertChangeDecimal("12.34m", "12.3", "decimal(4, 2)", "decimal(4, 1)"); // round down
+        assertChangeDecimal("12.35m", "12.4", "decimal(4, 2)", "decimal(4, 1)"); // tie rounds away
+        assertChangeDecimal("12.99m", "13.0", "decimal(4, 2)", "decimal(4, 1)"); // carry into integer
+    }
+
+    @Test
+    public void testChangeDecimalToDecimal() throws Exception {
+        // DECIMAL8 conversions
+        assertChangeDecimal("12", "12.0", "decimal(2, 0)", "decimal(4, 1)");
+        assertChangeDecimal("12", "12.00", "decimal(2, 0)", "decimal(8, 2)");
+        assertChangeDecimal("12", "12.000", "decimal(2, 0)", "decimal(18, 3)");
+        assertChangeDecimal("12", "12.0000", "decimal(2, 0)", "decimal(38, 4)");
+        assertChangeDecimal("12", "12", "decimal(2, 0)", "decimal(64, 0)");
+        assertChangeDecimal("12", "12.000000000000", "decimal(2, 0)", "decimal(64, 12)");
+
+        assertChangeDecimal("1.2m", "1.2", "decimal(2, 1)", "decimal(4, 1)");
+        assertChangeDecimal("1.2m", "1.20", "decimal(2, 1)", "decimal(8, 2)");
+        assertChangeDecimal("1.2m", "1.200", "decimal(2, 1)", "decimal(18, 3)");
+        assertChangeDecimal("1.2m", "1.2000", "decimal(2, 1)", "decimal(38, 4)");
+        // 1.2 rounds half away from zero to scale 0 -> 1 (a dropped fraction never NULLs).
+        assertChangeDecimal("1.2m", "1", "decimal(2, 1)", "decimal(64, 0)");
+        assertChangeDecimal("1.2m", "1.200000000000", "decimal(2, 1)", "decimal(64, 12)");
+
+        // DECIMAL16 conversions
+        assertChangeDecimal("1234", "1234.0", "decimal(4, 0)", "decimal(5, 1)");
+        assertChangeDecimal("1234", "1234.00", "decimal(4, 0)", "decimal(8, 2)");
+        assertChangeDecimal("1234", "1234.000", "decimal(4, 0)", "decimal(18, 3)");
+        assertChangeDecimal("1234", "1234.0000", "decimal(4, 0)", "decimal(38, 4)");
+        assertChangeDecimal("1234", "1234", "decimal(4, 0)", "decimal(64, 0)");
+        assertChangeDecimal("1234", "1234.000000000000", "decimal(4, 0)", "decimal(64, 12)");
+
+        assertChangeDecimal("12.34m", "12.340", "decimal(4, 2)", "decimal(8, 3)");
+        assertChangeDecimal("12.34m", "12.3400", "decimal(4, 2)", "decimal(18, 4)");
+        assertChangeDecimal("12.34m", "12.34000", "decimal(4, 2)", "decimal(38, 5)");
+        assertChangeDecimal("12.34m", "12.340000000000", "decimal(4, 2)", "decimal(64, 12)");
+
+        // DECIMAL32 conversions
+        assertChangeDecimal("123456789", "123456789.0", "decimal(9, 0)", "decimal(10, 1)");
+        assertChangeDecimal("123456789", "123456789.00", "decimal(9, 0)", "decimal(18, 2)");
+        assertChangeDecimal("123456789", "123456789.000", "decimal(9, 0)", "decimal(38, 3)");
+        assertChangeDecimal("123456789", "123456789.0000", "decimal(9, 0)", "decimal(64, 4)");
+
+        assertChangeDecimal("123456.789m", "123456.7890", "decimal(9, 3)", "decimal(18, 4)");
+        assertChangeDecimal("123456.789m", "123456.78900", "decimal(9, 3)", "decimal(38, 5)");
+        assertChangeDecimal("123456.789m", "123456.789000000000", "decimal(9, 3)", "decimal(64, 12)");
+
+        // DECIMAL64 conversions
+        assertChangeDecimal("123456789012345678m", "123456789012345678.0", "decimal(18, 0)", "decimal(19, 1)");
+        assertChangeDecimal("123456789012345678m", "123456789012345678.00", "decimal(18, 0)", "decimal(38, 2)");
+        assertChangeDecimal("123456789012345678m", "123456789012345678.000", "decimal(18, 0)", "decimal(64, 3)");
+
+        assertChangeDecimal("12345678901234.5678m", "12345678901234.56780", "decimal(18, 4)", "decimal(38, 5)");
+        assertChangeDecimal("12345678901234.5678m", "12345678901234.567800000000", "decimal(18, 4)", "decimal(64, 12)");
+
+        // DECIMAL128 conversions
+        assertChangeDecimal("12345678901234567890123456789012345678m", "12345678901234567890123456789012345678.0", "decimal(38, 0)", "decimal(64, 1)");
+        assertChangeDecimal("1234567890123456789012345678901234.5678m", "1234567890123456789012345678901234.56780", "decimal(38, 4)", "decimal(64, 5)");
+
+        // DECIMAL256 conversions (converting between different scales)
+        assertChangeDecimal("12345678901234567890123456789012345678901234567890123456789012345678901234.5m",
+                "12345678901234567890123456789012345678901234567890123456789012345678901234.50",
+                "decimal(76, 1)", "decimal(76, 2)");
+        assertChangeDecimal("9999999999999999999999999999999999999999999999999999999999999999999999.9999m",
+                "9999999999999999999999999999999999999999999999999999999999999999999999.999900",
+                "decimal(76, 4)", "decimal(76, 6)");
+
+        // Precision reduction: a value that does not fit the narrower target becomes NULL (the
+        // conversion no longer fails or suspends the WAL table).
+        assertChangeDecimalToNull("12345", "decimal(5, 0)", "decimal(4, 0)");
+        assertChangeDecimalToNull("123.45m", "decimal(5, 2)", "decimal(4, 2)");
+    }
+
+    @Test
+    public void testChangeDecimalToDouble() throws Exception {
+        assertChangeDecimal("12", "12.0", "decimal(2, 0)", "double");
+        assertChangeDecimal("1.2m", "1.2", "decimal(2, 1)", "double");
+        assertChangeDecimal("1234", "1234.0", "decimal(4, 0)", "double");
+        assertChangeDecimal("12.34m", "12.34", "decimal(4, 2)", "double");
+        assertChangeDecimal("123456789", "1.23456789E8", "decimal(9, 0)", "double");
+        assertChangeDecimal("123456.789m", "123456.789", "decimal(9, 3)", "double");
+        assertChangeDecimal("123456789012345678m", "1.2345678901234568E17", "decimal(18, 0)", "double");
+        assertChangeDecimal("12345678901234.5678m", "1.2345678901234568E13", "decimal(18, 4)", "double");
+        assertChangeDecimal("-99.9999m", "-99.9999", "decimal(18, 4)", "double");
+        assertChangeDecimal("12345678901234567890123456789012345678m", "1.2345678901234568E37", "decimal(38, 0)", "double");
+        assertChangeDecimal("12345678901234567890123456789012345678901234567890123456789012345678901234.5m",
+                "1.2345678901234569E73", "decimal(76, 1)", "double");
+        // a scale past 10^22, the largest power of ten a double holds exactly, leaves the
+        // divide shortcut in DecimalUtil.toDouble for the format-and-parse fallback
+        assertChangeDecimal("1.2345678901234567890123456m", "1.2345678901234567", "decimal(30, 25)", "double");
+    }
+
+    @Test
+    public void testChangeDecimalToFloat() throws Exception {
+        assertChangeDecimal("12", "12.0", "decimal(2, 0)", "float");
+        assertChangeDecimal("1.2m", "1.2", "decimal(2, 1)", "float");
+        assertChangeDecimal("1234", "1234.0", "decimal(4, 0)", "float");
+        assertChangeDecimal("12.34m", "12.34", "decimal(4, 2)", "float");
+        assertChangeDecimal("123456.789m", "123456.79", "decimal(9, 3)", "float");
+        assertChangeDecimal("-99.9999m", "-99.9999", "decimal(18, 4)", "float");
+        // a magnitude past Float.MAX_VALUE reads as NULL, the rule cast(<double> AS FLOAT) applies
+        assertChangeDecimal("999999999999999999999999999999999999999m", "null", "decimal(39, 0)", "float");
+        // a scale past 10^22, the largest power of ten a double holds exactly, leaves the
+        // divide shortcut in DecimalUtil.toFloat for the format-and-parse fallback
+        assertChangeDecimal("1.2345678901234567890123456m", "1.2345679", "decimal(30, 25)", "float");
+    }
+
+    @Test
+    public void testChangeDecimalToFloatWithNull() throws Exception {
+        assertMemoryLeak(() -> {
+            for (String source : new String[]{
+                    "DECIMAL(2, 1)",
+                    "DECIMAL(4, 2)",
+                    "DECIMAL(9, 3)",
+                    "DECIMAL(18, 4)",
+                    "DECIMAL(38, 4)",
+                    "DECIMAL(76, 4)",
+            }) {
+                execute("CREATE TABLE x (ts TIMESTAMP, col " + source + ") TIMESTAMP(ts) PARTITION BY DAY WAL", sqlExecutionContext);
+                execute("INSERT INTO x VALUES('2024-05-14T16:00:00.000000Z', 1.1m)", sqlExecutionContext);
+                execute("INSERT INTO x VALUES('2024-05-14T16:00:01.000000Z', NULL)", sqlExecutionContext);
+                execute("INSERT INTO x VALUES('2024-05-14T16:00:02.000000Z', -2.2m)", sqlExecutionContext);
+                drainWalQueue();
+
+                execute("ALTER TABLE x ALTER COLUMN col TYPE FLOAT", sqlExecutionContext);
+                drainWalQueue();
+
+                assertQuery("x")
+                        .noLeakCheck()
+                        .expectSize()
+                        .timestamp("ts")
+                        .returns("""
+                                ts\tcol
+                                2024-05-14T16:00:00.000000Z\t1.1
+                                2024-05-14T16:00:01.000000Z\tnull
+                                2024-05-14T16:00:02.000000Z\t-2.2
+                                """);
+
+                execute("DROP TABLE x");
+            }
+        });
+    }
+
+    @Test
+    public void testChangeDecimalToDoubleWithNull() throws Exception {
+        assertMemoryLeak(() -> {
+            for (String source : new String[]{
+                    "DECIMAL(2, 1)",
+                    "DECIMAL(4, 2)",
+                    "DECIMAL(9, 3)",
+                    "DECIMAL(18, 4)",
+                    "DECIMAL(38, 4)",
+                    "DECIMAL(76, 4)",
+            }) {
+                execute("CREATE TABLE x (ts TIMESTAMP, col " + source + ") TIMESTAMP(ts) PARTITION BY DAY WAL", sqlExecutionContext);
+                execute("INSERT INTO x VALUES('2024-05-14T16:00:00.000000Z', 1.1m)", sqlExecutionContext);
+                execute("INSERT INTO x VALUES('2024-05-14T16:00:01.000000Z', NULL)", sqlExecutionContext);
+                execute("INSERT INTO x VALUES('2024-05-14T16:00:02.000000Z', -2.2m)", sqlExecutionContext);
+                drainWalQueue();
+
+                execute("ALTER TABLE x ALTER COLUMN col TYPE DOUBLE", sqlExecutionContext);
+                drainWalQueue();
+
+                assertQuery("x")
+                        .noLeakCheck()
+                        .expectSize()
+                        .timestamp("ts")
+                        .returns("""
+                                ts\tcol
+                                2024-05-14T16:00:00.000000Z\t1.1
+                                2024-05-14T16:00:01.000000Z\tnull
+                                2024-05-14T16:00:02.000000Z\t-2.2
+                                """);
+
+                execute("DROP TABLE x");
+            }
+        });
+    }
+
+    @Test
+    public void testChangeDecimalToString() throws Exception {
+        // DECIMAL64 -> STRING
+        assertChangeDecimalToVar("123456789012345678m", "123456789012345678", "decimal(18, 0)", "STRING");
+        assertChangeDecimalToVar("12345678901234.5678m", "12345678901234.5678", "decimal(18, 4)", "STRING");
+    }
+
+    @Test
+    public void testChangeDecimalToStringWithNull() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("CREATE TABLE x (ts TIMESTAMP, col DECIMAL(18, 4)) TIMESTAMP(ts) PARTITION BY DAY WAL", sqlExecutionContext);
+            execute("INSERT INTO x VALUES('2024-05-14T16:00:00.000000Z', 12345.6789m)", sqlExecutionContext);
+            execute("INSERT INTO x VALUES('2024-05-14T16:00:01.000000Z', NULL)", sqlExecutionContext);
+            execute("INSERT INTO x VALUES('2024-05-14T16:00:02.000000Z', -99.9999m)", sqlExecutionContext);
+            drainWalQueue();
+
+            execute("ALTER TABLE x ALTER COLUMN col TYPE STRING", sqlExecutionContext);
+            drainWalQueue();
+
+            assertQuery("x")
+                    .noLeakCheck()
+                    .expectSize()
+                    .timestamp("ts")
+                    .returns("""
+                            ts\tcol
+                            2024-05-14T16:00:00.000000Z\t12345.6789
+                            2024-05-14T16:00:01.000000Z\t
+                            2024-05-14T16:00:02.000000Z\t-99.9999
+                            """);
+
+            execute("DROP TABLE x");
+        });
+    }
+
+    @Test
+    public void testChangeDecimalToVarchar() throws Exception {
+        // DECIMAL8 -> VARCHAR
+        assertChangeDecimalToVar("12", "12", "decimal(2, 0)", "VARCHAR");
+        assertChangeDecimalToVar("1.2m", "1.2", "decimal(2, 1)", "VARCHAR");
+
+        // DECIMAL16 -> VARCHAR
+        assertChangeDecimalToVar("1234", "1234", "decimal(4, 0)", "VARCHAR");
+        assertChangeDecimalToVar("12.34m", "12.34", "decimal(4, 2)", "VARCHAR");
+
+        // DECIMAL32 -> VARCHAR
+        assertChangeDecimalToVar("123456789", "123456789", "decimal(9, 0)", "VARCHAR");
+        assertChangeDecimalToVar("123456.789m", "123456.789", "decimal(9, 3)", "VARCHAR");
+
+        // DECIMAL64 -> VARCHAR
+        assertChangeDecimalToVar("123456789012345678m", "123456789012345678", "decimal(18, 0)", "VARCHAR");
+        assertChangeDecimalToVar("12345678901234.5678m", "12345678901234.5678", "decimal(18, 4)", "VARCHAR");
+
+        // DECIMAL128 -> VARCHAR
+        assertChangeDecimalToVar("12345678901234567890123456789012345678m", "12345678901234567890123456789012345678", "decimal(38, 0)", "VARCHAR");
+        assertChangeDecimalToVar("1234567890123456789012345678901234.5678m", "1234567890123456789012345678901234.5678", "decimal(38, 4)", "VARCHAR");
+
+        // DECIMAL256 -> VARCHAR
+        assertChangeDecimalToVar("12345678901234567890123456789012345678901234567890123456789012345678901234.5m",
+                "12345678901234567890123456789012345678901234567890123456789012345678901234.5",
+                "decimal(76, 1)", "VARCHAR");
+    }
+
+    @Test
+    public void testChangeDecimalToVarcharWithNull() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("CREATE TABLE x (ts TIMESTAMP, col DECIMAL(18, 4)) TIMESTAMP(ts) PARTITION BY DAY WAL", sqlExecutionContext);
+            execute("INSERT INTO x VALUES('2024-05-14T16:00:00.000000Z', 12345.6789m)", sqlExecutionContext);
+            execute("INSERT INTO x VALUES('2024-05-14T16:00:01.000000Z', NULL)", sqlExecutionContext);
+            execute("INSERT INTO x VALUES('2024-05-14T16:00:02.000000Z', -99.9999m)", sqlExecutionContext);
+            drainWalQueue();
+
+            execute("ALTER TABLE x ALTER COLUMN col TYPE VARCHAR", sqlExecutionContext);
+            drainWalQueue();
+
+            assertQuery("x")
+                    .noLeakCheck()
+                    .expectSize()
+                    .timestamp("ts")
+                    .returns("""
+                            ts\tcol
+                            2024-05-14T16:00:00.000000Z\t12345.6789
+                            2024-05-14T16:00:01.000000Z\t
+                            2024-05-14T16:00:02.000000Z\t-99.9999
+                            """);
+
+            execute("DROP TABLE x");
+        });
+    }
+
+    @Test
+    public void testChangeDoubleToDecimal() throws Exception {
+        assertChangeDecimal("1.5", "1.50", "double", "decimal(4, 2)");
+        assertChangeDecimal("-1.5", "-1.50", "double", "decimal(4, 2)");
+        assertChangeDecimal("0.0", "0.00", "double", "decimal(4, 2)");
+        assertChangeDecimal("12", "12.00", "double", "decimal(4, 2)");
+        // excess fractional digits truncate, which is what the DOUBLE -> DECIMAL cast does
+        assertChangeDecimal("3.14159", "3.14", "double", "decimal(10, 2)");
+        assertChangeDecimal("-3.14159", "-3.14", "double", "decimal(10, 2)");
+        assertChangeDecimal("2.999", "2.99", "double", "decimal(10, 2)");
+        // every target width
+        assertChangeDecimal("1.5", "1.5", "double", "decimal(2, 1)");
+        assertChangeDecimal("1.5", "1.50", "double", "decimal(4, 2)");
+        assertChangeDecimal("1.5", "1.500", "double", "decimal(9, 3)");
+        assertChangeDecimal("1.5", "1.5000", "double", "decimal(18, 4)");
+        assertChangeDecimal("1.5", "1.50000", "double", "decimal(38, 5)");
+        assertChangeDecimal("1.5", "1.500000", "double", "decimal(76, 6)");
+        // a magnitude the target precision cannot hold becomes NULL rather than failing the ALTER,
+        // and the widest value that does fit still lands
+        assertChangeDecimal("9999.0", "9999", "double", "decimal(4, 0)");
+        assertChangeDecimal("-9999.0", "-9999", "double", "decimal(4, 0)");
+        assertChangeDecimalToNull("1e300", "double", "decimal(10, 2)");
+        assertChangeDecimalToNull("12345.0", "double", "decimal(4, 0)");
+        // negative zero stores as zero
+        assertChangeDecimal("-0.0", "0.00", "double", "decimal(4, 2)");
+    }
+
+    @Test
+    public void testChangeDoubleToDecimalMatchesCast() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("CREATE TABLE x (ts TIMESTAMP, col DOUBLE) TIMESTAMP(ts) PARTITION BY DAY WAL", sqlExecutionContext);
+            execute("""
+                    INSERT INTO x VALUES
+                    ('2024-05-14T16:00:00.000000Z', 0.0),
+                    ('2024-05-14T16:00:01.000000Z', 1.5),
+                    ('2024-05-14T16:00:02.000000Z', -1.5),
+                    ('2024-05-14T16:00:03.000000Z', 3.14159265358979),
+                    ('2024-05-14T16:00:04.000000Z', -0.000123456),
+                    ('2024-05-14T16:00:05.000000Z', 1234567.891),
+                    ('2024-05-14T16:00:06.000000Z', NULL)""", sqlExecutionContext);
+            drainWalQueue();
+
+            execute("CREATE TABLE expected AS (SELECT ts, col::DECIMAL(18,4) col FROM x)", sqlExecutionContext);
+            execute("ALTER TABLE x ALTER COLUMN col TYPE DECIMAL(18,4)", sqlExecutionContext);
+            drainWalQueue();
+
+            assertSqlCursors("expected ORDER BY ts", "x ORDER BY ts");
+
+            execute("DROP TABLE x");
+            execute("DROP TABLE expected");
+        });
+    }
+
+    @Test
+    public void testChangeDoubleToDecimalNonFiniteAndNull() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("CREATE TABLE x (ts TIMESTAMP, col DOUBLE) TIMESTAMP(ts) PARTITION BY DAY", sqlExecutionContext);
+            // SQL cannot spell an infinity, so the exact bits go in through the writer
+            try (TableWriter writer = getWriter("x")) {
+                appendDouble(writer, "2024-05-14T16:00:00.000000Z", 1.25);
+                appendDouble(writer, "2024-05-14T16:00:01.000000Z", Double.NaN);
+                appendDouble(writer, "2024-05-14T16:00:02.000000Z", Double.POSITIVE_INFINITY);
+                appendDouble(writer, "2024-05-14T16:00:03.000000Z", Double.NEGATIVE_INFINITY);
+                writer.commit();
+            }
+
+            // NaN is the DOUBLE NULL and neither infinity has a decimal representation
+            execute("ALTER TABLE x ALTER COLUMN col TYPE DECIMAL(18,4)", sqlExecutionContext);
+
+            assertQuery("x")
+                    .noLeakCheck()
+                    .expectSize()
+                    .timestamp("ts")
+                    .returns("""
+                            ts\tcol
+                            2024-05-14T16:00:00.000000Z\t1.2500
+                            2024-05-14T16:00:01.000000Z\t
+                            2024-05-14T16:00:02.000000Z\t
+                            2024-05-14T16:00:03.000000Z\t
+                            """);
+
+            execute("DROP TABLE x");
+        });
+    }
+
+    @Test
+    public void testChangeVarcharToIntRejectsMalformedUtf8() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("CREATE TABLE x (ts TIMESTAMP, col VARCHAR) TIMESTAMP(ts) PARTITION BY DAY");
+
+            try (TableWriter writer = getWriter("x")) {
+                TableWriter.Row row = writer.newRow(0);
+                row.putVarchar(1, new Utf8String(new byte[]{'1', (byte) 0xC3}, false));
+                row.append();
+                writer.commit();
+            }
+
+            execute("ALTER TABLE x ALTER COLUMN col TYPE INT");
+
+            assertQuery("SELECT col FROM x")
+                    .noLeakCheck()
+                    .expectSize()
+                    .returns("""
+                            col
+                            null
+                            """);
+        });
+    }
+
+    @Test
+    public void testChangeDoubleToDecimalNonWal() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("CREATE TABLE x (ts TIMESTAMP, col DOUBLE) TIMESTAMP(ts) PARTITION BY DAY", sqlExecutionContext);
+            execute("""
+                    INSERT INTO x VALUES
+                    ('2024-05-14T16:00:00.000000Z', 1.25),
+                    ('2024-05-14T16:00:01.000000Z', NULL),
+                    ('2024-05-15T16:00:02.000000Z', -8.5)""", sqlExecutionContext);
+
+            execute("ALTER TABLE x ALTER COLUMN col TYPE DECIMAL(18,4)", sqlExecutionContext);
+            assertQuery("x")
+                    .noLeakCheck()
+                    .expectSize()
+                    .timestamp("ts")
+                    .returns("""
+                            ts\tcol
+                            2024-05-14T16:00:00.000000Z\t1.2500
+                            2024-05-14T16:00:01.000000Z\t
+                            2024-05-15T16:00:02.000000Z\t-8.5000
+                            """);
+
+            execute("ALTER TABLE x ALTER COLUMN col TYPE DOUBLE", sqlExecutionContext);
+            assertQuery("x")
+                    .noLeakCheck()
+                    .expectSize()
+                    .timestamp("ts")
+                    .returns("""
+                            ts\tcol
+                            2024-05-14T16:00:00.000000Z\t1.25
+                            2024-05-14T16:00:01.000000Z\tnull
+                            2024-05-15T16:00:02.000000Z\t-8.5
+                            """);
+
+            execute("DROP TABLE x");
+        });
+    }
+
+    @Test
+    public void testChangeDoubleToDecimalRoundTrip() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("CREATE TABLE x (ts TIMESTAMP, col DOUBLE) TIMESTAMP(ts) PARTITION BY DAY WAL", sqlExecutionContext);
+            execute("""
+                    INSERT INTO x VALUES
+                    ('2024-05-14T16:00:00.000000Z', 0.0),
+                    ('2024-05-14T16:00:01.000000Z', 1.5),
+                    ('2024-05-14T16:00:02.000000Z', -1234.5678),
+                    ('2024-05-14T16:00:03.000000Z', NULL)""", sqlExecutionContext);
+            drainWalQueue();
+
+            execute("ALTER TABLE x ALTER COLUMN col TYPE DECIMAL(38,4)", sqlExecutionContext);
+            drainWalQueue();
+            execute("ALTER TABLE x ALTER COLUMN col TYPE DOUBLE", sqlExecutionContext);
+            drainWalQueue();
+
+            assertQuery("x")
+                    .noLeakCheck()
+                    .expectSize()
+                    .timestamp("ts")
+                    .returns("""
+                            ts\tcol
+                            2024-05-14T16:00:00.000000Z\t0.0
+                            2024-05-14T16:00:01.000000Z\t1.5
+                            2024-05-14T16:00:02.000000Z\t-1234.5678
+                            2024-05-14T16:00:03.000000Z\tnull
+                            """);
+
+            execute("DROP TABLE x");
+        });
+    }
+
+    @Test
+    public void testChangeFloatToDecimal() throws Exception {
+        assertChangeDecimal("1.5", "1.50", "float", "decimal(4, 2)");
+        assertChangeDecimal("-1.5", "-1.50", "float", "decimal(4, 2)");
+        assertChangeDecimal("0.0", "0.00", "float", "decimal(4, 2)");
+        // the value routes through its shortest float text, so 0.1f stores as 0.1 rather than the
+        // 0.100000001490116119384765625 a widening to double would expose
+        assertChangeDecimal("0.1", "0.100000", "float", "decimal(10, 6)");
+        assertChangeDecimal("3.14159", "3.14", "float", "decimal(10, 2)");
+        assertChangeDecimal("-3.14159", "-3.14", "float", "decimal(10, 2)");
+        // every target width
+        assertChangeDecimal("1.5", "1.5", "float", "decimal(2, 1)");
+        assertChangeDecimal("1.5", "1.500", "float", "decimal(9, 3)");
+        assertChangeDecimal("1.5", "1.5000", "float", "decimal(18, 4)");
+        assertChangeDecimal("1.5", "1.50000", "float", "decimal(38, 5)");
+        assertChangeDecimal("1.5", "1.500000", "float", "decimal(76, 6)");
+        // a magnitude the target precision cannot hold becomes NULL rather than failing the ALTER,
+        // and the widest value that does fit still lands
+        assertChangeDecimal("9999.0", "9999", "float", "decimal(4, 0)");
+        assertChangeDecimal("-9999.0", "-9999", "float", "decimal(4, 0)");
+        assertChangeDecimalToNull("1e30", "float", "decimal(10, 2)");
+        assertChangeDecimalToNull("12345.0", "float", "decimal(4, 0)");
+        // negative zero stores as zero
+        assertChangeDecimal("-0.0", "0.00", "float", "decimal(4, 2)");
+    }
+
+    @Test
+    public void testChangeFloatToDecimalMatchesCast() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("CREATE TABLE x (ts TIMESTAMP, col FLOAT) TIMESTAMP(ts) PARTITION BY DAY WAL", sqlExecutionContext);
+            execute("""
+                    INSERT INTO x VALUES
+                    ('2024-05-14T16:00:00.000000Z', 0.0),
+                    ('2024-05-14T16:00:01.000000Z', 1.5),
+                    ('2024-05-14T16:00:02.000000Z', -1.5),
+                    ('2024-05-14T16:00:03.000000Z', 0.1),
+                    ('2024-05-14T16:00:04.000000Z', 3.14159),
+                    ('2024-05-14T16:00:05.000000Z', -0.000123456),
+                    ('2024-05-14T16:00:06.000000Z', NULL)""", sqlExecutionContext);
+            drainWalQueue();
+
+            execute("CREATE TABLE expected AS (SELECT ts, col::DECIMAL(18,4) col FROM x)", sqlExecutionContext);
+            execute("ALTER TABLE x ALTER COLUMN col TYPE DECIMAL(18,4)", sqlExecutionContext);
+            drainWalQueue();
+
+            assertSqlCursors("expected ORDER BY ts", "x ORDER BY ts");
+
+            execute("DROP TABLE x");
+            execute("DROP TABLE expected");
+        });
+    }
+
+    @Test
+    public void testChangeFloatToDecimalNonFiniteAndNull() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("CREATE TABLE x (ts TIMESTAMP, col FLOAT) TIMESTAMP(ts) PARTITION BY DAY", sqlExecutionContext);
+            // SQL cannot spell an infinity, so the exact bits go in through the writer
+            try (TableWriter writer = getWriter("x")) {
+                appendFloat(writer, "2024-05-14T16:00:00.000000Z", 1.25f);
+                appendFloat(writer, "2024-05-14T16:00:01.000000Z", Float.NaN);
+                appendFloat(writer, "2024-05-14T16:00:02.000000Z", Float.POSITIVE_INFINITY);
+                appendFloat(writer, "2024-05-14T16:00:03.000000Z", Float.NEGATIVE_INFINITY);
+                writer.commit();
+            }
+
+            execute("ALTER TABLE x ALTER COLUMN col TYPE DECIMAL(18,4)", sqlExecutionContext);
+
+            assertQuery("x")
+                    .noLeakCheck()
+                    .expectSize()
+                    .timestamp("ts")
+                    .returns("""
+                            ts\tcol
+                            2024-05-14T16:00:00.000000Z\t1.2500
+                            2024-05-14T16:00:01.000000Z\t
+                            2024-05-14T16:00:02.000000Z\t
+                            2024-05-14T16:00:03.000000Z\t
+                            """);
+
+            execute("DROP TABLE x");
+        });
+    }
+
+    @Test
+    public void testChangeFloatToDecimalNonWal() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("CREATE TABLE x (ts TIMESTAMP, col FLOAT) TIMESTAMP(ts) PARTITION BY DAY", sqlExecutionContext);
+            execute("""
+                    INSERT INTO x VALUES
+                    ('2024-05-14T16:00:00.000000Z', 1.25),
+                    ('2024-05-14T16:00:01.000000Z', NULL),
+                    ('2024-05-15T16:00:02.000000Z', -8.5)""", sqlExecutionContext);
+
+            execute("ALTER TABLE x ALTER COLUMN col TYPE DECIMAL(18,4)", sqlExecutionContext);
+            assertQuery("x")
+                    .noLeakCheck()
+                    .expectSize()
+                    .timestamp("ts")
+                    .returns("""
+                            ts\tcol
+                            2024-05-14T16:00:00.000000Z\t1.2500
+                            2024-05-14T16:00:01.000000Z\t
+                            2024-05-15T16:00:02.000000Z\t-8.5000
+                            """);
+
+            execute("ALTER TABLE x ALTER COLUMN col TYPE FLOAT", sqlExecutionContext);
+            assertQuery("x")
+                    .noLeakCheck()
+                    .expectSize()
+                    .timestamp("ts")
+                    .returns("""
+                            ts\tcol
+                            2024-05-14T16:00:00.000000Z\t1.25
+                            2024-05-14T16:00:01.000000Z\tnull
+                            2024-05-15T16:00:02.000000Z\t-8.5
+                            """);
+
+            execute("DROP TABLE x");
+        });
+    }
+
+    @Test
+    public void testChangeFloatToDecimalRoundTrip() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("CREATE TABLE x (ts TIMESTAMP, col FLOAT) TIMESTAMP(ts) PARTITION BY DAY WAL", sqlExecutionContext);
+            execute("""
+                    INSERT INTO x VALUES
+                    ('2024-05-14T16:00:00.000000Z', 0.0),
+                    ('2024-05-14T16:00:01.000000Z', 1.5),
+                    ('2024-05-14T16:00:02.000000Z', -1234.5),
+                    ('2024-05-14T16:00:03.000000Z', NULL)""", sqlExecutionContext);
+            drainWalQueue();
+
+            execute("ALTER TABLE x ALTER COLUMN col TYPE DECIMAL(38,4)", sqlExecutionContext);
+            drainWalQueue();
+            execute("ALTER TABLE x ALTER COLUMN col TYPE FLOAT", sqlExecutionContext);
+            drainWalQueue();
+
+            assertQuery("x")
+                    .noLeakCheck()
+                    .expectSize()
+                    .timestamp("ts")
+                    .returns("""
+                            ts\tcol
+                            2024-05-14T16:00:00.000000Z\t0.0
+                            2024-05-14T16:00:01.000000Z\t1.5
+                            2024-05-14T16:00:02.000000Z\t-1234.5
+                            2024-05-14T16:00:03.000000Z\tnull
+                            """);
+
+            execute("DROP TABLE x");
+        });
+    }
+
+    @Test
+    public void testChangeVarcharToStringAndSymbolRejectsMalformedUtf8() throws Exception {
+        assertMemoryLeak(() -> {
+            assertMalformedVarcharConversionIsNull("STRING");
+            assertMalformedVarcharConversionIsNull("SYMBOL");
+        });
     }
 
     @Test
     public void testChangeDoubleToFloat() throws Exception {
         assertMemoryLeak(() -> {
-            assumeWal();
-            ddl("create table x (ts timestamp, col double) timestamp(ts) partition by day wal", sqlExecutionContext);
-            insert("insert into x values('2024-05-14T16:00:00.000000Z', 0.0)", sqlExecutionContext);
-            insert("insert into x values('2024-05-14T16:00:01.000000Z', 0.1)", sqlExecutionContext);
-            insert("insert into x values('2024-05-14T16:00:02.000000Z', 3.1)", sqlExecutionContext);
-            insert("insert into x values('2024-05-14T16:00:02.000000Z', -9223372036854775808.0)", sqlExecutionContext);
-            insert("insert into x values('2024-05-14T16:00:02.000000Z', -3.4e38)", sqlExecutionContext);
-            insert("insert into x values('2024-05-14T16:00:02.000000Z', 3.4e38)", sqlExecutionContext);
-            insert("insert into x values('2024-05-14T16:00:02.000000Z', 1.80e300)", sqlExecutionContext);
-            insert("insert into x values('2024-05-14T16:00:02.000000Z', -1.80e300)", sqlExecutionContext);
+            execute("create table x (ts timestamp, col double) timestamp(ts) partition by day wal", sqlExecutionContext);
+            execute("insert into x values('2024-05-14T16:00:00.000000Z', 0.0)", sqlExecutionContext);
+            execute("insert into x values('2024-05-14T16:00:01.000000Z', 0.1)", sqlExecutionContext);
+            execute("insert into x values('2024-05-14T16:00:02.000000Z', 3.1)", sqlExecutionContext);
+            execute("insert into x values('2024-05-14T16:00:02.000000Z', -9223372036854775808.0)", sqlExecutionContext);
+            execute("insert into x values('2024-05-14T16:00:02.000000Z', -3.4e38)", sqlExecutionContext);
+            execute("insert into x values('2024-05-14T16:00:02.000000Z', 3.4e38)", sqlExecutionContext);
+            execute("insert into x values('2024-05-14T16:00:02.000000Z', 1.80e300)", sqlExecutionContext);
+            execute("insert into x values('2024-05-14T16:00:02.000000Z', -1.80e300)", sqlExecutionContext);
             drainWalQueue();
 
-            ddl("alter table x alter column col type float", sqlExecutionContext);
+            execute("alter table x alter column col type float", sqlExecutionContext);
             drainWalQueue();
 
-            assertSql("ts\tcol\n" +
-                            "2024-05-14T16:00:00.000000Z\t0.0000\n" +
-                            "2024-05-14T16:00:01.000000Z\t0.1000\n" +
-                            "2024-05-14T16:00:02.000000Z\t3.1000\n" +
-                            "2024-05-14T16:00:02.000000Z\t-9.223372E18\n" +
-                            "2024-05-14T16:00:02.000000Z\t-3.4E38\n" +
-                            "2024-05-14T16:00:02.000000Z\t3.4E38\n" +
-                            "2024-05-14T16:00:02.000000Z\tnull\n" +
-                            "2024-05-14T16:00:02.000000Z\tnull\n",
-                    "x");
+            assertQuery("x")
+                    .noLeakCheck()
+                    .expectSize()
+                    .timestamp("ts")
+                    .returns("""
+                            ts\tcol
+                            2024-05-14T16:00:00.000000Z\t0.0
+                            2024-05-14T16:00:01.000000Z\t0.1
+                            2024-05-14T16:00:02.000000Z\t3.1
+                            2024-05-14T16:00:02.000000Z\t-9.223372E18
+                            2024-05-14T16:00:02.000000Z\t-3.4E38
+                            2024-05-14T16:00:02.000000Z\t3.4E38
+                            2024-05-14T16:00:02.000000Z\tnull
+                            2024-05-14T16:00:02.000000Z\tnull
+                            """);
 
-            ddl("alter table x alter column col type int", sqlExecutionContext);
+            execute("alter table x alter column col type int", sqlExecutionContext);
             drainWalQueue();
 
-            assertSql("ts\tcol\n" +
-                    "2024-05-14T16:00:00.000000Z\t0\n" +
-                    "2024-05-14T16:00:01.000000Z\t0\n" +
-                    "2024-05-14T16:00:02.000000Z\t3\n" +
-                    "2024-05-14T16:00:02.000000Z\tnull\n" +
-                    "2024-05-14T16:00:02.000000Z\tnull\n" +
-                    "2024-05-14T16:00:02.000000Z\tnull\n" +
-                    "2024-05-14T16:00:02.000000Z\tnull\n" +
-                    "2024-05-14T16:00:02.000000Z\tnull\n", "x");
+            assertQuery("x")
+                    .noLeakCheck()
+                    .expectSize()
+                    .timestamp("ts")
+                    .returns("""
+                            ts\tcol
+                            2024-05-14T16:00:00.000000Z\t0
+                            2024-05-14T16:00:01.000000Z\t0
+                            2024-05-14T16:00:02.000000Z\t3
+                            2024-05-14T16:00:02.000000Z\tnull
+                            2024-05-14T16:00:02.000000Z\tnull
+                            2024-05-14T16:00:02.000000Z\tnull
+                            2024-05-14T16:00:02.000000Z\tnull
+                            2024-05-14T16:00:02.000000Z\tnull
+                            """);
         });
     }
 
     @Test
     public void testChangeFloatToDouble() throws Exception {
-        assumeWal();
         assertMemoryLeak(() -> {
-            ddl("create table x (ts timestamp, col float) timestamp(ts) partition by day wal", sqlExecutionContext);
-            insert("insert into x values('2024-05-14T16:00:00.000000Z', 0.0)", sqlExecutionContext);
-            insert("insert into x values('2024-05-14T16:00:01.000000Z', 0.1)", sqlExecutionContext);
-            insert("insert into x values('2024-05-14T16:00:02.000000Z', 3.1)", sqlExecutionContext);
-            insert("insert into x values('2024-05-14T16:00:02.000000Z', -9223372036854775808.0)", sqlExecutionContext);
-            insert("insert into x values('2024-05-14T16:00:02.000000Z', -3.4e38)", sqlExecutionContext);
-            insert("insert into x values('2024-05-14T16:00:02.000000Z', 3.4e38)", sqlExecutionContext);
+            execute("create table x (ts timestamp, col float) timestamp(ts) partition by day wal", sqlExecutionContext);
+            execute("insert into x values('2024-05-14T16:00:00.000000Z', 0.0)", sqlExecutionContext);
+            execute("insert into x values('2024-05-14T16:00:01.000000Z', 0.1)", sqlExecutionContext);
+            execute("insert into x values('2024-05-14T16:00:02.000000Z', 3.1)", sqlExecutionContext);
+            execute("insert into x values('2024-05-14T16:00:02.000000Z', -9223372036854775808.0)", sqlExecutionContext);
+            execute("insert into x values('2024-05-14T16:00:02.000000Z', -3.4e38)", sqlExecutionContext);
+            execute("insert into x values('2024-05-14T16:00:02.000000Z', 3.4e38)", sqlExecutionContext);
             drainWalQueue();
 
-            ddl("alter table x alter column col type double", sqlExecutionContext);
+            execute("alter table x alter column col type double", sqlExecutionContext);
             drainWalQueue();
 
-            assertSql("ts\tcol\n" +
-                    "2024-05-14T16:00:00.000000Z\t0.0\n" +
-                    "2024-05-14T16:00:01.000000Z\t0.10000000149011612\n" +
-                    "2024-05-14T16:00:02.000000Z\t3.0999999046325684\n" +
-                    "2024-05-14T16:00:02.000000Z\t-9.223372036854776E18\n" +
-                    "2024-05-14T16:00:02.000000Z\t-3.3999999521443642E38\n" +
-                    "2024-05-14T16:00:02.000000Z\t3.3999999521443642E38\n", "x");
+            assertQuery("x")
+                    .noLeakCheck()
+                    .expectSize()
+                    .timestamp("ts")
+                    .returns("""
+                            ts\tcol
+                            2024-05-14T16:00:00.000000Z\t0.0
+                            2024-05-14T16:00:01.000000Z\t0.10000000149011612
+                            2024-05-14T16:00:02.000000Z\t3.0999999046325684
+                            2024-05-14T16:00:02.000000Z\t-9.223372036854776E18
+                            2024-05-14T16:00:02.000000Z\t-3.3999999521443642E38
+                            2024-05-14T16:00:02.000000Z\t3.3999999521443642E38
+                            """);
 
-            ddl("alter table x alter column col type int", sqlExecutionContext);
+            execute("alter table x alter column col type int", sqlExecutionContext);
             drainWalQueue();
 
-            assertSql("ts\tcol\n" +
-                    "2024-05-14T16:00:00.000000Z\t0\n" +
-                    "2024-05-14T16:00:01.000000Z\t0\n" +
-                    "2024-05-14T16:00:02.000000Z\t3\n" +
-                    "2024-05-14T16:00:02.000000Z\tnull\n" +
-                    "2024-05-14T16:00:02.000000Z\tnull\n" +
-                    "2024-05-14T16:00:02.000000Z\tnull\n", "x");
+            assertQuery("x")
+                    .noLeakCheck()
+                    .expectSize()
+                    .timestamp("ts")
+                    .returns("""
+                            ts\tcol
+                            2024-05-14T16:00:00.000000Z\t0
+                            2024-05-14T16:00:01.000000Z\t0
+                            2024-05-14T16:00:02.000000Z\t3
+                            2024-05-14T16:00:02.000000Z\tnull
+                            2024-05-14T16:00:02.000000Z\tnull
+                            2024-05-14T16:00:02.000000Z\tnull
+                            """);
         });
     }
 
@@ -159,8 +859,8 @@ public class AlterTableChangeColumnTypeTest extends AbstractCairoTest {
             createX();
             drainWalQueue();
 
-            ddl("create table y as (select ik from x)", sqlExecutionContext);
-            ddl("alter table x alter column ik type varchar", sqlExecutionContext);
+            execute("create table y as (select ik from x)", sqlExecutionContext);
+            execute("alter table x alter column ik type varchar", sqlExecutionContext);
             drainWalQueue();
 
             assertSqlCursorsConvertedStrings(
@@ -168,12 +868,15 @@ public class AlterTableChangeColumnTypeTest extends AbstractCairoTest {
                     "select ik from x"
             );
 
-            insert("insert into x(ik, timestamp) values('abc', now())", sqlExecutionContext);
+            execute("insert into x(ik, timestamp) values('abc', now())", sqlExecutionContext);
             drainWalQueue();
 
-            assertSql("ik\nabc\n", "select ik from x limit -1");
+            assertQuery("select ik from x limit -1")
+                    .noLeakCheck()
+                    .expectSize()
+                    .returns("ik\nabc\n");
 
-            insert("insert into y(ik) values('abc')", sqlExecutionContext);
+            execute("insert into y(ik) values('abc')", sqlExecutionContext);
             assertSqlCursorsConvertedStrings(
                     "select 'abc' as ik",
                     "select ik from x where ik = 'abc'"
@@ -183,45 +886,39 @@ public class AlterTableChangeColumnTypeTest extends AbstractCairoTest {
     }
 
     @Test
-    public void testChangeTypePreservesInsertColDefaultOrder() throws Exception {
-        assertMemoryLeak(() -> {
-            ddl(
-                    "create table x as (" +
-                            "select" +
-                            " rnd_str(5,5,2) c," +
-                            " to_timestamp('2018-01', 'yyyy-MM') + x * 7200000 timestamp," +
-                            " from long_sequence(1)" +
-                            ") timestamp (timestamp) PARTITION BY HOUR" + (walEnabled ? "  WAL" : " BYPASS WAL")
-            );
+    public void testChangeIntegerToDecimal() throws Exception {
+        // BYTE to DECIMAL conversions
+        assertChangeIntToDecimal("127", "127", "BYTE", "decimal(3, 0)");
+        assertChangeIntToDecimal("127", "127.0", "BYTE", "decimal(4, 1)");
+        assertChangeIntToDecimal("127", "127.00", "BYTE", "decimal(8, 2)");
+        assertChangeIntToDecimal("-128", "-128.000", "BYTE", "decimal(18, 3)");
+        assertChangeIntToDecimal("100", "100.0000", "BYTE", "decimal(38, 4)");
+        assertChangeIntToDecimal("50", "50.00000", "BYTE", "decimal(64, 5)");
 
-            drainWalQueue();
-            ddl("alter table x alter column c type varchar", sqlExecutionContext);
-            drainWalQueue();
+        // SHORT to DECIMAL conversions
+        assertChangeIntToDecimal("32767", "32767", "SHORT", "decimal(5, 0)");
+        assertChangeIntToDecimal("32767", "32767.0", "SHORT", "decimal(6, 1)");
+        assertChangeIntToDecimal("-32768", "-32768.00", "SHORT", "decimal(8, 2)");
+        assertChangeIntToDecimal("1000", "1000.000", "SHORT", "decimal(18, 3)");
+        assertChangeIntToDecimal("5000", "5000.0000", "SHORT", "decimal(38, 4)");
+        assertChangeIntToDecimal("10000", "10000.00000", "SHORT", "decimal(64, 5)");
 
-            insert("insert into x values('abc', '2024-06-20T17:18:27.752076Z')", sqlExecutionContext);
-            drainWalQueue();
+        // INT to DECIMAL conversions
+        assertChangeIntToDecimal("2147483647", "2147483647", "INT", "decimal(10, 0)");
+        assertChangeIntToDecimal("2147483647", "2147483647.0", "INT", "decimal(11, 1)");
+        assertChangeIntToDecimal("-2147483647", "-2147483647.00", "INT", "decimal(18, 2)");
+        assertChangeIntToDecimal("-2147483648", "", "INT", "decimal(18, 2)");
+        assertChangeIntToDecimal("1000000", "1000000.000", "INT", "decimal(18, 3)");
+        assertChangeIntToDecimal("5000000", "5000000.0000", "INT", "decimal(38, 4)");
+        assertChangeIntToDecimal("10000000", "10000000.00000", "INT", "decimal(64, 5)");
 
-            assertSql("c\nabc\n", "select c from x limit -1");
-
-            ddl("alter table x alter column c type string", sqlExecutionContext);
-            drainWalQueue();
-            engine.releaseInactive();
-
-            insert("insert into x values('def', '2024-06-20T17:18:27.752076Z')", sqlExecutionContext);
-            drainWalQueue();
-            assertSql("c\ndef\n", "select c from x limit -1");
-
-            ddl("insert into x select * from x");
-            drainWalQueue();
-
-            assertSql("c\ttimestamp\n" +
-                    "TJWCP\t2018-01-01T00:00:07.200000Z\n" +
-                    "TJWCP\t2018-01-01T00:00:07.200000Z\n" +
-                    "abc\t2024-06-20T17:18:27.752076Z\n" +
-                    "abc\t2024-06-20T17:18:27.752076Z\n" +
-                    "def\t2024-06-20T17:18:27.752076Z\n" +
-                    "def\t2024-06-20T17:18:27.752076Z\n", "x order by timestamp, c");
-        });
+        // LONG to DECIMAL conversions
+        assertChangeIntToDecimal("9223372036854775807L", "9223372036854775807", "LONG", "decimal(19, 0)");
+        assertChangeIntToDecimal("9223372036854775807L", "9223372036854775807.0", "LONG", "decimal(20, 1)");
+        assertChangeIntToDecimal("-9223372036854775807L", "-9223372036854775807.00", "LONG", "decimal(38, 2)");
+        assertChangeIntToDecimal("1000000000000L", "1000000000000.000", "LONG", "decimal(38, 3)");
+        assertChangeIntToDecimal("5000000000000L", "5000000000000.0000", "LONG", "decimal(38, 4)");
+        assertChangeIntToDecimal("10000000000000L", "10000000000000.00000", "LONG", "decimal(64, 5)");
     }
 
     @Test
@@ -230,16 +927,19 @@ public class AlterTableChangeColumnTypeTest extends AbstractCairoTest {
             createX();
             drainWalQueue();
             engine.releaseInactive();
-            ddl("alter table x alter column ik type varchar", sqlExecutionContext);
-            ddl("alter table x alter column ik type string", sqlExecutionContext);
-            ddl("alter table x alter column ik type symbol index", sqlExecutionContext);
-            ddl("alter table x alter column ik type string", sqlExecutionContext);
+            execute("alter table x alter column ik type varchar", sqlExecutionContext);
+            execute("alter table x alter column ik type string", sqlExecutionContext);
+            execute("alter table x alter column ik type symbol index", sqlExecutionContext);
+            execute("alter table x alter column ik type string", sqlExecutionContext);
             drainWalQueue();
 
-            insert("insert into x(ik, timestamp) values('abc', now())", sqlExecutionContext);
+            execute("insert into x(ik, timestamp) values('abc', now())", sqlExecutionContext);
             drainWalQueue();
 
-            assertSql("ik\nabc\n", "select ik from x limit -1");
+            assertQuery("select ik from x limit -1")
+                    .noLeakCheck()
+                    .expectSize()
+                    .returns("ik\nabc\n");
         });
     }
 
@@ -249,13 +949,51 @@ public class AlterTableChangeColumnTypeTest extends AbstractCairoTest {
     }
 
     @Test
+    public void testChangeStringToDecimal() throws Exception {
+        // STRING -> DECIMAL64
+        assertChangeVarToDecimal("'123456789012345678'", "123456789012345678", "STRING", "decimal(18, 0)");
+        assertChangeVarToDecimal("'12345678901234.5678'", "12345678901234.5678", "STRING", "decimal(18, 4)");
+    }
+
+    @Test
+    public void testChangeStringToDecimalWithInvalidValues() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("CREATE TABLE x (ts TIMESTAMP, col STRING) TIMESTAMP(ts) PARTITION BY DAY WAL", sqlExecutionContext);
+            execute("INSERT INTO x VALUES('2024-05-14T16:00:00.000000Z', '12345.6789')", sqlExecutionContext);
+            execute("INSERT INTO x VALUES('2024-05-14T16:00:01.000000Z', 'abc')", sqlExecutionContext);
+            execute("INSERT INTO x VALUES('2024-05-14T16:00:02.000000Z', '')", sqlExecutionContext);
+            execute("INSERT INTO x VALUES('2024-05-14T16:00:03.000000Z', '12.34.56')", sqlExecutionContext);
+            execute("INSERT INTO x VALUES('2024-05-14T16:00:04.000000Z', NULL)", sqlExecutionContext);
+            drainWalQueue();
+
+            execute("ALTER TABLE x ALTER COLUMN col TYPE DECIMAL(18, 4)", sqlExecutionContext);
+            drainWalQueue();
+
+            assertQuery("x")
+                    .noLeakCheck()
+                    .expectSize()
+                    .timestamp("ts")
+                    .returns("""
+                            ts\tcol
+                            2024-05-14T16:00:00.000000Z\t12345.6789
+                            2024-05-14T16:00:01.000000Z\t
+                            2024-05-14T16:00:02.000000Z\t
+                            2024-05-14T16:00:03.000000Z\t
+                            2024-05-14T16:00:04.000000Z\t
+                            """);
+
+            execute("DROP TABLE x");
+        });
+    }
+
+    @Test
     public void testChangeStringToIndexedSymbol() throws Exception {
         assertMemoryLeak(() -> {
             createX();
             drainWalQueue();
 
-            ddl("create table y as (select c from x)", sqlExecutionContext);
-            ddl("alter table x alter column c type symbol index", sqlExecutionContext);
+            execute("create table y as (select c from x)", sqlExecutionContext);
+            execute("alter table x alter column c type symbol index", sqlExecutionContext);
             drainWalQueue();
 
             assertSqlCursorsConvertedStrings(
@@ -263,11 +1001,14 @@ public class AlterTableChangeColumnTypeTest extends AbstractCairoTest {
                     "select c from x"
             );
 
-            insert("insert into x(c, timestamp) values('abc', now())", sqlExecutionContext);
+            execute("insert into x(c, timestamp) values('abc', now())", sqlExecutionContext);
             drainWalQueue();
-            assertSql("c\nabc\n", "select c from x limit -1");
+            assertQuery("select c from x limit -1")
+                    .noLeakCheck()
+                    .expectSize()
+                    .returns("c\nabc\n");
 
-            insert("insert into y(c) values('abc')", sqlExecutionContext);
+            execute("insert into y(c) values('abc')", sqlExecutionContext);
             assertSqlCursorsConvertedStrings(
                     "select c from y where c = 'abc'",
                     "select c from x where c = 'abc'"
@@ -281,8 +1022,8 @@ public class AlterTableChangeColumnTypeTest extends AbstractCairoTest {
         assertMemoryLeak(() -> {
             createX();
             drainWalQueue();
-            ddl("create table y as (select c from x)", sqlExecutionContext);
-            ddl("alter table x alter column c type symbol", sqlExecutionContext);
+            execute("create table y as (select c from x)", sqlExecutionContext);
+            execute("alter table x alter column c type symbol", sqlExecutionContext);
             drainWalQueue();
 
             assertSqlCursorsConvertedStrings(
@@ -290,12 +1031,15 @@ public class AlterTableChangeColumnTypeTest extends AbstractCairoTest {
                     "select c from x"
             );
 
-            insert("insert into x(c, timestamp) values('abc', now())", sqlExecutionContext);
+            execute("insert into x(c, timestamp) values('abc', now())", sqlExecutionContext);
             drainWalQueue();
-            assertSql("c\nabc\n", "select c from x limit -1");
+            assertQuery("select c from x limit -1")
+                    .noLeakCheck()
+                    .expectSize()
+                    .returns("c\nabc\n");
 
-            ddl("create table z as (select c from x)", sqlExecutionContext);
-            ddl("alter table x alter column c type string", sqlExecutionContext);
+            execute("create table z as (select c from x)", sqlExecutionContext);
+            execute("alter table x alter column c type string", sqlExecutionContext);
 
             assertSqlCursorsConvertedStrings(
                     "select c from z",
@@ -310,8 +1054,8 @@ public class AlterTableChangeColumnTypeTest extends AbstractCairoTest {
         assertMemoryLeak(() -> {
             createX();
             drainWalQueue();
-            ddl("create table y as (select c from x)", sqlExecutionContext);
-            ddl("alter table x alter column c type varchar", sqlExecutionContext);
+            execute("create table y as (select c from x)", sqlExecutionContext);
+            execute("alter table x alter column c type varchar", sqlExecutionContext);
             drainWalQueue();
 
             assertSqlCursorsConvertedStrings(
@@ -319,12 +1063,15 @@ public class AlterTableChangeColumnTypeTest extends AbstractCairoTest {
                     "select c from y"
             );
 
-            insert("insert into x(c, timestamp) values('abc', now())", sqlExecutionContext);
+            execute("insert into x(c, timestamp) values('abc', now())", sqlExecutionContext);
             drainWalQueue();
-            assertSql("c\nabc\n", "select c from x limit -1");
+            assertQuery("select c from x limit -1")
+                    .noLeakCheck()
+                    .expectSize()
+                    .returns("c\nabc\n");
 
-            ddl("create table z as (select c from x)", sqlExecutionContext);
-            ddl("alter table x alter column c type string", sqlExecutionContext);
+            execute("create table z as (select c from x)", sqlExecutionContext);
+            execute("alter table x alter column c type string", sqlExecutionContext);
 
             assertSqlCursorsConvertedStrings(
                     "select c from z",
@@ -334,18 +1081,77 @@ public class AlterTableChangeColumnTypeTest extends AbstractCairoTest {
     }
 
     @Test
+    public void testChangeSymbolCannotChangeIndex() throws Exception {
+        assertMemoryLeak(() -> {
+            createX();
+            try {
+                execute("alter table x alter column ik symbol capacity 512 index", sqlExecutionContext);
+                Assert.fail("index syntax not supported when changing SYMBOL capacity");
+            } catch (SqlException ex) {
+                TestUtils.assertContains(ex.getFlyweightMessage(), "unexpected token [index] while trying to change symbol capacity");
+            }
+            drainWalQueue();
+        });
+    }
+
+    @Test
+    public void testChangeSymbolCapacity() throws Exception {
+        assertMemoryLeak(() -> {
+            createX();
+            drainWalQueue();
+
+            execute("create table y as (select ik from x)", sqlExecutionContext);
+            execute("alter table x alter column ik symbol capacity 512", sqlExecutionContext);
+            drainWalQueue();
+
+            assertSqlCursorsConvertedStrings(
+                    "select ik from y",
+                    "select ik from x"
+            );
+
+            assertQuery("(SHOW COLUMNS FROM x) WHERE column = 'ik'")
+                    .noLeakCheck()
+                    .noRandomAccess()
+                    .returns("""
+                            column\ttype\tindexed\tindexBlockCapacity\tsymbolCached\tsymbolCapacity\tsymbolTableSize\tdesignated\tupsertKey\tindexType\tindexInclude
+                            ik\tSYMBOL\ttrue\t256\tfalse\t512\t5\tfalse\tfalse\tBITMAP\t
+                            """);
+
+            execute("alter table x alter column ik symbol capacity 1000", sqlExecutionContext);
+
+            drainWalQueue();
+
+            assertSqlCursorsConvertedStrings(
+                    "select ik from y",
+                    "select ik from x"
+            );
+
+            assertQuery("(SHOW COLUMNS FROM x) WHERE column = 'ik'")
+                    .noLeakCheck()
+                    .noRandomAccess()
+                    .returns("""
+                            column\ttype\tindexed\tindexBlockCapacity\tsymbolCached\tsymbolCapacity\tsymbolTableSize\tdesignated\tupsertKey\tindexType\tindexInclude
+                            ik\tSYMBOL\ttrue\t256\tfalse\t1024\t5\tfalse\tfalse\tBITMAP\t
+                            """);
+        });
+    }
+
+    @Test
     public void testChangeSymbolToVarcharReleaseWriters() throws Exception {
         assertMemoryLeak(() -> {
             createX();
             drainWalQueue();
             engine.releaseInactive();
-            ddl("alter table x alter column ik type varchar", sqlExecutionContext);
+            execute("alter table x alter column ik type varchar", sqlExecutionContext);
             drainWalQueue();
 
-            insert("insert into x(ik, timestamp) values('abc', now())", sqlExecutionContext);
+            execute("insert into x(ik, timestamp) values('abc', now())", sqlExecutionContext);
             drainWalQueue();
 
-            assertSql("ik\nabc\n", "select ik from x limit -1");
+            assertQuery("select ik from x limit -1")
+                    .noLeakCheck()
+                    .expectSize()
+                    .returns("ik\nabc\n");
         });
     }
 
@@ -353,8 +1159,8 @@ public class AlterTableChangeColumnTypeTest extends AbstractCairoTest {
     public void testChangeTypePreservesColumnOrder() throws Exception {
         assertMemoryLeak(() -> {
             createX();
-            ddl("create table y as (select * from x)", sqlExecutionContext);
-            ddl("alter table x alter column c type symbol", sqlExecutionContext);
+            execute("create table y as (select * from x)", sqlExecutionContext);
+            execute("alter table x alter column c type symbol", sqlExecutionContext);
 
             assertSqlCursorsConvertedStrings(
                     "select * from y limit 10",
@@ -364,10 +1170,64 @@ public class AlterTableChangeColumnTypeTest extends AbstractCairoTest {
     }
 
     @Test
+    public void testChangeTypePreservesInsertColDefaultOrder() throws Exception {
+        assertMemoryLeak(() -> {
+            execute(
+                    "create table x as (" +
+                            "select" +
+                            " rnd_str(5,5,2) c," +
+                            " to_timestamp('2018-01', 'yyyy-MM') + x * 7200000 timestamp," +
+                            " from long_sequence(1)" +
+                            ") timestamp (timestamp) PARTITION BY HOUR" + (walEnabled ? "  WAL" : " BYPASS WAL")
+            );
+
+            drainWalQueue();
+            execute("alter table x alter column c type varchar", sqlExecutionContext);
+            drainWalQueue();
+
+            execute("insert into x values('abc', '2024-06-20T17:18:27.752076Z')", sqlExecutionContext);
+            drainWalQueue();
+
+            assertQuery("select c from x limit -1")
+                    .noLeakCheck()
+                    .expectSize()
+                    .returns("c\nabc\n");
+
+            execute("alter table x alter column c type string", sqlExecutionContext);
+            drainWalQueue();
+            engine.releaseInactive();
+
+            execute("insert into x values('def', '2024-06-20T17:18:27.752076Z')", sqlExecutionContext);
+            drainWalQueue();
+            assertQuery("select c from x limit -1")
+                    .noLeakCheck()
+                    .expectSize()
+                    .returns("c\ndef\n");
+
+            execute("insert into x select * from x");
+            drainWalQueue();
+
+            assertQuery("x order by timestamp, c")
+                    .noLeakCheck()
+                    .expectSize()
+                    .timestamp("timestamp")
+                    .returns("""
+                            c\ttimestamp
+                            TJWCP\t2018-01-01T00:00:07.200000Z
+                            TJWCP\t2018-01-01T00:00:07.200000Z
+                            abc\t2024-06-20T17:18:27.752076Z
+                            abc\t2024-06-20T17:18:27.752076Z
+                            def\t2024-06-20T17:18:27.752076Z
+                            def\t2024-06-20T17:18:27.752076Z
+                            """);
+        });
+    }
+
+    @Test
     public void testChangeVarcharStringSymbol() throws Exception {
         assertMemoryLeak(() -> {
             createX();
-            ddl("create table y as (select v from x)", sqlExecutionContext);
+            execute("create table y as (select v from x)", sqlExecutionContext);
 
             Rnd rnd = new Rnd();
             int currentType = ColumnType.VARCHAR;
@@ -375,21 +1235,15 @@ public class AlterTableChangeColumnTypeTest extends AbstractCairoTest {
 
                 int typeId = currentType;
                 while (typeId == currentType) {
-                    switch (rnd.nextPositiveInt() % 3) {
-                        case 0:
-                            typeId = ColumnType.STRING;
-                            break;
-                        case 1:
-                            typeId = ColumnType.SYMBOL;
-                            break;
-                        default:
-                            typeId = ColumnType.VARCHAR;
-                            break;
-                    }
+                    typeId = switch (rnd.nextPositiveInt() % 3) {
+                        case 0 -> ColumnType.STRING;
+                        case 1 -> ColumnType.SYMBOL;
+                        default -> ColumnType.VARCHAR;
+                    };
                 }
                 String type = ColumnType.nameOf(typeId);
                 currentType = typeId;
-                ddl("alter table x alter column v type " + type, sqlExecutionContext);
+                execute("alter table x alter column v type " + type, sqlExecutionContext);
 
                 assertSqlCursorsConvertedStrings(
                         "select v from y",
@@ -399,13 +1253,188 @@ public class AlterTableChangeColumnTypeTest extends AbstractCairoTest {
         });
     }
 
+    /**
+     * Pre-existing bug in the native ALTER COLUMN TYPE path: VARCHAR to CHAR (and any
+     * other fixed target routed through {@code ColumnTypeConverter.convertFromVarcharToFixed})
+     * treated UTF-8 bytes as Latin-1 chars via {@code Utf8Sequence.asAsciiCharSequence()}.
+     * <p>
+     * For a CHAR destination the downstream converter reads {@code charAt(0)}, so the
+     * first raw UTF-8 byte became the CHAR value instead of the decoded code point. E.g.
+     * the value {@code 'e-acute'} (UTF-8 {@code 0xC3 0xA9}) was stored as CHAR
+     * {@code U+00C3} ('A-tilde') rather than {@code U+00E9} ('e-acute').
+     * <p>
+     * This test exercises only native partitions (no CONVERT PARTITION TO PARQUET) and
+     * asserts the stored CHAR matches the first UTF-16 code point of the source value.
+     * The peer fix lives in
+     * {@code ColumnTypeConverter.convertFromVarcharToFixed}; removing that fix reverts
+     * this test to a failure.
+     */
+    @Test
+    public void testChangeVarcharToCharPreservesNonAsciiCodepoint() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("CREATE TABLE x (ts TIMESTAMP, col VARCHAR) TIMESTAMP(ts) PARTITION BY DAY WAL", sqlExecutionContext);
+            execute("""
+                    INSERT INTO x VALUES
+                    ('2024-05-14T16:00:00.000000Z', 'a'),
+                    ('2024-05-14T16:00:01.000000Z', 'é'),
+                    ('2024-05-14T16:00:02.000000Z', '日')""", sqlExecutionContext);
+            drainWalQueue();
+
+            execute("ALTER TABLE x ALTER COLUMN col TYPE CHAR", sqlExecutionContext);
+            drainWalQueue();
+
+            // Expected: first UTF-16 code point of each stored value.
+            //   'a'  -> 'a'
+            //   'é'  -> 'é' (U+00E9)
+            //   '日' -> '日' (U+65E5)
+            // With the pre-fix code, non-ASCII rows stored the first UTF-8 byte as a char
+            // (e.g. 'é' -> 'A-tilde'), so the assertion below would fail.
+            assertQuery("x").noLeakCheck().inferTimestamp().inferRandomAccess().sizeMayVary().returns(
+                    """
+                            ts\tcol
+                            2024-05-14T16:00:00.000000Z\ta
+                            2024-05-14T16:00:01.000000Z\té
+                            2024-05-14T16:00:02.000000Z\t日
+                            """);
+
+            execute("DROP TABLE x");
+        });
+    }
+
+    @Test
+    public void testChangeVarcharToDecimal() throws Exception {
+        // VARCHAR -> DECIMAL8
+        assertChangeVarToDecimal("'12'", "12", "VARCHAR", "decimal(2, 0)");
+        assertChangeVarToDecimal("'1.2'", "1.2", "VARCHAR", "decimal(2, 1)");
+
+        // VARCHAR -> DECIMAL16
+        assertChangeVarToDecimal("'1234'", "1234", "VARCHAR", "decimal(4, 0)");
+        assertChangeVarToDecimal("'12.34'", "12.34", "VARCHAR", "decimal(4, 2)");
+
+        // VARCHAR -> DECIMAL32
+        assertChangeVarToDecimal("'123456789'", "123456789", "VARCHAR", "decimal(9, 0)");
+
+        // VARCHAR -> DECIMAL64
+        assertChangeVarToDecimal("'123456789012345678'", "123456789012345678", "VARCHAR", "decimal(18, 0)");
+        assertChangeVarToDecimal("'12345678901234.5678'", "12345678901234.5678", "VARCHAR", "decimal(18, 4)");
+
+        // VARCHAR -> DECIMAL128
+        assertChangeVarToDecimal("'12345678901234567890123456789012345678'", "12345678901234567890123456789012345678", "VARCHAR", "decimal(38, 0)");
+
+        // VARCHAR -> DECIMAL256
+        assertChangeVarToDecimal("'12345678901234567890123456789012345678901234567890123456789012345678901234.5'",
+                "12345678901234567890123456789012345678901234567890123456789012345678901234.5",
+                "VARCHAR", "decimal(76, 1)");
+    }
+
+    @Test
+    public void testChangeVarcharToDecimalRoundTrip() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("CREATE TABLE x (ts TIMESTAMP, col DECIMAL(18, 4)) TIMESTAMP(ts) PARTITION BY DAY WAL", sqlExecutionContext);
+            execute("INSERT INTO x VALUES('2024-05-14T16:00:00.000000Z', 12345.6789m)", sqlExecutionContext);
+            execute("INSERT INTO x VALUES('2024-05-14T16:00:01.000000Z', NULL)", sqlExecutionContext);
+            execute("INSERT INTO x VALUES('2024-05-14T16:00:02.000000Z', -99.9999m)", sqlExecutionContext);
+            drainWalQueue();
+
+            // DECIMAL -> VARCHAR
+            execute("ALTER TABLE x ALTER COLUMN col TYPE VARCHAR", sqlExecutionContext);
+            drainWalQueue();
+
+            assertQuery("x")
+                    .noLeakCheck()
+                    .expectSize()
+                    .timestamp("ts")
+                    .returns("""
+                            ts\tcol
+                            2024-05-14T16:00:00.000000Z\t12345.6789
+                            2024-05-14T16:00:01.000000Z\t
+                            2024-05-14T16:00:02.000000Z\t-99.9999
+                            """);
+
+            // VARCHAR -> DECIMAL (round trip)
+            execute("ALTER TABLE x ALTER COLUMN col TYPE DECIMAL(18, 4)", sqlExecutionContext);
+            drainWalQueue();
+
+            assertQuery("x")
+                    .noLeakCheck()
+                    .expectSize()
+                    .timestamp("ts")
+                    .returns("""
+                            ts\tcol
+                            2024-05-14T16:00:00.000000Z\t12345.6789
+                            2024-05-14T16:00:01.000000Z\t
+                            2024-05-14T16:00:02.000000Z\t-99.9999
+                            """);
+
+            execute("DROP TABLE x");
+        });
+    }
+
+    @Test
+    public void testChangeVarcharToDecimalWithInvalidValues() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("CREATE TABLE x (ts TIMESTAMP, col VARCHAR) TIMESTAMP(ts) PARTITION BY DAY WAL", sqlExecutionContext);
+            execute("INSERT INTO x VALUES('2024-05-14T16:00:00.000000Z', '12345.6789')", sqlExecutionContext);
+            execute("INSERT INTO x VALUES('2024-05-14T16:00:01.000000Z', 'abc')", sqlExecutionContext);
+            execute("INSERT INTO x VALUES('2024-05-14T16:00:02.000000Z', '')", sqlExecutionContext);
+            execute("INSERT INTO x VALUES('2024-05-14T16:00:03.000000Z', '12.34.56')", sqlExecutionContext);
+            execute("INSERT INTO x VALUES('2024-05-14T16:00:04.000000Z', NULL)", sqlExecutionContext);
+            drainWalQueue();
+
+            execute("ALTER TABLE x ALTER COLUMN col TYPE DECIMAL(18, 4)", sqlExecutionContext);
+            drainWalQueue();
+
+            assertQuery("x")
+                    .noLeakCheck()
+                    .expectSize()
+                    .timestamp("ts")
+                    .returns("""
+                            ts\tcol
+                            2024-05-14T16:00:00.000000Z\t12345.6789
+                            2024-05-14T16:00:01.000000Z\t
+                            2024-05-14T16:00:02.000000Z\t
+                            2024-05-14T16:00:03.000000Z\t
+                            2024-05-14T16:00:04.000000Z\t
+                            """);
+
+            execute("DROP TABLE x");
+        });
+    }
+
+    @Test
+    public void testChangeVarcharToDecimalWithNull() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("CREATE TABLE x (ts TIMESTAMP, col VARCHAR) TIMESTAMP(ts) PARTITION BY DAY WAL", sqlExecutionContext);
+            execute("INSERT INTO x VALUES('2024-05-14T16:00:00.000000Z', '12345.6789')", sqlExecutionContext);
+            execute("INSERT INTO x VALUES('2024-05-14T16:00:01.000000Z', NULL)", sqlExecutionContext);
+            execute("INSERT INTO x VALUES('2024-05-14T16:00:02.000000Z', '-99.9999')", sqlExecutionContext);
+            drainWalQueue();
+
+            execute("ALTER TABLE x ALTER COLUMN col TYPE DECIMAL(18, 4)", sqlExecutionContext);
+            drainWalQueue();
+
+            assertQuery("x")
+                    .noLeakCheck()
+                    .expectSize()
+                    .timestamp("ts")
+                    .returns("""
+                            ts\tcol
+                            2024-05-14T16:00:00.000000Z\t12345.6789
+                            2024-05-14T16:00:01.000000Z\t
+                            2024-05-14T16:00:02.000000Z\t-99.9999
+                            """);
+
+            execute("DROP TABLE x");
+        });
+    }
+
     @Test
     public void testChangeVarcharToSymbol() throws Exception {
         assertMemoryLeak(() -> {
             createX();
             drainWalQueue();
-            ddl("create table y as (select v from x)", sqlExecutionContext);
-            ddl("alter table x alter column v type symbol", sqlExecutionContext);
+            execute("create table y as (select v from x)", sqlExecutionContext);
+            execute("alter table x alter column v type symbol", sqlExecutionContext);
 
             drainWalQueue();
             assertSqlCursorsConvertedStrings(
@@ -413,23 +1442,26 @@ public class AlterTableChangeColumnTypeTest extends AbstractCairoTest {
                     "select v from y"
             );
 
-            insert("insert into x(v, timestamp) values('abc', now())", sqlExecutionContext);
+            execute("insert into x(v, timestamp) values('abc', now())", sqlExecutionContext);
             drainWalQueue();
-            assertSql("v\nabc\n", "select v from x limit -1");
+            assertQuery("select v from x limit -1")
+                    .noLeakCheck()
+                    .expectSize()
+                    .returns("v\nabc\n");
 
-            ddl("create table z as (select v from x)", sqlExecutionContext);
-            ddl("alter table x alter column v type varchar", sqlExecutionContext);
+            execute("create table z as (select v from x)", sqlExecutionContext);
+            execute("alter table x alter column v type varchar", sqlExecutionContext);
 
             assertSqlCursorsConvertedStrings(
                     "select v from z",
                     "select v from x"
             );
 
-            ddl("alter table x add column sym_top symbol", sqlExecutionContext);
-            ddl("alter table z add column sym_top symbol", sqlExecutionContext);
-            insert("insert into x(sym_top, timestamp) select rnd_symbol('a', 'b', 'c', null), timestamp_sequence(now(), 1) from long_sequence(123)", sqlExecutionContext);
+            execute("alter table x add column sym_top symbol", sqlExecutionContext);
+            execute("alter table z add column sym_top symbol", sqlExecutionContext);
+            execute("insert into x(sym_top, timestamp) select rnd_symbol('a', 'b', 'c', null), timestamp_sequence(now(), 1) from long_sequence(123)", sqlExecutionContext);
             drainWalQueue();
-            insert("insert into z(sym_top) select sym_top from x limit -123", sqlExecutionContext);
+            execute("insert into z(sym_top) select sym_top from x limit -123", sqlExecutionContext);
             drainWalQueue();
 
             assertSqlCursorsConvertedStrings(
@@ -437,8 +1469,8 @@ public class AlterTableChangeColumnTypeTest extends AbstractCairoTest {
                     "select sym_top from x"
             );
 
-            ddl("alter table x alter column sym_top type varchar", sqlExecutionContext);
-            ddl("alter table z alter column sym_top type varchar", sqlExecutionContext);
+            execute("alter table x alter column sym_top type varchar", sqlExecutionContext);
+            execute("alter table z alter column sym_top type varchar", sqlExecutionContext);
             drainWalQueue();
 
             assertSqlCursorsConvertedStrings(
@@ -450,14 +1482,122 @@ public class AlterTableChangeColumnTypeTest extends AbstractCairoTest {
 
     @Test
     public void testColumnDoesNotExist() throws Exception {
-        Assume.assumeTrue(!walEnabled && partitioned);
-        assertFailure("alter table x alter column non_existing", 27, "column 'non_existing' does not exists in table 'x'");
+        assertFailure("alter table x alter column non_existing", 27, "column 'non_existing' does not exist in table 'x'");
     }
 
     @Test
     public void testConversionInvalidToken() throws Exception {
-        Assume.assumeTrue(!walEnabled && partitioned);
         assertFailure("alter table x alter column i type long abc", 39, "unexpected token [abc] while trying to change column type");
+    }
+
+    @Test
+    public void testConversionsFromArray() throws Exception {
+        assertMemoryLeak(() -> {
+            try {
+                execute("create table x (arr double[]);");
+                assertQuery("alter table x alter column arr type uuid")
+                        .fails(36, "incompatible column type change [existing=DOUBLE[], new=UUID]");
+                assertQuery("alter table x alter column arr type int")
+                        .fails(36, "incompatible column type change [existing=DOUBLE[], new=INT]");
+                assertQuery("alter table x alter column arr type ipv4")
+                        .fails(36, "incompatible column type change [existing=DOUBLE[], new=IPv4]");
+                assertQuery("alter table x alter column arr type long")
+                        .fails(36, "incompatible column type change [existing=DOUBLE[], new=LONG]");
+                assertQuery("alter table x alter column arr type short")
+                        .fails(36, "incompatible column type change [existing=DOUBLE[], new=SHORT]");
+                assertQuery("alter table x alter column arr type byte")
+                        .fails(36, "incompatible column type change [existing=DOUBLE[], new=BYTE]");
+                assertQuery("alter table x alter column arr type double")
+                        .fails(36, "incompatible column type change [existing=DOUBLE[], new=DOUBLE]");
+                assertQuery("alter table x alter column arr type float")
+                        .fails(36, "incompatible column type change [existing=DOUBLE[], new=FLOAT]");
+                assertQuery("alter table x alter column arr type char")
+                        .fails(36, "incompatible column type change [existing=DOUBLE[], new=CHAR]");
+                assertQuery("alter table x alter column arr type boolean")
+                        .fails(36, "incompatible column type change [existing=DOUBLE[], new=BOOLEAN]");
+                assertQuery("alter table x alter column arr type timestamp")
+                        .fails(36, "incompatible column type change [existing=DOUBLE[], new=TIMESTAMP]");
+                assertQuery("alter table x alter column arr type date")
+                        .fails(36, "incompatible column type change [existing=DOUBLE[], new=DATE]");
+                assertQuery("alter table x alter column arr type symbol")
+                        .fails(36, "incompatible column type change [existing=DOUBLE[], new=SYMBOL]");
+                assertQuery("alter table x alter column arr type string")
+                        .fails(36, "incompatible column type change [existing=DOUBLE[], new=STRING]");
+                assertQuery("alter table x alter column arr type varchar")
+                        .fails(36, "incompatible column type change [existing=DOUBLE[], new=VARCHAR]");
+                assertQuery("alter table x alter column arr type binary")
+                        .fails(36, "incompatible column type change [existing=DOUBLE[], new=BINARY]");
+            } finally {
+                execute("drop table if exists x;");
+            }
+        });
+    }
+
+    @Test
+    public void testConversionsToArray() throws Exception {
+        assertMemoryLeak(() -> {
+            try {
+                execute(
+                        "create table x as (" +
+                                "select" +
+                                " rnd_uuid4() guid," +
+                                " rnd_int() rint," +
+                                " rnd_ipv4() ip," +
+                                " rnd_long() i64," +
+                                " rnd_short() i16," +
+                                " rnd_byte() i8," +
+                                " rnd_double() f64," +
+                                " rnd_float() f32," +
+                                " rnd_char() ch," +
+                                " rnd_boolean() b," +
+                                " to_timestamp('2018-01', 'yyyy-MM') + x * 7200000 ts," +
+                                " cast(to_timestamp('2018-01', 'yyyy-MM') + x * 7200000 as date) dt," +
+                                " to_timestamp('2018-01', 'yyyy-MM') + x * 7200000 timestamp," +
+                                " rnd_symbol('A', 'B', 'C') sym," +
+                                " rnd_str('abc', 'def', 'ghi') str," +
+                                " rnd_varchar('abc', 'def', 'ghi') var," +
+                                " rnd_bin() bin" +
+                                " from long_sequence(1000)" +
+                                ")"
+                );
+
+                assertQuery("alter table x alter column guid type DOUBLE[]")
+                        .fails(44, "incompatible column type change [existing=UUID, new=DOUBLE[]]");
+                assertQuery("alter table x alter column rint type DOUBLE[]")
+                        .fails(44, "incompatible column type change [existing=INT, new=DOUBLE[]]");
+                assertQuery("alter table x alter column ip type DOUBLE[]")
+                        .fails(42, "incompatible column type change [existing=IPv4, new=DOUBLE[]]");
+                assertQuery("alter table x alter column i64 type DOUBLE[]")
+                        .fails(43, "incompatible column type change [existing=LONG, new=DOUBLE[]]");
+                assertQuery("alter table x alter column i16 type DOUBLE[]")
+                        .fails(43, "incompatible column type change [existing=SHORT, new=DOUBLE[]]");
+                assertQuery("alter table x alter column i8 type DOUBLE[]")
+                        .fails(42, "incompatible column type change [existing=BYTE, new=DOUBLE[]]");
+                assertQuery("alter table x alter column f64 type DOUBLE[]")
+                        .fails(43, "incompatible column type change [existing=DOUBLE, new=DOUBLE[]]");
+                assertQuery("alter table x alter column f32 type DOUBLE[]")
+                        .fails(43, "incompatible column type change [existing=FLOAT, new=DOUBLE[]]");
+                assertQuery("alter table x alter column ch type DOUBLE[]")
+                        .fails(42, "incompatible column type change [existing=CHAR, new=DOUBLE[]]");
+                assertQuery("alter table x alter column b type DOUBLE[]")
+                        .fails(41, "incompatible column type change [existing=BOOLEAN, new=DOUBLE[]]");
+                assertQuery("alter table x alter column ts type DOUBLE[]")
+                        .fails(42, "incompatible column type change [existing=TIMESTAMP, new=DOUBLE[]]");
+                assertQuery("alter table x alter column dt type DOUBLE[]")
+                        .fails(42, "incompatible column type change [existing=DATE, new=DOUBLE[]]");
+                assertQuery("alter table x alter column sym type DOUBLE[]")
+                        .fails(43, "incompatible column type change [existing=SYMBOL, new=DOUBLE[]]");
+                assertQuery("alter table x alter column str type DOUBLE[]")
+                        .fails(43, "incompatible column type change [existing=STRING, new=DOUBLE[]]");
+                assertQuery("alter table x alter column var type DOUBLE[]")
+                        .fails(43, "incompatible column type change [existing=VARCHAR, new=DOUBLE[]]");
+                assertQuery("alter table x alter column bin type DOUBLE[]")
+                        .fails(43, "incompatible column type change [existing=BINARY, new=DOUBLE[]]");
+
+            } finally {
+                execute("drop table if exists x;");
+            }
+        });
     }
 
     @Test
@@ -466,28 +1606,34 @@ public class AlterTableChangeColumnTypeTest extends AbstractCairoTest {
         assertMemoryLeak(() -> {
             createX();
 
-            ddl("alter table x dedup enable upsert keys(timestamp, d)");
+            execute("alter table x dedup enable upsert keys(timestamp, d)");
             drainWalQueue();
-            checkDedupSet("x", "d", true);
+            checkDedupSet("d", true);
 
-            ddl("alter table x alter column d type float");
+            execute("alter table x alter column d type float");
             drainWalQueue();
-            checkDedupSet("x", "d", true);
+            checkDedupSet("d", true);
 
             engine.releaseInactive();
-            checkDedupSet("x", "d", true);
+            checkDedupSet("d", true);
 
-            insert("insert into x(d, timestamp) values(1.0, '2044-02-24')", sqlExecutionContext);
-            insert("insert into x(d, timestamp) values(1.0, '2044-02-25')", sqlExecutionContext);
-            insert("insert into x(d, timestamp) values(1.0, '2044-02-25')", sqlExecutionContext);
-            insert("insert into x(d, timestamp) values(1.2, '2044-02-25')", sqlExecutionContext);
+            execute("insert into x(d, timestamp) values(1.0, '2044-02-24')", sqlExecutionContext);
+            execute("insert into x(d, timestamp) values(1.0, '2044-02-25')", sqlExecutionContext);
+            execute("insert into x(d, timestamp) values(1.0, '2044-02-25')", sqlExecutionContext);
+            execute("insert into x(d, timestamp) values(1.2, '2044-02-25')", sqlExecutionContext);
 
             drainWalQueue();
 
-            assertSql("timestamp\td\n" +
-                    "2044-02-24T00:00:00.000000Z\t1.0000\n" +
-                    "2044-02-25T00:00:00.000000Z\t1.2000\n" +
-                    "2044-02-25T00:00:00.000000Z\t1.0000\n", "select timestamp, d from x limit -3");
+            assertQuery("select timestamp, d from x order by timestamp, d limit -3")
+                    .noLeakCheck()
+                    .expectSize()
+                    .timestamp("timestamp")
+                    .returns("""
+                            timestamp\td
+                            2044-02-24T00:00:00.000000Z\t1.0
+                            2044-02-25T00:00:00.000000Z\t1.0
+                            2044-02-25T00:00:00.000000Z\t1.2
+                            """);
         });
     }
 
@@ -495,23 +1641,41 @@ public class AlterTableChangeColumnTypeTest extends AbstractCairoTest {
     public void testConvertFailsOnColumnFileOpen() throws Exception {
         assumeNonWal();
         AtomicReference<String> fail = new AtomicReference<>();
+        AtomicBoolean failRead = new AtomicBoolean();
 
         FilesFacade ff = new TestFilesFacadeImpl() {
+            private int injectedErrno;
+
             @Override
-            public int openRO(LPSZ name) {
-                if (fail.get() != null && Misc.getThreadLocalUtf8Sink().put(name).toString().endsWith(fail.get())) {
+            public int errno() {
+                // The injected failures below return -1 without a syscall, so the native
+                // errno is left at whatever the last real syscall set. A writer open
+                // probes for an absent posting-seal-purge file, leaving ENOENT behind,
+                // which would steer TableUtils.openRO into its "file does not exist"
+                // branch. The failures simulate an existing file that cannot be opened,
+                // so report a non-ENOENT errno to keep the intended error messages.
+                return injectedErrno != 0 ? injectedErrno : super.errno();
+            }
+
+            @Override
+            public long openRO(LPSZ name) {
+                if (failRead.get() && fail.get() != null && Misc.getThreadLocalUtf8Sink().put(name).toString().endsWith(fail.get())) {
                     fail.set(null);
+                    injectedErrno = -1;
                     return -1;
                 }
+                injectedErrno = 0;
                 return super.openRO(name);
             }
 
             @Override
-            public int openRW(LPSZ name, long opts) {
-                if (fail.get() != null && Misc.getThreadLocalUtf8Sink().put(name).toString().endsWith(fail.get())) {
+            public long openRW(LPSZ name, int opts) {
+                if (!failRead.get() && fail.get() != null && Misc.getThreadLocalUtf8Sink().put(name).toString().endsWith(fail.get())) {
                     fail.set(null);
+                    injectedErrno = -1;
                     return -1;
                 }
+                injectedErrno = 0;
                 return super.openRW(name, opts);
             }
         };
@@ -521,7 +1685,7 @@ public class AlterTableChangeColumnTypeTest extends AbstractCairoTest {
 
             fail.set("c.d.1");
             try {
-                ddl("alter table x alter column c type varchar", sqlExecutionContext);
+                execute("alter table x alter column c type varchar", sqlExecutionContext);
                 Assert.fail();
             } catch (CairoException e) {
                 TestUtils.assertContains(e.getFlyweightMessage(), "could not open read-write");
@@ -529,15 +1693,16 @@ public class AlterTableChangeColumnTypeTest extends AbstractCairoTest {
 
             fail.set("c.i.1");
             try {
-                ddl("alter table x alter column c type varchar", sqlExecutionContext);
+                execute("alter table x alter column c type varchar", sqlExecutionContext);
                 Assert.fail();
             } catch (CairoException e) {
                 TestUtils.assertContains(e.getFlyweightMessage(), "could not open read-write");
             }
 
             fail.set("c.d");
+            failRead.set(true);
             try {
-                ddl("alter table x alter column c type varchar", sqlExecutionContext);
+                execute("alter table x alter column c type varchar", sqlExecutionContext);
                 Assert.fail();
             } catch (CairoException e) {
                 TestUtils.assertContains(e.getFlyweightMessage(), "could not open read-only");
@@ -545,17 +1710,108 @@ public class AlterTableChangeColumnTypeTest extends AbstractCairoTest {
 
             fail.set("c.i");
             try {
-                ddl("alter table x alter column c type varchar", sqlExecutionContext);
+                execute("alter table x alter column c type varchar", sqlExecutionContext);
                 Assert.fail();
             } catch (CairoException e) {
                 TestUtils.assertContains(e.getFlyweightMessage(), "could not open read-only");
             }
 
             fail.set(null);
-            ddl("alter table x alter column c type varchar", sqlExecutionContext);
+            execute("alter table x alter column c type varchar", sqlExecutionContext);
 
-            insert("insert into x(c, timestamp) values('asdfadf', now())", sqlExecutionContext);
-            assertSql("c\nasdfadf\n", "select c from x limit -1");
+            execute("insert into x(c, timestamp) values('asdfadf', now())", sqlExecutionContext);
+            assertQuery("select c from x limit -1")
+                    .noLeakCheck()
+                    .expectSize()
+                    .returns("c\nasdfadf\n");
+        });
+    }
+
+    @Test
+    public void testConvertFixedToFixedReservesDiskSpaceBeforeMapping() throws Exception {
+        // Regression test for a JVM-crashing SIGBUS: convertFixedToFixed() must reserve real
+        // disk blocks for the destination column file (ff.allocate(), i.e. posix_fallocate)
+        // before mapping it MAP_RW, exactly like every other writable-mmap call site in the
+        // codebase (TableUtils.mapRW, ContiguousFileFixFrameColumn, O3PartitionJob, etc). The
+        // buggy version only called ff.truncate(), which sets the logical file size without
+        // reserving blocks, so a native write through the mmap could fault with an uncatchable
+        // SIGBUS instead of a normal CairoException on disk exhaustion.
+        final AtomicLong dstFd = new AtomicLong(-1);
+        final AtomicLong allocatedSizeForDst = new AtomicLong(-1);
+        final AtomicBoolean dstMappedForWrite = new AtomicBoolean();
+        final AtomicBoolean dstMappedBeforeAllocated = new AtomicBoolean();
+
+        FilesFacade ff = new TestFilesFacadeImpl() {
+            @Override
+            public boolean allocate(long fd, long size) {
+                if (fd == dstFd.get() && allocatedSizeForDst.get() < 0) {
+                    allocatedSizeForDst.set(size);
+                }
+                return super.allocate(fd, size);
+            }
+
+            @Override
+            public long mmap(long fd, long len, long offset, int flags, int memoryTag) {
+                if (fd == dstFd.get() && flags == Files.MAP_RW) {
+                    dstMappedForWrite.set(true);
+                    if (allocatedSizeForDst.get() < 0) {
+                        dstMappedBeforeAllocated.set(true);
+                    }
+                }
+                return super.mmap(fd, len, offset, flags, memoryTag);
+            }
+
+            @Override
+            public long openRW(LPSZ name, int opts) {
+                long fd = super.openRW(name, opts);
+                // The pre-existing "i" column (columnNameTxn == -1, bare file name "i.d")
+                // is opened read-write by the ordinary writer append path during INSERT, and
+                // read-only by ConvertOperatorImpl during the ALTER. The ALTER's destination
+                // file always carries a fresh columnNameTxn suffix, e.g. "i.d.0"/"i.d.1". The
+                // *first* such open is ConvertOperatorImpl/convertFixedToFixed sizing and
+                // mapping the destination for the conversion itself - a later reopen of the
+                // same path (the writer attaching the converted column for further live
+                // appends, extended to the default append page size) is unrelated to the fix
+                // under test, so only the first match is latched.
+                String path = Misc.getThreadLocalUtf8Sink().put(name).toString();
+                int sep = Math.max(path.lastIndexOf('/'), path.lastIndexOf('\\'));
+                String fileName = sep >= 0 ? path.substring(sep + 1) : path;
+                if (fileName.startsWith("i.d.") && dstFd.get() == -1) {
+                    dstFd.set(fd);
+                }
+                return fd;
+            }
+        };
+
+        assertMemoryLeak(ff, () -> {
+            execute("CREATE TABLE y (i INT, ts TIMESTAMP) TIMESTAMP(ts) PARTITION BY DAY", sqlExecutionContext);
+            execute("""
+                    INSERT INTO y VALUES
+                    (1, '2024-05-14T16:00:00.000000Z'),
+                    (2, '2024-05-14T16:00:01.000000Z')""");
+
+            execute("ALTER TABLE y ALTER COLUMN i TYPE LONG", sqlExecutionContext);
+
+            Assert.assertNotEquals("destination column file was never opened for write", -1, dstFd.get());
+            Assert.assertTrue("destination column data file was never mapped read-write", dstMappedForWrite.get());
+            Assert.assertEquals(
+                    "ff.allocate() must reserve the exact destination byte size before mapping",
+                    2L * Long.BYTES,
+                    allocatedSizeForDst.get()
+            );
+            Assert.assertFalse(
+                    "destination file was mapped read-write before its disk space was allocated",
+                    dstMappedBeforeAllocated.get()
+            );
+
+            assertQuery("select i from y")
+                    .noLeakCheck()
+                    .expectSize()
+                    .returns("""
+                            i
+                            1
+                            2
+                            """);
         });
     }
 
@@ -566,77 +1822,75 @@ public class AlterTableChangeColumnTypeTest extends AbstractCairoTest {
             createX();
 
             try (TableWriter writer = getWriter("x")) {
-                writer.changeColumnType("timestamp", ColumnType.INT, 0, false, false, 0, false, null);
+                writer.changeColumnType("timestamp", ColumnType.INT, 0, false, IndexType.NONE, 0, false, null);
                 Assert.fail();
             } catch (CairoException e) {
                 TestUtils.assertContains(e.getFlyweightMessage(), "cannot change column type, column is the designated timestamp");
             }
 
             try (TableWriter writer = getWriter("x")) {
-                writer.changeColumnType("d", ColumnType.DOUBLE, 0, false, false, 0, false, null);
+                writer.changeColumnType("d", ColumnType.DOUBLE, 0, false, IndexType.NONE, 0, false, null);
                 Assert.fail();
             } catch (CairoException e) {
                 TestUtils.assertContains(e.getFlyweightMessage(), "cannot change column type, new type is the same as existing");
             }
 
             try (TableWriter writer = getWriter("x")) {
-                writer.changeColumnType("ik", ColumnType.GEOBYTE, 0, false, false, 0, false, null);
+                writer.changeColumnType("ik", ColumnType.GEOBYTE, 0, false, IndexType.NONE, 0, false, null);
                 Assert.fail();
             } catch (CairoException e) {
                 TestUtils.assertContains(e.getFlyweightMessage(), "column conversion failed, see logs for details");
             }
 
-            insert("insert into x(c, timestamp) values('abc', now())", sqlExecutionContext);
-            assertSql("c\nabc\n", "select c from x limit -1");
+            execute("insert into x(c, timestamp) values('abc', now())", sqlExecutionContext);
+            assertQuery("select c from x limit -1")
+                    .noLeakCheck()
+                    .expectSize()
+                    .returns("c\nabc\n");
 
             engine.releaseInactive();
 
-            insert("insert into x(c, timestamp) values('def', now())", sqlExecutionContext);
-            assertSql("c\ndef\n", "select c from x limit -1");
+            execute("insert into x(c, timestamp) values('def', now())", sqlExecutionContext);
+            assertQuery("select c from x limit -1")
+                    .noLeakCheck()
+                    .expectSize()
+                    .returns("c\ndef\n");
         });
     }
 
     @Test
-    public void testConvertFromSymbolToStringDedupFlagNotAllowed() throws Exception {
+    public void testConvertFromSymbolToStringDedupFlagIsAllowed() throws Exception {
         assumeWal();
         assertMemoryLeak(() -> {
             createX();
 
-            ddl("alter table x dedup enable upsert keys(timestamp, ik)");
+            execute("alter table x dedup enable upsert keys(timestamp, ik)");
             drainWalQueue();
-            checkDedupSet("x", "ik", true);
+            checkDedupSet("ik", true);
+            checkDedupSet("f", false);
 
-            try {
-                ddl("alter table x alter column ik type varchar");
-                Assert.fail();
-            } catch (SqlException ex) {
-                TestUtils.assertContains(ex.getFlyweightMessage(), "cannot change type of deduplicated key column 'ik' to variable size type 'VARCHAR', deduplication is only supported for fixed size types");
-                Assert.assertEquals(35, ex.getPosition());
-            }
-
-            ddl("alter table x dedup disable");
+            execute("alter table x alter column ik type varchar");
             drainWalQueue();
+            checkDedupSet("ik", true);
 
-            // In one go, enable dedup and change type
-            ddl("alter table x dedup enable upsert keys(timestamp, ik)");
-            ddl("alter table x alter column ik type varchar");
-            drainWalQueue();
-
-            checkDedupSet("x", "ik", false);
-
-            engine.releaseInactive();
-            checkDedupSet("x", "ik", false);
-
-            insert("insert into x(ik, d, timestamp) values('abc', 2, '2044-02-24')", sqlExecutionContext);
-            insert("insert into x(ik, d, timestamp) values('abc', 3, '2044-02-25')", sqlExecutionContext);
-            insert("insert into x(ik, d, timestamp) values('def', 4, '2044-02-25')", sqlExecutionContext);
+            execute("insert into x(ik, d, timestamp) values('abc', 2, '2044-02-24')", sqlExecutionContext);
+            execute("insert into x(ik, d, timestamp) values('abc', 3, '2044-02-24')", sqlExecutionContext);
+            execute("insert into x(ik, d, timestamp) values('abc', 4, '2044-02-25')", sqlExecutionContext);
+            execute("insert into x(ik, d, timestamp) values('def', 5, '2044-02-25')", sqlExecutionContext);
 
             drainWalQueue();
 
-            assertSql("timestamp\td\tik\n" +
-                    "2018-01-01T02:00:00.000000Z\t0.04488373772232379\tCPSW\n" +
-                    "2044-02-24T00:00:00.000000Z\t2.0\tabc\n" +
-                    "2044-02-25T00:00:00.000000Z\t4.0\tdef\n", "select timestamp, d, ik from x limit -3");
+            assertQuery("select timestamp, d, ik from x limit -4")
+                    .noLeakCheck()
+                    .expectSize()
+                    .timestamp("timestamp")
+                    .returns("""
+                            timestamp\td\tik
+                            2018-01-01T02:00:00.000000Z\t0.04488373772232379\tCPSW
+                            2044-02-24T00:00:00.000000Z\t3.0\tabc
+                            2044-02-25T00:00:00.000000Z\t4.0\tabc
+                            2044-02-25T00:00:00.000000Z\t5.0\tdef
+                            """);
         });
     }
 
@@ -647,21 +1901,24 @@ public class AlterTableChangeColumnTypeTest extends AbstractCairoTest {
             createX();
 
             try (TableWriter writer = getWriter("x")) {
-                writer.changeColumnType("non_existing", ColumnType.INT, 0, false, false, 0, false, null);
+                writer.changeColumnType("non_existing", ColumnType.INT, 0, false, IndexType.NONE, 0, false, null);
                 Assert.fail();
             } catch (CairoException e) {
-                TestUtils.assertContains(e.getFlyweightMessage(), "cannot change column type, column does not exists");
+                TestUtils.assertContains(e.getFlyweightMessage(), "cannot change column type, column does not exist");
             }
 
-            insert("insert into x(c, timestamp) values('abc', now())", sqlExecutionContext);
-            assertSql("c\nabc\n", "select c from x limit -1");
+            execute("insert into x(c, timestamp) values('abc', now())", sqlExecutionContext);
+            assertQuery("select c from x limit -1")
+                    .noLeakCheck()
+                    .expectSize()
+                    .returns("c\nabc\n");
         });
     }
 
     @Test
     public void testFixedSizeColumnEquivalentToCast() throws Exception {
-        final String[] types = {"BYTE", "SHORT", "INT", "LONG", "FLOAT", "DOUBLE", "TIMESTAMP", "BOOLEAN", "DATE"};
-        final char[] col_names = {'l', 'f', 'i', 'j', 'e', 'd', 'k', 't', 'g'};
+        final String[] types = {"BYTE", "SHORT", "INT", "LONG", "FLOAT", "DOUBLE", "TIMESTAMP", "TIMESTAMP_NS", "BOOLEAN", "DATE"};
+        final char[] col_names = {'l', 'f', 'i', 'j', 'e', 'd', 'k', 'n', 't', 'g'};
 
         testFixedToFixedConversions(types, col_names);
     }
@@ -672,21 +1929,24 @@ public class AlterTableChangeColumnTypeTest extends AbstractCairoTest {
             createX();
             drainWalQueue();
 
-            ddl("create table y ( converted long, casted int, original long );", sqlExecutionContext);
-            insert("insert into y (converted, casted, original) values (9999999999999, 9999999999999::int, 9999999999999)", sqlExecutionContext);
+            execute("create table y ( converted long, casted int, original long );", sqlExecutionContext);
+            execute("insert into y (converted, casted, original) values (9999999999999, 9999999999999::int, 9999999999999)", sqlExecutionContext);
             drainWalQueue();
-            ddl("alter table y alter column converted type int", sqlExecutionContext);
+            execute("alter table y alter column converted type int", sqlExecutionContext);
             drainWalQueue();
 
-            assertQuery("converted\tcasted\toriginal\n" +
-                    "1316134911\t1316134911\t9999999999999\n", "select * from y", null, true, true);
+            assertQuery("select * from y")
+                    .expectSize()
+                    .returns("""
+                            converted\tcasted\toriginal
+                            1316134911\t1316134911\t9999999999999
+                            """);
 
         });
     }
 
     @Test
     public void testFixedSizeColumnNullableBehaviour() throws Exception {
-        assumeNonWal();
         assertMemoryLeak(() -> {
             drainWalQueue();
             final String[] types = {"BYTE", "SHORT", "INT", "LONG", "FLOAT", "DOUBLE", "TIMESTAMP", "BOOLEAN", "DATE"};
@@ -694,6 +1954,8 @@ public class AlterTableChangeColumnTypeTest extends AbstractCairoTest {
             final String[] minVals = {"-128", Short.toString(Short.MIN_VALUE), Integer.toString(Integer.MIN_VALUE + 1), longMinValue, -Float.MAX_VALUE + "f", Double.toString(-Double.MAX_VALUE), longMinValue, "false", longMinValue};
             String longMaxValue = Long.toString(Long.MAX_VALUE);
             final String[] maxVals = {"127", Short.toString(Short.MAX_VALUE), Integer.toString(Integer.MAX_VALUE), longMaxValue, Float.MAX_VALUE + "f", Double.toString(Double.MAX_VALUE), longMaxValue, "true", longMaxValue};
+
+            execute("drop table if exists y", sqlExecutionContext);
 
             for (int i = 0, n = types.length; i < n; i++) {
                 for (int j = 0, m = types.length; j < m; j++) {
@@ -707,18 +1969,19 @@ public class AlterTableChangeColumnTypeTest extends AbstractCairoTest {
 
                     LOG.info().$("checking `" + srcType + "` to `" + dstType + "` conversion").$();
 
-                    ddl("create table y ( converted " + srcType + ", casted " + dstType + ", original " + srcType + ")", sqlExecutionContext);
-                    insert("insert into y (converted, casted, original) values (null, cast(cast(null as " + srcType + ") as " + dstType + "), null)", sqlExecutionContext);
-                    insert("insert into y (converted, casted, original) values (" + minVals[i] + ", cast(cast(" + minVals[i] + " as " + srcType + ") as " + dstType + "), " + minVals[i] + ")", sqlExecutionContext);
-                    insert("insert into y (converted, casted, original) values (" + maxVals[i] + ", cast(cast(" + maxVals[i] + " as " + srcType + ") as " + dstType + "), " + maxVals[i] + ")", sqlExecutionContext);
+                    execute("create table y ( converted " + srcType + ", casted " + dstType + ", original " + srcType + ")", sqlExecutionContext);
+                    execute("insert into y (converted, casted, original) values (null, cast(cast(null as " + srcType + ") as " + dstType + "), null)", sqlExecutionContext);
+                    execute("insert into y (converted, casted, original) values (" + minVals[i] + ", cast(cast(" + minVals[i] + " as " + srcType + ") as " + dstType + "), " + minVals[i] + ")", sqlExecutionContext);
+                    execute("insert into y (converted, casted, original) values (" + maxVals[i] + ", cast(cast(" + maxVals[i] + " as " + srcType + ") as " + dstType + "), " + maxVals[i] + ")", sqlExecutionContext);
 
-                    ddl("alter table y alter column converted type " + dstType, sqlExecutionContext);
+                    execute("alter table y alter column converted type " + dstType, sqlExecutionContext);
 
                     try {
-                        assertSql(
-                                "count\n0\n",
-                                "select count(*) from y where converted <> casted"
-                        );
+                        assertQuery("select count(*) from y where converted <> casted")
+                                .noLeakCheck()
+                                .noRandomAccess()
+                                .expectSize()
+                                .returns("count\n0\n");
                     } catch (AssertionError e) {
                         LOG.error().$("failed, error: ").$(e).$();
                         // if the column wasn't converted
@@ -726,17 +1989,19 @@ public class AlterTableChangeColumnTypeTest extends AbstractCairoTest {
                             throw e;
                         } else {
                             // dump the difference in data
-                            assertSql("\nFailed equivalent conversion from `" + srcType + "` to `" + dstType + "`.\n", "select converted, casted, original from y");
+                            assertQuery("select converted, casted, original from y")
+                                    .noLeakCheck()
+                                    .returnsOnce("\nFailed equivalent conversion from `" + srcType + "` to `" + dstType + "`.\n");
                         }
                     }
-                    assertSql(
-                            "column\ttype\n" +
+                    assertQuery("select \"column\", type from table_columns('y')")
+                            .noLeakCheck()
+                            .noRandomAccess()
+                            .returns("column\ttype\n" +
                                     "converted\t" + dstType + "\n" +
                                     "casted\t" + dstType + "\n" +
-                                    "original\t" + srcType + "\n",
-                            "select \"column\", type from table_columns('y')"
-                    );
-                    drop("drop table y", sqlExecutionContext);
+                                    "original\t" + srcType + "\n");
+                    execute("drop table y", sqlExecutionContext);
                     drainWalQueue();
                 }
 
@@ -746,63 +2011,207 @@ public class AlterTableChangeColumnTypeTest extends AbstractCairoTest {
 
     @Test
     public void testFixedToStrConversions() throws Exception {
-        assertMemoryLeak(() -> {
-            assumeNonWal();
-            testConvertFixedToVar("string");
-        });
+        assertMemoryLeak(() -> testConvertFixedToVar("string"));
     }
 
     @Test
     public void testFixedToSymbolConversions() throws Exception {
-        assertMemoryLeak(() -> {
-            assumeNonWal();
-            testConvertVarToFixed("symbol");
-        });
+        assertMemoryLeak(() -> testConvertVarToFixed("symbol"));
     }
 
     @Test
     public void testFixedToVarcharConversions() throws Exception {
-        assertMemoryLeak(() -> {
-            assumeNonWal();
-            testConvertFixedToVar("varchar");
-        });
+        assertMemoryLeak(() -> testConvertFixedToVar("varchar"));
     }
 
     @Test
-    public void testIntOverflowConversions() throws SqlException {
-        //assumeWal();
-        ddl("create table x (a long, timestamp timestamp) timestamp (timestamp) PARTITION BY HOUR" + (walEnabled ? " WAL" : " BYPASS WAL"));
-        insert("insert into x(a, timestamp) values(-7178801693176412875L, '2024-02-04T00:00:00.000Z')", sqlExecutionContext);
+    public void testIntOverflowConversions() throws Exception {
+        execute("create table x (a long, timestamp timestamp) timestamp (timestamp) PARTITION BY HOUR" + (walEnabled ? " WAL" : " BYPASS WAL"));
+        execute("insert into x(a, timestamp) values(-7178801693176412875L, '2024-02-04T00:00:00.000Z')", sqlExecutionContext);
         drainWalQueue();
 
-        ddl("alter table x alter column a type double", sqlExecutionContext);
+        execute("alter table x alter column a type double", sqlExecutionContext);
         drainWalQueue();
-        assertSql("a\n-7.1788016931764132E18\n", "select a from x");
+        assertQuery("select a from x")
+                .noLeakCheck()
+                .expectSize()
+                .returns("a\n-7.178801693176413E18\n");
 
-        ddl("alter table x alter column a type int", sqlExecutionContext);
+        execute("alter table x alter column a type int", sqlExecutionContext);
         drainWalQueue();
-        assertSql("cast\ta\n" +
-                "null\tnull\n", "select cast(-7.1788016931764132E18 as int), a from x");
+        assertQuery("select cast(-7.178801693176413E18 as int), a from x")
+                .noLeakCheck()
+                .expectSize()
+                .returns("""
+                        cast\ta
+                        null\tnull
+                        """);
     }
 
     @Test
     public void testNewTypeInvalid() throws Exception {
-        assumeNonWal();
-        assertFailure("alter table x alter column c type abracadabra", 34, "invalid type");
+        assertFailure("alter table x alter column c type abracadabra", 34, "unsupported column type: abracadabra");
     }
 
     @Test
     public void testNewTypeMissing() throws Exception {
-        assumeNonWal();
         assertFailure("alter table x alter column c type", 33, "column type expected");
     }
 
     @Test
+    public void testProduceParquetFromNativeResolvesColumnTopByWriterIndex() throws Exception {
+        // A column added after a partition existed has a non-zero column top. Dropping an earlier
+        // column shifts this column's dense index below its writer index in a reader's compacted
+        // metadata, so produceParquetFromNative must read the column top by writer index; the dense
+        // index resolves an earlier column's top and mis-aligns the data. (A re-key alone keeps a
+        // column's display position, so a DROP is what drives the dense/writer split here; the same
+        // reader-metadata path is why no OSS SQL statement reaches this -- see the re-key test.)
+        assertMemoryLeak(() -> {
+            inputRoot = root;
+            execute("CREATE TABLE t (ts TIMESTAMP, a INT) TIMESTAMP(ts) PARTITION BY DAY WAL");
+            execute("INSERT INTO t VALUES ('2024-01-01T00:00:00', 10), ('2024-01-01T01:00:00', 20)");
+            drainWalQueue();
+            execute("ALTER TABLE t ADD COLUMN c INT");
+            drainWalQueue();
+            // c gets data in day1 with column top 2 -- rows 0 and 1 predate it.
+            execute("INSERT INTO t VALUES ('2024-01-01T02:00:00', 30, 100), ('2024-01-01T03:00:00', 40, 200)");
+            drainWalQueue();
+            // day2 seals day1 as a non-active native partition.
+            execute("INSERT INTO t VALUES ('2024-01-02T00:00:00', 50, 300)");
+            drainWalQueue();
+            // Drop a: c's dense index now drops below its writer index in the reader metadata.
+            execute("ALTER TABLE t DROP COLUMN a");
+            drainWalQueue();
+
+            final TableToken tt = engine.verifyTableName("t");
+            final String parquetFile;
+            try (TableReader reader = engine.getReader(tt)) {
+                final ColumnVersionReader cvr = reader.getColumnVersionReader();
+                final long partitionTs = reader.getTxFile().getPartitionTimestampByIndex(0);
+                final int cDense = reader.getMetadata().getColumnIndex("c");
+                final int cWriter = reader.getMetadata().getColumnMetadata(cDense).getWriterIndex();
+                // Precondition: the dense and writer indices resolve different column tops.
+                Assert.assertNotEquals(cDense, cWriter);
+                Assert.assertNotEquals(cvr.getColumnTop(partitionTs, cDense), cvr.getColumnTop(partitionTs, cWriter));
+                parquetFile = produceParquetForPartition(reader, 0);
+            }
+            // Column top honoured: c is null for the two rows that predate it.
+            assertQuery("SELECT c FROM read_parquet('" + parquetFile + "')")
+                    .noLeakCheck()
+                    .expectSize()
+                    .returns("c\nnull\nnull\n100\n200\n");
+        });
+    }
+
+    @Test
+    public void testProduceParquetFromNativeResolvesReKeyedColumnByWriterIndex() throws Exception {
+        // ALTER COLUMN TYPE re-keys the column: in a TableReader's compacted metadata its dense
+        // index no longer equals its writer index. produceParquetFromNative must resolve the column
+        // name txn by writer index (as TableReader does), else it opens 'x.d' instead of the real
+        // 'x.d.<txn>' and fails. No OSS SQL path hits this -- SQL CONVERT PARTITION TO PARQUET runs
+        // through the writer, whose metadata keeps deleted-column tombstones so dense == writer; the
+        // storage-policy TO PARQUET conversion calls this with a reader's metadata, exercised here.
+        assertMemoryLeak(() -> {
+            inputRoot = root;
+            execute("CREATE TABLE t (ts TIMESTAMP, x INT) TIMESTAMP(ts) PARTITION BY DAY WAL");
+            execute("INSERT INTO t VALUES ('2024-01-01T00:00:00', 10), ('2024-01-01T01:00:00', 20)");
+            drainWalQueue();
+            // day2 seals day1 as a non-active native partition.
+            execute("INSERT INTO t VALUES ('2024-01-02T00:00:00', 30)");
+            drainWalQueue();
+            execute("ALTER TABLE t ALTER COLUMN x TYPE DOUBLE");
+            drainWalQueue();
+
+            final TableToken tt = engine.verifyTableName("t");
+            final String parquetFile;
+            try (TableReader reader = engine.getReader(tt)) {
+                // Precondition: x really is re-keyed (dense index != writer index) in the reader.
+                final int xDense = reader.getMetadata().getColumnIndex("x");
+                Assert.assertNotEquals(xDense, reader.getMetadata().getColumnMetadata(xDense).getWriterIndex());
+                parquetFile = produceParquetForPartition(reader, 0);
+            }
+            assertQuery("SELECT x FROM read_parquet('" + parquetFile + "')")
+                    .noLeakCheck()
+                    .expectSize()
+                    .returns("x\n10.0\n20.0\n");
+        });
+    }
+
+    @Test
+    public void testProduceParquetFromNativeResolvesSymbolFilesByWriterIndex() throws Exception {
+        // Re-keying a column to SYMBOL leaves its dense index below its writer index in the reader
+        // metadata, and its offset/char files carry a symbol-table name txn. produceParquetFromNative
+        // must resolve that txn by writer index; the dense index opens different (missing) .o/.c files.
+        assertMemoryLeak(() -> {
+            inputRoot = root;
+            execute("CREATE TABLE t (ts TIMESTAMP, k INT) TIMESTAMP(ts) PARTITION BY DAY WAL");
+            execute("INSERT INTO t VALUES ('2024-01-01T00:00:00', 1), ('2024-01-01T01:00:00', 2)");
+            drainWalQueue();
+            // day2 seals day1 as a non-active native partition.
+            execute("INSERT INTO t VALUES ('2024-01-02T00:00:00', 3)");
+            drainWalQueue();
+            execute("ALTER TABLE t ALTER COLUMN k TYPE SYMBOL");
+            drainWalQueue();
+
+            final TableToken tt = engine.verifyTableName("t");
+            final String parquetFile;
+            try (TableReader reader = engine.getReader(tt)) {
+                final ColumnVersionReader cvr = reader.getColumnVersionReader();
+                final int kDense = reader.getMetadata().getColumnIndex("k");
+                final int kWriter = reader.getMetadata().getColumnMetadata(kDense).getWriterIndex();
+                // Precondition: the symbol-table name txn differs by index, and only the writer
+                // index yields the real (suffixed) offset/char files.
+                Assert.assertNotEquals(kDense, kWriter);
+                Assert.assertTrue(cvr.getSymbolTableNameTxn(kWriter) > TableUtils.COLUMN_NAME_TXN_NONE);
+                Assert.assertNotEquals(cvr.getSymbolTableNameTxn(kDense), cvr.getSymbolTableNameTxn(kWriter));
+                parquetFile = produceParquetForPartition(reader, 0);
+            }
+            assertQuery("SELECT k FROM read_parquet('" + parquetFile + "')")
+                    .noLeakCheck()
+                    .expectSize()
+                    .returns("k\n1\n2\n");
+        });
+    }
+
+    @Test
+    public void testReconcileColumnTopsResolvesByWriterIndex() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("CREATE TABLE t (ts TIMESTAMP, a INT) TIMESTAMP(ts) PARTITION BY DAY WAL");
+            execute("INSERT INTO t VALUES ('2024-01-01T00:00:00', 10), ('2024-01-01T01:00:00', 20)");
+            drainWalQueue();
+            execute("ALTER TABLE t ADD COLUMN c INT");
+            drainWalQueue();
+            execute("INSERT INTO t VALUES ('2024-01-01T02:00:00', 30, 100), ('2024-01-01T03:00:00', 40, 200)");
+            drainWalQueue();
+            execute("INSERT INTO t VALUES ('2024-01-02T00:00:00', 50, 300)");
+            drainWalQueue();
+            execute("ALTER TABLE t DROP COLUMN a");
+            drainWalQueue();
+
+            final TableToken tt = engine.verifyTableName("t");
+            try (TableReader reader = engine.getReader(tt)) {
+                reader.openPartition(0);
+
+                final long partitionTs = reader.getTxFile().getPartitionTimestampByIndex(0);
+                final int cDense = reader.getMetadata().getColumnIndex("c");
+                final int cWriter = reader.getMetadata().getColumnMetadata(cDense).getWriterIndex();
+                final ColumnVersionReader cvr = reader.getColumnVersionReader();
+
+                Assert.assertNotEquals(cDense, cWriter);
+                Assert.assertNotEquals(cvr.getColumnTop(partitionTs, cDense), cvr.getColumnTop(partitionTs, cWriter));
+
+                final LongList partitionTimestamps = new LongList();
+                partitionTimestamps.add(partitionTs);
+                Assert.assertTrue(DebugUtils.reconcileColumnTops(1, partitionTimestamps, cvr, reader));
+            }
+        });
+    }
+
+    @Test
     public void testShouldTruncateConvertedColumns() throws Exception {
-        assumeNonWal();
         assertMemoryLeak(() -> {
             // Create table with many partitions
-            ddl(
+            execute(
                     "create table x as (" +
                             "select" +
                             " to_timestamp('2018-01', 'yyyy-MM') + x * 72000000 timestamp," +
@@ -813,80 +2222,193 @@ public class AlterTableChangeColumnTypeTest extends AbstractCairoTest {
             );
 
             // One each platform the table size can be slightly different, query the size from QuestDB
-            getFirstRowFirstColumn("select sum(diskSize) from table_partitions('x')", sink);
+            getFirstRowFirstColumn();
             long initialSize = Numbers.parseLong(sink);
 
             // 5-15Mb approx
             Assert.assertTrue(initialSize > 5E6 && initialSize < 15E6);
 
             // Test the size isn't ballooned after the conversion, it's no more than 25% larger than the initial size
-            ddl("alter table x alter column c type varchar", sqlExecutionContext);
-            assertSql("column\ntrue\n", "select sum(diskSize) < " + (initialSize * 1.25) + " from table_partitions('x')");
+            execute("alter table x alter column c type varchar", sqlExecutionContext);
+            assertQuery("select sum(diskSize) < " + (initialSize * 1.25) + " from table_partitions('x')")
+                    .noLeakCheck()
+                    .expectSize()
+                    .noRandomAccess()
+                    .returns("column\ntrue\n");
 
             // Test the size back to the original
-            ddl("alter table x alter column c type string", sqlExecutionContext);
-            assertSql("sum\n" + initialSize + "\n", "select sum(diskSize) from table_partitions('x')");
+            execute("alter table x alter column c type string", sqlExecutionContext);
+            assertQuery("select sum(diskSize) from table_partitions('x')")
+                    .noLeakCheck()
+                    .expectSize()
+                    .noRandomAccess()
+                    .returns("sum\n" + initialSize + "\n");
 
             // Test the size isn't ballooned after the conversion, it's no more than 50% larger than the initial size
-            ddl("alter table x alter column x type string", sqlExecutionContext);
-            assertSql("column\ntrue\n", "select sum(diskSize) < " + (initialSize * 1.5) + " from table_partitions('x')");
+            execute("alter table x alter column x type string", sqlExecutionContext);
+            assertQuery("select sum(diskSize) < " + (initialSize * 1.5) + " from table_partitions('x')")
+                    .noLeakCheck()
+                    .expectSize()
+                    .noRandomAccess()
+                    .returns("column\ntrue\n");
 
             // Test the size back to the original
-            ddl("alter table x alter column x type int", sqlExecutionContext);
-            assertSql("sum\n" + initialSize + "\n", "select sum(diskSize) from table_partitions('x')");
+            execute("alter table x alter column x type int", sqlExecutionContext);
+            assertQuery("select sum(diskSize) from table_partitions('x')")
+                    .noLeakCheck()
+                    .expectSize()
+                    .noRandomAccess()
+                    .returns("sum\n" + initialSize + "\n");
         });
     }
 
     @Test
     public void testStrToFixedConversions() throws Exception {
-        assertMemoryLeak(() -> {
-            assumeNonWal();
-            testConvertVarToFixed("string");
-        });
+        assertMemoryLeak(() -> testConvertVarToFixed("string"));
     }
 
     @Test
     public void testSymbolToFixedConversions() throws Exception {
-        assertMemoryLeak(() -> {
-            assumeNonWal();
-
-            testConvertFixedToVar("symbol");
-        });
+        assertMemoryLeak(() -> testConvertFixedToVar("symbol"));
     }
 
     @Test
     public void testTimestampConversionInvalid() throws Exception {
-        Assume.assumeTrue(!walEnabled && partitioned);
         assertFailure("alter table x alter column timestamp type long", 42, "cannot change type of designated timestamp column");
     }
 
     @Test
     public void testVarcharToFixedConversions() throws Exception {
-        assertMemoryLeak(() -> {
-            assumeNonWal();
-            testConvertVarToFixed("varchar");
-        });
+        assertMemoryLeak(() -> testConvertVarToFixed("varchar"));
     }
 
     @Test
     public void testWalConversionFromVarToFixedDoesNotLeaveAuxFiles() throws Exception {
-        assumeWal();
         assertMemoryLeak(() -> {
-            ddl("create table x (s string, timestamp timestamp) timestamp (timestamp) PARTITION BY HOUR WAL;");
-            ddl("alter table x alter column s type int;");
+            execute("create table x (s string, timestamp timestamp) timestamp (timestamp) PARTITION BY HOUR WAL;");
+            execute("alter table x alter column s type int;");
 
             TableToken xTbl = engine.verifyTableName("x");
 
-            Path path = Path.getThreadLocal(engine.getConfiguration().getRoot()).concat(xTbl).concat("wal1").concat("0").concat("s.d");
+            Path path = Path.getThreadLocal(engine.getConfiguration().getDbRoot()).concat(xTbl).concat("wal1").concat("0").concat("s.d");
             Assert.assertTrue(Files.exists(path.$()));
 
-            path = Path.getThreadLocal(engine.getConfiguration().getRoot()).concat(xTbl).concat("wal1").concat("0").concat("s.i");
+            path = Path.getThreadLocal(engine.getConfiguration().getDbRoot()).concat(xTbl).concat("wal1").concat("0").concat("s.i");
             Assert.assertFalse(Files.exists(path.$()));
 
-            insert("insert into x(s, timestamp) values(1, '2024-02-04T00:00:00.000Z')", sqlExecutionContext);
+            execute("insert into x(s, timestamp) values(1, '2024-02-04T00:00:00.000Z')", sqlExecutionContext);
             drainWalQueue();
 
-            assertSql("s\n1\n", "select s from x limit -1");
+            assertQuery("select s from x limit -1")
+                    .noLeakCheck()
+                    .expectSize()
+                    .returns("s\n1\n");
+        });
+    }
+
+    @Test
+    public void testWalWriterConvertsRowOnUncommittedDataDecimalToDouble() throws Exception {
+        assertMemoryLeak(() -> {
+            assumeWal();
+            execute("""
+                    CREATE TABLE x AS (
+                    SELECT 1.5m::DECIMAL(18,4) c, to_timestamp('2018-01', 'yyyy-MM') + x * 7200000 timestamp
+                    FROM long_sequence(100)
+                    ) TIMESTAMP(timestamp) PARTITION BY HOUR WAL""");
+
+            try (WalWriter walWriter = getWalWriter("x")) {
+                TableWriter.Row row = walWriter.newRow(MicrosTimestampDriver.floor("2024-02-04"));
+                // DECIMAL(18,4) is backed by a long holding the unscaled value
+                row.putLong(0, 25_000);
+                row.append();
+                execute("alter table x alter column c type double", sqlExecutionContext);
+                walWriter.commit();
+            }
+            drainWalQueue();
+
+            assertQuery("select c from x limit -1")
+                    .noLeakCheck()
+                    .expectSize()
+                    .returns("c\n2.5\n");
+        });
+    }
+
+    @Test
+    public void testWalWriterConvertsRowOnUncommittedDataDoubleToDecimal() throws Exception {
+        assertMemoryLeak(() -> {
+            assumeWal();
+            execute("""
+                    CREATE TABLE x AS (
+                    SELECT 1.5 c, to_timestamp('2018-01', 'yyyy-MM') + x * 7200000 timestamp
+                    FROM long_sequence(100)
+                    ) TIMESTAMP(timestamp) PARTITION BY HOUR WAL""");
+
+            try (WalWriter walWriter = getWalWriter("x")) {
+                TableWriter.Row row = walWriter.newRow(MicrosTimestampDriver.floor("2024-02-04"));
+                row.putDouble(0, 2.5);
+                row.append();
+                execute("alter table x alter column c type decimal(18,4)", sqlExecutionContext);
+                walWriter.commit();
+            }
+            drainWalQueue();
+
+            assertQuery("select c from x limit -1")
+                    .noLeakCheck()
+                    .expectSize()
+                    .returns("c\n2.5000\n");
+        });
+    }
+
+    @Test
+    public void testWalWriterConvertsRowOnUncommittedDataDecimalToFloat() throws Exception {
+        assertMemoryLeak(() -> {
+            assumeWal();
+            execute("""
+                    CREATE TABLE x AS (
+                    SELECT 1.5m::DECIMAL(18,4) c, to_timestamp('2018-01', 'yyyy-MM') + x * 7200000 timestamp
+                    FROM long_sequence(100)
+                    ) TIMESTAMP(timestamp) PARTITION BY HOUR WAL""");
+
+            try (WalWriter walWriter = getWalWriter("x")) {
+                TableWriter.Row row = walWriter.newRow(MicrosTimestampDriver.floor("2024-02-04"));
+                // DECIMAL(18,4) is backed by a long holding the unscaled value
+                row.putLong(0, 25_000);
+                row.append();
+                execute("alter table x alter column c type float", sqlExecutionContext);
+                walWriter.commit();
+            }
+            drainWalQueue();
+
+            assertQuery("select c from x limit -1")
+                    .noLeakCheck()
+                    .expectSize()
+                    .returns("c\n2.5\n");
+        });
+    }
+
+    @Test
+    public void testWalWriterConvertsRowOnUncommittedDataFloatToDecimal() throws Exception {
+        assertMemoryLeak(() -> {
+            assumeWal();
+            execute("""
+                    CREATE TABLE x AS (
+                    SELECT 1.5f c, to_timestamp('2018-01', 'yyyy-MM') + x * 7200000 timestamp
+                    FROM long_sequence(100)
+                    ) TIMESTAMP(timestamp) PARTITION BY HOUR WAL""");
+
+            try (WalWriter walWriter = getWalWriter("x")) {
+                TableWriter.Row row = walWriter.newRow(MicrosTimestampDriver.floor("2024-02-04"));
+                row.putFloat(0, 2.5f);
+                row.append();
+                execute("alter table x alter column c type decimal(18,4)", sqlExecutionContext);
+                walWriter.commit();
+            }
+            drainWalQueue();
+
+            assertQuery("select c from x limit -1")
+                    .noLeakCheck()
+                    .expectSize()
+                    .returns("c\n2.5000\n");
         });
     }
 
@@ -920,66 +2442,137 @@ public class AlterTableChangeColumnTypeTest extends AbstractCairoTest {
         assertMemoryLeak(() -> testWalRollUncommittedConversion(ColumnType.VARCHAR, " rnd_varchar(5,1024,2) c,", "symbol"));
     }
 
+    // Encodes the given native partition to parquet through TableUtils.produceParquetFromNative
+    // with the reader's compacted metadata -- the shape the storage-policy TO PARQUET conversion
+    // uses -- and returns the absolute path to the produced data.parquet.
+    private static void appendDouble(TableWriter writer, String timestamp, double value) {
+        TableWriter.Row row = writer.newRow(MicrosTimestampDriver.floor(timestamp));
+        row.putDouble(1, value);
+        row.append();
+    }
+
+    private static void appendFloat(TableWriter writer, String timestamp, float value) {
+        TableWriter.Row row = writer.newRow(MicrosTimestampDriver.floor(timestamp));
+        row.putFloat(1, value);
+        row.append();
+    }
+
+    private static String produceParquetForPartition(TableReader reader, int partitionIndex) {
+        final DirectIntList bloomIndexes = new DirectIntList(0, MemoryTag.NATIVE_DEFAULT);
+        final TableUtils.SymbolTableProviderFromReader symbolProvider = new TableUtils.SymbolTableProviderFromReader();
+        symbolProvider.of(reader);
+        try (
+                Path path = new Path();
+                Path other = new Path();
+                Path parquetPath = new Path()
+        ) {
+            final TxReader tx = reader.getTxFile();
+            final long partitionTs = tx.getPartitionTimestampByIndex(partitionIndex);
+            final long partitionNameTxn = tx.getPartitionNameTxn(partitionIndex);
+            final long rowCount = tx.getPartitionSize(partitionIndex);
+
+            path.of(configuration.getDbRoot()).concat(reader.getTableToken());
+            other.of(configuration.getDbRoot()).concat(reader.getTableToken());
+
+            final long parquetLen = TableUtils.produceParquetFromNative(
+                    path,
+                    other,
+                    path.size(),
+                    partitionTs,
+                    partitionNameTxn,
+                    partitionNameTxn,
+                    reader.getTableToken().getTableName(),
+                    rowCount,
+                    reader.getMetadata(),
+                    reader.getColumnVersionReader(),
+                    symbolProvider,
+                    configuration,
+                    null,
+                    Double.NaN,
+                    bloomIndexes,
+                    -1L,
+                    tx.getSeqTxn()
+            );
+            Assert.assertTrue("produceParquetFromNative must encode the partition", parquetLen > 0);
+
+            TableUtils.setPathForParquetPartition(
+                    parquetPath.of(configuration.getDbRoot()).concat(reader.getTableToken()),
+                    reader.getMetadata().getTimestampType(),
+                    reader.getMetadata().getPartitionBy(),
+                    partitionTs,
+                    partitionNameTxn
+            );
+            return parquetPath.toString();
+        } finally {
+            bloomIndexes.close();
+        }
+    }
+
     private static void testConvertFixedToVar(String varTypeName) throws SqlException {
-        ddl(
-                "create table x as (" +
-                        "select" +
-                        " rnd_uuid4() guid," +
-                        " rnd_int() rint," +
-                        " rnd_ipv4() ip," +
-                        " rnd_long() i64," +
-                        " rnd_short() i16," +
-                        " rnd_byte() i8," +
-                        " rnd_double() f64," +
-                        " rnd_float() f32," +
-                        " rnd_char() ch," +
-                        " rnd_boolean() b," +
-                        " to_timestamp('2018-01', 'yyyy-MM') + x * 7200000 ts," +
-                        " cast(to_timestamp('2018-01', 'yyyy-MM') + x * 7200000 as date) dt," +
-                        " to_timestamp('2018-01', 'yyyy-MM') + x * 7200000 timestamp" +
-                        " from long_sequence(1000)" +
-                        ")"
-        );
-        // add nulls last line
-        insert("insert into x(timestamp) values('2018-01-03T23:23')", sqlExecutionContext);
+        try {
+            execute(
+                    "create table if not exists x as (" +
+                            "select" +
+                            " rnd_uuid4() guid," +
+                            " rnd_int() rint," +
+                            " rnd_ipv4() ip," +
+                            " rnd_long() i64," +
+                            " rnd_short() i16," +
+                            " rnd_byte() i8," +
+                            " rnd_double() f64," +
+                            " rnd_float() f32," +
+                            " rnd_char() ch," +
+                            " rnd_boolean() b," +
+                            " to_timestamp('2018-01', 'yyyy-MM') + x * 7200000 ts," +
+                            " cast(to_timestamp('2018-01', 'yyyy-MM') + x * 7200000 as date) dt," +
+                            " to_timestamp('2018-01', 'yyyy-MM') + x * 7200000 timestamp" +
+                            " from long_sequence(1000)" +
+                            ")"
+            );
+            // add nulls last line
+            execute("insert into x(timestamp) values('2018-01-03T23:23')", sqlExecutionContext);
 
-        ddl("create table y as (" +
-                "select cast(cast(guid as string) as " + varTypeName + ") as guid," +
-                " cast(cast(rint as string) as " + varTypeName + ") as rint," +
-                " cast(cast(ip as string) as " + varTypeName + ") as ip," +
-                " cast(cast(i64 as string) as " + varTypeName + ") as i64," +
-                " cast(cast(i16 as string) as " + varTypeName + ") as i16," +
-                " cast(cast(i8 as string) as " + varTypeName + ") as i8," +
-                " cast(cast(f64 as string) as " + varTypeName + ") as f64," +
-                " cast(cast(f32 as string) as " + varTypeName + ") as f32," +
-                " cast(cast(ch as string) as " + varTypeName + ") as ch," +
-                " cast(cast(b as string) as " + varTypeName + ") as b," +
-                " cast(cast(ts as string) as " + varTypeName + ") as ts," +
-                " cast(cast(dt as string) as " + varTypeName + ") as dt," +
-                " timestamp from x) " +
-                "timestamp (timestamp) partition by DAY;", sqlExecutionContext);
+            execute("create table y as (" +
+                    "select cast(cast(guid as string) as " + varTypeName + ") as guid," +
+                    " cast(cast(rint as string) as " + varTypeName + ") as rint," +
+                    " cast(cast(ip as string) as " + varTypeName + ") as ip," +
+                    " cast(cast(i64 as string) as " + varTypeName + ") as i64," +
+                    " cast(cast(i16 as string) as " + varTypeName + ") as i16," +
+                    " cast(cast(i8 as string) as " + varTypeName + ") as i8," +
+                    " cast(cast(f64 as string) as " + varTypeName + ") as f64," +
+                    " cast(cast(f32 as string) as " + varTypeName + ") as f32," +
+                    " cast(cast(ch as string) as " + varTypeName + ") as ch," +
+                    " cast(cast(b as string) as " + varTypeName + ") as b," +
+                    " cast(cast(ts as string) as " + varTypeName + ") as ts," +
+                    " cast(cast(dt as string) as " + varTypeName + ") as dt," +
+                    " timestamp from x) " +
+                    "timestamp (timestamp) partition by DAY;", sqlExecutionContext);
 
-        ddl("alter table x alter column guid type " + varTypeName, sqlExecutionContext);
-        ddl("alter table x alter column rint type " + varTypeName, sqlExecutionContext);
-        ddl("alter table x alter column ip type " + varTypeName, sqlExecutionContext);
-        ddl("alter table x alter column i64 type " + varTypeName, sqlExecutionContext);
-        ddl("alter table x alter column i16 type " + varTypeName, sqlExecutionContext);
-        ddl("alter table x alter column i8 type " + varTypeName, sqlExecutionContext);
-        ddl("alter table x alter column f64 type " + varTypeName, sqlExecutionContext);
-        ddl("alter table x alter column f32 type " + varTypeName, sqlExecutionContext);
-        ddl("alter table x alter column ch type " + varTypeName, sqlExecutionContext);
-        ddl("alter table x alter column ts type " + varTypeName, sqlExecutionContext);
-        ddl("alter table x alter column dt type " + varTypeName, sqlExecutionContext);
-        ddl("alter table x alter column b type " + varTypeName, sqlExecutionContext);
+            execute("alter table x alter column guid type " + varTypeName, sqlExecutionContext);
+            execute("alter table x alter column rint type " + varTypeName, sqlExecutionContext);
+            execute("alter table x alter column ip type " + varTypeName, sqlExecutionContext);
+            execute("alter table x alter column i64 type " + varTypeName, sqlExecutionContext);
+            execute("alter table x alter column i16 type " + varTypeName, sqlExecutionContext);
+            execute("alter table x alter column i8 type " + varTypeName, sqlExecutionContext);
+            execute("alter table x alter column f64 type " + varTypeName, sqlExecutionContext);
+            execute("alter table x alter column f32 type " + varTypeName, sqlExecutionContext);
+            execute("alter table x alter column ch type " + varTypeName, sqlExecutionContext);
+            execute("alter table x alter column b type " + varTypeName, sqlExecutionContext);
+            execute("alter table x alter column ts type " + varTypeName, sqlExecutionContext);
+            execute("alter table x alter column dt type " + varTypeName, sqlExecutionContext);
 
-        assertSqlCursorsConvertedStrings(
-                "select * from x",
-                "select * from y"
-        );
+            assertSqlCursorsConvertedStrings(
+                    "select * from x",
+                    "select * from y"
+            );
+        } finally {
+            execute("drop table if exists x;");
+            execute("drop table if exists y;");
+        }
     }
 
     private static void testConvertVarToFixed(String varType) throws SqlException {
-        ddl(
+        execute(
                 "create table x as (" +
                         "select" +
                         " rnd_uuid4() guid," +
@@ -999,10 +2592,11 @@ public class AlterTableChangeColumnTypeTest extends AbstractCairoTest {
                         ")"
         );
         // add nulls last line
-        insert("insert into x(timestamp) values('2018-01-03T23:23')", sqlExecutionContext);
+        execute("insert into x(timestamp) values('2018-01-03T23:23')", sqlExecutionContext);
 
-        ddl("create table y as (" +
-                "select cast(guid as " + varType + ") as guid," +
+        execute("create table y as (" +
+                "select" +
+                " cast(guid as " + varType + ") as guid," +
                 " cast(cast(rint as string) as " + varType + ") as rint," +
                 " cast(cast(ip as string) as " + varType + ") as ip," +
                 " cast(cast(i64 as string) as " + varType + ") as i64," +
@@ -1018,22 +2612,22 @@ public class AlterTableChangeColumnTypeTest extends AbstractCairoTest {
                 "timestamp (timestamp) partition by DAY;", sqlExecutionContext);
 
         // Insert garbage data
-        insert("insert into y(guid, rint, ip, i64, i8, i16, f64, f32, ch, ts, dt, timestamp) values('abc', 'abc', 'abc', 'abc', 'abc', 'abc', 'abc', 'abc', 'abc', 'abc', 'abc', '2018-01-03T23:23:10')", sqlExecutionContext);
+        execute("insert into y(guid, rint, ip, i64, i8, i16, f64, f32, ch, ts, dt, timestamp) values('abc', 'abc', 'abc', 'abc', 'abc', 'abc', 'abc', 'abc', '', 'abc', 'abc', '2018-01-03T23:23:10')", sqlExecutionContext);
         // Expect nulls
-        insert("insert into x(timestamp) values('2018-01-03T23:23:10')", sqlExecutionContext);
+        execute("insert into x(timestamp) values('2018-01-03T23:23:10')", sqlExecutionContext);
 
-        ddl("alter table y alter column guid type uuid", sqlExecutionContext);
-        ddl("alter table y alter column rint type int", sqlExecutionContext);
-        ddl("alter table y alter column ip type ipv4", sqlExecutionContext);
-        ddl("alter table y alter column i64 type long", sqlExecutionContext);
-        ddl("alter table y alter column i16 type short", sqlExecutionContext);
-        ddl("alter table y alter column i8 type byte", sqlExecutionContext);
-        ddl("alter table y alter column f64 type double", sqlExecutionContext);
-        ddl("alter table y alter column f32 type float", sqlExecutionContext);
-        ddl("alter table y alter column ch type char", sqlExecutionContext);
-        ddl("alter table y alter column b type boolean", sqlExecutionContext);
-        ddl("alter table y alter column ts type timestamp", sqlExecutionContext);
-        ddl("alter table y alter column dt type date", sqlExecutionContext);
+        execute("alter table y alter column guid type uuid", sqlExecutionContext);
+        execute("alter table y alter column rint type int", sqlExecutionContext);
+        execute("alter table y alter column ip type ipv4", sqlExecutionContext);
+        execute("alter table y alter column i64 type long", sqlExecutionContext);
+        execute("alter table y alter column i16 type short", sqlExecutionContext);
+        execute("alter table y alter column i8 type byte", sqlExecutionContext);
+        execute("alter table y alter column f64 type double", sqlExecutionContext);
+        execute("alter table y alter column f32 type float", sqlExecutionContext);
+        execute("alter table y alter column ch type char", sqlExecutionContext);
+        execute("alter table y alter column b type boolean", sqlExecutionContext);
+        execute("alter table y alter column ts type timestamp", sqlExecutionContext);
+        execute("alter table y alter column dt type date", sqlExecutionContext);
 
         assertSqlCursorsConvertedStrings(
                 "select * from x",
@@ -1041,17 +2635,143 @@ public class AlterTableChangeColumnTypeTest extends AbstractCairoTest {
         );
     }
 
+    private void assertChangeDecimal(CharSequence initial, CharSequence expected, CharSequence fromType, CharSequence toType) throws Exception {
+        assertMemoryLeak(() -> {
+            execute(String.format("create table x (ts timestamp, col %s) timestamp(ts) partition by day wal", fromType), sqlExecutionContext);
+            execute(String.format("insert into x values('2024-05-14T16:00:00.000000Z', %s)", initial), sqlExecutionContext);
+            drainWalQueue();
+
+            execute(String.format("alter table x alter column col type %s", toType), sqlExecutionContext);
+            drainWalQueue();
+
+            assertQuery("x")
+                    .noLeakCheck()
+                    .expectSize()
+                    .timestamp("ts")
+                    .returns("ts\tcol\n" +
+                            "2024-05-14T16:00:00.000000Z\t" + expected + "\n");
+
+            execute("drop table x");
+        });
+    }
+
+    private void assertChangeDecimalToNull(CharSequence initial, CharSequence fromType, CharSequence toType) throws Exception {
+        assertMemoryLeak(() -> {
+            execute(String.format("create table x (ts timestamp, col %s) timestamp(ts) partition by day wal", fromType), sqlExecutionContext);
+            execute(String.format("insert into x values('2024-05-14T16:00:00.000000Z', %s)", initial), sqlExecutionContext);
+            drainWalQueue();
+
+            // A value whose magnitude exceeds the target precision becomes NULL (a scale reduction
+            // instead rounds half away from zero, so only magnitude overflow NULLs). The conversion
+            // succeeds and the WAL table is never suspended (mirrors an out-of-range DOUBLE->FLOAT
+            // becoming NaN).
+            execute(String.format("alter table x alter column col type %s", toType), sqlExecutionContext);
+            drainWalQueue();
+
+            Assert.assertFalse(engine.getTableSequencerAPI().isSuspended(engine.verifyTableName("x")));
+            assertQuery("x")
+                    .noLeakCheck()
+                    .expectSize()
+                    .timestamp("ts")
+                    .returns("ts\tcol\n2024-05-14T16:00:00.000000Z\t\n");
+
+            execute("drop table x");
+        });
+    }
+
+    private void assertChangeDecimalToVar(CharSequence initial, CharSequence expected, CharSequence fromType, CharSequence toType) throws Exception {
+        assertMemoryLeak(() -> {
+            execute(String.format("CREATE TABLE x (ts TIMESTAMP, col %s) TIMESTAMP(ts) PARTITION BY DAY WAL", fromType), sqlExecutionContext);
+            execute(String.format("INSERT INTO x VALUES('2024-05-14T16:00:00.000000Z', %s)", initial), sqlExecutionContext);
+            drainWalQueue();
+
+            execute(String.format("ALTER TABLE x ALTER COLUMN col TYPE %s", toType), sqlExecutionContext);
+            drainWalQueue();
+
+            assertQuery("x")
+                    .noLeakCheck()
+                    .expectSize()
+                    .timestamp("ts")
+                    .returns("ts\tcol\n" +
+                            "2024-05-14T16:00:00.000000Z\t" + expected + "\n");
+
+            execute("DROP TABLE x");
+        });
+    }
+
+    private void assertChangeIntToDecimal(CharSequence initial, CharSequence expected, CharSequence fromType, CharSequence toType) throws Exception {
+        assertMemoryLeak(() -> {
+            execute(String.format("create table x (ts timestamp, col %s) timestamp(ts) partition by day wal", fromType), sqlExecutionContext);
+            execute(String.format("insert into x values('2024-05-14T16:00:00.000000Z', %s)", initial), sqlExecutionContext);
+            drainWalQueue();
+
+            execute(String.format("alter table x alter column col type %s", toType), sqlExecutionContext);
+            drainWalQueue();
+
+            assertQuery("x")
+                    .noLeakCheck()
+                    .expectSize()
+                    .timestamp("ts")
+                    .returns("ts\tcol\n" +
+                            "2024-05-14T16:00:00.000000Z\t" + expected + "\n");
+
+            execute("drop table x");
+        });
+    }
+
+    private void assertChangeVarToDecimal(CharSequence initial, CharSequence expected, CharSequence fromType, CharSequence toType) throws Exception {
+        assertMemoryLeak(() -> {
+            execute(String.format("CREATE TABLE x (ts TIMESTAMP, col %s) TIMESTAMP(ts) PARTITION BY DAY WAL", fromType), sqlExecutionContext);
+            execute(String.format("INSERT INTO x VALUES('2024-05-14T16:00:00.000000Z', %s)", initial), sqlExecutionContext);
+            drainWalQueue();
+
+            execute(String.format("ALTER TABLE x ALTER COLUMN col TYPE %s", toType), sqlExecutionContext);
+            drainWalQueue();
+
+            assertQuery("x")
+                    .noLeakCheck()
+                    .expectSize()
+                    .timestamp("ts")
+                    .returns("ts\tcol\n" +
+                            "2024-05-14T16:00:00.000000Z\t" + expected + "\n");
+
+            execute("DROP TABLE x");
+        });
+    }
+
     private void assertFailure(String sql, int position, String message) throws Exception {
         assertMemoryLeak(() -> {
             try {
                 createX();
-                ddl(sql, sqlExecutionContext);
+                execute(sql, sqlExecutionContext);
                 Assert.fail();
             } catch (SqlException e) {
                 Assert.assertEquals(position, e.getPosition());
                 TestUtils.assertContains(e.getFlyweightMessage(), message);
             }
         });
+    }
+
+    private void assertMalformedVarcharConversionIsNull(String targetType) throws Exception {
+        execute("CREATE TABLE x (ts TIMESTAMP, col VARCHAR) TIMESTAMP(ts) PARTITION BY DAY");
+
+        try (TableWriter writer = getWriter("x")) {
+            TableWriter.Row row = writer.newRow(0);
+            row.putVarchar(1, new Utf8String(new byte[]{'1', (byte) 0xC3}, false));
+            row.append();
+            writer.commit();
+        }
+
+        execute("ALTER TABLE x ALTER COLUMN col TYPE " + targetType);
+
+        assertQuery("SELECT col IS NULL AS is_null FROM x")
+                .noLeakCheck()
+                .expectSize()
+                .returns("""
+                        is_null
+                        true
+                        """);
+        execute("DROP TABLE x");
     }
 
     private void assumeNonWal() {
@@ -1062,15 +2782,15 @@ public class AlterTableChangeColumnTypeTest extends AbstractCairoTest {
         Assume.assumeTrue("Test disabled during WAL run.", walEnabled);
     }
 
-    private void checkDedupSet(String tableName, String columnName, boolean value) {
-        try (TableWriter writer = getWriter(tableName)) {
+    private void checkDedupSet(String columnName, boolean value) {
+        try (TableWriter writer = getWriter("x")) {
             int colIndex = writer.getMetadata().getColumnIndex(columnName);
             Assert.assertEquals("dedup key flag mismatch column:" + columnName, value, writer.getMetadata().isDedupKey(colIndex));
         }
     }
 
     private void createX() throws SqlException {
-        ddl(
+        execute(
                 "create table x as (" +
                         "select" +
                         " case WHEN x % 10 = 0 THEN NULL WHEN x % 10 = 1 THEN 0 ELSE cast(x as int) END i," +
@@ -1086,6 +2806,7 @@ public class AlterTableChangeColumnTypeTest extends AbstractCairoTest {
                         " rnd_symbol(4,4,4,2) ik," +
                         " case WHEN x % 10 = 0 THEN NULL WHEN x % 10 = 1 THEN 0 ELSE rnd_long() END j," +
                         " case WHEN x % 10 = 0 THEN NULL WHEN x % 10 = 1 THEN CAST('1970-01-01' AS TIMESTAMP) ELSE timestamp_sequence(0, 1000000000) END k," +
+                        " case WHEN x % 10 = 0 THEN NULL WHEN x % 10 = 1 THEN CAST('1970-01-01' AS TIMESTAMP_NS) ELSE timestamp_sequence(0, 1000000000) END n," +
                         " rnd_byte(2,50) l," +
                         " rnd_boolean() t," +
                         " rnd_bin(10, 20, 2) m," +
@@ -1116,15 +2837,16 @@ public class AlterTableChangeColumnTypeTest extends AbstractCairoTest {
 
                     LOG.info().$("checking `" + srcType + "` to `" + dstType + "` conversion").$();
 
-                    ddl("create table y ( converted " + srcType + ", casted " + dstType + ", original " + srcType + ")", sqlExecutionContext);
-                    insert("insert into y select " + srcColName + " as converted, cast(" + srcColName + " as " + dstType + ") as casted, " + srcColName + " as original from x", sqlExecutionContext);
-                    ddl("alter table y alter column converted type " + dstType, sqlExecutionContext);
+                    execute("create table y ( converted " + srcType + ", casted " + dstType + ", original " + srcType + ")", sqlExecutionContext);
+                    execute("insert into y select " + srcColName + " as converted, cast(" + srcColName + " as " + dstType + ") as casted, " + srcColName + " as original from x", sqlExecutionContext);
+                    execute("alter table y alter column converted type " + dstType, sqlExecutionContext);
 
                     try {
-                        assertSql(
-                                "count\n0\n",
-                                "select count(*) from y where converted <> casted"
-                        );
+                        assertQuery("select count(*) from y where converted <> casted")
+                                .noLeakCheck()
+                                .noRandomAccess()
+                                .expectSize()
+                                .returns("count\n0\n");
                     } catch (AssertionError e) {
                         LOG.error().$("failed, error: ").$(e).$();
                         // if the column wasn't converted
@@ -1132,17 +2854,19 @@ public class AlterTableChangeColumnTypeTest extends AbstractCairoTest {
                             throw e;
                         } else {
                             // dump the difference in data
-                            assertSql("\nFailed equivalent conversion from `" + srcType + "` to `" + dstType + "`.\n", "select converted, casted, original from y");
+                            assertQuery("select converted, casted, original from y")
+                                    .noLeakCheck()
+                                    .returnsOnce("\nFailed equivalent conversion from `" + srcType + "` to `" + dstType + "`.\n");
                         }
                     }
-                    assertSql(
-                            "column\ttype\n" +
+                    assertQuery("select \"column\", type from table_columns('y')")
+                            .noLeakCheck()
+                            .noRandomAccess()
+                            .returns("column\ttype\n" +
                                     "converted\t" + dstType + "\n" +
                                     "casted\t" + dstType + "\n" +
-                                    "original\t" + srcType + "\n",
-                            "select \"column\", type from table_columns('y')"
-                    );
-                    drop("drop table y", sqlExecutionContext);
+                                    "original\t" + srcType + "\n");
+                    execute("drop table y", sqlExecutionContext);
                     drainWalQueue();
 
                 }
@@ -1151,9 +2875,9 @@ public class AlterTableChangeColumnTypeTest extends AbstractCairoTest {
         });
     }
 
-    private void testWalRollUncommittedConversion(int columnType, String columnCreateSql, String convertToTypeSql) throws SqlException, NumericException {
+    private void testWalRollUncommittedConversion(int columnType, String columnCreateSql, String convertToTypeSql) throws Exception {
         assumeWal();
-        ddl(
+        execute(
                 "create table x as (" +
                         "select" +
                         columnCreateSql +
@@ -1163,7 +2887,7 @@ public class AlterTableChangeColumnTypeTest extends AbstractCairoTest {
         );
 
         try (WalWriter walWriter = getWalWriter("x")) {
-            TableWriter.Row row = walWriter.newRow(IntervalUtils.parseFloorPartialTimestamp("2024-02-04"));
+            TableWriter.Row row = walWriter.newRow(MicrosTimestampDriver.floor("2024-02-04"));
             switch (columnType) {
                 case ColumnType.STRING:
                     row.putStr(0, "abc");
@@ -1176,14 +2900,17 @@ public class AlterTableChangeColumnTypeTest extends AbstractCairoTest {
                     break;
             }
             row.append();
-            ddl("alter table x alter column c type " + convertToTypeSql, sqlExecutionContext);
+            execute("alter table x alter column c type " + convertToTypeSql, sqlExecutionContext);
 
             walWriter.commit();
         }
 
         drainWalQueue();
 
-        assertSql("c\nabc\n", "select c from x limit -1");
+        assertQuery("select c from x limit -1")
+                .noLeakCheck()
+                .expectSize()
+                .returns("c\nabc\n");
     }
 
     protected static void assertSqlCursorsConvertedStrings(CharSequence expectedSql, CharSequence actualSql) throws SqlException {
@@ -1196,6 +2923,19 @@ public class AlterTableChangeColumnTypeTest extends AbstractCairoTest {
                     LOG,
                     true
             );
+        }
+    }
+
+    protected static void getFirstRowFirstColumn() throws SqlException {
+        try (RecordCursorFactory factory = select("select sum(diskSize) from table_partitions('x')")) {
+            try (RecordCursor cursor = factory.getCursor(sqlExecutionContext)) {
+                RecordMetadata metadata = factory.getMetadata();
+                sink.clear();
+                final Record record = cursor.getRecord();
+                if (cursor.hasNext()) {
+                    CursorPrinter.printColumn(record, metadata, 0, sink, false);
+                }
+            }
         }
     }
 

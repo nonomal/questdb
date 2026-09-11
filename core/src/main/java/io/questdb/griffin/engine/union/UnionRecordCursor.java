@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -27,12 +27,15 @@ package io.questdb.griffin.engine.union;
 import io.questdb.cairo.RecordSink;
 import io.questdb.cairo.map.Map;
 import io.questdb.cairo.map.MapKey;
+import io.questdb.cairo.sql.Function;
+import io.questdb.cairo.sql.NoRandomAccessRecordCursor;
 import io.questdb.cairo.sql.Record;
-import io.questdb.cairo.sql.*;
+import io.questdb.cairo.sql.RecordCursor;
 import io.questdb.griffin.SqlException;
+import io.questdb.griffin.SqlExecutionContext;
 import io.questdb.std.ObjList;
 
-class UnionRecordCursor extends AbstractSetRecordCursor implements NoRandomAccessRecordCursor {
+class UnionRecordCursor extends AbstractUnionSymbolSourceCursor implements NoRandomAccessRecordCursor {
     private final Map map;
     private final NextMethod nextB = this::nextB;
     private final AbstractUnionRecord record;
@@ -49,7 +52,7 @@ class UnionRecordCursor extends AbstractSetRecordCursor implements NoRandomAcces
             this.record = new UnionRecord();
         }
         this.map = map;
-        this.isOpen = true;
+        this.isOpen = false;
         this.recordSink = recordSink;
     }
 
@@ -85,6 +88,11 @@ class UnionRecordCursor extends AbstractSetRecordCursor implements NoRandomAcces
     }
 
     @Override
+    public long preComputedStateSize() {
+        return cursorA.preComputedStateSize() + cursorB.preComputedStateSize();
+    }
+
+    @Override
     public long size() {
         return -1;
     }
@@ -92,6 +100,7 @@ class UnionRecordCursor extends AbstractSetRecordCursor implements NoRandomAcces
     @Override
     public void toTop() {
         map.clear();
+        isUsingCursorA = true;
         record.setAb(true);
         nextMethod = nextA;
         cursorA.toTop();
@@ -110,17 +119,20 @@ class UnionRecordCursor extends AbstractSetRecordCursor implements NoRandomAcces
     }
 
     private boolean switchToCursorB() {
+        isUsingCursorA = false;
         record.setAb(false);
         nextMethod = nextB;
+        updateSymbolSource();
         return nextMethod.next();
     }
 
-    void of(RecordCursor cursorA, RecordCursor cursorB, SqlExecutionCircuitBreaker circuitBreaker) throws SqlException {
+    void of(RecordCursor cursorA, RecordCursor cursorB, SqlExecutionContext executionContext) throws SqlException {
         if (!isOpen) {
             this.isOpen = true;
+            this.map.setMemoryTracker(executionContext.getMemoryTracker());
             this.map.reopen();
         }
-        super.of(cursorA, cursorB, circuitBreaker);
+        super.of(cursorA, cursorB, executionContext);
         this.record.of(cursorA.getRecord(), cursorB.getRecord());
         toTop();
     }

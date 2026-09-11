@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -36,7 +36,6 @@ import io.questdb.griffin.engine.functions.VarcharFunction;
 import io.questdb.griffin.engine.groupby.GroupByAllocator;
 import io.questdb.griffin.engine.groupby.GroupByUtf8Sink;
 import io.questdb.std.str.Utf8Sequence;
-import io.questdb.std.str.Utf8Sink;
 import io.questdb.std.str.Utf8s;
 import org.jetbrains.annotations.NotNull;
 
@@ -98,15 +97,6 @@ public final class MinVarcharGroupByFunction extends VarcharFunction implements 
     }
 
     @Override
-    public void getVarchar(Record rec, Utf8Sink utf8Sink) {
-        final long ptr = rec.getLong(valueIndex);
-        if (ptr != 0) {
-            sinkA.of(ptr);
-            utf8Sink.put(sinkA);
-        }
-    }
-
-    @Override
     public Utf8Sequence getVarcharA(Record rec) {
         final long ptr = rec.getLong(valueIndex);
         return ptr == 0 ? null : sinkA.of(ptr);
@@ -134,7 +124,7 @@ public final class MinVarcharGroupByFunction extends VarcharFunction implements 
     }
 
     @Override
-    public boolean isReadThreadSafe() {
+    public boolean isThreadSafe() {
         return false;
     }
 

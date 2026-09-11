@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,33 +24,40 @@
 
 package io.questdb.griffin.engine.table;
 
-import io.questdb.cairo.sql.*;
+import io.questdb.cairo.CairoException;
+import io.questdb.cairo.sql.Function;
+import io.questdb.cairo.sql.PageFrameCursor;
+import io.questdb.cairo.sql.PartitionFrameCursorFactory;
+import io.questdb.cairo.sql.RecordCursor;
+import io.questdb.cairo.sql.RecordMetadata;
+import io.questdb.cairo.sql.SymbolTable;
 import io.questdb.griffin.PlanSink;
 import io.questdb.griffin.SqlException;
 import io.questdb.griffin.SqlExecutionContext;
 import io.questdb.griffin.engine.EmptyTableRandomRecordCursor;
 import io.questdb.griffin.engine.EmptyTableRecordCursor;
 import io.questdb.std.IntList;
+import io.questdb.std.Misc;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
-abstract class AbstractDeferredValueRecordCursorFactory extends AbstractDataFrameRecordCursorFactory {
-
+abstract class AbstractDeferredValueRecordCursorFactory extends AbstractPageFrameRecordCursorFactory {
     protected final int columnIndex;
     protected final IntList columnIndexes;
-    protected final Function filter;
-    private final Function symbolFunc;
+    protected Function filter;
     private AbstractLatestByValueRecordCursor cursor;
+    private Function symbolFunc;
 
     public AbstractDeferredValueRecordCursorFactory(
             @NotNull RecordMetadata metadata,
-            @NotNull DataFrameCursorFactory dataFrameCursorFactory,
+            @NotNull PartitionFrameCursorFactory partitionFrameCursorFactory,
             int columnIndex,
             Function symbolFunc,
             @Nullable Function filter,
-            IntList columnIndexes
+            @NotNull IntList columnIndexes,
+            @NotNull IntList columnSizeShifts
     ) {
-        super(metadata, dataFrameCursorFactory);
+        super(metadata, partitionFrameCursorFactory, columnIndexes, columnSizeShifts);
         this.columnIndex = columnIndex;
         this.symbolFunc = symbolFunc;
         this.filter = filter;
@@ -61,21 +68,21 @@ abstract class AbstractDeferredValueRecordCursorFactory extends AbstractDataFram
     public void toPlan(PlanSink sink) {
         sink.optAttr("filter", filter);
         sink.attr("symbolFilter").putColumnName(columnIndex).val('=').val(symbolFunc);
-        sink.child(dataFrameCursorFactory);
+        sink.child(partitionFrameCursorFactory);
     }
 
-    private boolean lookupDeferredSymbol(DataFrameCursor dataFrameCursor) {
+    private boolean lookupDeferredSymbol(PageFrameCursor pageFrameCursor) {
         final CharSequence symbol = symbolFunc.getStrA(null);
-        int newSymbolKey = dataFrameCursor.getSymbolTable(columnIndexes.get(columnIndex)).keyOf(symbol);
+        final int newSymbolKey = pageFrameCursor.getSymbolTable(columnIndex).keyOf(symbol);
         if (newSymbolKey == SymbolTable.VALUE_NOT_FOUND) {
-            dataFrameCursor.close();
+            pageFrameCursor.close();
             return true;
         }
 
         if (cursor != null) {
             cursor.setSymbolKey(newSymbolKey);
         } else {
-            cursor = createDataFrameCursorFor(newSymbolKey);
+            cursor = createCursorFor(newSymbolKey);
         }
 
         return false;
@@ -83,26 +90,45 @@ abstract class AbstractDeferredValueRecordCursorFactory extends AbstractDataFram
 
     @Override
     protected void _close() {
-        super._close();
-        if (filter != null) {
-            filter.close();
+        final AbstractLatestByValueRecordCursor cursor = this.cursor;
+        this.cursor = null;
+        final Function filter = this.filter;
+        this.filter = null;
+        final Function symbolFunc = this.symbolFunc;
+        this.symbolFunc = null;
+        Throwable failure = null;
+        try {
+            super._close();
+        } catch (Throwable th) {
+            failure = th;
         }
+        failure = Misc.freeBestEffort(failure, filter);
+        failure = Misc.freeBestEffort(failure, cursor);
+        if (symbolFunc != filter) {
+            failure = Misc.freeBestEffort(failure, symbolFunc);
+        }
+        CairoException.rethrowCleanupFailure(failure);
     }
 
-    protected abstract AbstractLatestByValueRecordCursor createDataFrameCursorFor(int symbolKey);
+    protected abstract AbstractLatestByValueRecordCursor createCursorFor(int symbolKey);
 
     @Override
-    protected RecordCursor getCursorInstance(
-            DataFrameCursor dataFrameCursor,
+    protected RecordCursor initRecordCursor(
+            PageFrameCursor pageFrameCursor,
             SqlExecutionContext executionContext
     ) throws SqlException {
-        if (lookupDeferredSymbol(dataFrameCursor)) {
+        symbolFunc.init(pageFrameCursor, executionContext);
+
+        if (lookupDeferredSymbol(pageFrameCursor)) {
+            // The deferred symbol is absent, so this returns a shared empty cursor that never checks the
+            // breaker on its own. Consult it once at open so the query still observes cancellation.
+            executionContext.getCircuitBreaker().statefulThrowExceptionIfTrippedTimeThrottled();
             if (recordCursorSupportsRandomAccess()) {
                 return EmptyTableRandomRecordCursor.INSTANCE;
             }
             return EmptyTableRecordCursor.INSTANCE;
         }
-        cursor.of(dataFrameCursor, executionContext);
+        cursor.of(pageFrameCursor, executionContext);
         return cursor;
     }
 }

@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,6 +24,7 @@
 
 package io.questdb.griffin.model;
 
+import io.questdb.cairo.TimestampDriver;
 import io.questdb.griffin.Plannable;
 import io.questdb.griffin.SqlException;
 import io.questdb.griffin.SqlExecutionContext;
@@ -31,7 +32,30 @@ import io.questdb.std.LongList;
 import io.questdb.std.QuietCloseable;
 
 public interface RuntimeIntrinsicIntervalModel extends QuietCloseable, Plannable {
-    boolean allIntervalsHitOnePartition(int partitionBy);
 
-    LongList calculateIntervals(SqlExecutionContext sqlContext) throws SqlException;
+    boolean allIntervalsHitOnePartition();
+
+    LongList calculateIntervals(SqlExecutionContext sqlExecutionContext) throws SqlException;
+
+    TimestampDriver getTimestampDriver();
+
+    /**
+     * Fail-safe determinism contract mirroring {@code RecordCursorFactory#isNonDeterministic()}:
+     * returns {@code true} unless the model can prove its intervals are stable across two
+     * evaluations (static intervals, or dynamic bounds that are all deterministic).
+     */
+    default boolean isNonDeterministic() {
+        return true;
+    }
+
+    /**
+     * Returns {@code true} if repeated interval calculations within one query execution produce
+     * the same intervals. The default stays fail-safe by deriving from determinism; runtime
+     * models may prove the weaker property for execution-scoped bound functions.
+     */
+    default boolean isStableWithinExecution() {
+        return !isNonDeterministic();
+    }
+
+    boolean isStatic();
 }

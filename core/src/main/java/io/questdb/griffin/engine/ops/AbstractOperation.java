@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -36,28 +36,40 @@ import org.jetbrains.annotations.Nullable;
 
 public abstract class AbstractOperation implements AsyncWriterCommand, QuietCloseable {
     private static final long NO_CORRELATION_ID = -1L;
-    protected @Nullable TableToken tableToken;
-    @Nullable SecurityContext securityContext;
-    @Nullable SqlExecutionContext sqlExecutionContext;
-    @Nullable CharSequence sqlText;
+    @Nullable
+    SecurityContext securityContext;
+    @Nullable
+    SqlExecutionContext sqlExecutionContext;
+    @Nullable
+    CharSequence sqlText;
     int tableNamePosition;
+    @Nullable
+    TableToken tableToken;
     private String cmdName;
     private int cmdType;
     private long correlationId;
     private int tableId;
     private long tableVersion;
 
+    /**
+     * Authorizes the operation against the current security context.
+     * Cached operations must be re-authorized on every execution.
+     */
+    public abstract void authorize();
+
     public void clearCommandCorrelationId() {
         setCommandCorrelationId(NO_CORRELATION_ID);
     }
 
     public void clearSecurityContext() {
-        Misc.clear(securityContext);
+        securityContext = Misc.clear(securityContext);
     }
 
     @Override
     public void close() {
-        // intentionally left empty
+        // todo: temporary fix, until a proper lifecycle around CompiledQuery
+        // is implemented
+//        this.tableToken = null;
     }
 
     @Override
@@ -94,13 +106,27 @@ public abstract class AbstractOperation implements AsyncWriterCommand, QuietClos
     }
 
     @Override
-    public @Nullable TableToken getTableToken() {
+    public @NotNull TableToken getTableToken() {
+        assert tableToken != null : "initialized operation";
         return tableToken;
     }
 
     @Override
     public long getTableVersion() {
         return tableVersion;
+    }
+
+    public boolean isForceWalBypass() {
+        return false;
+    }
+
+    /**
+     * Whether this operation may bypass the WAL and apply directly to the table (like
+     * {@code FORCE DROP PARTITION}) when the table is hard-suspended. Lets maintenance run on a
+     * frozen table that otherwise denies WAL writes. Data writes (e.g. UPDATE) return false.
+     */
+    public boolean isForceableWhenSuspended() {
+        return false;
     }
 
     @Override

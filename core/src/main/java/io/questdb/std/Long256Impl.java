@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -30,7 +30,6 @@ import io.questdb.std.str.StringSink;
 import org.jetbrains.annotations.NotNull;
 
 public class Long256Impl implements Long256, Sinkable {
-
     public static final Long256Impl NULL_LONG256 = new Long256Impl();
     public static final Long256Impl ZERO_LONG256 = new Long256Impl();
 
@@ -57,10 +56,10 @@ public class Long256Impl implements Long256, Sinkable {
     }
 
     public static void putNull(long appendPointer) {
-        Unsafe.getUnsafe().putLong(appendPointer, NULL_LONG256.getLong0());
-        Unsafe.getUnsafe().putLong(appendPointer + Long.BYTES, NULL_LONG256.getLong1());
-        Unsafe.getUnsafe().putLong(appendPointer + Long.BYTES * 2, NULL_LONG256.getLong2());
-        Unsafe.getUnsafe().putLong(appendPointer + Long.BYTES * 3, NULL_LONG256.getLong3());
+        Unsafe.putLong(appendPointer, NULL_LONG256.getLong0());
+        Unsafe.putLong(appendPointer + Long.BYTES, NULL_LONG256.getLong1());
+        Unsafe.putLong(appendPointer + Long.BYTES * 2, NULL_LONG256.getLong2());
+        Unsafe.putLong(appendPointer + Long.BYTES * 3, NULL_LONG256.getLong3());
     }
 
     public void copyFrom(Long256 value) {
@@ -83,15 +82,6 @@ public class Long256Impl implements Long256, Sinkable {
                 rnd.nextLong(),
                 rnd.nextLong(),
                 rnd.nextLong()
-        );
-    }
-
-    public void fromRnd(Rnd rnd, long N) {
-        setAll(
-                rnd.nextLong(N),
-                rnd.nextLong(N),
-                rnd.nextLong(N),
-                rnd.nextLong(N)
         );
     }
 

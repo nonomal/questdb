@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -25,24 +25,23 @@
 package io.questdb.test.griffin;
 
 import io.questdb.cairo.ColumnType;
-import io.questdb.cairo.PartitionBy;
-import io.questdb.cairo.TableReader;
 import io.questdb.cairo.TableWriter;
+import io.questdb.cairo.sql.Function;
 import io.questdb.cairo.sql.Record;
-import io.questdb.cairo.sql.*;
+import io.questdb.cairo.sql.RecordCursor;
+import io.questdb.cairo.sql.RecordCursorFactory;
+import io.questdb.cairo.sql.RecordMetadata;
 import io.questdb.griffin.engine.functions.table.WriterPoolFunctionFactory;
-import io.questdb.griffin.engine.table.ReaderPoolRecordCursorFactory;
 import io.questdb.griffin.engine.table.WriterPoolRecordCursorFactory;
 import io.questdb.std.IntList;
 import io.questdb.std.ObjList;
+import io.questdb.std.datetime.microtime.MicrosFormatUtils;
 import io.questdb.test.AbstractCairoTest;
-import io.questdb.test.cairo.TableModel;
 import org.junit.Assert;
 import org.junit.Test;
 
-import static org.junit.Assert.assertTrue;
-
 public class WriterPoolTableFunctionTest extends AbstractCairoTest {
+
     @Test
     public void testCursorDoesHaveUpfrontSize() throws Exception {
         assertMemoryLeak(() -> {
@@ -66,7 +65,9 @@ public class WriterPoolTableFunctionTest extends AbstractCairoTest {
 
     @Test
     public void testEmptyPool() throws Exception {
-        assertMemoryLeak(() -> assertSql("table_name\towner_thread_id\tlast_access_timestamp\townership_reason\n", "select * from writer_pool()"));
+        assertQuery("select * from writer_pool()")
+                .noRandomAccess()
+                .returns("table_name\towner_thread_id\tlast_access_timestamp\townership_reason\n");
     }
 
     @Test
@@ -100,11 +101,11 @@ public class WriterPoolTableFunctionTest extends AbstractCairoTest {
     public void testRandomAccessUnsupported() throws Exception {
         assertMemoryLeak(() -> {
             try (
-                    RecordCursorFactory readerPoolFactory = new WriterPoolRecordCursorFactory(sqlExecutionContext.getCairoEngine());
-                    RecordCursor readerPoolCursor = readerPoolFactory.getCursor(sqlExecutionContext)
+                    RecordCursorFactory writerPoolFactory = new WriterPoolRecordCursorFactory(sqlExecutionContext.getCairoEngine());
+                    RecordCursor writerPoolCursor = writerPoolFactory.getCursor(sqlExecutionContext)
             ) {
-                Record record = readerPoolCursor.getRecord();
-                readerPoolCursor.recordAt(record, 0);
+                Record record = writerPoolCursor.getRecord();
+                writerPoolCursor.recordAt(record, 0);
                 Assert.fail("Random access is not expected to be implemented");
             } catch (UnsupportedOperationException ignored) {
             }
@@ -115,10 +116,10 @@ public class WriterPoolTableFunctionTest extends AbstractCairoTest {
     public void testRecordBNotImplemented() throws Exception {
         assertMemoryLeak(() -> {
             try (
-                    RecordCursorFactory readerPoolFactory = new WriterPoolRecordCursorFactory(sqlExecutionContext.getCairoEngine());
-                    RecordCursor readerPoolCursor = readerPoolFactory.getCursor(sqlExecutionContext)
+                    RecordCursorFactory writerPoolFactory = new WriterPoolRecordCursorFactory(sqlExecutionContext.getCairoEngine());
+                    RecordCursor writerPoolCursor = writerPoolFactory.getCursor(sqlExecutionContext)
             ) {
-                readerPoolCursor.getRecordB();
+                writerPoolCursor.getRecordB();
                 Assert.fail("RecordB is not expected to be implemented");
             } catch (UnsupportedOperationException ignored) {
             }
@@ -126,77 +127,69 @@ public class WriterPoolTableFunctionTest extends AbstractCairoTest {
     }
 
     @Test
-    public void testToTop() throws Exception {
-        assertMemoryLeak(() -> {
-            TableModel tm = new TableModel(configuration, "tab1", PartitionBy.NONE);
-            tm.timestamp("ts").col("ID", ColumnType.INT);
-            createPopulateTable(tm, 20, "2020-01-01", 1);
-
-            try (TableReader ignored = getReader("tab1");
-                 RecordCursorFactory readerPoolFactory = new ReaderPoolRecordCursorFactory(sqlExecutionContext.getCairoEngine());
-                 RecordCursor readerPoolCursor = readerPoolFactory.getCursor(sqlExecutionContext)) {
-                // scroll cursor ignoring its contents
-                //noinspection StatementWithEmptyBody
-                while (readerPoolCursor.hasNext()) {
-                }
-                readerPoolCursor.toTop();
-                assertTrue(readerPoolCursor.hasNext());
-            }
-        });
-    }
-
-    @Test
     public void testWriterList() throws Exception {
+        currentMicros = MicrosFormatUtils.parseTimestamp("2024-10-24T17:22:09.842574Z");
         assertMemoryLeak(() -> {
-            ddl("create table a(u int)");
-            ddl("create table b(u int)");
-            ddl("create table c(u int)");
-            ddl("create table d(u int)");
+            execute("create table a as (select 1 as u)");
 
-            assertSql(
-                    "table_name\townership_reason\n" +
-                            "a\t\n" +
-                            "b\t\n" +
-                            "c\t\n" +
-                            "d\t\n",
-                    "select table_name,ownership_reason from writer_pool order by 1"
-            );
+            assertQuery("writer_pool")
+                    .noLeakCheck()
+                    .noRandomAccess()
+                    .returns("""
+                            table_name\towner_thread_id\tlast_access_timestamp\townership_reason
+                            a\tnull\t2024-10-24T17:22:09.842574Z\t
+                            """);
+
+            execute("create table b as (select 1 as u)");
+            execute("create table c as (select 1 as u)");
+            execute("create table d as (select 1 as u)");
+
+            assertQuery("select table_name,ownership_reason from writer_pool order by 1")
+                    .noLeakCheck()
+                    .returns("""
+                            table_name\townership_reason
+                            a\t
+                            b\t
+                            c\t
+                            d\t
+                            """);
 
             // assert ordering
-            assertSql(
-                    "table_name\townership_reason\n" +
-                            "d\t\n" +
-                            "c\t\n" +
-                            "b\t\n" +
-                            "a\t\n",
-                    "select table_name,ownership_reason from writer_pool order by 1 desc"
-            );
+            assertQuery("select table_name,ownership_reason from writer_pool order by 1 desc")
+                    .noLeakCheck()
+                    .returns("""
+                            table_name\townership_reason
+                            d\t
+                            c\t
+                            b\t
+                            a\t
+                            """);
 
             engine.releaseAllWriters();
 
-            assertSql(
-                    "table_name\townership_reason\n",
-                    "select table_name,ownership_reason from writer_pool order by 1"
-            );
+            assertQuery("select table_name,ownership_reason from writer_pool order by 1")
+                    .noLeakCheck()
+                    .returns("table_name\townership_reason\n");
 
-            assertSql(
-                    "table_name\townership_reason\n",
-                    "select table_name,ownership_reason from writer_pool order by 1 desc"
-            );
+            assertQuery("select table_name,ownership_reason from writer_pool order by 1 desc")
+                    .noLeakCheck()
+                    .returns("table_name\townership_reason\n");
 
             try (TableWriter ignored = engine.getWriter(engine.getTableTokenIfExists("a"), "test reason")) {
-                assertSql(
-                        "table_name\townership_reason\n" +
-                                "a\ttest reason\n",
-                        "select table_name,ownership_reason from writer_pool order by 1 desc"
-                );
+                assertQuery("select table_name,ownership_reason from writer_pool order by 1 desc")
+                        .noLeakCheck()
+                        .returns("""
+                                table_name\townership_reason
+                                a\ttest reason
+                                """);
             }
 
-            assertSql(
-                    "table_name\townership_reason\n" +
-                            "a\t\n",
-                    "select table_name,ownership_reason from writer_pool order by 1 desc"
-            );
+            assertQuery("select table_name,ownership_reason from writer_pool order by 1 desc")
+                    .noLeakCheck()
+                    .returns("""
+                            table_name\townership_reason
+                            a\t
+                            """);
         });
     }
 }

@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,9 +24,10 @@
 
 package io.questdb.griffin.engine.functions.bool;
 
-import io.questdb.cairo.BinarySearch;
 import io.questdb.cairo.CairoConfiguration;
+import io.questdb.cairo.CairoException;
 import io.questdb.cairo.ColumnType;
+import io.questdb.cairo.TimestampDriver;
 import io.questdb.cairo.sql.Function;
 import io.questdb.cairo.sql.Record;
 import io.questdb.cairo.sql.SymbolTableSource;
@@ -38,20 +39,34 @@ import io.questdb.griffin.engine.functions.BinaryFunction;
 import io.questdb.griffin.engine.functions.MultiArgFunction;
 import io.questdb.griffin.engine.functions.NegatableBooleanFunction;
 import io.questdb.griffin.engine.functions.UnaryFunction;
+import io.questdb.griffin.model.CompiledTickExpression;
+import io.questdb.griffin.model.DateExpressionEvaluator;
 import io.questdb.griffin.model.IntervalUtils;
-import io.questdb.std.*;
+import io.questdb.std.IntList;
+import io.questdb.std.LongList;
+import io.questdb.std.Numbers;
+import io.questdb.std.NumericException;
+import io.questdb.std.ObjList;
+import io.questdb.std.Vect;
+import io.questdb.std.str.StringSink;
+import io.questdb.std.str.Utf8Sequence;
 
 import static io.questdb.griffin.model.IntervalUtils.isInIntervals;
-import static io.questdb.griffin.model.IntervalUtils.parseAndApplyIntervalEx;
 
 public class InTimestampTimestampFunctionFactory implements FunctionFactory {
+
     @Override
     public String getSignature() {
         return "in(NV)";
     }
 
     @Override
-    public Function newInstance(int position, ObjList<Function> args, IntList argPositions, CairoConfiguration configuration, SqlExecutionContext sqlExecutionContext) throws SqlException {
+    public Function newInstance(
+            int position,
+            ObjList<Function> args,
+            IntList argPositions,
+            CairoConfiguration configuration,
+            SqlExecutionContext sqlExecutionContext) throws SqlException {
         boolean allConst = true;
         boolean allRuntimeConst = true;
         for (int i = 1, n = args.size(); i < n && (allConst || allRuntimeConst); i++) {
@@ -67,8 +82,12 @@ public class InTimestampTimestampFunctionFactory implements FunctionFactory {
                 case ColumnType.VARCHAR:
                 case ColumnType.UNDEFINED:
                     break;
+                case ColumnType.INTERVAL:
+                    return new InTimestampIntervalFunctionFactory.Func(args.getQuick(0), args.getQuick(1));
                 default:
-                    throw SqlException.position(argPositions.getQuick(i)).put("cannot compare TIMESTAMP with type ").put(ColumnType.nameOf(func.getType()));
+                    throw SqlException.position(argPositions.getQuick(i))
+                            .put("cannot compare TIMESTAMP with type ")
+                            .put(ColumnType.nameOf(func.getType()));
             }
             if (!func.isConstant()) {
                 allConst = false;
@@ -80,60 +99,84 @@ public class InTimestampTimestampFunctionFactory implements FunctionFactory {
             }
         }
 
+        boolean intervalSearch = isIntervalSearch(args);
+        int timestampType = ColumnType.getTimestampType(args.getQuick(0).getType());
+        assert ColumnType.isTimestamp(timestampType);
         if (allConst) {
-            return new InTimestampConstFunction(args.getQuick(0), parseDiscreteTimestampValues(args, argPositions));
-        }
-
-        if (args.size() == 2 && (ColumnType.isString(args.get(1).getType()) || ColumnType.isVarchar(args.get(1).getType()))) {
-            // special case - one argument and it a string
-            return new InTimestampStrFunctionFactory.EqTimestampStrFunction(args.get(0), args.get(1));
+            if (intervalSearch) {
+                Function rightFn = args.getQuick(1);
+                CharSequence right = rightFn.getStrA(null);
+                if (right != null && containsDateVariable(right)) {
+                    TimestampDriver driver = ColumnType.getTimestampDriver(timestampType);
+                    CompiledTickExpression compiled = IntervalUtils.compileTickExpr(
+                            driver, configuration, right, 0, right.length(), argPositions.getQuick(1));
+                    return new EqTimestampCompiledTickExprFunction(args.getQuick(0), compiled);
+                }
+                return new EqTimestampStrConstantFunction(args.getQuick(0), timestampType, right, argPositions.getQuick(1), configuration);
+            }
+            return new InTimestampConstFunction(args.getQuick(0), parseDiscreteTimestampValues(timestampType, args, argPositions));
         }
 
         if (allRuntimeConst) {
-            if (args.size() == 2 && args.get(1).getType() == ColumnType.UNDEFINED) {
-                // this is an odd case, we have something like this
-                //
-                // where ts in ?
-                //
-                // Type of the runtime constant may not be known upfront.
-                // When user passes string as the value we perform the interval lookup,
-                // otherwise it is discrete value
-                return new InTimestampRuntimeConstIntervalFunction(args.getQuick(0), args.getQuick(1), argPositions.getQuick(1));
+            if (intervalSearch) {
+                return new InTimestampRuntimeConstIntervalFunction(
+                        args.getQuick(0),
+                        args.getQuick(1),
+                        timestampType,
+                        argPositions.getQuick(1)
+                );
 
             }
-            return new InTimestampManyRuntimeConstantsFunction(new ObjList<>(args));
+            return new InTimestampManyRuntimeConstantsFunction(new ObjList<>(args), timestampType);
         }
+
+        if (intervalSearch) {
+            return new EqTimestampStrFunction(args.get(0), args.get(1), timestampType, configuration);
+        }
+
         // have to copy, args is mutable
-        return new InTimestampVarFunction(new ObjList<>(args));
+        return new InTimestampVarFunction(new ObjList<>(args), timestampType);
     }
 
-    private static LongList parseDiscreteTimestampValues(ObjList<Function> args, IntList argPositions) throws SqlException {
+    private static boolean containsDateVariable(CharSequence seq) {
+        int lim = seq.length();
+        for (int i = 0; i < lim - 1; i++) {
+            if (seq.charAt(i) == '$' && DateExpressionEvaluator.isDateVariable(seq, i, lim)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static boolean isIntervalSearch(ObjList<Function> args) {
+        if (args.size() != 2) {
+            return false;
+        }
+        Function rightFn = args.getQuick(1);
+        return ColumnType.isVarcharOrString(rightFn.getType());
+    }
+
+    private static LongList parseDiscreteTimestampValues(int timestampType, ObjList<Function> args, IntList argPositions)
+            throws SqlException {
+        TimestampDriver driver = ColumnType.getTimestampDriver(timestampType);
         LongList res = new LongList(args.size() - 1);
         res.extendAndSet(args.size() - 2, 0);
 
         for (int i = 1, n = args.size(); i < n; i++) {
             Function func = args.getQuick(i);
             long val;
-            switch (ColumnType.tagOf(func.getType())) {
-                case ColumnType.DATE:
-                    val = func.getDate(null);
-                    val = (val == Numbers.LONG_NULL) ? val : val * 1000L;
-                    break;
-                case ColumnType.TIMESTAMP:
-                case ColumnType.LONG:
-                case ColumnType.INT:
-                    val = func.getTimestamp(null);
-                    break;
-                case ColumnType.STRING:
-                case ColumnType.SYMBOL:
-                case ColumnType.VARCHAR:
-                case ColumnType.NULL:
-                    CharSequence tsValue = func.getStrA(null);
-                    val = (tsValue != null) ? tryParseTimestamp(tsValue, argPositions.getQuick(i)) : Numbers.LONG_NULL;
-                    break;
-                default:
-                    throw SqlException.inconvertibleTypes(argPositions.getQuick(i), func.getType(), ColumnType.nameOf(func.getType()), ColumnType.TIMESTAMP, ColumnType.nameOf(ColumnType.TIMESTAMP));
-            }
+            int funcType = func.getType();
+            val = switch (ColumnType.tagOf(funcType)) {
+                case ColumnType.DATE -> driver.fromDate(func.getDate(null));
+                case ColumnType.TIMESTAMP -> driver.from(func.getTimestamp(null), funcType);
+                case ColumnType.LONG, ColumnType.INT -> func.getTimestamp(null);
+                case ColumnType.STRING, ColumnType.SYMBOL, ColumnType.NULL ->
+                        parseFloorOrDie(driver, func.getStrA(null), argPositions.getQuick(i));
+                case ColumnType.VARCHAR -> parseFloorOrDie(driver, func.getVarcharA(null), argPositions.getQuick(i));
+                default -> throw SqlException.inconvertibleTypes(argPositions.getQuick(i), func.getType(),
+                        ColumnType.nameOf(func.getType()), timestampType,
+                        ColumnType.nameOf(timestampType));
+            };
             res.setQuick(i - 1, val);
         }
 
@@ -141,11 +184,174 @@ public class InTimestampTimestampFunctionFactory implements FunctionFactory {
         return res;
     }
 
-    private static long tryParseTimestamp(CharSequence seq, int position) throws SqlException {
+    private static long parseFloorOrDie(TimestampDriver driver, CharSequence value) {
         try {
-            return IntervalUtils.parseFloorPartialTimestamp(seq);
+            return driver.parseFloorLiteral(value);
+        } catch (NumericException e) {
+            throw CairoException.nonCritical().put("Invalid timestamp: ").put(value);
+        }
+    }
+
+    private static long parseFloorOrDie(TimestampDriver driver, Utf8Sequence value) {
+        try {
+            return driver.parseFloorLiteral(value);
+        } catch (NumericException e) {
+            throw CairoException.nonCritical().put("Invalid timestamp: ").put(value);
+        }
+    }
+
+    private static long parseFloorOrDie(TimestampDriver driver, CharSequence seq, int position) throws SqlException {
+        try {
+            return driver.parseFloorLiteral(seq);
         } catch (NumericException e) {
             throw SqlException.invalidDate(seq, position);
+        }
+    }
+
+    private static long parseFloorOrDie(TimestampDriver driver, Utf8Sequence seq, int position) throws SqlException {
+        try {
+            return driver.parseFloorLiteral(seq);
+        } catch (NumericException e) {
+            throw SqlException.invalidDate(seq, position);
+        }
+    }
+
+    private static class EqTimestampCompiledTickExprFunction extends NegatableBooleanFunction implements UnaryFunction {
+        private final CompiledTickExpression compiledExpr;
+        private final LongList intervals = new LongList();
+        private final Function left;
+
+        public EqTimestampCompiledTickExprFunction(Function left, CompiledTickExpression compiledExpr) {
+            this.left = left;
+            this.compiledExpr = compiledExpr;
+        }
+
+        @Override
+        public Function getArg() {
+            return left;
+        }
+
+        @Override
+        public boolean getBool(Record rec) {
+            return negated != isInIntervals(intervals, left.getTimestamp(rec));
+        }
+
+        @Override
+        public void init(SymbolTableSource symbolTableSource, SqlExecutionContext executionContext) throws SqlException {
+            UnaryFunction.super.init(symbolTableSource, executionContext);
+            intervals.clear();
+            compiledExpr.init(symbolTableSource, executionContext);
+            compiledExpr.evaluate(intervals);
+        }
+
+        @Override
+        public boolean isThreadSafe() {
+            return false;
+        }
+
+        @Override
+        public void toPlan(PlanSink sink) {
+            sink.val(left);
+            if (negated) {
+                sink.val(" not");
+            }
+            sink.val(" in ").val(intervals);
+        }
+    }
+
+    private static class EqTimestampStrConstantFunction extends NegatableBooleanFunction implements UnaryFunction {
+        private final LongList intervals = new LongList();
+        private final Function left;
+
+        public EqTimestampStrConstantFunction(
+                Function left,
+                int leftTimestampType,
+                CharSequence right,
+                int rightPosition,
+                CairoConfiguration configuration
+        ) throws SqlException {
+            this.left = left;
+            final StringSink sink = new StringSink();
+            IntervalUtils.parseTickExprAndIntersect(ColumnType.getTimestampDriver(leftTimestampType), configuration, right, intervals, rightPosition, sink, true);
+        }
+
+        @Override
+        public Function getArg() {
+            return left;
+        }
+
+        @Override
+        public boolean getBool(Record rec) {
+            return negated != isInIntervals(intervals, left.getTimestamp(rec));
+        }
+
+        @Override
+        public void toPlan(PlanSink sink) {
+            sink.val(left);
+            if (negated) {
+                sink.val(" not");
+            }
+            sink.val(" in ").val(intervals);
+        }
+    }
+
+    private static class EqTimestampStrFunction extends NegatableBooleanFunction implements BinaryFunction {
+        private final CairoConfiguration configuration;
+        private final LongList intervals = new LongList();
+        private final Function left;
+        private final Function right;
+        private final TimestampDriver timestampDriver;
+        private final StringSink sink = new StringSink();
+
+        public EqTimestampStrFunction(Function left, Function right, int timestampType, CairoConfiguration configuration) {
+            this.left = left;
+            this.right = right;
+            this.timestampDriver = ColumnType.getTimestampDriver(timestampType);
+            this.configuration = configuration;
+        }
+
+        @Override
+        public boolean getBool(Record rec) {
+            long ts = left.getTimestamp(rec);
+            if (ts == Numbers.LONG_NULL) {
+                return negated;
+            }
+            CharSequence timestampAsString = right.getStrA(rec);
+            if (timestampAsString == null) {
+                return negated;
+            }
+            intervals.clear();
+            try {
+                // we are ignoring exception contents here, so we do not need the exact position
+                IntervalUtils.parseTickExprAndIntersect(timestampDriver, configuration, timestampAsString, intervals, 0, sink, true);
+            } catch (SqlException e) {
+                return negated;
+            }
+            return negated != isInIntervals(intervals, ts);
+        }
+
+        @Override
+        public Function getLeft() {
+            return left;
+        }
+
+        @Override
+        public Function getRight() {
+            return right;
+        }
+
+        @Override
+        public boolean isThreadSafe() {
+            return false;
+        }
+
+        @Override
+        public void toPlan(PlanSink sink) {
+            sink.val(left);
+            if (negated) {
+                sink.val(" not");
+            }
+            sink.val(" in ").val(right);
         }
     }
 
@@ -166,7 +372,7 @@ public class InTimestampTimestampFunctionFactory implements FunctionFactory {
         @Override
         public boolean getBool(Record rec) {
             long ts = tsFunc.getTimestamp(rec);
-            return negated != inList.binarySearch(ts, BinarySearch.SCAN_UP) >= 0;
+            return negated != inList.binarySearch(ts, Vect.BIN_SEARCH_SCAN_UP) >= 0;
         }
 
         @Override
@@ -179,17 +385,20 @@ public class InTimestampTimestampFunctionFactory implements FunctionFactory {
         }
     }
 
-    private static class InTimestampManyRuntimeConstantsFunction extends NegatableBooleanFunction implements MultiArgFunction {
+    private static class InTimestampManyRuntimeConstantsFunction extends NegatableBooleanFunction
+            implements MultiArgFunction {
         private final ObjList<Function> args;
+        private final TimestampDriver driver;
         private final LongList timestampValues;
 
-        public InTimestampManyRuntimeConstantsFunction(ObjList<Function> args) {
+        public InTimestampManyRuntimeConstantsFunction(ObjList<Function> args, int timestampType) {
             this.args = args;
             this.timestampValues = new LongList(args.size());
+            this.driver = ColumnType.getTimestampDriver(timestampType);
         }
 
         @Override
-        public ObjList<Function> getArgs() {
+        public ObjList<Function> args() {
             return args;
         }
 
@@ -206,25 +415,22 @@ public class InTimestampTimestampFunctionFactory implements FunctionFactory {
         }
 
         @Override
-        public void init(SymbolTableSource symbolTableSource, SqlExecutionContext executionContext) throws SqlException {
+        public void init(SymbolTableSource symbolTableSource, SqlExecutionContext executionContext)
+                throws SqlException {
             MultiArgFunction.super.init(symbolTableSource, executionContext);
             timestampValues.clear();
             for (int i = 1, n = args.size(); i < n; i++) {
                 Function func = args.getQuick(i);
                 long val = Numbers.LONG_NULL;
-                switch (ColumnType.tagOf(func.getType())) {
-                    case ColumnType.TIMESTAMP:
-                    case ColumnType.LONG:
-                    case ColumnType.INT:
-                        val = func.getTimestamp(null);
-                        break;
-                    case ColumnType.STRING:
-                    case ColumnType.SYMBOL:
-                    case ColumnType.VARCHAR:
-                        CharSequence str = func.getStrA(null);
-                        val = str != null ? IntervalUtils.tryParseTimestamp(str) : Numbers.LONG_NULL;
-                        break;
-                }
+                int funcType = func.getType();
+                val = switch (ColumnType.tagOf(funcType)) {
+                    case ColumnType.DATE -> driver.fromDate(func.getDate(null));
+                    case ColumnType.TIMESTAMP -> driver.from(func.getTimestamp(null), funcType);
+                    case ColumnType.LONG, ColumnType.INT -> func.getTimestamp(null);
+                    case ColumnType.STRING, ColumnType.SYMBOL -> parseFloorOrDie(driver, func.getStrA(null));
+                    case ColumnType.VARCHAR -> parseFloorOrDie(driver, func.getVarcharA(null));
+                    default -> val;
+                };
                 timestampValues.add(val);
             }
         }
@@ -240,16 +446,20 @@ public class InTimestampTimestampFunctionFactory implements FunctionFactory {
         }
     }
 
-    public static class InTimestampRuntimeConstIntervalFunction extends NegatableBooleanFunction implements BinaryFunction {
+    private static class InTimestampRuntimeConstIntervalFunction extends NegatableBooleanFunction
+            implements BinaryFunction {
+        private final TimestampDriver driver;
         private final Function intervalFunc;
         private final int intervalFuncPos;
         private final LongList intervals = new LongList();
         private final Function left;
+        private final StringSink sink = new StringSink();
 
-        public InTimestampRuntimeConstIntervalFunction(Function left, Function intervalFunc, int intervalFuncPos) {
+        public InTimestampRuntimeConstIntervalFunction(Function left, Function intervalFunc, int timestampType, int intervalFuncPos) {
             this.left = left;
             this.intervalFunc = intervalFunc;
             this.intervalFuncPos = intervalFuncPos;
+            this.driver = ColumnType.getTimestampDriver(timestampType);
         }
 
         @Override
@@ -269,26 +479,30 @@ public class InTimestampTimestampFunctionFactory implements FunctionFactory {
         }
 
         @Override
-        public void init(SymbolTableSource symbolTableSource, SqlExecutionContext executionContext) throws SqlException {
+        public void init(SymbolTableSource symbolTableSource, SqlExecutionContext executionContext)
+                throws SqlException {
             BinaryFunction.super.init(symbolTableSource, executionContext);
             intervals.clear();
             // This is a specific function, which accepts "in interval" as bind variable.
-            // For this reason only STRING and VARCHAR bind variables are supported. Other types,
-            // such as INT, LONG etc will require two or move values to represent the interval
+            // For this reason, only STRING and VARCHAR bind variables are supported. Other
+            // types,
+            // such as INT, LONG etc. will require two or move values to represent the
+            // interval
             switch (intervalFunc.getType()) {
                 case ColumnType.STRING:
                 case ColumnType.VARCHAR:
-                    parseAndApplyIntervalEx(intervalFunc.getStrA(null), intervals, 0);
+                    IntervalUtils.parseTickExprAndIntersect(driver, executionContext.getCairoEngine().getConfiguration(), intervalFunc.getStrA(null), intervals, 0, sink, true);
                     break;
                 default:
                     throw SqlException
-                            .$(intervalFuncPos, "unsupported bind variable type [").put(ColumnType.nameOf(intervalFunc.getType()))
+                            .$(intervalFuncPos, "unsupported bind variable type [")
+                            .put(ColumnType.nameOf(intervalFunc.getType()))
                             .put("] expected one of [STRING or VARCHAR]");
             }
         }
 
         @Override
-        public boolean isReadThreadSafe() {
+        public boolean isThreadSafe() {
             return false;
         }
 
@@ -304,13 +518,15 @@ public class InTimestampTimestampFunctionFactory implements FunctionFactory {
 
     private static class InTimestampVarFunction extends NegatableBooleanFunction implements MultiArgFunction {
         private final ObjList<Function> args;
+        private final TimestampDriver driver;
 
-        public InTimestampVarFunction(ObjList<Function> args) {
+        public InTimestampVarFunction(ObjList<Function> args, int timestampType) {
             this.args = args;
+            this.driver = ColumnType.getTimestampDriver(timestampType);
         }
 
         @Override
-        public ObjList<Function> getArgs() {
+        public ObjList<Function> args() {
             return args;
         }
 
@@ -321,19 +537,15 @@ public class InTimestampTimestampFunctionFactory implements FunctionFactory {
             for (int i = 1, n = args.size(); i < n; i++) {
                 Function func = args.getQuick(i);
                 long val = Numbers.LONG_NULL;
-                switch (ColumnType.tagOf(func.getType())) {
-                    case ColumnType.TIMESTAMP:
-                    case ColumnType.LONG:
-                    case ColumnType.INT:
-                        val = func.getTimestamp(rec);
-                        break;
-                    case ColumnType.STRING:
-                    case ColumnType.SYMBOL:
-                    case ColumnType.VARCHAR:
-                        CharSequence str = func.getStrA(rec);
-                        val = str != null ? IntervalUtils.tryParseTimestamp(str) : Numbers.LONG_NULL;
-                        break;
-                }
+                int funcType = func.getType();
+                val = switch (ColumnType.tagOf(funcType)) {
+                    case ColumnType.DATE -> driver.fromDate(func.getDate(rec));
+                    case ColumnType.TIMESTAMP -> driver.from(func.getTimestamp(rec), funcType);
+                    case ColumnType.LONG, ColumnType.INT -> func.getTimestamp(rec);
+                    case ColumnType.STRING, ColumnType.SYMBOL -> parseFloorOrDie(driver, func.getStrA(rec));
+                    case ColumnType.VARCHAR -> parseFloorOrDie(driver, func.getVarcharA(rec));
+                    default -> val;
+                };
                 if (val == ts) {
                     return !negated;
                 }

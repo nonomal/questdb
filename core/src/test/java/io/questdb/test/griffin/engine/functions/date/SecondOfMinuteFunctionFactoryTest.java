@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -30,40 +30,50 @@ import org.junit.Test;
 public class SecondOfMinuteFunctionFactoryTest extends AbstractCairoTest {
     @Test
     public void testNull() throws Exception {
-        assertQuery(
-                "second\n" +
-                        "null\n",
-                "select second(null)",
-                null,
-                null,
-                true,
-                true
-        );
+        assertQuery("select second(null)")
+                .ddl(null)
+                .expectSize()
+                .returns("""
+                        second
+                        null
+                        """);
     }
 
     @Test
     public void testPreEpoch() throws Exception {
-        assertQuery(
-                "second\n" +
-                        "21\n",
-                "select second('1901-07-11T22:00:21.555998Z'::timestamp)",
-                null,
-                null,
-                true,
-                true
-        );
+        assertQuery("select second('1901-07-11T22:00:21.555998Z'::timestamp)")
+                .ddl(null)
+                .expectSize()
+                .returns("""
+                        second
+                        21
+                        """);
+
+        assertQuery("select second('1901-07-11T22:00:21.555998123Z')")
+                .ddl(null)
+                .expectSize()
+                .returns("""
+                        second
+                        21
+                        """);
     }
 
     @Test
     public void testVanilla() throws Exception {
-        assertQuery(
-                "second\n" +
-                        "30\n",
-                "select second('1997-04-11T22:00:30.555555Z'::timestamp)",
-                null,
-                null,
-                true,
-                true
-        );
+        assertQuery("select second('1997-04-11T22:00:30.555555Z'::timestamp)")
+                .ddl(null)
+                .expectSize()
+                .returns("""
+                        second
+                        30
+                        """);
+
+        assertQuery("select second('1997-04-11T22:00:30.555555123Z'::timestamp_ns)")
+                .ddl(null)
+                .expectSize()
+                .returns("""
+                        second
+                        30
+                        """);
     }
 }

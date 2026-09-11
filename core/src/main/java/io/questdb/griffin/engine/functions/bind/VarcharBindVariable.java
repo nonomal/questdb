@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,41 +24,24 @@
 
 package io.questdb.griffin.engine.functions.bind;
 
+import io.questdb.cairo.ColumnType;
 import io.questdb.cairo.sql.Record;
-import io.questdb.cairo.sql.ScalarFunction;
 import io.questdb.griffin.PlanSink;
 import io.questdb.griffin.SqlUtil;
 import io.questdb.griffin.engine.functions.VarcharFunction;
 import io.questdb.std.Mutable;
 import io.questdb.std.Numbers;
-import io.questdb.std.datetime.microtime.TimestampFormatUtils;
-import io.questdb.std.str.Utf16Sink;
 import io.questdb.std.str.Utf8Sequence;
-import io.questdb.std.str.Utf8Sink;
 import io.questdb.std.str.Utf8StringSink;
 
-public class VarcharBindVariable extends VarcharFunction implements ScalarFunction, Mutable {
-    private final int floatScale;
+public class VarcharBindVariable extends VarcharFunction implements Mutable {
     private final Utf8StringSink utf8Sink = new Utf8StringSink();
     private boolean isNull = true;
-
-    public VarcharBindVariable(int floatScale) {
-        this.floatScale = floatScale;
-    }
 
     @Override
     public void clear() {
         isNull = true;
         utf8Sink.clear();
-    }
-
-    @Override
-    public void getStr(Record rec, Utf16Sink utf16Sink) {
-        if (isNull) {
-            utf16Sink.put((CharSequence) null);
-        } else {
-            utf16Sink.put(this.utf8Sink);
-        }
     }
 
     @Override
@@ -80,15 +63,6 @@ public class VarcharBindVariable extends VarcharFunction implements ScalarFuncti
     }
 
     @Override
-    public void getVarchar(Record rec, Utf8Sink utf8Sink) {
-        if (isNull) {
-            utf8Sink.put((CharSequence) null);
-        } else {
-            utf8Sink.put(this.utf8Sink);
-        }
-    }
-
-    @Override
     public Utf8Sequence getVarcharA(Record rec) {
         return isNull ? null : utf8Sink;
     }
@@ -107,7 +81,7 @@ public class VarcharBindVariable extends VarcharFunction implements ScalarFuncti
     }
 
     @Override
-    public boolean isReadThreadSafe() {
+    public boolean isNonDeterministic() {
         return true;
     }
 
@@ -116,19 +90,28 @@ public class VarcharBindVariable extends VarcharFunction implements ScalarFuncti
         return true;
     }
 
-    public void setTimestamp(long value) {
+    @Override
+    public boolean isStableWithinExecution() {
+        // the bound value is set before execution starts and is immutable while it runs
+        return true;
+    }
+
+    @Override
+    public boolean isThreadSafe() {
+        return true;
+    }
+
+    public void setTimestamp(long value, int timestampType) {
         isNull = value == Numbers.LONG_NULL;
         if (!isNull) {
             utf8Sink.clear();
-            TimestampFormatUtils.appendDateTimeUSec(utf8Sink, value);
+            ColumnType.getTimestampDriver(timestampType).append(utf8Sink, value);
         }
     }
 
     public void setUuidValue(long lo, long hi) {
         utf8Sink.clear();
-        if (SqlUtil.implicitCastUuidAsStr(lo, hi, utf8Sink)) {
-            isNull = false;
-        }
+        isNull = !SqlUtil.implicitCastUuidAsStr(lo, hi, utf8Sink);
     }
 
     public void setValue(boolean value) {
@@ -189,7 +172,7 @@ public class VarcharBindVariable extends VarcharFunction implements ScalarFuncti
         isNull = Numbers.isNull(value);
         if (!isNull) {
             utf8Sink.clear();
-            utf8Sink.put(value, floatScale);
+            utf8Sink.put(value);
         }
     }
 

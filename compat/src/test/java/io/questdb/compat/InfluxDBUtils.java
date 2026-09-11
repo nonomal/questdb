@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,6 +24,8 @@
 
 package io.questdb.compat;
 
+import com.influxdb.client.InfluxDBClient;
+import com.influxdb.client.InfluxDBClientFactory;
 import io.questdb.ServerMain;
 import io.questdb.std.Chars;
 import org.influxdb.InfluxDB;
@@ -37,6 +39,7 @@ import java.util.List;
 public class InfluxDBUtils {
 
     public static void assertRequestErrorContains(InfluxDB influxDB, List<String> points, String line, String... errors) {
+        assert errors.length > 0;
         points.add(line);
         try {
             influxDB.write(points);
@@ -62,5 +65,12 @@ public class InfluxDBUtils {
         int httpPort = serverMain.getHttpServerPort();
         final String serverURL = "http://127.0.0.1:" + httpPort, username = "root", password = "root";
         return InfluxDBFactory.connect(serverURL, username, password);
+    }
+
+    @NotNull
+    public static InfluxDBClient getV2Connection(ServerMain serverMain) {
+        int httpPort = serverMain.getHttpServerPort();
+        final String serverURL = "http://127.0.0.1:" + httpPort;
+        return InfluxDBClientFactory.create(serverURL, "root", "root".toCharArray());
     }
 }

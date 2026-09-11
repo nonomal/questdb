@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -31,7 +31,6 @@ import io.questdb.griffin.SqlKeywords;
 import io.questdb.griffin.engine.functions.SymbolFunction;
 import io.questdb.std.Chars;
 import io.questdb.std.str.Utf8Sequence;
-import io.questdb.std.str.Utf8Sink;
 import io.questdb.std.str.Utf8String;
 import org.jetbrains.annotations.Nullable;
 
@@ -49,7 +48,7 @@ public class SymbolConstant extends SymbolFunction implements ConstantFunction {
             this.utf8Value = null;
             this.index = SymbolTable.VALUE_IS_NULL;
         } else {
-            if (Chars.startsWith(value, '\'')) {
+            if (Chars.startsWith(value, '\'') && Chars.endsWith(value, '\'') && value.length() > 1) {
                 this.value = Chars.toString(value, 1, value.length() - 1);
             } else {
                 this.value = Chars.toString(value);
@@ -88,11 +87,6 @@ public class SymbolConstant extends SymbolFunction implements ConstantFunction {
     }
 
     @Override
-    public void getVarchar(Record rec, Utf8Sink utf8Sink) {
-        utf8Sink.put(utf8Value);
-    }
-
-    @Override
     public Utf8Sequence getVarcharA(Record rec) {
         return utf8Value;
     }
@@ -118,6 +112,14 @@ public class SymbolConstant extends SymbolFunction implements ConstantFunction {
     }
 
     @Override
+    public boolean supportsKeyValueAccess() {
+        // The key is a field read and valueOf() resolves it without touching text, so a key
+        // consumer such as QWP egress should ship this constant once per batch rather than
+        // re-encoding it on every row.
+        return true;
+    }
+
+    @Override
     public boolean supportsParallelism() {
         return true;
     }
@@ -133,11 +135,12 @@ public class SymbolConstant extends SymbolFunction implements ConstantFunction {
 
     @Override
     public CharSequence valueBOf(int key) {
-        return value;
+        // Aggregates store VALUE_IS_NULL on setEmpty and read it back through arg.
+        return key != SymbolTable.VALUE_IS_NULL ? value : null;
     }
 
     @Override
     public CharSequence valueOf(int symbolKey) {
-        return value;
+        return symbolKey != SymbolTable.VALUE_IS_NULL ? value : null;
     }
 }

@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -31,42 +31,38 @@ public class ApproxCountDistinctIPv4GroupByFunctionFactoryTest extends AbstractC
 
     @Test
     public void testConstant() throws Exception {
-        assertQuery(
-                "a\tapprox_count_distinct\n" +
-                        "a\t1\n" +
-                        "b\t1\n" +
-                        "c\t1\n",
-                "select a, approx_count_distinct('127.0.0.1'::ipv4) from x order by a",
-                "create table x as (select * from (select rnd_symbol('a','b','c') a from long_sequence(20)))",
-                null,
-                true,
-                true
-        );
+        assertQuery("select a, approx_count_distinct('127.0.0.1'::ipv4) from x order by a")
+                .ddl("create table x as (select * from (select rnd_symbol('a','b','c') a from long_sequence(20)))")
+                .expectSize()
+                .returns("""
+                        a\tapprox_count_distinct
+                        a\t1
+                        b\t1
+                        c\t1
+                        """);
     }
 
     @Test
     public void testDifferentPrecisionsDenseHLL() throws Exception {
         assertMemoryLeak(() -> {
-            compile("create table x as (select * from (select rnd_ipv4('1.1.1.1/8', 0) s, timestamp_sequence(0, 100000) ts from long_sequence(100000)) timestamp(ts))");
+            execute("create table x as (select * from (select rnd_ipv4('1.1.1.1/8', 0) s, timestamp_sequence(0, 100000) ts from long_sequence(100000)) timestamp(ts))");
 
-            assertQueryNoLeakCheck(
-                    "count_distinct\n" +
-                            "99685\n",
-                    "select count_distinct(s) from x",
-                    null,
-                    false,
-                    true
-            );
+            assertQuery("select count_distinct(s) from x")
+                    .noLeakCheck()
+                    .noRandomAccess()
+                    .expectSize()
+                    .returns("""
+                            count_distinct
+                            99685
+                            """);
 
             for (int precision = 4; precision <= 18; precision++) {
-                assertQueryNoLeakCheck(
-                        "approx_count_distinct" + precision + "\n" +
-                                "99152\n",
-                        "select approx_count_distinct(s, " + precision + ") as approx_count_distinct" + precision + " from x",
-                        null,
-                        false,
-                        true
-                );
+                assertQuery("select approx_count_distinct(s, " + precision + ") as approx_count_distinct" + precision + " from x")
+                        .noLeakCheck()
+                        .noRandomAccess()
+                        .expectSize()
+                        .returns("approx_count_distinct" + precision + "\n" +
+                                "99152\n");
             }
         });
     }
@@ -74,26 +70,24 @@ public class ApproxCountDistinctIPv4GroupByFunctionFactoryTest extends AbstractC
     @Test
     public void testDifferentPrecisionsSparseHLL() throws Exception {
         assertMemoryLeak(() -> {
-            compile("create table x as (select * from (select rnd_ipv4('1.1.1.1/8', 0) s, timestamp_sequence(0, 100000) ts from long_sequence(100)) timestamp(ts))");
+            execute("create table x as (select * from (select rnd_ipv4('1.1.1.1/8', 0) s, timestamp_sequence(0, 100000) ts from long_sequence(100)) timestamp(ts))");
 
-            assertQueryNoLeakCheck(
-                    "count_distinct\n" +
-                            "100\n",
-                    "select count_distinct(s) from x",
-                    null,
-                    false,
-                    true
-            );
+            assertQuery("select count_distinct(s) from x")
+                    .noLeakCheck()
+                    .noRandomAccess()
+                    .expectSize()
+                    .returns("""
+                            count_distinct
+                            100
+                            """);
 
             for (int precision = 4; precision <= 18; precision++) {
-                assertQueryNoLeakCheck(
-                        "approx_count_distinct" + precision + "\n" +
-                                "100\n",
-                        "select approx_count_distinct(s, " + precision + ") as approx_count_distinct" + precision + " from x",
-                        null,
-                        false,
-                        true
-                );
+                assertQuery("select approx_count_distinct(s, " + precision + ") as approx_count_distinct" + precision + " from x")
+                        .noLeakCheck()
+                        .noRandomAccess()
+                        .expectSize()
+                        .returns("approx_count_distinct" + precision + "\n" +
+                                "100\n");
             }
         });
     }
@@ -101,330 +95,343 @@ public class ApproxCountDistinctIPv4GroupByFunctionFactoryTest extends AbstractC
     @Test
     public void testExpression() throws Exception {
         assertMemoryLeak(() -> {
-            final String expected = "a\tapprox_count_distinct\n" +
-                    "a\t6\n" +
-                    "b\t6\n" +
-                    "c\t8\n";
-            assertQueryNoLeakCheck(
-                    expected,
-                    "select a, approx_count_distinct(s + 42) from x order by a",
-                    "create table x as (select * from (select rnd_symbol('a','b','c') a, rnd_ipv4('1.1.1.1/16', 0) s from long_sequence(20)))",
-                    null,
-                    true,
-                    true
-            );
+            final String expected = """
+                    a\tapprox_count_distinct
+                    a\t6
+                    b\t6
+                    c\t8
+                    """;
+            assertQuery("select a, approx_count_distinct(s + 42) from x order by a")
+                    .noLeakCheck()
+                    .ddl("create table x as (select * from (select rnd_symbol('a','b','c') a, rnd_ipv4('1.1.1.1/16', 0) s from long_sequence(20)))")
+                    .expectSize()
+                    .returns(expected);
             // addition shouldn't affect the number of distinct values,
             // so the result should stay the same
-            assertSql(expected, "select a, approx_count_distinct(s) from x order by a");
+            assertQuery("select a, approx_count_distinct(s) from x order by a")
+                    .noLeakCheck()
+                    .expectSize()
+                    .returns(expected);
         });
     }
 
     @Test
     public void testGroupKeyedDenseHLL() throws Exception {
         assertMemoryLeak(() -> {
-            compile("create table x as (" +
+            execute("create table x as (" +
                     "select * from (select rnd_symbol('a','b','c','d','e','f') a, rnd_ipv4('1.1.1.1/8', 0) s, timestamp_sequence(0, 100000) ts from long_sequence(1000000)" +
                     ") timestamp(ts))");
-            assertQueryNoLeakCheck(
-                    "a\tcount_distinct\n" +
-                            "a\t165309\n" +
-                            "b\t166198\n" +
-                            "c\t166121\n" +
-                            "d\t165973\n" +
-                            "e\t165557\n" +
-                            "f\t165845\n",
-                    "select a, count_distinct(s) from x order by a",
-                    null,
-                    true,
-                    true
-            );
-            assertQueryNoLeakCheck(
-                    "a\tapprox_count_distinct\n" +
-                            "a\t165044\n" +
-                            "b\t164963\n" +
-                            "c\t164909\n" +
-                            "d\t166100\n" +
-                            "e\t165568\n" +
-                            "f\t166248\n",
-                    "select a, approx_count_distinct(s) from x order by a",
-                    null,
-                    true,
-                    true
-            );
+            assertQuery("select a, count_distinct(s) from x order by a")
+                    .noLeakCheck()
+                    .expectSize()
+                    .returns("""
+                            a\tcount_distinct
+                            a\t165309
+                            b\t166198
+                            c\t166121
+                            d\t165973
+                            e\t165557
+                            f\t165845
+                            """);
+            assertQuery("select a, approx_count_distinct(s) from x order by a")
+                    .noLeakCheck()
+                    .expectSize()
+                    .returns("""
+                            a\tapprox_count_distinct
+                            a\t165044
+                            b\t164963
+                            c\t164909
+                            d\t166100
+                            e\t165568
+                            f\t166248
+                            """);
         });
     }
 
     @Test
     public void testGroupKeyedSparseHLL() throws Exception {
         assertMemoryLeak(() -> {
-            compile("create table x as (" +
+            execute("create table x as (" +
                     "select * from (select rnd_symbol('a','b','c','d','e','f') a, rnd_ipv4('1.1.1.1/16', 0) s, timestamp_sequence(0, 100000) ts from long_sequence(20)" +
                     ") timestamp(ts))");
-            assertQueryNoLeakCheck(
-                    "a\tcount_distinct\n" +
-                            "a\t2\n" +
-                            "b\t1\n" +
-                            "c\t2\n" +
-                            "d\t4\n" +
-                            "e\t5\n" +
-                            "f\t6\n",
-                    "select a, count_distinct(s) from x order by a",
-                    null,
-                    true,
-                    true
-            );
-            assertQueryNoLeakCheck(
-                    "a\tapprox_count_distinct\n" +
-                            "a\t2\n" +
-                            "b\t1\n" +
-                            "c\t2\n" +
-                            "d\t4\n" +
-                            "e\t5\n" +
-                            "f\t6\n",
-                    "select a, approx_count_distinct(s) from x order by a",
-                    null,
-                    true,
-                    true
-            );
+            assertQuery("select a, count_distinct(s) from x order by a")
+                    .noLeakCheck()
+                    .expectSize()
+                    .returns("""
+                            a\tcount_distinct
+                            a\t2
+                            b\t1
+                            c\t2
+                            d\t4
+                            e\t5
+                            f\t6
+                            """);
+            assertQuery("select a, approx_count_distinct(s) from x order by a")
+                    .noLeakCheck()
+                    .expectSize()
+                    .returns("""
+                            a\tapprox_count_distinct
+                            a\t2
+                            b\t1
+                            c\t2
+                            d\t4
+                            e\t5
+                            f\t6
+                            """);
         });
     }
 
     @Test
     public void testGroupNotKeyedDenseHLL() throws Exception {
         assertMemoryLeak(() -> {
-            compile("create table x as (select * from (select rnd_ipv4('1.1.1.1/8', 0) s, timestamp_sequence(0, 100000) ts from long_sequence(100000)) timestamp(ts))");
-            assertQueryNoLeakCheck(
-                    "count_distinct\n" +
-                            "99685\n",
-                    "select count_distinct(s) from x",
-                    null,
-                    false,
-                    true
-            );
-            assertQueryNoLeakCheck(
-                    "approx_count_distinct\n" +
-                            "99152\n",
-                    "select approx_count_distinct(s) from x",
-                    null,
-                    false,
-                    true
-            );
+            execute("create table x as (select * from (select rnd_ipv4('1.1.1.1/8', 0) s, timestamp_sequence(0, 100000) ts from long_sequence(100000)) timestamp(ts))");
+            assertQuery("select count_distinct(s) from x")
+                    .noLeakCheck()
+                    .noRandomAccess()
+                    .expectSize()
+                    .returns("""
+                            count_distinct
+                            99685
+                            """);
+            assertQuery("select approx_count_distinct(s) from x")
+                    .noLeakCheck()
+                    .noRandomAccess()
+                    .expectSize()
+                    .returns("""
+                            approx_count_distinct
+                            99152
+                            """);
         });
     }
 
     @Test
     public void testGroupNotKeyedSparseHLL() throws Exception {
         assertMemoryLeak(() -> {
-            compile("create table x as (select * from (select rnd_ipv4('1.1.1.1/8', 0) s, timestamp_sequence(0, 100000) ts from long_sequence(100)) timestamp(ts))");
-            assertQueryNoLeakCheck(
-                    "count_distinct\n" +
-                            "100\n",
-                    "select count_distinct(s) from x",
-                    null,
-                    false,
-                    true
-            );
-            assertQueryNoLeakCheck(
-                    "approx_count_distinct\n" +
-                            "100\n",
-                    "select approx_count_distinct(s) from x",
-                    null,
-                    false,
-                    true
-            );
+            execute("create table x as (select * from (select rnd_ipv4('1.1.1.1/8', 0) s, timestamp_sequence(0, 100000) ts from long_sequence(100)) timestamp(ts))");
+            assertQuery("select count_distinct(s) from x")
+                    .noLeakCheck()
+                    .noRandomAccess()
+                    .expectSize()
+                    .returns("""
+                            count_distinct
+                            100
+                            """);
+            assertQuery("select approx_count_distinct(s) from x")
+                    .noLeakCheck()
+                    .noRandomAccess()
+                    .expectSize()
+                    .returns("""
+                            approx_count_distinct
+                            100
+                            """);
         });
     }
 
     @Test
     public void testGroupNotKeyedWithNullsDenseHLL() throws Exception {
         assertMemoryLeak(() -> {
-            compile("create table x as (" +
+            execute("create table x as (" +
                     "select * from (select rnd_ipv4('1.1.1.1/8', 0) s, timestamp_sequence(10, 100000) ts from long_sequence(1000000)) timestamp(ts)" +
                     ") timestamp(ts) PARTITION BY YEAR");
 
-            String expectedExact = "count_distinct\n" +
-                    "970716\n";
-            String expectedEstimated = "approx_count_distinct\n" +
-                    "975818\n";
+            String expectedExact = """
+                    count_distinct
+                    970716
+                    """;
+            String expectedEstimated = """
+                    approx_count_distinct
+                    975818
+                    """;
 
-            assertQueryNoLeakCheck(
-                    expectedExact,
-                    "select count_distinct(s) from x",
-                    null,
-                    false,
-                    true
-            );
-            assertQueryNoLeakCheck(
-                    expectedEstimated,
-                    "select approx_count_distinct(s) from x",
-                    null,
-                    false,
-                    true
-            );
+            assertQuery("select count_distinct(s) from x")
+                    .noLeakCheck()
+                    .noRandomAccess()
+                    .expectSize()
+                    .returns(expectedExact);
+            assertQuery("select approx_count_distinct(s) from x")
+                    .noLeakCheck()
+                    .noRandomAccess()
+                    .expectSize()
+                    .returns(expectedEstimated);
 
-            insert("insert into x values(cast(null as IPV4), '2021-05-21')");
-            insert("insert into x values(cast(null as IPV4), '1970-01-01')");
-            assertSql(expectedExact, "select count_distinct(s) from x");
-            assertSql(expectedEstimated, "select approx_count_distinct(s) from x");
+            execute("insert into x values(cast(null as IPV4), '2021-05-21')");
+            execute("insert into x values(cast(null as IPV4), '1970-01-01')");
+            assertQuery("select count_distinct(s) from x")
+                    .noLeakCheck()
+                    .noRandomAccess()
+                    .expectSize()
+                    .returns(expectedExact);
+            assertQuery("select approx_count_distinct(s) from x")
+                    .noLeakCheck()
+                    .noRandomAccess()
+                    .expectSize()
+                    .returns(expectedEstimated);
         });
     }
 
     @Test
     public void testGroupNotKeyedWithNullsSparseHLL() throws Exception {
         assertMemoryLeak(() -> {
-            compile("create table x as (" +
+            execute("create table x as (" +
                     "select * from (select rnd_ipv4('1.1.1.1/8', 0) s, timestamp_sequence(10, 100000) ts from long_sequence(100)) timestamp(ts)" +
                     ") timestamp(ts) PARTITION BY YEAR");
 
-            String expectedExact = "count_distinct\n" +
-                    "100\n";
-            String expectedEstimated = "approx_count_distinct\n" +
-                    "100\n";
+            String expectedExact = """
+                    count_distinct
+                    100
+                    """;
+            String expectedEstimated = """
+                    approx_count_distinct
+                    100
+                    """;
 
-            assertQueryNoLeakCheck(
-                    expectedExact,
-                    "select count_distinct(s) from x",
-                    null,
-                    false,
-                    true
-            );
-            assertQueryNoLeakCheck(
-                    expectedEstimated,
-                    "select approx_count_distinct(s) from x",
-                    null,
-                    false,
-                    true
-            );
+            assertQuery("select count_distinct(s) from x")
+                    .noLeakCheck()
+                    .noRandomAccess()
+                    .expectSize()
+                    .returns(expectedExact);
+            assertQuery("select approx_count_distinct(s) from x")
+                    .noLeakCheck()
+                    .noRandomAccess()
+                    .expectSize()
+                    .returns(expectedEstimated);
 
-            insert("insert into x values(cast(null as IPV4), '2021-05-21')");
-            insert("insert into x values(cast(null as IPV4), '1970-01-01')");
-            assertSql(expectedExact, "select count_distinct(s) from x");
-            assertSql(expectedEstimated, "select approx_count_distinct(s) from x");
+            execute("insert into x values(cast(null as IPV4), '2021-05-21')");
+            execute("insert into x values(cast(null as IPV4), '1970-01-01')");
+            assertQuery("select count_distinct(s) from x")
+                    .noLeakCheck()
+                    .noRandomAccess()
+                    .expectSize()
+                    .returns(expectedExact);
+            assertQuery("select approx_count_distinct(s) from x")
+                    .noLeakCheck()
+                    .noRandomAccess()
+                    .expectSize()
+                    .returns(expectedEstimated);
         });
     }
 
     @Test
     public void testInterpolation() throws Exception {
-        assertQuery(
-                "ts\tapprox_count_distinct\n" +
-                        "1970-01-01T00:00:00.000000Z\t1\n" +
-                        "1970-01-01T00:00:01.000000Z\t1\n",
-                "select ts, approx_count_distinct(s) from x sample by 1s fill(linear) limit 2",
-                "create table x as (select * from (select rnd_ipv4('1.1.1.1/28', 0) s, timestamp_sequence(0, 60000000) ts from long_sequence(100)) timestamp(ts))",
-                "ts",
-                true,
-                false
-        );
+        assertQuery("select ts, approx_count_distinct(s) from x sample by 1s fill(linear) limit 2")
+                .ddl("create table x as (select * from (select rnd_ipv4('1.1.1.1/28', 0) s, timestamp_sequence(0, 60000000) ts from long_sequence(100)) timestamp(ts))")
+                .timestamp("ts")
+                .returns("""
+                        ts\tapprox_count_distinct
+                        1970-01-01T00:00:00.000000Z\t1
+                        1970-01-01T00:00:01.000000Z\t1
+                        """);
     }
 
     @Test
     public void testNoValues() throws Exception {
-        assertQuery(
-                "approx_count_distinct\n" +
-                        "0\n",
-                "select approx_count_distinct(a) from x",
-                "create table x (a ipv4)",
-                null,
-                false,
-                true
-        );
+        assertQuery("select approx_count_distinct(a) from x")
+                .ddl("create table x (a ipv4)")
+                .noRandomAccess()
+                .expectSize()
+                .returns("""
+                        approx_count_distinct
+                        0
+                        """);
     }
 
     @Test
     public void testNullConstant() throws Exception {
-        assertQuery(
-                "a\tapprox_count_distinct\n" +
-                        "a\t0\n" +
-                        "b\t0\n" +
-                        "c\t0\n",
-                "select a, approx_count_distinct(cast(null as IPV4)) from x order by a",
-                "create table x as (select * from (select rnd_symbol('a','b','c') a from long_sequence(20)))",
-                null,
-                true,
-                true
-        );
+        assertQuery("select a, approx_count_distinct(cast(null as IPV4)) from x order by a")
+                .ddl("create table x as (select * from (select rnd_symbol('a','b','c') a from long_sequence(20)))")
+                .expectSize()
+                .returns("""
+                        a\tapprox_count_distinct
+                        a\t0
+                        b\t0
+                        c\t0
+                        """);
     }
 
     @Test
     public void testPrecisionOutOfRange() throws Exception {
-        assertException("select approx_count_distinct('127.0.0.1'::ipv4, 3) from long_sequence(1)", 7, "precision must be between 4 and 18");
-        assertException("select approx_count_distinct('127.0.0.1'::ipv4, 19) from long_sequence(1)", 7, "precision must be between 4 and 18");
+        assertQuery("select approx_count_distinct('127.0.0.1'::ipv4, 3) from long_sequence(1)")
+                .fails(7, "precision must be between 4 and 18");
+        assertQuery("select approx_count_distinct('127.0.0.1'::ipv4, 19) from long_sequence(1)")
+                .fails(7, "precision must be between 4 and 18");
     }
 
     @Test
     public void testSampleFillLinear() throws Exception {
-        assertQuery(
-                "ts\tapprox_count_distinct\n" +
-                        "1970-01-01T00:00:00.000000Z\t9\n" +
-                        "1970-01-01T00:00:01.000000Z\t9\n" +
-                        "1970-01-01T00:00:02.000000Z\t7\n" +
-                        "1970-01-01T00:00:03.000000Z\t7\n" +
-                        "1970-01-01T00:00:04.000000Z\t8\n" +
-                        "1970-01-01T00:00:05.000000Z\t6\n" +
-                        "1970-01-01T00:00:06.000000Z\t9\n" +
-                        "1970-01-01T00:00:07.000000Z\t9\n" +
-                        "1970-01-01T00:00:08.000000Z\t7\n" +
-                        "1970-01-01T00:00:09.000000Z\t8\n",
-                "select ts, approx_count_distinct(s) from x sample by 1s fill(linear)",
-                "create table x as (select * from (select rnd_ipv4('1.1.1.1/28', 0) s, timestamp_sequence(0, 100000) ts from long_sequence(100)) timestamp(ts))",
-                "ts",
-                true,
-                true
-        );
+        assertQuery("select ts, approx_count_distinct(s) from x sample by 1s fill(linear)")
+                .ddl("create table x as (select * from (select rnd_ipv4('1.1.1.1/28', 0) s, timestamp_sequence(0, 100000) ts from long_sequence(100)) timestamp(ts))")
+                .timestamp("ts")
+                .expectSize()
+                .returns("""
+                        ts\tapprox_count_distinct
+                        1970-01-01T00:00:00.000000Z\t9
+                        1970-01-01T00:00:01.000000Z\t9
+                        1970-01-01T00:00:02.000000Z\t7
+                        1970-01-01T00:00:03.000000Z\t7
+                        1970-01-01T00:00:04.000000Z\t8
+                        1970-01-01T00:00:05.000000Z\t6
+                        1970-01-01T00:00:06.000000Z\t9
+                        1970-01-01T00:00:07.000000Z\t9
+                        1970-01-01T00:00:08.000000Z\t7
+                        1970-01-01T00:00:09.000000Z\t8
+                        """);
     }
 
     @Test
     public void testSampleFillNone() throws Exception {
-        assertMemoryLeak(() -> assertSql(
-                "ts\tapprox_count_distinct\n" +
-                        "1970-01-01T00:00:00.050000Z\t16\n" +
-                        "1970-01-01T00:00:02.050000Z\t16\n",
-                "with x as (select * from (select rnd_ipv4('1.1.1.1/28', 0) s, timestamp_sequence(50000, 100000L/4) ts from long_sequence(150)) timestamp(ts))\n" +
-                        "select ts, approx_count_distinct(s) from x sample by 2s align to first observation"
-        ));
+        // returnsOnce(): the query projects rnd_ipv4() inline in a CTE, so the random IPv4s - and thus
+        // the approx_count_distinct results - differ across the re-reads returns() performs. The sibling
+        // fill tests materialize the random data into a table first, so they use the full returns().
+        assertQuery("with x as (select * from (select rnd_ipv4('1.1.1.1/28', 0) s, timestamp_sequence(50000, 100000L/4) ts from long_sequence(150)) timestamp(ts))\n" +
+                "select ts, approx_count_distinct(s) from x sample by 2s align to first observation")
+                .returnsOnce("""
+                        ts\tapprox_count_distinct
+                        1970-01-01T00:00:00.050000Z\t16
+                        1970-01-01T00:00:02.050000Z\t16
+                        """);
     }
 
     @Test
     public void testSampleFillValue() throws Exception {
-        assertQuery(
-                "ts\tapprox_count_distinct\n" +
-                        "1970-01-01T00:00:00.000000Z\t9\n" +
-                        "1970-01-01T00:00:01.000000Z\t9\n" +
-                        "1970-01-01T00:00:02.000000Z\t7\n" +
-                        "1970-01-01T00:00:03.000000Z\t7\n" +
-                        "1970-01-01T00:00:04.000000Z\t8\n" +
-                        "1970-01-01T00:00:05.000000Z\t6\n" +
-                        "1970-01-01T00:00:06.000000Z\t9\n" +
-                        "1970-01-01T00:00:07.000000Z\t9\n" +
-                        "1970-01-01T00:00:08.000000Z\t7\n" +
-                        "1970-01-01T00:00:09.000000Z\t8\n",
-                "select ts, approx_count_distinct(s) from x sample by 1s fill(99)",
-                "create table x as (select * from (select rnd_ipv4('1.1.1.1/28', 0) s, timestamp_sequence(0, 100000) ts from long_sequence(100)) timestamp(ts))",
-                "ts",
-                false
-        );
+        assertQuery("select ts, approx_count_distinct(s) from x sample by 1s fill(99)")
+                .ddl("create table x as (select * from (select rnd_ipv4('1.1.1.1/28', 0) s, timestamp_sequence(0, 100000) ts from long_sequence(100)) timestamp(ts))")
+                .timestamp("ts")
+                .noRandomAccess()
+                .returns("""
+                        ts\tapprox_count_distinct
+                        1970-01-01T00:00:00.000000Z\t9
+                        1970-01-01T00:00:01.000000Z\t9
+                        1970-01-01T00:00:02.000000Z\t7
+                        1970-01-01T00:00:03.000000Z\t7
+                        1970-01-01T00:00:04.000000Z\t8
+                        1970-01-01T00:00:05.000000Z\t6
+                        1970-01-01T00:00:06.000000Z\t9
+                        1970-01-01T00:00:07.000000Z\t9
+                        1970-01-01T00:00:08.000000Z\t7
+                        1970-01-01T00:00:09.000000Z\t8
+                        """);
     }
 
     @Test
     public void testSampleKeyed() throws Exception {
-        assertQuery(
-                "a\tapprox_count_distinct\tts\n" +
-                        "a\t4\t1970-01-01T00:00:00.000000Z\n" +
-                        "f\t6\t1970-01-01T00:00:00.000000Z\n" +
-                        "c\t9\t1970-01-01T00:00:00.000000Z\n" +
-                        "e\t6\t1970-01-01T00:00:00.000000Z\n" +
-                        "d\t7\t1970-01-01T00:00:00.000000Z\n" +
-                        "b\t6\t1970-01-01T00:00:00.000000Z\n" +
-                        "b\t7\t1970-01-01T00:00:05.000000Z\n" +
-                        "c\t5\t1970-01-01T00:00:05.000000Z\n" +
-                        "f\t7\t1970-01-01T00:00:05.000000Z\n" +
-                        "e\t8\t1970-01-01T00:00:05.000000Z\n" +
-                        "d\t7\t1970-01-01T00:00:05.000000Z\n" +
-                        "a\t5\t1970-01-01T00:00:05.000000Z\n",
-                "select a, approx_count_distinct(s), ts from x sample by 5s align to first observation",
-                "create table x as (select * from (select rnd_symbol('a','b','c','d','e','f') a, rnd_ipv4('1.1.1.1/28', 0) s, timestamp_sequence(0, 100000) ts from long_sequence(100)) timestamp(ts))",
-                "ts",
-                false
-        );
+        assertQuery("select a, approx_count_distinct(s), ts from x sample by 5s align to first observation")
+                .ddl("create table x as (select * from (select rnd_symbol('a','b','c','d','e','f') a, rnd_ipv4('1.1.1.1/28', 0) s, timestamp_sequence(0, 100000) ts from long_sequence(100)) timestamp(ts))")
+                .timestamp("ts")
+                .noRandomAccess()
+                .returns("""
+                        a\tapprox_count_distinct\tts
+                        a\t4\t1970-01-01T00:00:00.000000Z
+                        f\t6\t1970-01-01T00:00:00.000000Z
+                        c\t9\t1970-01-01T00:00:00.000000Z
+                        e\t6\t1970-01-01T00:00:00.000000Z
+                        d\t7\t1970-01-01T00:00:00.000000Z
+                        b\t6\t1970-01-01T00:00:00.000000Z
+                        b\t7\t1970-01-01T00:00:05.000000Z
+                        c\t5\t1970-01-01T00:00:05.000000Z
+                        f\t7\t1970-01-01T00:00:05.000000Z
+                        e\t8\t1970-01-01T00:00:05.000000Z
+                        d\t7\t1970-01-01T00:00:05.000000Z
+                        a\t5\t1970-01-01T00:00:05.000000Z
+                        """);
     }
 }

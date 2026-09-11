@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -25,12 +25,33 @@
 package io.questdb.network;
 
 import io.questdb.cutlass.http.HttpException;
+import io.questdb.std.CarrierLocal;
 
 public class NoSpaceLeftInResponseBufferException extends HttpException {
-    public static final NoSpaceLeftInResponseBufferException INSTANCE;
+    private static final CarrierLocal<NoSpaceLeftInResponseBufferException> tlException = new CarrierLocal<>(NoSpaceLeftInResponseBufferException::new);
 
-    static {
-        INSTANCE = new NoSpaceLeftInResponseBufferException();
-        INSTANCE.put("no space left in response buffer");
+    private long bytesRequired;
+    private long bytesAvailable;
+    private long capacity;
+
+    public NoSpaceLeftInResponseBufferException() {
+        super();
+        put("no space left in response buffer [bytesRequired=").put(bytesRequired).put(']');
+    }
+
+    public static NoSpaceLeftInResponseBufferException instance(long bytesRequired, long bytesAvailable, long capacity) {
+        NoSpaceLeftInResponseBufferException ex = tlException.get();
+        ex.bytesRequired = bytesRequired;
+        ex.bytesAvailable = bytesAvailable;
+        ex.capacity = capacity;
+        return ex;
+    }
+
+    public long getBytesRequired() {
+        return bytesRequired;
+    }
+
+    public void setBytesRequired(long bytesRequired) {
+        this.bytesRequired = bytesRequired;
     }
 }

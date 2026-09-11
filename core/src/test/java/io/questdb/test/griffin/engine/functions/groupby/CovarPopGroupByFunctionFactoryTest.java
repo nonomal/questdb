@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -31,110 +31,132 @@ public class CovarPopGroupByFunctionFactoryTest extends AbstractCairoTest {
 
     @Test
     public void testCovarPopAllNull() throws Exception {
-        assertMemoryLeak(() -> assertSql(
-                "covar_pop\nnull\n", "select covar_pop(x, y) from (select cast(null as double) x, cast(null as double) y from long_sequence(100))"
-        ));
-    }
-
-    @Test
-    public void testCovarPopNoValues() throws Exception {
-        assertMemoryLeak(() -> {
-            ddl("create table tbl1(x int, y int)");
-            assertSql(
-                    "covar_pop\nnull\n", "select covar_pop(x, y) from tbl1"
-            );
-        });
+        assertMemoryLeak(() -> assertQuery("select covar_pop(x, y) from (select cast(null as double) x, cast(null as double) y from long_sequence(100))")
+                .noLeakCheck()
+                .noRandomAccess()
+                .expectSize()
+                .returns("covar_pop\nnull\n"));
     }
 
     @Test
     public void testCovarPopAllSameValues() throws Exception {
         assertMemoryLeak(() -> {
-            ddl("create table tbl1 as (select 17.2151921 x, 17.2151921 y from long_sequence(100))");
-            assertSql(
-                    "covar_pop\n0.0\n", "select covar_pop(x, y) from tbl1"
-            );
+            execute("create table tbl1 as (select 17.2151921 x, 17.2151921 y from long_sequence(100))");
+            assertQuery("select covar_pop(x, y) from tbl1")
+                    .noLeakCheck()
+                    .noRandomAccess()
+                    .expectSize()
+                    .returns("covar_pop\n0.0\n");
         });
     }
 
     @Test
     public void testCovarPopDoubleValues() throws Exception {
         assertMemoryLeak(() -> {
-            ddl("create table tbl1 as (select cast(x as double) x, cast(x as double) y from long_sequence(100))");
-            assertSql(
-                    "covar_pop\n833.25\n", "select covar_pop(x, y) from tbl1"
-            );
+            execute("create table tbl1 as (select cast(x as double) x, cast(x as double) y from long_sequence(100))");
+            assertQuery("select covar_pop(x, y) from tbl1")
+                    .noLeakCheck()
+                    .noRandomAccess()
+                    .expectSize()
+                    .returns("covar_pop\n833.25\n");
         });
     }
 
     @Test
     public void testCovarPopFirstNull() throws Exception {
         assertMemoryLeak(() -> {
-            ddl("create table tbl1(x double, y double)");
-            insert("insert into 'tbl1' VALUES (null, null)");
-            insert("insert into 'tbl1' select x, x as y from long_sequence(100)");
-            assertSql(
-                    "covar_pop\n833.25\n", "select covar_pop(x, y) from tbl1"
-            );
+            execute("create table tbl1(x double, y double)");
+            execute("insert into 'tbl1' VALUES (null, null)");
+            execute("insert into 'tbl1' select x, x as y from long_sequence(100)");
+            assertQuery("select covar_pop(x, y) from tbl1")
+                    .noLeakCheck()
+                    .noRandomAccess()
+                    .expectSize()
+                    .returns("covar_pop\n833.25\n");
         });
     }
 
     @Test
     public void testCovarPopFloatValues() throws Exception {
         assertMemoryLeak(() -> {
-            ddl("create table tbl1 as (select cast(x as float) x, cast(x as float) y from long_sequence(100))");
-            assertSql(
-                    "covar_pop\n833.25\n", "select covar_pop(x, y) from tbl1"
-            );
+            execute("create table tbl1 as (select cast(x as float) x, cast(x as float) y from long_sequence(100))");
+            assertQuery("select covar_pop(x, y) from tbl1")
+                    .noLeakCheck()
+                    .noRandomAccess()
+                    .expectSize()
+                    .returns("covar_pop\n833.25\n");
         });
     }
 
     @Test
     public void testCovarPopIntValues() throws Exception {
         assertMemoryLeak(() -> {
-            ddl("create table tbl1 as (select cast(x as int) x, cast(x as int) y from long_sequence(100))");
-            assertSql(
-                    "covar_pop\n833.25\n", "select covar_pop(x, y) from tbl1"
-            );
+            execute("create table tbl1 as (select cast(x as int) x, cast(x as int) y from long_sequence(100))");
+            assertQuery("select covar_pop(x, y) from tbl1")
+                    .noLeakCheck()
+                    .noRandomAccess()
+                    .expectSize()
+                    .returns("covar_pop\n833.25\n");
+        });
+    }
+
+    @Test
+    public void testCovarPopNoValues() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("create table tbl1(x int, y int)");
+            assertQuery("select covar_pop(x, y) from tbl1")
+                    .noLeakCheck()
+                    .noRandomAccess()
+                    .expectSize()
+                    .returns("covar_pop\nnull\n");
         });
     }
 
     @Test
     public void testCovarPopOneColumnAllNull() throws Exception {
-        assertMemoryLeak(() -> assertSql(
-                "covar_pop\nnull\n", "select covar_pop(x, y) from (select cast(null as double) x, x as y from long_sequence(100))"
-        ));
+        assertMemoryLeak(() -> assertQuery("select covar_pop(x, y) from (select cast(null as double) x, x as y from long_sequence(100))")
+                .noLeakCheck()
+                .noRandomAccess()
+                .expectSize()
+                .returns("covar_pop\nnull\n"));
     }
 
     @Test
     public void testCovarPopOneValue() throws Exception {
         assertMemoryLeak(() -> {
-            ddl("create table tbl1(x int, y int)");
-            insert("insert into 'tbl1' VALUES " +
+            execute("create table tbl1(x int, y int)");
+            execute("insert into 'tbl1' VALUES " +
                     "(17.2151920, 17.2151920)");
-            assertSql(
-                    "covar_pop\n0.0\n", "select covar_pop(x, y) from tbl1"
-            );
+            assertQuery("select covar_pop(x, y) from tbl1")
+                    .noLeakCheck()
+                    .noRandomAccess()
+                    .expectSize()
+                    .returns("covar_pop\n0.0\n");
         });
     }
 
     @Test
     public void testCovarPopOverflow() throws Exception {
         assertMemoryLeak(() -> {
-            ddl("create table tbl1 as (select 100000000 x, 100000000 y from long_sequence(1000000))");
-            assertSql(
-                    "covar_pop\n0.0\n", "select covar_pop(x, y) from tbl1"
-            );
+            execute("create table tbl1 as (select 100000000 x, 100000000 y from long_sequence(1000000))");
+            assertQuery("select covar_pop(x, y) from tbl1")
+                    .noLeakCheck()
+                    .noRandomAccess()
+                    .expectSize()
+                    .returns("covar_pop\n0.0\n");
         });
     }
 
     @Test
     public void testCovarPopSomeNull() throws Exception {
         assertMemoryLeak(() -> {
-            ddl("create table tbl1 as (select cast(x as double) x, cast(x as double) y from long_sequence(100))");
-            insert("insert into 'tbl1' VALUES (null, null)");
-            assertSql(
-                    "covar_pop\n833.25\n", "select covar_pop(x, y) from tbl1"
-            );
+            execute("create table tbl1 as (select cast(x as double) x, cast(x as double) y from long_sequence(100))");
+            execute("insert into 'tbl1' VALUES (null, null)");
+            assertQuery("select covar_pop(x, y) from tbl1")
+                    .noLeakCheck()
+                    .noRandomAccess()
+                    .expectSize()
+                    .returns("covar_pop\n833.25\n");
         });
     }
 }

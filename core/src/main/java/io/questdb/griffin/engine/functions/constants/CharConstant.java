@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,12 +24,11 @@
 
 package io.questdb.griffin.engine.functions.constants;
 
+import io.questdb.cairo.sql.Function;
 import io.questdb.cairo.sql.Record;
 import io.questdb.griffin.PlanSink;
 import io.questdb.griffin.engine.functions.CharFunction;
-import io.questdb.std.str.Utf16Sink;
 import io.questdb.std.str.Utf8Sequence;
-import io.questdb.std.str.Utf8Sink;
 import io.questdb.std.str.Utf8String;
 
 public class CharConstant extends CharFunction implements ConstantFunction {
@@ -52,13 +51,6 @@ public class CharConstant extends CharFunction implements ConstantFunction {
     }
 
     @Override
-    public void getVarchar(Record rec, Utf8Sink utf8Sink) {
-        if (value != 0) {
-            utf8Sink.put(utf8Value);
-        }
-    }
-
-    @Override
     public Utf8Sequence getVarcharA(Record rec) {
         return utf8Value;
     }
@@ -66,6 +58,17 @@ public class CharConstant extends CharFunction implements ConstantFunction {
     @Override
     public Utf8Sequence getVarcharB(Record rec) {
         return utf8Value;
+    }
+
+    @Override
+    public boolean isEquivalentTo(Function obj) {
+        if (this == obj) {
+            return true;
+        }
+        if (obj instanceof CharConstant that) {
+            return this.value == that.value;
+        }
+        return false;
     }
 
     @Override

@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -25,19 +25,38 @@
 package io.questdb.griffin.engine.groupby.vect;
 
 import io.questdb.MessageBus;
+import io.questdb.cairo.sql.async.QueryParallelFiberDispatcher;
+import io.questdb.log.Log;
+import io.questdb.log.LogFactory;
 import io.questdb.mp.AbstractQueueConsumerJob;
 import io.questdb.tasks.VectorAggregateTask;
+import org.jetbrains.annotations.NotNull;
 
 public class GroupByVectorAggregateJob extends AbstractQueueConsumerJob<VectorAggregateTask> {
+    private final static Log LOG = LogFactory.getLog(GroupByVectorAggregateJob.class);
+    private final MessageBus messageBus;
 
     public GroupByVectorAggregateJob(MessageBus messageBus) {
         super(messageBus.getVectorAggregateQueue(), messageBus.getVectorAggregateSubSeq());
+        this.messageBus = messageBus;
     }
 
     @Override
-    protected boolean doRun(int workerId, long cursor, RunStatus runStatus) {
+    public boolean run(@NotNull WorkerContext workerContext) {
+        final QueryParallelFiberDispatcher dispatcher = messageBus.getQueryParallelFiberDispatcher();
+        return dispatcher != null
+                ? !dispatcher.consumeVectorAggregate(workerContext.carrierId())
+                : super.run(workerContext);
+    }
+
+    @Override
+    protected boolean doRun(long cursor, WorkerContext workerContext) {
         final VectorAggregateEntry entry = queue.get(cursor).entry;
-        entry.run(workerId, subSeq, cursor);
+        try {
+            entry.run(workerContext.carrierId(), subSeq, cursor);
+        } catch (Throwable th) {
+            LOG.error().$("vectorized reduce error [ex=").$(th).I$();
+        }
         return true;
     }
 }

@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,7 +24,15 @@
 
 package io.questdb.griffin.engine.table;
 
-import io.questdb.cairo.*;
+import io.questdb.cairo.AbstractRecordCursorFactory;
+import io.questdb.cairo.CairoEngine;
+import io.questdb.cairo.CairoException;
+import io.questdb.cairo.ColumnType;
+import io.questdb.cairo.GenericRecordMetadata;
+import io.questdb.cairo.TableColumnMetadata;
+import io.questdb.cairo.TableReader;
+import io.questdb.cairo.TableToken;
+import io.questdb.cairo.TableUtils;
 import io.questdb.cairo.pool.AbstractMultiTenantPool;
 import io.questdb.cairo.pool.ReaderPool;
 import io.questdb.cairo.sql.NoRandomAccessRecordCursor;
@@ -39,11 +47,11 @@ import java.util.Iterator;
 import java.util.Map;
 
 public final class ReaderPoolRecordCursorFactory extends AbstractRecordCursorFactory {
+    private static final int CURRENT_TXN_COLUMN_INDEX = 3;
+    private static final int LAST_ACCESS_TIMESTAMP_COLUMN_INDEX = 2;
     private static final RecordMetadata METADATA;
     private static final int OWNER_THREAD_COLUMN_INDEX = 1;
     private static final int TABLE_NAME_COLUMN_INDEX = 0;
-    private static final int LAST_ACCESS_TIMESTAMP_COLUMN_INDEX = 2;
-    private static final int CURRENT_TXN_COLUMN_INDEX = 3;
     private final CairoEngine cairoEngine;
 
     public ReaderPoolRecordCursorFactory(CairoEngine cairoEngine) {
@@ -53,8 +61,9 @@ public final class ReaderPoolRecordCursorFactory extends AbstractRecordCursorFac
 
     @Override
     public RecordCursor getCursor(SqlExecutionContext executionContext) {
+        executionContext.getCircuitBreaker().statefulThrowExceptionIfTrippedTimeThrottled();
         ReaderPoolCursor readerPoolCursor = new ReaderPoolCursor();
-        readerPoolCursor.of(cairoEngine.getReaderPoolEntries());
+        readerPoolCursor.of(cairoEngine.getReaderPoolEntries(), cairoEngine.getConfiguration().getPoolSegmentSize());
         return readerPoolCursor;
     }
 
@@ -71,13 +80,14 @@ public final class ReaderPoolRecordCursorFactory extends AbstractRecordCursorFac
     private static class ReaderPoolCursor implements NoRandomAccessRecordCursor {
         private final ReaderPoolEntryRecord record = new ReaderPoolEntryRecord();
         private int allocationIndex = 0;
+        private long currentTxn;
         private Iterator<Map.Entry<CharSequence, AbstractMultiTenantPool.Entry<ReaderPool.R>>> iterator;
+        private long lastAccessTimestamp;
         private long owner_thread;
         private AbstractMultiTenantPool.Entry<ReaderPool.R> poolEntry;
+        private int poolSegmentSize;
         private Map<CharSequence, AbstractMultiTenantPool.Entry<ReaderPool.R>> readerPoolEntries;
         private TableToken tableToken;
-        private long lastAccessTimestamp;
-        private long currentTxn;
 
         @Override
         public void close() {
@@ -111,9 +121,15 @@ public final class ReaderPoolRecordCursorFactory extends AbstractRecordCursorFac
             return true;
         }
 
-        public void of(Map<CharSequence, AbstractMultiTenantPool.Entry<ReaderPool.R>> readerPoolEntries) {
+        public void of(Map<CharSequence, AbstractMultiTenantPool.Entry<ReaderPool.R>> readerPoolEntries, int poolSegmentSize) {
             this.readerPoolEntries = readerPoolEntries;
+            this.poolSegmentSize = poolSegmentSize;
             toTop();
+        }
+
+        @Override
+        public long preComputedStateSize() {
+            return 0;
         }
 
         @Override
@@ -140,7 +156,7 @@ public final class ReaderPoolRecordCursorFactory extends AbstractRecordCursorFac
                     Map.Entry<CharSequence, AbstractMultiTenantPool.Entry<ReaderPool.R>> mapEntry = iterator.next();
                     poolEntry = mapEntry.getValue();
                     return true;
-                } else if (allocationIndex == ReaderPool.ENTRY_SIZE) {
+                } else if (allocationIndex == poolSegmentSize) {
                     // we exhausted all slots in the current Entry
                     // let's see if there is another Entry chained
                     poolEntry = poolEntry.getNext();
@@ -177,6 +193,11 @@ public final class ReaderPoolRecordCursorFactory extends AbstractRecordCursorFac
             }
 
             @Override
+            public int getStrLen(int col) {
+                return TableUtils.lengthOf(getStrA(col));
+            }
+
+            @Override
             public long getTimestamp(int col) {
                 assert col == LAST_ACCESS_TIMESTAMP_COLUMN_INDEX;
                 return lastAccessTimestamp;
@@ -188,7 +209,7 @@ public final class ReaderPoolRecordCursorFactory extends AbstractRecordCursorFac
         final GenericRecordMetadata metadata = new GenericRecordMetadata();
         metadata.add(TABLE_NAME_COLUMN_INDEX, new TableColumnMetadata("table_name", ColumnType.STRING))
                 .add(OWNER_THREAD_COLUMN_INDEX, new TableColumnMetadata("owner_thread_id", ColumnType.LONG))
-                .add(LAST_ACCESS_TIMESTAMP_COLUMN_INDEX, new TableColumnMetadata("last_access_timestamp", ColumnType.TIMESTAMP))
+                .add(LAST_ACCESS_TIMESTAMP_COLUMN_INDEX, new TableColumnMetadata("last_access_timestamp", ColumnType.TIMESTAMP_MICRO))
                 .add(CURRENT_TXN_COLUMN_INDEX, new TableColumnMetadata("current_txn", ColumnType.LONG));
         METADATA = metadata;
     }

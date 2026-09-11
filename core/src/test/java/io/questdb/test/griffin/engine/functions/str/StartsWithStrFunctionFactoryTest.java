@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -25,8 +25,8 @@
 package io.questdb.test.griffin.engine.functions.str;
 
 import io.questdb.griffin.FunctionFactory;
-import io.questdb.test.griffin.engine.AbstractFunctionFactoryTest;
 import io.questdb.griffin.engine.functions.str.StartsWithStrFunctionFactory;
+import io.questdb.test.griffin.engine.AbstractFunctionFactoryTest;
 import org.junit.Test;
 
 public class StartsWithStrFunctionFactoryTest extends AbstractFunctionFactoryTest {
@@ -42,22 +42,22 @@ public class StartsWithStrFunctionFactoryTest extends AbstractFunctionFactoryTes
 
     @Test
     public void testStartsWith() throws Exception {
-        assertQuery("col\ntrue\n", "select starts_with('ABCDEFGH', 'ABC') col");
-        assertQuery("col\nfalse\n", "select starts_with('ABCDEFGH', 'XYZ') col");
-        assertQuery("col\nfalse\n", "select starts_with('ABCDEFGH', 'ABCDEFGHIJK') col");
-        assertQuery("col\ntrue\n", "select starts_with('cAsEsEnsItIvE', 'cAsE') col");
-        assertQuery("col\nfalse\n", "select starts_with('smallcase', 'SMALL') col");
-        assertQuery("col\nfalse\n", "select starts_with('smallcase', 'smaLL') col");
+        assertQuery("select starts_with('ABCDEFGH', 'ABC') col").expectSize().returns("col\ntrue\n");
+        assertQuery("select starts_with('ABCDEFGH', 'XYZ') col").expectSize().returns("col\nfalse\n");
+        assertQuery("select starts_with('ABCDEFGH', 'ABCDEFGHIJK') col").expectSize().returns("col\nfalse\n");
+        assertQuery("select starts_with('cAsEsEnsItIvE', 'cAsE') col").expectSize().returns("col\ntrue\n");
+        assertQuery("select starts_with('smallcase', 'SMALL') col").expectSize().returns("col\nfalse\n");
+        assertQuery("select starts_with('smallcase', 'smaLL') col").expectSize().returns("col\nfalse\n");
     }
 
     @Test
     public void testStartsWithNonASCII() throws Exception {
-        assertQuery("col\ntrue\n", "select starts_with('hőmérséklet','hőmé') col");
+        assertQuery("select starts_with('hőmérséklet','hőmé') col").expectSize().returns("col\ntrue\n");
     }
 
     @Test
     public void testStartsWithSpecialCharacters() throws Exception {
-        assertQuery("col\ntrue\n", "select starts_with('~!@#$%^&*()_-:<>?,./', '~!@#') col");
+        assertQuery("select starts_with('~!@#$%^&*()_-:<>?,./', '~!@#') col").expectSize().returns("col\ntrue\n");
     }
 
     @Override

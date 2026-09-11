@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,6 +24,7 @@
 
 package io.questdb.test.griffin.engine.functions.activity;
 
+import io.questdb.PropertyKey;
 import io.questdb.cairo.CairoEngine;
 import io.questdb.cairo.CairoException;
 import io.questdb.cairo.security.AllowAllSecurityContext;
@@ -31,12 +32,10 @@ import io.questdb.cairo.security.ReadOnlySecurityContext;
 import io.questdb.cairo.sql.AtomicBooleanCircuitBreaker;
 import io.questdb.cairo.sql.RecordCursor;
 import io.questdb.cairo.sql.RecordCursorFactory;
-import io.questdb.griffin.CompiledQuery;
 import io.questdb.griffin.SqlCompiler;
-import io.questdb.griffin.SqlExecutionContext;
+import io.questdb.griffin.SqlException;
 import io.questdb.griffin.SqlExecutionContextImpl;
 import io.questdb.mp.SOCountDownLatch;
-import io.questdb.std.FlyweightMessageContainer;
 import io.questdb.std.Os;
 import io.questdb.test.AbstractCairoTest;
 import io.questdb.test.tools.TestUtils;
@@ -55,17 +54,19 @@ public class CancelQueryFunctionFactoryTest extends AbstractCairoTest {
     public void setUp() {
         super.setUp();
 
+        node1.setProperty(PropertyKey.DEV_MODE_ENABLED, true);
+
         readOnlyUserContext = new SqlExecutionContextImpl(engine, 1).with(new ReadOnlyUserContext());
-        readOnlyUserContext.with(new AtomicBooleanCircuitBreaker());
+        readOnlyUserContext.with(new AtomicBooleanCircuitBreaker(engine));
 
         regularUserContext = new SqlExecutionContextImpl(engine, 1).with(new RegularUserContext());
-        regularUserContext.with(new AtomicBooleanCircuitBreaker());
+        regularUserContext.with(new AtomicBooleanCircuitBreaker(engine));
 
         adminUserContext1 = new SqlExecutionContextImpl(engine, 1).with(new AdminContext());
-        adminUserContext1.with(new AtomicBooleanCircuitBreaker());
+        adminUserContext1.with(new AtomicBooleanCircuitBreaker(engine));
 
         adminUserContext2 = new SqlExecutionContextImpl(engine, 1).with(new AdminContext());
-        adminUserContext2.with(new AtomicBooleanCircuitBreaker());
+        adminUserContext2.with(new AtomicBooleanCircuitBreaker(engine));
     }
 
     @Test
@@ -94,15 +95,16 @@ public class CancelQueryFunctionFactoryTest extends AbstractCairoTest {
                     started.countDown();
                     try {
                         SqlExecutionContextImpl context = new SqlExecutionContextImpl(engine, 1).with(new ReadOnlyUserContext());
-                        context.with(new AtomicBooleanCircuitBreaker());
+                        context.with(new AtomicBooleanCircuitBreaker(engine));
 
-                        try (SqlCompiler compiler = engine.getSqlCompiler()) {
-                            TestUtils.assertSql(compiler, context, query, sink, "t\n1\n");
-                            Assert.fail("Query should have been cancelled");
-                        } catch (Exception e) {
-                            if (!e.getMessage().contains("cancelled by user")) {
-                                error.set(e);
-                            }
+                        assertQuery(query)
+                                .withContext(context)
+                                .noLeakCheck()
+                                .returnsOnce("t\n1\n");
+                        Assert.fail("Query should have been cancelled");
+                    } catch (Exception e) {
+                        if (!e.getMessage().contains("cancelled by user")) {
+                            error.set(e);
                         }
                     } finally {
                         stopped.countDown();
@@ -126,12 +128,13 @@ public class CancelQueryFunctionFactoryTest extends AbstractCairoTest {
             }
 
             try {
-                assertSql(
-                        "query\twas_cancelled\n" +
-                                "select 1 t from long_sequence(1) where sleep(120000)\ttrue\n" +
-                                "select 1 t from long_sequence(1) where sleep(120000)\ttrue\n",
-                        "select query, cancel_query(query_id) was_cancelled from query_activity() where query = '" + query + "'"
-                );
+                assertQuery("select query, cancel_query(query_id) was_cancelled from query_activity() where query = '" + query + "'")
+                        .noLeakCheck()
+                        .returnsOnce("""
+                                query\twas_cancelled
+                                select 1 t from long_sequence(1) where sleep(120000)\ttrue
+                                select 1 t from long_sequence(1) where sleep(120000)\ttrue
+                                """);
             } finally {
                 stopped.await();
             }
@@ -144,17 +147,25 @@ public class CancelQueryFunctionFactoryTest extends AbstractCairoTest {
     @Test
     public void testQueryIdToCancelMustBeNonNegativeInteger() throws Exception {
         assertMemoryLeak(() -> {
-            assertExceptionNoLeakCheck("select cancel_query()", 7, "unexpected argument for function: cancel_query");
-            assertExceptionNoLeakCheck("select cancel_query(null)", 20, "non-negative integer literal expected as query id");
-            assertExceptionNoLeakCheck("select cancel_query(-1)", 20, "non-negative integer literal expected as query id");
-            assertExceptionNoLeakCheck("select cancel_query(12.01f)", 7, "unexpected argument for function: cancel_query. expected args: (LONG). actual args: (FLOAT constant)");
+            assertQuery("select cancel_query()")
+                    .noLeakCheck()
+                    .fails(7, "function `cancel_query` requires arguments: cancel_query(LONG)");
+            assertQuery("select cancel_query(null)")
+                    .noLeakCheck()
+                    .fails(20, "non-negative integer literal expected as query id");
+            assertQuery("select cancel_query(-1)")
+                    .noLeakCheck()
+                    .fails(20, "non-negative integer literal expected as query id");
+            assertQuery("select cancel_query(12.01f)")
+                    .noLeakCheck()
+                    .fails(20, "argument type mismatch for function `cancel_query` at #1 expected: LONG, actual: FLOAT");
         });
     }
 
     @Test
     public void testRegularUserCanNotCancelOtherUsersCommands() throws Exception {
         assertMemoryLeak(() -> {
-            final String query = "select 1 t from long_sequence(1) where sleep(120000)";
+            final String query = "select 1 t from long_sequence(1) where sleep(5000)";
 
             SOCountDownLatch started = new SOCountDownLatch(1);
             SOCountDownLatch stopped = new SOCountDownLatch(1);
@@ -163,13 +174,14 @@ public class CancelQueryFunctionFactoryTest extends AbstractCairoTest {
             new Thread(() -> {
                 started.countDown();
                 try {
-                    try (SqlCompiler compiler = engine.getSqlCompiler()) {
-                        TestUtils.assertSql(compiler, adminUserContext1, query, sink, "t\n1\n");
-                        Assert.fail("Query should have been cancelled");
-                    } catch (Exception e) {
-                        if (!e.getMessage().contains("cancelled by user")) {
-                            error.set(e);
-                        }
+                    assertQuery(query)
+                            .withContext(adminUserContext1)
+                            .noLeakCheck()
+                            .returnsOnce("t\n1\n");
+                    Assert.fail("Query should have been cancelled");
+                } catch (Exception e) {
+                    if (!e.getMessage().contains("cancelled by user")) {
+                        error.set(e);
                     }
                 } finally {
                     stopped.countDown();
@@ -197,12 +209,18 @@ public class CancelQueryFunctionFactoryTest extends AbstractCairoTest {
                     }
 
                     // readonly user can't cancel any commands
-                    assertExceptionNoLeakCheck0("select cancel_query(" + queryId + ")", 7, "Write permission denied", readOnlyUserContext);
+                    assertQuery("select cancel_query(" + queryId + ")")
+                            .withContext(readOnlyUserContext)
+                            .noLeakCheck()
+                            .fails(7, "Query cancellation is disabled");
 
                     // regular user can't cancel other user's commands
-                    assertExceptionNoLeakCheck0("select cancel_query(" + queryId + ")", 7, "Access denied for bob [built-in admin user required]", regularUserContext);
+                    assertQuery("select cancel_query(" + queryId + ")")
+                            .withContext(regularUserContext)
+                            .noLeakCheck()
+                            .fails(7, "Access denied for bob [SQL ENGINE ADMIN]");
 
-                    ddl("cancel query " + queryId, adminUserContext2);
+                    execute("cancel query " + queryId, adminUserContext2);
                 }
 
             } finally {
@@ -215,43 +233,31 @@ public class CancelQueryFunctionFactoryTest extends AbstractCairoTest {
         });
     }
 
-    private static void assertExceptionNoLeakCheck0(CharSequence sql, int errorPos, CharSequence contains, SqlExecutionContext sqlExecutionContext) throws Exception {
-        try {
+    @Test
+    public void testValidateCancelQueryDoesNotCancel() throws Exception {
+        assertMemoryLeak(() -> {
+            final SqlExecutionContextImpl ctx = (SqlExecutionContextImpl) sqlExecutionContext;
+
+            // Validation compiles CANCEL QUERY but skips the registry lookup, so it succeeds
+            // even for an id that is not registered - no "query to cancel not found" error.
+            ctx.setValidationOnly(true);
             try (SqlCompiler compiler = engine.getSqlCompiler()) {
-                compiler.setFullFatJoins(false);
-                CompiledQuery cq = compiler.compile(sql, sqlExecutionContext);
-                try (
-                        RecordCursorFactory factory = cq.getRecordCursorFactory();
-                        RecordCursor cursor = factory.getCursor(sqlExecutionContext)
-                ) {
-                    cursor.hasNext();
-                    cursor.getRecord().getBool(0);
-                }
+                compiler.compile("cancel query 123456789", ctx);
+            } finally {
+                ctx.setValidationOnly(false);
             }
-            Assert.fail();
-        } catch (Throwable e) {
-            if (e instanceof FlyweightMessageContainer) {
-                TestUtils.assertContains(((FlyweightMessageContainer) e).getFlyweightMessage(), contains);
-                if (errorPos > -1) {
-                    Assert.assertEquals(errorPos, ((FlyweightMessageContainer) e).getPosition());
-                }
-            } else {
-                throw e;
+
+            // Real execution performs the lookup and fails because the id is not registered.
+            try (SqlCompiler compiler = engine.getSqlCompiler()) {
+                compiler.compile("cancel query 123456789", ctx);
+                Assert.fail("expected query-not-found error");
+            } catch (SqlException e) {
+                TestUtils.assertContains(e.getFlyweightMessage(), "query to cancel not found in registry");
             }
-        }
+        });
     }
 
     private static class AdminContext extends AllowAllSecurityContext {
-        @Override
-        public void authorizeAdminAction() {
-            // do nothing
-        }
-
-        @Override
-        public void authorizeCancelQuery() {
-            // do nothing
-        }
-
         @Override
         public String getPrincipal() {
             return "admin";
@@ -260,11 +266,6 @@ public class CancelQueryFunctionFactoryTest extends AbstractCairoTest {
 
     private static class ReadOnlyUserContext extends ReadOnlySecurityContext {
         @Override
-        public void authorizeAdminAction() {
-            throw CairoException.authorization().put("Access denied for ").put(getPrincipal()).put(" [built-in admin user required]");
-        }
-
-        @Override
         public String getPrincipal() {
             return "bob";
         }
@@ -272,8 +273,8 @@ public class CancelQueryFunctionFactoryTest extends AbstractCairoTest {
 
     private static class RegularUserContext extends AllowAllSecurityContext {
         @Override
-        public void authorizeAdminAction() {
-            throw CairoException.authorization().put("Access denied for ").put(getPrincipal()).put(" [built-in admin user required]");
+        public void authorizeSqlEngineAdmin() {
+            throw CairoException.authorization().put("Access denied for ").put(getPrincipal()).put(" [SQL ENGINE ADMIN]");
         }
 
         @Override

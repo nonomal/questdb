@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,16 +24,16 @@
 
 package io.questdb.griffin.engine.table;
 
-import io.questdb.cairo.BitmapIndexReader;
 import io.questdb.cairo.TableUtils;
-import io.questdb.cairo.sql.DataFrame;
+import io.questdb.cairo.idx.IndexReader;
 import io.questdb.cairo.sql.Function;
+import io.questdb.cairo.sql.PageFrame;
+import io.questdb.cairo.sql.PageFrameMemory;
 import io.questdb.cairo.sql.RowCursor;
 import io.questdb.cairo.sql.SymbolTable;
 import io.questdb.griffin.PlanSink;
 
 public class SymbolIndexRowCursorFactory implements SymbolFunctionRowCursorFactory {
-    private final boolean cachedIndexReaderCursor;
     private final int columnIndex;
     private final int indexDirection;
     private final Function symbolFunction;
@@ -42,22 +42,20 @@ public class SymbolIndexRowCursorFactory implements SymbolFunctionRowCursorFacto
     public SymbolIndexRowCursorFactory(
             int columnIndex,
             int symbolKey,
-            boolean cachedIndexReaderCursor,
             int indexDirection,
             Function symbolFunction
     ) {
         this.columnIndex = columnIndex;
         this.symbolKey = TableUtils.toIndexKey(symbolKey);
-        this.cachedIndexReaderCursor = cachedIndexReaderCursor;
         this.indexDirection = indexDirection;
         this.symbolFunction = symbolFunction;
     }
 
     @Override
-    public RowCursor getCursor(DataFrame dataFrame) {
-        return dataFrame
-                .getBitmapIndexReader(columnIndex, indexDirection)
-                .getCursor(cachedIndexReaderCursor, symbolKey, dataFrame.getRowLo(), dataFrame.getRowHi() - 1);
+    public RowCursor getCursor(PageFrame pageFrame, PageFrameMemory pageFrameMemory) {
+        return pageFrame
+                .getIndexReader(columnIndex, indexDirection)
+                .getCursor(symbolKey, pageFrame.getPartitionLo(), pageFrame.getPartitionHi() - 1);
     }
 
     @Override
@@ -74,6 +72,14 @@ public class SymbolIndexRowCursorFactory implements SymbolFunctionRowCursorFacto
         return false;
     }
 
+    // Stable within the execution iff the looked-up symbol key is: a null key function means the
+    // key was resolved to a compile-time constant (fully stable); otherwise a bind variable re-reads
+    // the same frozen snapshot (stable) while an rnd_* key is not.
+    @Override
+    public boolean isStableWithinExecution() {
+        return symbolFunction == null || symbolFunction.isStableWithinExecution();
+    }
+
     @Override
     public boolean isUsingIndex() {
         return true;
@@ -86,7 +92,7 @@ public class SymbolIndexRowCursorFactory implements SymbolFunctionRowCursorFacto
 
     @Override
     public void toPlan(PlanSink sink) {
-        sink.type("Index ").type(BitmapIndexReader.nameOf(indexDirection)).type(" scan").meta("on").putBaseColumnName(columnIndex);
+        sink.type("Index ").type(IndexReader.nameOf(indexDirection)).type(" scan").meta("on").putBaseColumnName(columnIndex);
         sink.attr("filter").putBaseColumnName(columnIndex).val('=').val(symbolKey);
     }
 }

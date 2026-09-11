@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -40,6 +40,8 @@ public class HttpMultipartContentParser implements Closeable, Mutable {
 
     private static final int BODY = 6;
     private static final int BODY_BROKEN = 8;
+    private static final int BODY_REPLAY_BOUNDARY_AFTER_CR = 14;
+    private static final int BODY_REPLAY_BOUNDARY_AFTER_DASH = 15;
     private static final int BOUNDARY_INCOMPLETE = 3;
     private static final int BOUNDARY_MATCH = 1;
     private static final int BOUNDARY_NO_MATCH = 2;
@@ -49,17 +51,18 @@ public class HttpMultipartContentParser implements Closeable, Mutable {
     private static final int PARTIAL_START_BOUNDARY = 3;
     private static final int POTENTIAL_BOUNDARY = 9;
     private static final int PRE_HEADERS = 10;
-    private static final int START_BOUNDARY = 2;
+    private static final int PRE_HEADERS_AFTER_CR = 16;
+    private static final int PRE_HEADERS_AFTER_DASH = 17;
     private static final int START_HEADERS = 12;
     private static final int START_PARSING = 1;
     private static final int START_PRE_HEADERS = 11;
+    private static final int START_PRE_HEADERS_AFTER_DASH = 18;
     private final HttpHeaderParser headerParser;
     private DirectUtf8Sequence boundary;
     private byte boundaryByte;
     private int boundaryLen;
     private int boundaryPtr;
     private int consumedBoundaryLen;
-    private boolean firstDashRead;
     private long resumePtr;
     private int state;
 
@@ -75,7 +78,6 @@ public class HttpMultipartContentParser implements Closeable, Mutable {
         this.boundaryByte = 0;
         this.boundary = null;
         this.consumedBoundaryLen = 0;
-        this.firstDashRead = false;
         this.headerParser.clear();
     }
 
@@ -103,7 +105,7 @@ public class HttpMultipartContentParser implements Closeable, Mutable {
     public boolean parse(
             long lo,
             long hi,
-            HttpMultipartContentListener listener
+            HttpMultipartContentProcessor processor
     ) throws PeerDisconnectedException, PeerIsSlowToReadException, ServerDisconnectException {
         long _lo = lo;
         long ptr = lo;
@@ -113,10 +115,13 @@ public class HttpMultipartContentParser implements Closeable, Mutable {
                     _lo = ptr;
                     state = BODY;
                     break;
+                case BODY_REPLAY_BOUNDARY_AFTER_CR:
+                    ptr = onChunkWithRetryHandle(processor, boundary.lo(), boundary.lo() + 1, BODY_BROKEN, ptr, false);
+                    break;
+                case BODY_REPLAY_BOUNDARY_AFTER_DASH:
+                    ptr = onChunkWithRetryHandle(processor, boundary.lo() + 2, boundary.lo() + 3, BODY_BROKEN, ptr, false);
+                    break;
                 case START_PARSING:
-                    state = START_BOUNDARY;
-                    // fall through
-                case START_BOUNDARY:
                     boundaryPtr = 2;
                     // fall through
                 case PARTIAL_START_BOUNDARY:
@@ -133,47 +138,67 @@ public class HttpMultipartContentParser implements Closeable, Mutable {
                     }
                     break;
                 case PRE_HEADERS:
-                    switch (Unsafe.getUnsafe().getByte(ptr)) {
+                    byte preHeaderByte = Unsafe.getByte(ptr);
+                    switch (preHeaderByte) {
                         case '\n':
                             state = HEADERS;
-                            // fall through
+                            ptr++;
+                            break;
                         case '\r':
+                            state = PRE_HEADERS_AFTER_CR;
                             ptr++;
                             break;
                         case '-':
-                            // make sure that we set the status to DONE only after we read the second '-'
-                            if (!firstDashRead) {
-                                firstDashRead = true;
-                                // on the first '-' we just need to read the next byte
-                                ptr++;
-                                break;
-                            }
-                            listener.onPartEnd();
-                            state = DONE;
-                            return true;
+                            state = PRE_HEADERS_AFTER_DASH;
+                            ptr++;
+                            break;
                         default:
-                            listener.onChunk(boundary.lo(), boundary.hi());
-                            _lo = ptr;
-                            state = BODY;
+                            ptr = onChunkWithRetryHandle(processor, boundary.lo(), boundary.hi(), BODY_BROKEN, ptr, false);
                             break;
                     }
                     break;
+                case PRE_HEADERS_AFTER_CR:
+                    if (Unsafe.getByte(ptr) == '\n') {
+                        state = HEADERS;
+                        ptr++;
+                    } else {
+                        ptr = onChunkWithRetryHandle(processor, boundary.lo(), boundary.hi(), BODY_REPLAY_BOUNDARY_AFTER_CR, ptr, false);
+                    }
+                    break;
+                case PRE_HEADERS_AFTER_DASH:
+                    if (Unsafe.getByte(ptr) == '-') {
+                        processor.onPartEnd();
+                        state = DONE;
+                        return true;
+                    }
+                    ptr = onChunkWithRetryHandle(processor, boundary.lo(), boundary.hi(), BODY_REPLAY_BOUNDARY_AFTER_DASH, ptr, false);
+                    break;
                 case START_PRE_HEADERS:
-                    switch (Unsafe.getUnsafe().getByte(ptr)) {
+                    byte startPreHeaderByte = Unsafe.getByte(ptr);
+                    switch (startPreHeaderByte) {
                         case '\n':
                             state = START_HEADERS;
-                            // fall through
+                            ptr++;
+                            break;
                         case '\r':
                             ptr++;
                             break;
                         case '-':
-                            return true;
+                            state = START_PRE_HEADERS_AFTER_DASH;
+                            ptr++;
+                            break;
                         default:
                             throw HttpException.instance("Malformed start boundary");
                     }
                     break;
+                case START_PRE_HEADERS_AFTER_DASH:
+                    if (Unsafe.getByte(ptr) == '-') {
+                        state = DONE;
+                        return true;
+                    }
+                    throw HttpException.instance("Malformed start boundary");
                 case HEADERS:
-                    listener.onPartEnd();
+                    processor.onPartEnd();
                     state = HEADERS;
                     // fall through
                 case START_HEADERS:
@@ -187,19 +212,19 @@ public class HttpMultipartContentParser implements Closeable, Mutable {
                         return false;
                     }
                     _lo = ptr;
-                    listener.onPartBegin(headerParser);
+                    processor.onPartBegin(headerParser);
                     state = BODY;
                     break;
                 case BODY:
-                    byte b = Unsafe.getUnsafe().getByte(ptr++);
+                    byte b = Unsafe.getByte(ptr++);
                     if (b == boundaryByte) {
                         boundaryPtr = 1;
                         switch (matchBoundary(ptr, hi)) {
                             case BOUNDARY_INCOMPLETE:
-                                onChunkWithRetryHandle(listener, _lo, ptr - 1, POTENTIAL_BOUNDARY, hi, true);
+                                onChunkWithRetryHandle(processor, _lo, ptr - 1, POTENTIAL_BOUNDARY, hi, true);
                                 return false;
                             case BOUNDARY_MATCH:
-                                ptr = onChunkWithRetryHandle(listener, _lo, ptr - 1, PRE_HEADERS, ptr + consumedBoundaryLen, false);
+                                ptr = onChunkWithRetryHandle(processor, _lo, ptr - 1, PRE_HEADERS, ptr + consumedBoundaryLen, false);
                                 break;
                             default:
                                 break;
@@ -217,7 +242,7 @@ public class HttpMultipartContentParser implements Closeable, Mutable {
                             break;
                         default:
                             // can only be BOUNDARY_NO_MATCH:
-                            onChunkWithRetryHandle(listener, boundary.lo(), boundary.lo() + p, BODY_BROKEN, ptr, true);
+                            onChunkWithRetryHandle(processor, boundary.lo(), boundary.lo() + p, BODY_BROKEN, ptr, false);
                             break;
                     }
                     break;
@@ -228,7 +253,7 @@ public class HttpMultipartContentParser implements Closeable, Mutable {
         }
 
         if (state == BODY) {
-            onChunkWithRetryHandle(listener, _lo, ptr, BODY_BROKEN, ptr, true);
+            onChunkWithRetryHandle(processor, _lo, ptr, BODY_BROKEN, ptr, true);
         }
 
         return false;
@@ -239,7 +264,7 @@ public class HttpMultipartContentParser implements Closeable, Mutable {
         int ptr = boundaryPtr;
 
         while (lo < hi && ptr < boundaryLen) {
-            if (Unsafe.getUnsafe().getByte(lo++) != boundary.byteAt(ptr++)) {
+            if (Unsafe.getByte(lo++) != boundary.byteAt(ptr++)) {
                 return BOUNDARY_NO_MATCH;
             }
         }
@@ -255,7 +280,7 @@ public class HttpMultipartContentParser implements Closeable, Mutable {
     }
 
     private long onChunkWithRetryHandle(
-            HttpMultipartContentListener listener,
+            HttpMultipartContentProcessor processor,
             long lo,
             long hi,
             int state,
@@ -264,7 +289,7 @@ public class HttpMultipartContentParser implements Closeable, Mutable {
     ) throws PeerIsSlowToReadException, PeerDisconnectedException, ServerDisconnectException {
         RetryOperationException needsRetry = null;
         try {
-            listener.onChunk(lo, hi);
+            processor.onChunk(lo, hi);
         } catch (RetryOperationException e) {
             // Request re-try.
             needsRetry = e;

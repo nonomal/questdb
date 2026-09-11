@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -32,7 +32,7 @@ import org.jetbrains.annotations.Nullable;
  * to accumulate messages, so they require extra calls to convert encrypted data to raw data.
  * <p>
  * {@link #close()} implementations must be idempotent. Also, supports object reuse after
- * {@link #close()}: see {@link #of(int)}.
+ * {@link #close()}: see {@link #of(long)}.
  */
 public interface Socket extends QuietCloseable {
     int HAS_MORE_PLAINTEXT_FLAG = 1 << 2;
@@ -42,7 +42,7 @@ public interface Socket extends QuietCloseable {
     /**
      * @return file descriptor associated with the socket.
      */
-    int getFd();
+    long getFd();
 
     boolean isClosed();
 
@@ -67,7 +67,7 @@ public interface Socket extends QuietCloseable {
      *
      * @param fd file descriptor
      */
-    void of(int fd);
+    void of(long fd);
 
     /**
      * Receives plain data into the given buffer from the socket. On encrypted
@@ -110,9 +110,9 @@ public interface Socket extends QuietCloseable {
      * on server connections.
      *
      * @param peerName server name to use for SNI and certificate validation.
-     * @return 0 if the call is successful; -1 if there was an error.
+     * @throws TlsSessionInitFailedException if the call fails.
      */
-    int startTlsSession(@Nullable CharSequence peerName);
+    void startTlsSession(@Nullable CharSequence peerName) throws TlsSessionInitFailedException;
 
     /**
      * @return true if the socket support TLS encryption; false otherwise.

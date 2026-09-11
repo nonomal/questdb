@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -25,22 +25,29 @@
 package io.questdb.test.cutlass.pgwire;
 
 import io.questdb.PropertyKey;
+import io.questdb.cairo.CursorPrinter;
 import io.questdb.cairo.EntryUnavailableException;
 import io.questdb.cairo.TableReader;
 import io.questdb.cairo.TableWriter;
 import io.questdb.cairo.sql.Record;
-import io.questdb.cairo.sql.RecordCursor;
 import io.questdb.cairo.sql.RecordMetadata;
-import io.questdb.cutlass.pgwire.PGWireServer;
+import io.questdb.cutlass.pgwire.PGServer;
 import io.questdb.griffin.SqlException;
 import io.questdb.mp.WorkerPool;
-import io.questdb.std.ThreadLocal;
-import io.questdb.std.*;
+import io.questdb.std.Chars;
+import io.questdb.std.IntObjHashMap;
+import io.questdb.std.ObjList;
+import io.questdb.std.Os;
+import io.questdb.std.CarrierLocal;
+import io.questdb.std.str.Path;
 import io.questdb.std.str.StringSink;
 import io.questdb.test.AbstractCairoTest;
-import io.questdb.cairo.CursorPrinter;
+import io.questdb.test.cairo.TestTableReaderRecordCursor;
 import io.questdb.test.tools.TestUtils;
-import org.junit.*;
+import org.junit.Assert;
+import org.junit.Before;
+import org.junit.BeforeClass;
+import org.junit.Test;
 import org.postgresql.util.PSQLException;
 
 import java.sql.Connection;
@@ -53,7 +60,7 @@ import static io.questdb.PropertyKey.CAIRO_WRITER_ALTER_BUSY_WAIT_TIMEOUT;
 import static io.questdb.PropertyKey.CAIRO_WRITER_ALTER_MAX_WAIT_TIMEOUT;
 
 public class PGUpdateConcurrentTest extends BasePGTest {
-    private static final ThreadLocal<StringSink> readerSink = new ThreadLocal<>(StringSink::new);
+    private static final CarrierLocal<StringSink> readerSink = new CarrierLocal<>(StringSink::new);
 
     @BeforeClass
     public static void setUpStatic() throws Exception {
@@ -71,11 +78,6 @@ public class PGUpdateConcurrentTest extends BasePGTest {
     @Test
     public void testConcurrencyMultipleWriterMultipleReaderMultiPartitioned() throws Exception {
         testConcurrency(4, 10, 8, PartitionMode.MULTIPLE);
-    }
-
-    @Test
-    public void testConcurrencyMultipleWriterMultipleReaderNonPartitioned() throws Exception {
-        testConcurrency(4, 10, 8, PartitionMode.NONE);
     }
 
     @Test
@@ -117,7 +119,7 @@ public class PGUpdateConcurrentTest extends BasePGTest {
     public void testUpdateTimeout() throws Exception {
         assertMemoryLeak(() -> {
             try (
-                    PGWireServer server1 = createPGServer(1);
+                    PGServer server1 = createPGServer(1);
                     WorkerPool workerPool = server1.getWorkerPool()
             ) {
                 workerPool.start(LOG);
@@ -153,12 +155,16 @@ public class PGUpdateConcurrentTest extends BasePGTest {
                     update.close();
                 }
 
-                assertSql("ts\tx\n" +
-                        "1970-01-01T00:00:00.000000Z\t5\n" +
-                        "1970-01-01T00:00:01.000000Z\t5\n" +
-                        "1970-01-01T00:00:02.000000Z\t5\n" +
-                        "1970-01-01T00:00:03.000000Z\t5\n" +
-                        "1970-01-01T00:00:04.000000Z\t5\n", "testUpdateTimeout");
+                assertQuery("testUpdateTimeout")
+                        .noLeakCheck()
+                        .returnsOnce("""
+                                ts\tx
+                                1970-01-01T00:00:00.000000Z\t5
+                                1970-01-01T00:00:01.000000Z\t5
+                                1970-01-01T00:00:02.000000Z\t5
+                                1970-01-01T00:00:03.000000Z\t5
+                                1970-01-01T00:00:04.000000Z\t5
+                                """);
             }
         });
     }
@@ -168,24 +174,26 @@ public class PGUpdateConcurrentTest extends BasePGTest {
         for (int i = 0, n = metadata.getColumnCount(); i < n; i++) {
             validators.get(i).reset();
         }
-        RecordCursor cursor = rdr.getCursor();
-        final Record record = cursor.getRecord();
-        int recordIndex = 0;
-        while (cursor.hasNext()) {
-            for (int i = 0, n = metadata.getColumnCount(); i < n; i++) {
-                final StringSink readerSink = PGUpdateConcurrentTest.readerSink.get();
-                readerSink.clear();
-                CursorPrinter.printColumn(record, metadata, i, readerSink);
-                CharSequence[] expectedValueArray = expectedValues.get(i);
-                CharSequence expectedValue = expectedValueArray != null ? expectedValueArray[recordIndex] : null;
-                if (!validators.get(i).validate(expectedValue, readerSink)) {
-                    throw SqlException.$(0, "assertSql failed, recordIndex=").put(recordIndex)
-                            .put(", columnIndex=").put(i)
-                            .put(", expected=").put(expectedValue)
-                            .put(", actual=").put(readerSink);
+        try (TestTableReaderRecordCursor cursor = new TestTableReaderRecordCursor()) {
+            cursor.of(rdr);
+            final Record record = cursor.getRecord();
+            int recordIndex = 0;
+            while (cursor.hasNext()) {
+                for (int i = 0, n = metadata.getColumnCount(); i < n; i++) {
+                    final StringSink readerSink = PGUpdateConcurrentTest.readerSink.get();
+                    readerSink.clear();
+                    CursorPrinter.printColumn(record, metadata, i, readerSink);
+                    CharSequence[] expectedValueArray = expectedValues.get(i);
+                    CharSequence expectedValue = expectedValueArray != null ? expectedValueArray[recordIndex] : null;
+                    if (!validators.get(i).validate(expectedValue, readerSink)) {
+                        throw SqlException.$(0, "assertSql failed, recordIndex=").put(recordIndex)
+                                .put(", columnIndex=").put(i)
+                                .put(", expected=").put(expectedValue)
+                                .put(", actual=").put(readerSink);
+                    }
                 }
+                recordIndex++;
             }
-            recordIndex++;
         }
     }
 
@@ -193,6 +201,7 @@ public class PGUpdateConcurrentTest extends BasePGTest {
         setProperty(CAIRO_WRITER_ALTER_BUSY_WAIT_TIMEOUT, 20_000L); // On in CI Windows updates are particularly slow
         node1.setProperty(CAIRO_WRITER_ALTER_MAX_WAIT_TIMEOUT, 90_000L);
         node1.setProperty(PropertyKey.CAIRO_SPIN_LOCK_TIMEOUT, 20_000L);
+        spinLockTimeout = 20_000L;
         assertMemoryLeak(() -> {
             CyclicBarrier barrier = new CyclicBarrier(numOfWriters + numOfReaders);
             ConcurrentLinkedQueue<Throwable> exceptions = new ConcurrentLinkedQueue<>();
@@ -200,7 +209,7 @@ public class PGUpdateConcurrentTest extends BasePGTest {
             ObjList<Thread> threads = new ObjList<>(numOfWriters + numOfReaders + 1);
 
             try (
-                    final PGWireServer pgServer = createPGServer(2);
+                    final PGServer pgServer = createPGServer(2);
                     WorkerPool workerPool = pgServer.getWorkerPool()
             ) {
                 workerPool.start(LOG);
@@ -210,9 +219,11 @@ public class PGUpdateConcurrentTest extends BasePGTest {
                             " 0 as x" +
                             " from long_sequence(5))" +
                             " timestamp(ts)" +
-                            (PartitionMode.isPartitioned(partitionMode) ? " partition by DAY" : ""));
+                            (PartitionMode.isPartitioned(partitionMode) ? " partition by DAY WAL" : ""));
                     create.execute();
                     create.close();
+
+                    TestUtils.drainWalQueue(engine);
                 }
 
                 Thread tick = new Thread(() -> {
@@ -229,18 +240,23 @@ public class PGUpdateConcurrentTest extends BasePGTest {
 
                 for (int k = 0; k < numOfWriters; k++) {
                     Thread writer = new Thread(() -> {
-                        try (final Connection connection = getConnection(pgServer.getPort(), false, true)) {
-                            barrier.await();
-                            PreparedStatement update = connection.prepareStatement("UPDATE up SET x = ?");
-                            for (int i = 0; i < numOfUpdates; i++) {
-                                update.setInt(1, i);
-                                Assert.assertEquals(5, update.executeUpdate());
-                                current.incrementAndGet();
+                        try {
+                            try (final Connection connection = getConnection(pgServer.getPort(), false, true)) {
+                                barrier.await();
+                                PreparedStatement update = connection.prepareStatement("UPDATE up SET x = ?");
+                                for (int i = 0; i < numOfUpdates; i++) {
+                                    update.setInt(1, i);
+                                    // update against WAL table will return txn instead of row count
+                                    update.executeUpdate();
+                                    current.incrementAndGet();
+                                }
+                                update.close();
                             }
-                            update.close();
                         } catch (Throwable th) {
                             LOG.error().$("writer error ").$(th).$();
                             exceptions.add(th);
+                        } finally {
+                            Path.clearThreadLocals();
                         }
                     });
                     threads.add(writer);
@@ -282,6 +298,8 @@ public class PGUpdateConcurrentTest extends BasePGTest {
                         } catch (Throwable th) {
                             LOG.error().$("reader error ").$(th).$();
                             exceptions.add(th);
+                        } finally {
+                            Path.clearThreadLocals();
                         }
                     });
                     threads.add(reader);

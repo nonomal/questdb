@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -691,7 +691,7 @@ public class GeoHashesTest {
         final long hi = lo + len;
         try {
             for (long p = lo; p < hi; p++) {
-                Unsafe.getUnsafe().putByte(p, (byte) token.charAt((int) (p - lo)));
+                Unsafe.putByte(p, (byte) token.charAt((int) (p - lo)));
             }
             code.apply(lo, hi);
         } finally {

@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -25,20 +25,34 @@
 package io.questdb.griffin.engine.table;
 
 import io.questdb.MessageBus;
+import io.questdb.cairo.sql.async.QueryParallelFiberDispatcher;
 import io.questdb.mp.AbstractQueueConsumerJob;
 import io.questdb.tasks.LatestByTask;
+import org.jetbrains.annotations.NotNull;
 
 public class LatestByAllIndexedJob extends AbstractQueueConsumerJob<LatestByTask> {
+    private final MessageBus messageBus;
 
     public LatestByAllIndexedJob(MessageBus messageBus) {
         super(messageBus.getLatestByQueue(), messageBus.getLatestBySubSeq());
+        this.messageBus = messageBus;
     }
 
     @Override
-    protected boolean doRun(int workerId, long cursor, RunStatus runStatus) {
+    public boolean run(@NotNull WorkerContext workerContext) {
+        final QueryParallelFiberDispatcher dispatcher = messageBus.getQueryParallelFiberDispatcher();
+        return dispatcher != null
+                ? !dispatcher.consumeLatestBy(workerContext.carrierId())
+                : super.run(workerContext);
+    }
+
+    @Override
+    protected boolean doRun(long cursor, WorkerContext workerContext) {
         final LatestByTask task = queue.get(cursor);
-        final boolean result = task.run();
-        subSeq.done(cursor);
-        return result;
+        try {
+            return task.run();
+        } finally {
+            subSeq.done(cursor);
+        }
     }
 }

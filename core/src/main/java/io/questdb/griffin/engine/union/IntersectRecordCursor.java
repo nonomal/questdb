@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -29,9 +29,9 @@ import io.questdb.cairo.map.Map;
 import io.questdb.cairo.map.MapKey;
 import io.questdb.cairo.sql.Record;
 import io.questdb.cairo.sql.RecordCursor;
-import io.questdb.cairo.sql.SqlExecutionCircuitBreaker;
 import io.questdb.cairo.sql.SymbolTable;
 import io.questdb.griffin.SqlException;
+import io.questdb.griffin.SqlExecutionContext;
 import io.questdb.std.Misc;
 
 class IntersectRecordCursor extends AbstractSetRecordCursor {
@@ -47,7 +47,7 @@ class IntersectRecordCursor extends AbstractSetRecordCursor {
         this.mapA = mapA;
         this.mapB = mapB;
         this.recordSink = recordSink;
-        this.isOpen = true;
+        this.isOpen = false;
     }
 
     @Override
@@ -103,6 +103,11 @@ class IntersectRecordCursor extends AbstractSetRecordCursor {
     }
 
     @Override
+    public long preComputedStateSize() {
+        return RecordCursor.fromBool(isCursorBHashed);
+    }
+
+    @Override
     public void recordAt(Record record, long atRowId) {
         cursorA.recordAt(record, atRowId);
     }
@@ -131,14 +136,16 @@ class IntersectRecordCursor extends AbstractSetRecordCursor {
         cursorB = Misc.free(cursorB);
     }
 
-    void of(RecordCursor cursorA, RecordCursor cursorB, SqlExecutionCircuitBreaker circuitBreaker) throws SqlException {
+    void of(RecordCursor cursorA, RecordCursor cursorB, SqlExecutionContext executionContext) throws SqlException {
         if (!isOpen) {
             isOpen = true;
+            mapA.setMemoryTracker(executionContext.getMemoryTracker());
+            mapB.setMemoryTracker(executionContext.getMemoryTracker());
             mapA.reopen();
             mapB.reopen();
         }
 
-        super.of(cursorA, cursorB, circuitBreaker);
+        super.of(cursorA, cursorB, executionContext);
         recordA = cursorA.getRecord();
         recordB = cursorB.getRecord();
         isCursorBHashed = false;

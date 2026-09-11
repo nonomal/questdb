@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -60,9 +60,9 @@ public class ZipTest {
 
                     long pIn = 0;
                     long pOut = 0;
-                    int fdIn = Files.openRO(path.of(expected.getAbsolutePath()).$());
+                    long fdIn = Files.openRO(path.of(expected.getAbsolutePath()).$());
                     try {
-                        int fdOut = Files.openRW(path.of(outFile.getAbsolutePath()).$());
+                        long fdOut = Files.openRW(path.of(outFile.getAbsolutePath()).$());
                         try {
                             // header
                             Files.write(fdOut, Zip.gzipHeader, Zip.gzipHeaderLen, pOut);
@@ -103,8 +103,8 @@ public class ZipTest {
                             } while (ret != 1);
 
                             // write trailer
-                            Unsafe.getUnsafe().putInt(out, crc);
-                            Unsafe.getUnsafe().putInt(out + 4, (int) pIn);
+                            Unsafe.putInt(out, crc);
+                            Unsafe.putInt(out + 4, (int) pIn);
                             Files.write(fdOut, out, 8, pOut);
                         } finally {
                             Files.close(fdOut);

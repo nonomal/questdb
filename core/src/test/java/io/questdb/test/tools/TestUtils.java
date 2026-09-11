@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -26,60 +26,163 @@ package io.questdb.test.tools;
 
 import io.questdb.MessageBus;
 import io.questdb.MessageBusImpl;
-import io.questdb.Metrics;
 import io.questdb.ServerMain;
-import io.questdb.cairo.*;
+import io.questdb.cairo.CairoConfiguration;
+import io.questdb.cairo.CairoEngine;
+import io.questdb.cairo.CairoException;
+import io.questdb.cairo.ColumnType;
+import io.questdb.cairo.CursorPrinter;
+import io.questdb.cairo.DefaultDdlListener;
+import io.questdb.cairo.DefaultLifecycleManager;
+import io.questdb.cairo.LogRecordSinkAdapter;
+import io.questdb.cairo.MetadataCacheReader;
+import io.questdb.cairo.O3PartitionJob;
+import io.questdb.cairo.ParquetMetaFileReader;
+import io.questdb.cairo.PartitionBy;
+import io.questdb.cairo.TableReader;
+import io.questdb.cairo.TableReaderMetadata;
+import io.questdb.cairo.TableStructure;
+import io.questdb.cairo.TableToken;
+import io.questdb.cairo.TableUtils;
+import io.questdb.cairo.TableWriter;
+import io.questdb.cairo.TimestampDriver;
+import io.questdb.cairo.TxReader;
+import io.questdb.cairo.arr.ArrayView;
+import io.questdb.cairo.idx.IndexReader;
+import io.questdb.cairo.sql.BindVariableService;
+import io.questdb.cairo.sql.InsertOperation;
+import io.questdb.cairo.sql.OperationFuture;
 import io.questdb.cairo.sql.Record;
-import io.questdb.cairo.sql.*;
+import io.questdb.cairo.sql.RecordCursor;
+import io.questdb.cairo.sql.RecordCursorFactory;
+import io.questdb.cairo.sql.RecordMetadata;
+import io.questdb.cairo.sql.StatefulAtom;
+import io.questdb.cairo.view.ViewState;
 import io.questdb.cairo.vm.Vm;
 import io.questdb.cairo.vm.api.MemoryMARW;
 import io.questdb.cairo.wal.ApplyWal2TableJob;
 import io.questdb.cairo.wal.CheckWalTransactionsJob;
-import io.questdb.cutlass.text.CopyRequestJob;
+import io.questdb.cairo.wal.WalPurgeJob;
+import io.questdb.cutlass.http.client.HttpClient;
+import io.questdb.cutlass.text.CopyImportRequestJob;
+import io.questdb.griffin.CompiledQuery;
 import io.questdb.griffin.SqlCompiler;
 import io.questdb.griffin.SqlException;
 import io.questdb.griffin.SqlExecutionContext;
 import io.questdb.griffin.SqlExecutionContextImpl;
+import io.questdb.griffin.engine.PerWorkerLockOwner;
+import io.questdb.griffin.engine.PerWorkerLocks;
 import io.questdb.griffin.engine.functions.bind.BindVariableServiceImpl;
-import io.questdb.griffin.model.IntervalUtils;
+import io.questdb.griffin.engine.functions.str.SizePrettyFunctionFactory;
+import io.questdb.griffin.engine.ops.Operation;
+import io.questdb.griffin.engine.ops.UpdateOperation;
 import io.questdb.log.Log;
+import io.questdb.log.LogFactory;
 import io.questdb.log.LogRecord;
 import io.questdb.mp.WorkerPool;
+import io.questdb.mp.WorkerPoolMode;
 import io.questdb.mp.WorkerPoolUtils;
 import io.questdb.network.Net;
 import io.questdb.network.NetworkFacade;
 import io.questdb.network.NetworkFacadeImpl;
-import io.questdb.std.ThreadLocal;
-import io.questdb.std.*;
-import io.questdb.std.datetime.microtime.Timestamps;
-import io.questdb.std.str.*;
+import io.questdb.std.BinarySequence;
+import io.questdb.std.CarrierLocal;
+import io.questdb.std.Chars;
+import io.questdb.std.Decimal128;
+import io.questdb.std.Decimal256;
+import io.questdb.std.Files;
+import io.questdb.std.FilesFacade;
+import io.questdb.std.FilesFacadeImpl;
+import io.questdb.std.IntList;
+import io.questdb.std.Long256;
+import io.questdb.std.LongList;
+import io.questdb.std.MemoryTag;
+import io.questdb.std.Misc;
+import io.questdb.std.Numbers;
+import io.questdb.std.NumericException;
+import io.questdb.std.ObjHashSet;
+import io.questdb.std.ObjList;
+import io.questdb.std.ObjObjHashMap;
+import io.questdb.std.Os;
+import io.questdb.std.QuietCloseable;
+import io.questdb.std.Rnd;
+import io.questdb.std.Unsafe;
+import io.questdb.std.str.CharSink;
+import io.questdb.std.str.DirectUtf8Sink;
+import io.questdb.std.str.DirectUtf8String;
+import io.questdb.std.str.LPSZ;
+import io.questdb.std.str.MutableCharSink;
+import io.questdb.std.str.MutableUtf16Sink;
+import io.questdb.std.str.Path;
+import io.questdb.std.str.Sinkable;
+import io.questdb.std.str.StringSink;
+import io.questdb.std.str.Utf8Sequence;
+import io.questdb.std.str.Utf8String;
+import io.questdb.std.str.Utf8StringSink;
+import io.questdb.std.str.Utf8s;
 import io.questdb.test.QuestDBTestNode;
+import io.questdb.test.TestTimestampType;
 import io.questdb.test.cairo.TableModel;
+import io.questdb.test.cairo.TestTableReaderRecordCursor;
+import io.questdb.test.cutlass.http.HttpUtils;
 import io.questdb.test.griffin.CustomisableRunnable;
 import io.questdb.test.std.TestFilesFacadeImpl;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 import org.junit.Assert;
+import org.junit.Assume;
+import org.junit.AssumptionViolatedException;
 
-import java.io.*;
+import java.io.BufferedInputStream;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.lang.management.ManagementFactory;
+import java.lang.management.ThreadMXBean;
 import java.net.URISyntaxException;
 import java.net.URL;
 import java.nio.file.Paths;
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.PreparedStatement;
+import java.sql.SQLException;
 import java.sql.Timestamp;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.Optional;
+import java.util.Properties;
+import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.CyclicBarrier;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.locks.LockSupport;
+import java.util.function.BooleanSupplier;
+import java.util.function.IntConsumer;
 
 import static io.questdb.cairo.TableUtils.*;
+import static io.questdb.test.AbstractTest.CLOSEABLE;
 import static org.junit.Assert.assertNotNull;
 
 public final class TestUtils {
-
-    private final static ThreadLocal<StringSink> tlSink = new ThreadLocal<>(StringSink::new);
+    public static final boolean INVALID = true;
+    public static final boolean VALID = false;
+    private static final Log LOG = LogFactory.getLog(TestUtils.class);
+    private static final long THREAD_JOIN_CLEANUP_TIMEOUT_MILLIS = 1_000;
+    private static final long THREAD_JOIN_TIMEOUT_MILLIS = 20_000;
+    private static final Object threadAllocationLock = new Object();
+    private static final Object threadCpuTimeLock = new Object();
+    private static final CarrierLocal<StringSink> tlSink = new CarrierLocal<>(StringSink::new);
+    private static boolean isThreadAllocationInitiallyEnabled;
+    private static boolean isThreadCpuTimeInitiallyEnabled;
+    private static int threadAllocationScopeCount;
+    private static int threadCpuTimeScopeCount;
 
     private TestUtils() {
     }
@@ -96,61 +199,117 @@ public final class TestUtils {
     }
 
     public static void assertAsciiCompliance(@Nullable Utf8Sequence utf8Sequence) {
-        Assert.assertEquals(utf8Sequence == null || utf8Sequence.isAscii(), Utf8s.isAscii(utf8Sequence));
+        if (utf8Sequence != null && utf8Sequence.isAscii()) {
+            for (int i = 0, n = utf8Sequence.size(); i < n; i++) {
+                if (utf8Sequence.byteAt(i) < 0) {
+                    // isAscii()=true but value is not actually ASCII — this is always wrong.
+                    // isAscii()=false is conservatively valid even for ASCII values (e.g. Parquet
+                    // VarcharSlice uses column-level metadata and may not know per-value).
+                    Utf8StringSink sink = new Utf8StringSink();
+                    sink.put("ascii flag set to 'true' for non-ASCII value '").put(utf8Sequence).put("'. ");
+                    Assert.fail(sink.toString());
+                }
+            }
+        }
     }
 
-    public static void assertConnect(int fd, long sockAddr) {
+    public static void assertConnect(long fd, long sockAddr) {
         long rc = connect(fd, sockAddr);
         if (rc != 0) {
             Assert.fail("could not connect, errno=" + Os.errno());
         }
     }
 
-    public static void assertConnect(NetworkFacade nf, int fd, long pSockAddr) {
+    public static void assertConnect(NetworkFacade nf, long fd, long pSockAddr) {
         long rc = nf.connect(fd, pSockAddr);
         if (rc != 0) {
             Assert.fail("could not connect, errno=" + nf.errno());
         }
     }
 
-    public static void assertConnectAddrInfo(int fd, long sockAddrInfo) {
+    public static void assertConnectAddrInfo(long fd, long sockAddrInfo) {
         long rc = connectAddrInfo(fd, sockAddrInfo);
         if (rc != 0) {
             Assert.fail("could not connect, errno=" + Os.errno());
         }
     }
 
-    public static void assertContains(String message, CharSequence actual, CharSequence expected) {
+    public static void assertContains(String message, CharSequence sequence, CharSequence term) {
         // Assume that "" is contained in any string.
-        if (expected.length() == 0) {
+        if (term.isEmpty()) {
             return;
         }
-        if (Chars.contains(actual, expected)) {
+        if (Chars.contains(sequence, term)) {
             return;
         }
-        Assert.fail((message != null ? message + ": '" : "'") + actual + "' does not contain: " + expected);
+        Assert.fail((message != null ? message + ": '" : "'") + sequence + "' does not contain: " + term);
     }
 
-    public static void assertContains(CharSequence actual, CharSequence expected) {
-        assertContains(null, actual, expected);
+    public static void assertContains(CharSequence sequence, CharSequence term) {
+        assertContains(null, sequence, term);
     }
 
-    public static void assertCursor(CharSequence expected, RecordCursor cursor, RecordMetadata metadata, boolean header, MutableUtf16Sink sink) {
+    public static void assertContainsEither(CharSequence sequence, CharSequence term1, CharSequence term2) {
+        // Assume that "" is contained in any string.
+        if (term1.isEmpty() || term2.isEmpty()) {
+            return;
+        }
+
+        if (Chars.contains(sequence, term1)) {
+            return;
+        }
+        if (Chars.contains(sequence, term2)) {
+            return;
+        }
+        Assert.fail("'" + sequence + "' does not contain either: " + term1 + " or " + term2);
+    }
+
+    public static void assertContainsEither(CharSequence sequence, CharSequence... terms) {
+        for (CharSequence term : terms) {
+            if (Chars.contains(sequence, term)) {
+                return;
+            }
+        }
+        Assert.fail("'" + sequence + "' does not contain either: " + String.join(" or ", terms));
+    }
+
+    public static void assertCursor(
+            CharSequence expected,
+            RecordCursor cursor,
+            RecordMetadata metadata,
+            boolean header,
+            MutableUtf16Sink sink
+    ) {
         CursorPrinter.println(cursor, metadata, sink, header, false);
         assertEquals(expected, sink);
     }
 
-    public static void assertCursor(CharSequence expected, RecordCursor cursor, RecordMetadata metadata, boolean header, boolean printTypes, MutableUtf16Sink sink) {
+    public static void assertCursor(
+            CharSequence expected,
+            RecordCursor cursor,
+            RecordMetadata metadata,
+            boolean header,
+            boolean printTypes,
+            MutableUtf16Sink sink
+    ) {
         CursorPrinter.println(cursor, metadata, sink, header, printTypes);
         assertEquals(expected, sink);
     }
 
-    public static void assertEquals(RecordCursor cursorExpected, RecordMetadata metadataExpected, RecordCursor cursorActual, RecordMetadata metadataActual, boolean genericStringMatch) {
+    public static void assertEquals(
+            RecordCursor cursorExpected,
+            RecordMetadata metadataExpected,
+            RecordCursor cursorActual,
+            RecordMetadata metadataActual,
+            boolean genericStringMatch
+    ) {
         StringSink sink = getTlSink();
         assertEquals(metadataExpected, metadataActual, genericStringMatch);
         Record r = cursorExpected.getRecord();
         Record l = cursorActual.getRecord();
         final int timestampIndex = metadataActual.getTimestampIndex();
+        final int timestampType = metadataActual.getTimestampType();
+        TimestampDriver driver = ColumnType.getTimestampDriver(timestampType);
 
         long timestampValue = -1;
         HashMap<String, Integer> mapL = null;
@@ -177,7 +336,11 @@ public final class TestUtils {
 
                 // check if we can bail out early because current record timestamps do not match
                 if (tsL != tsR) {
-                    throw new AssertionError(String.format("Row %d column %s[%s] %s. Expected %s but found %s", rowIndex, metadataActual.getColumnName(timestampIndex), ColumnType.TIMESTAMP, "timestamp mismatch", Timestamps.toUSecString(tsL), Timestamps.toUSecString(tsR)));
+                    throw new AssertionError(String.format(
+                            "Row %d column %s[%s] %s. Expected %s but found %s",
+                            rowIndex, metadataActual.getColumnName(timestampIndex), timestampType,
+                            "timestamp mismatch", driver.toMSecString(tsL), driver.toUSecString(tsR)
+                    ));
                 }
 
                 // compare accumulated records
@@ -189,6 +352,7 @@ public final class TestUtils {
 
                 // something changed, reset the store
                 timestampValue = -1;
+                deferred = null;
 
                 mapL.clear();
                 mapR.clear();
@@ -228,18 +392,27 @@ public final class TestUtils {
             }
         }
 
+        if (deferred != null) {
+            // looks like there was no more rows to do the comparison, so do it now
+            try {
+                Assert.assertEquals(mapL, mapR);
+            } catch (AssertionError ignore) {
+                throw deferred;
+            }
+        }
+
         Assert.assertFalse("Expected cursor misses record " + rowIndex, cursorActual.hasNext());
     }
 
     public static void assertEquals(File a, File b) {
         try (Path path = new Path()) {
             path.of(a.getAbsolutePath());
-            int fda = TestFilesFacadeImpl.INSTANCE.openRO(path.$());
+            long fda = TestFilesFacadeImpl.INSTANCE.openRO(path.$());
             Assert.assertNotEquals(-1, fda);
 
             try {
                 path.of(b.getAbsolutePath());
-                int fdb = TestFilesFacadeImpl.INSTANCE.openRO(path.$());
+                long fdb = TestFilesFacadeImpl.INSTANCE.openRO(path.$());
                 Assert.assertNotEquals(-1, fdb);
                 try {
 
@@ -263,7 +436,10 @@ public final class TestUtils {
                             offset += reada;
 
                             for (int i = 0; i < reada; i++) {
-                                Assert.assertEquals(Unsafe.getUnsafe().getByte(bufa + i), Unsafe.getUnsafe().getByte(bufb + i));
+                                Assert.assertEquals(
+                                        Unsafe.getByte(bufa + i),
+                                        Unsafe.getByte(bufb + i)
+                                );
                             }
                         }
                     } finally {
@@ -282,7 +458,7 @@ public final class TestUtils {
     public static void assertEquals(File a, CharSequence actual) {
         try (Path path = new Path()) {
             path.of(a.getAbsolutePath());
-            int fda = TestFilesFacadeImpl.INSTANCE.openRO(path.$());
+            long fda = TestFilesFacadeImpl.INSTANCE.openRO(path.$());
             Assert.assertNotEquals(-1, fda);
 
             try {
@@ -300,14 +476,15 @@ public final class TestUtils {
                         }
 
                         for (int i = 0; i < reada; i++) {
-                            byte b = Unsafe.getUnsafe().getByte(bufa + i);
+                            byte b = Unsafe.getByte(bufa + i);
                             if (b == 13) {
                                 continue;
                             }
-                            byte bb = Unsafe.getUnsafe().getByte(strp);
+                            byte bb = Unsafe.getByte(strp);
                             strp++;
                             if (b != bb) {
-                                Assert.fail("expected: '" + (char) (bb) + "'(" + bb + ")" + ", actual: '" + (char) (b) + "'(" + b + ")" + ", at: " + (offset + i - 1));
+                                Assert.fail("expected: '" + (char) (bb) + "'(" + bb + ")" + ", actual: '" + (char) (b)
+                                        + "'(" + b + ")" + ", at: " + (offset + i - 1));
                             }
                         }
 
@@ -367,7 +544,7 @@ public final class TestUtils {
         }
 
         if (expected != null && actual == null) {
-            Assert.fail("Expected: \n`" + expected + "`\nbut have NULL");
+            Assert.fail("Expected: \n`" + expected + "`\nbut have NULL. ");
         }
 
         if (expected == null) {
@@ -383,7 +560,7 @@ public final class TestUtils {
         String expectedStr = sink.toString();
         sink.clear();
         Utf8s.utf8ToUtf16(actual, sink);
-        assertEquals(null, expectedStr, sink);
+        assertEquals(expectedStr, sink);
     }
 
     public static void assertEquals(CharSequence expected, CharSequence actual) {
@@ -459,13 +636,44 @@ public final class TestUtils {
         }
     }
 
-    public static void assertEquals(SqlCompiler compiler, SqlExecutionContext sqlExecutionContext, String expectedSql, String actualSql) throws SqlException {
-        try (RecordCursorFactory f1 = compiler.compile(expectedSql, sqlExecutionContext).getRecordCursorFactory(); RecordCursorFactory f2 = compiler.compile(actualSql, sqlExecutionContext).getRecordCursorFactory(); RecordCursor c1 = f1.getCursor(sqlExecutionContext); RecordCursor c2 = f2.getCursor(sqlExecutionContext)) {
+    public static void assertEquals(
+            SqlCompiler compiler, SqlExecutionContext sqlExecutionContext,
+            String expectedSql, String actualSql
+    ) throws SqlException {
+        try (
+                RecordCursorFactory f1 = compiler.compile(expectedSql, sqlExecutionContext).getRecordCursorFactory();
+                RecordCursorFactory f2 = compiler.compile(actualSql, sqlExecutionContext).getRecordCursorFactory();
+                RecordCursor c1 = f1.getCursor(sqlExecutionContext);
+                RecordCursor c2 = f2.getCursor(sqlExecutionContext)
+        ) {
             assertEquals(c1, f1.getMetadata(), c2, f2.getMetadata(), true);
         }
     }
 
-    public static void assertEqualsExactOrder(RecordCursor cursorExpected, RecordMetadata metadataExpected, RecordCursor cursorActual, RecordMetadata metadataActual, boolean genericStringMatch) {
+    public static void assertEquals(ArrayView expected, ArrayView actual) {
+        if (expected == null) {
+            Assert.assertNull("expected NULL array", actual);
+            return;
+        }
+        Assert.assertNotNull("expected NON-NULL array", actual);
+        // Check that the number of dimensions matches
+        final int expectedDimCount = expected.getDimCount();
+        Assert.assertEquals("Array dimensionality mismatch", expectedDimCount, actual.getDimCount());
+        if (expectedDimCount == 0) {
+            return;
+        }
+        // Check if each dimension has the same length
+        for (int i = 0; i < expectedDimCount; i++) {
+            Assert.assertEquals(expected.getDimLen(i), actual.getDimLen(i));
+        }
+        // Compare elements using flat indexing
+        assertEqualsRecursive(expected, actual, 0, 0, 0);
+    }
+
+    public static void assertEqualsExactOrder(
+            RecordCursor cursorExpected, RecordMetadata metadataExpected,
+            RecordCursor cursorActual, RecordMetadata metadataActual, boolean genericStringMatch
+    ) {
         assertEquals(metadataExpected, metadataActual, genericStringMatch);
         Record r = cursorExpected.getRecord();
         Record l = cursorActual.getRecord();
@@ -481,8 +689,14 @@ public final class TestUtils {
         Assert.assertFalse("Expected cursor misses record " + rowIndex, cursorActual.hasNext());
     }
 
-    public static void assertEqualsExactOrder(SqlCompiler compiler, SqlExecutionContext sqlExecutionContext, String expectedSql, String actualSql) throws SqlException {
-        try (RecordCursorFactory f1 = compiler.compile(expectedSql, sqlExecutionContext).getRecordCursorFactory(); RecordCursorFactory f2 = compiler.compile(actualSql, sqlExecutionContext).getRecordCursorFactory(); RecordCursor c1 = f1.getCursor(sqlExecutionContext); RecordCursor c2 = f2.getCursor(sqlExecutionContext)) {
+    public static void assertEqualsExactOrder(
+            SqlCompiler compiler, SqlExecutionContext sqlExecutionContext,
+            String expectedSql, String actualSql
+    ) throws SqlException {
+        try (RecordCursorFactory f1 = compiler.compile(expectedSql, sqlExecutionContext).getRecordCursorFactory();
+             RecordCursorFactory f2 = compiler.compile(actualSql, sqlExecutionContext).getRecordCursorFactory();
+             RecordCursor c1 = f1.getCursor(sqlExecutionContext); RecordCursor c2 = f2.getCursor(sqlExecutionContext)
+        ) {
             assertEqualsExactOrder(c1, f1.getMetadata(), c2, f2.getMetadata(), true);
         }
     }
@@ -515,11 +729,38 @@ public final class TestUtils {
         }
     }
 
-    public static void assertEventually(Runnable assertion) {
-        assertEventually(assertion, 30);
+    public static void assertEventually(EventualCode assertion) throws Exception {
+        assertEventually(assertion, 60);
     }
 
-    public static void assertEventually(Runnable assertion, int timeoutSeconds) {
+    public static void assertEventually(EventualCode assertion, Set<Class<?>> exceptionTypesToCatch) throws Exception {
+        exceptionTypesToCatch.add(AssertionError.class);
+        assertEventually(assertion, 30, exceptionTypesToCatch);
+    }
+
+    public static void assertEventually(EventualCode assertion, int timeoutSeconds, Set<Class<?>> exceptionTypesToCatch) throws Exception {
+        long maxSleepingTimeMillis = 1000;
+        long nextSleepingTimeMillis = 10;
+        long startTime = System.nanoTime();
+        long deadline = startTime + TimeUnit.SECONDS.toNanos(timeoutSeconds);
+        for (; ; ) {
+            try {
+                assertion.run();
+                return;
+            } catch (Exception error) {
+                if (!exceptionTypesToCatch.contains(error.getClass())) {
+                    throw error;
+                }
+                if (System.nanoTime() >= deadline) {
+                    throw error;
+                }
+            }
+            Os.sleep(nextSleepingTimeMillis);
+            nextSleepingTimeMillis = Math.min(maxSleepingTimeMillis, nextSleepingTimeMillis << 1);
+        }
+    }
+
+    public static void assertEventually(EventualCode assertion, int timeoutSeconds) throws Exception {
         long maxSleepingTimeMillis = 1000;
         long nextSleepingTimeMillis = 10;
         long startTime = System.nanoTime();
@@ -538,8 +779,96 @@ public final class TestUtils {
         }
     }
 
+    public static void assertException(
+            CairoEngine engine,
+            SqlExecutionContext sqlExecutionContext,
+            CharSequence sql,
+            CharSequence expectedMessage,
+            int expectedPosition,
+            MutableCharSink<?> sink
+    ) throws SqlException {
+        try {
+            assertException(
+                    engine,
+                    sqlExecutionContext,
+                    false,
+                    sql,
+                    sink
+            );
+            Assert.fail();
+        } catch (CairoException | SqlException e) {
+            assertContains(e.getMessage(), expectedMessage);
+            Assert.assertEquals(expectedPosition, e.getPosition());
+        }
+    }
+
+    public static void assertException(
+            CairoEngine engine,
+            SqlExecutionContext sqlExecutionContext,
+            boolean fullFatJoins,
+            CharSequence sql,
+            MutableCharSink<?> sink
+    ) throws SqlException {
+        try (SqlCompiler compiler = engine.getSqlCompiler()) {
+            compiler.setFullFatJoins(fullFatJoins);
+            CompiledQuery cq = compiler.compile(sql, sqlExecutionContext);
+            if (cq.getRecordCursorFactory() != null) {
+                try (
+                        RecordCursorFactory factory = cq.getRecordCursorFactory();
+                        RecordCursor cursor = factory.getCursor(sqlExecutionContext)
+                ) {
+                    sink.clear();
+                    Record record = cursor.getRecord();
+                    while (cursor.hasNext()) {
+                        // ignore the output, we're looking for an error
+                        println(record, factory.getMetadata(), sink);
+                        sink.clear();
+                    }
+                }
+            } else if (cq.getOperation() != null) {
+                try (
+                        Operation op = cq.getOperation();
+                        OperationFuture fut = op.execute(sqlExecutionContext, null)
+                ) {
+                    fut.await();
+                }
+            } else {
+                // make sure to close update/insert operation
+                try (
+                        UpdateOperation ignore = cq.getUpdateOperation();
+                        InsertOperation ignored = cq.popInsertOperation()
+                ) {
+                    CairoEngine.execute(compiler, sql, sqlExecutionContext, null);
+                }
+            }
+        }
+        Assert.fail("SQL statement should have failed");
+    }
+
+    /**
+     * Asserts that the factory tree, walked down the base factories, contains an instance of the
+     * expected class. Pinning the factory keeps a test honest: the reduce phase follows from the
+     * factory the optimizer picks, so a query that quietly moved to a different one would still
+     * run, still pass, and cover nothing.
+     */
+    public static void assertFactoryInTree(RecordCursorFactory factory, Class<?> expected) {
+        assertFactoryInTree(factory, expected, null);
+    }
+
+    public static void assertFactoryInTree(RecordCursorFactory factory, Class<?> expected, @Nullable CharSequence context) {
+        for (RecordCursorFactory f = factory; f != null; f = f.getBaseFactory()) {
+            if (expected.isInstance(f)) {
+                return;
+            }
+        }
+        Assert.fail("expected " + expected.getSimpleName() + " in the factory tree, but top was "
+                + factory.getClass().getSimpleName() + (context != null ? ": " + context : ""));
+    }
+
     public static void assertFileContentsEquals(Path expected, Path actual) throws IOException {
-        try (BufferedInputStream expectedStream = new BufferedInputStream(new FileInputStream(expected.toString())); BufferedInputStream actualStream = new BufferedInputStream(new FileInputStream(actual.toString()))) {
+        try (BufferedInputStream expectedStream = new BufferedInputStream(new FileInputStream(expected.toString()));
+             BufferedInputStream actualStream = new BufferedInputStream(new FileInputStream(actual.toString()))
+        ) {
             int byte1, byte2;
             long length = 0;
             do {
@@ -566,126 +895,366 @@ public final class TestUtils {
                 int expectedCapacity = metadata.getIndexValueBlockCapacity(symIndex);
 
                 for (int partitionIndex = 0; partitionIndex < rdr.getPartitionCount(); partitionIndex++) {
-                    BitmapIndexReader bitmapIndexReader = rdr.getBitmapIndexReader(0, symIndex, BitmapIndexReader.DIR_BACKWARD);
-                    Assert.assertEquals(expectedCapacity, bitmapIndexReader.getValueBlockCapacity() + 1);
+                    IndexReader indexReader =
+                            rdr.getIndexReader(0, symIndex, IndexReader.DIR_BACKWARD);
+                    Assert.assertEquals(expectedCapacity, indexReader.getValueBlockCapacity() + 1);
                 }
             }
         }
     }
 
+    public static void assertInterruptedWaitDoesNotSpin(
+            String operation,
+            Runnable wait,
+            @NotNull Object waitBlocker,
+            Runnable release
+    ) throws Exception {
+        assertInterruptedWaitDoesNotSpin(operation, wait, waitBlocker, null, release);
+    }
+
+    public static void assertInterruptedWaitDoesNotSpin(
+            String operation,
+            Runnable wait,
+            @NotNull Object waitBlocker,
+            @Nullable EventualCode waitReady,
+            Runnable release
+    ) throws Exception {
+        assertWaitDoesNotSpin(operation, wait, waitBlocker, waitReady, release, true);
+    }
+
+    public static void assertInterruptedWaitTimesOutWithoutSpin(
+            String operation,
+            long timeoutNanos,
+            BooleanSupplier timedWait,
+            BooleanSupplier releasedWait,
+            Runnable release
+    ) throws Exception {
+        try (ThreadMetricsScope<ThreadMXBean> scope = threadCpuTimeScope()) {
+            assertInterruptedWaitTimesOutWithoutSpin0(
+                    scope.getBean(),
+                    operation,
+                    timeoutNanos,
+                    timedWait,
+                    releasedWait,
+                    release
+            );
+        }
+    }
+
+    // When the runnable throws, LeakCheck.close() still runs and try-with-resources
+    // attaches any leak assertion to the original exception as suppressed (JLS 14.20.3),
+    // so a failing test surfaces failure-path leaks without masking the original error.
     public static void assertMemoryLeak(LeakProneCode runnable) throws Exception {
-        Path.clearThreadLocals();
-        long mem = Unsafe.getMemUsed();
-        long[] memoryUsageByTag = new long[MemoryTag.SIZE];
-        for (int i = MemoryTag.MMAP_DEFAULT; i < MemoryTag.SIZE; i++) {
-            memoryUsageByTag[i] = Unsafe.getMemUsedByTag(i);
+        try (LeakCheck check = new LeakCheck()) {
+            runnable.run();
         }
+    }
 
-        Assert.assertTrue("Initial file unsafe mem should be >= 0", mem >= 0);
-        long fileCount = Files.getOpenFileCount();
-        String fileDebugInfo = Files.getOpenFdDebugInfo();
-        Assert.assertTrue("Initial file count should be >= 0", fileCount >= 0);
+    public static void assertNonInterruptedWaitDoesNotSpin(
+            String operation,
+            Runnable wait,
+            @NotNull Object waitBlocker,
+            Runnable release
+    ) throws Exception {
+        assertWaitDoesNotSpin(operation, wait, waitBlocker, null, release, false);
+    }
 
-        int addrInfoCount = Net.getAllocatedAddrInfoCount();
-        Assert.assertTrue("Initial allocated addrinfo count should be >= 0", addrInfoCount >= 0);
+    /**
+     * Asserts that the first parallel factory in the tree holds no per-worker slots. Call it once
+     * the cursor is closed, so the frame sequence has been awaited and no worker is inside a locked
+     * section. A reducer that acquires a slot and then throws before entering the try that releases
+     * it leaves the slot held forever: {@link io.questdb.griffin.engine.PerWorkerLocks} has no reset
+     * and the atom belongs to the factory, so every later execution of the same cached factory finds
+     * one slot fewer, until the workers spin for a slot nobody will release.
+     * <p>
+     * An atom that holds no locks at all reports -1 and fails here rather than passing for the wrong
+     * reason.
+     *
+     * @param factory the compiled factory, executed at least once and with its cursor closed
+     * @param context what is being asserted, for the failure message
+     */
+    public static void assertNoSlotLeak(RecordCursorFactory factory, CharSequence context) {
+        Assert.assertEquals(
+                "worker slot leaked: " + context,
+                0,
+                findPerWorkerLocks(factory, context).getAcquiredSlotCount()
+        );
+    }
 
-        int sockAddrCount = Net.getAllocatedSockAddrCount();
-        Assert.assertTrue("Initial allocated sockaddr count should be >= 0", sockAddrCount >= 0);
-
-        runnable.run();
-        Path.clearThreadLocals();
-        if (fileCount != Files.getOpenFileCount()) {
-            Assert.assertEquals("file descriptors, expected: " + fileDebugInfo + ", actual: " + Files.getOpenFdDebugInfo(), fileCount, Files.getOpenFileCount());
-        }
-
-        // Checks that the same tag used for allocation and freeing native memory
-        long memAfter = Unsafe.getMemUsed();
-        long memNativeSqlCompilerDiff = 0;
-        Assert.assertTrue(memAfter > -1);
-        if (mem != memAfter) {
-            for (int i = MemoryTag.MMAP_DEFAULT; i < MemoryTag.SIZE; i++) {
-                long actualMemByTag = Unsafe.getMemUsedByTag(i);
-                if (memoryUsageByTag[i] != actualMemByTag) {
-                    if (i != MemoryTag.NATIVE_SQL_COMPILER) {
-                        Assert.assertEquals("Memory usage by tag: " + MemoryTag.nameOf(i) + ", difference: " + (actualMemByTag - memoryUsageByTag[i]), memoryUsageByTag[i], actualMemByTag);
-                        Assert.assertTrue(actualMemByTag > -1);
-                    } else {
-                        // SqlCompiler memory is not released immediately as compilers are pooled
-                        Assert.assertTrue(actualMemByTag >= memoryUsageByTag[i]);
-                        memNativeSqlCompilerDiff = actualMemByTag - memoryUsageByTag[i];
+    /**
+     * Compiles the query once and executes the same factory twice. A worker must acquire a slot
+     * before the owner can reduce, and both executions must report the expected memory breach. Each execution verifies exact slot balance after close; the second also observes that the cached
+     * factory remains reusable after the first failure without depending on a concrete factory class.
+     */
+    public static void assertNoSlotLeakOnBreach(
+            SqlCompiler compiler,
+            SqlExecutionContext ctx,
+            String query
+    ) throws SqlException {
+        try (RecordCursorFactory factory = compiler.compile(query, ctx).getRecordCursorFactory()) {
+            final PerWorkerLocks locks = findPerWorkerLocks(factory, query);
+            for (int i = 0; i < 2; i++) {
+                // A fresh latch per execution, so the acquisition it records is this execution's.
+                // An atom that owns no locks never reaches here, which is what stops a plan that
+                // quietly stopped cloning per-worker state from passing.
+                final CountDownLatch acquired = new CountDownLatch(1);
+                locks.setTestAcquireLatch(acquired);
+                try {
+                    try (RecordCursor cursor = factory.getCursor(ctx)) {
+                        //noinspection StatementWithEmptyBody
+                        while (cursor.hasNext()) {
+                            // drain until breach
+                        }
+                        Assert.fail("expected per-query memory breach for: " + query);
+                    } catch (CairoException e) {
+                        Assert.assertTrue("expected isOutOfMemory(), got: " + e.getFlyweightMessage(), e.isOutOfMemory());
+                        assertContains(e.getFlyweightMessage(), "query memory limit exceeded");
                     }
+                    assertNoSlotLeak(factory, query);
+                    // The latch is the tally: a worker counts it down as it takes a slot, so a
+                    // latch still standing means no worker ever entered the path under test and the
+                    // zero above would be zero for the wrong reason. It also catches a pool trimmed
+                    // below the work-stealing threshold, where the owner reduces every frame itself
+                    // and no worker ever gets a chance to take a slot.
+                    Assert.assertEquals(
+                            "no worker acquired a slot for: " + query,
+                            0,
+                            acquired.getCount()
+                    );
+                } finally {
+                    locks.setTestAcquireLatch(null);
                 }
             }
-            Assert.assertEquals(mem + memNativeSqlCompilerDiff, memAfter);
+        }
+    }
+
+    /**
+     * Asserts that a {@code CharSequence} does NOT contain another {@code CharSequence}.
+     *
+     * @param sequence the {@code CharSequence} to check.
+     * @param term     the {@code CharSequence} to search for (and assert its absence).
+     * @see #assertNotContains(String, CharSequence, CharSequence)
+     */
+    public static void assertNotContains(CharSequence sequence, CharSequence term) {
+        assertNotContains(null, sequence, term);
+    }
+
+    /**
+     * Asserts that a {@code CharSequence} does NOT contain another {@code CharSequence}.
+     * <p>
+     * Fails if the {@code term} is empty (""), because the convention established by
+     * {@link #assertContains(String, CharSequence, CharSequence)} considers an empty
+     * term to be contained within any sequence.
+     * </p>
+     *
+     * @param message  the identifying message for the {@link AssertionError} (<code>null</code> okay)
+     * @param sequence the {@code CharSequence} to check.
+     * @param term     the {@code CharSequence} to search for (and assert its absence).
+     */
+    public static void assertNotContains(String message, CharSequence sequence, CharSequence term) {
+        if (term.isEmpty()) {
+            String formatted = "";
+            if (message != null) {
+                formatted = message + " ";
+            }
+            Assert.fail(formatted + "Cannot assert that sequence does not contain an empty term; an empty term is always considered contained by definition.");
         }
 
-        int addrInfoCountAfter = Net.getAllocatedAddrInfoCount();
-        Assert.assertTrue(addrInfoCountAfter > -1);
-        if (addrInfoCount != addrInfoCountAfter) {
-            Assert.fail("AddrInfo allocation count before the test: " + addrInfoCount + ", after the test: " + addrInfoCountAfter);
+        if (!Chars.contains(sequence, term)) {
+            return;
         }
 
-        int sockAddrCountAfter = Net.getAllocatedSockAddrCount();
-        Assert.assertTrue(sockAddrCountAfter > -1);
-        if (sockAddrCount != sockAddrCountAfter) {
-            Assert.fail("SockAddr allocation count before the test: " + sockAddrCount + ", after the test: " + sockAddrCountAfter);
+        String formatted = "";
+        if (message != null) {
+            formatted = message + " ";
         }
+        Assert.fail(formatted + "Expected sequence <" + sequence + "> to NOT contain term <" + term + "> but it did.");
     }
 
     public static void assertReader(CharSequence expected, TableReader reader, MutableUtf16Sink sink) {
-        assertCursor(expected, reader.getCursor(), reader.getMetadata(), true, sink);
-    }
-
-    public static void assertSql(
-            CairoEngine engine,
-            SqlExecutionContext sqlExecutionContext,
-            CharSequence sql,
-            MutableUtf16Sink sink,
-            CharSequence expected
-    ) throws SqlException {
-        try (SqlCompiler compiler = engine.getSqlCompiler()) {
-            assertSql(compiler, sqlExecutionContext, sql, sink, expected);
+        try (TestTableReaderRecordCursor cursor = new TestTableReaderRecordCursor().of(reader)) {
+            assertCursor(expected, cursor, reader.getMetadata(), true, sink);
         }
     }
 
-    public static void assertSql(
-            SqlCompiler compiler,
-            SqlExecutionContext sqlExecutionContext,
-            CharSequence sql,
-            MutableUtf16Sink sink,
-            CharSequence expected
-    ) throws SqlException {
-        printSql(compiler, sqlExecutionContext, sql, sink);
-        assertEquals(expected, sink);
+    public static void assertResponse(HttpClient.Request request, int expectedStatusCode, String expectedHttpResponse) {
+        try (HttpClient.ResponseHeaders responseHeaders = request.send()) {
+            responseHeaders.await();
+            assertEquals(String.valueOf(expectedStatusCode), responseHeaders.getStatusCode());
+            HttpUtils.assertChunkedBody(responseHeaders, expectedHttpResponse);
+        }
     }
 
-    public static void assertSqlCursors(CairoEngine engine, SqlExecutionContext sqlExecutionContext, CharSequence expected, CharSequence actual, Log log) throws SqlException {
+    /**
+     * Asserts that the actual lines are the same as the expected lines in the reverse order.
+     * For example, assertion with expected: "123\n456\n789\n" and actual: "789\n456\n123\n" passes.
+     * This method expects for the char sequences to end up with a newline character.
+     */
+    public static void assertReverseLinesEqual(@Nullable String message, CharSequence expected, CharSequence actual) {
+        String cleanMessage = message == null ? "" : message;
+        if (expected == null && actual == null) {
+            return;
+        }
+
+        if (expected != null && actual == null) {
+            Assert.fail(cleanMessage + "expected:<" + expected + "> but was: NULL");
+        }
+
+        if (expected == null) {
+            Assert.fail(cleanMessage + "expected: NULL but was:<" + actual + ">");
+        }
+
+        if (expected.length() != actual.length()) {
+            Assert.fail(cleanMessage + "expected:<" + reverseLines(expected) + "> but was:<" + actual + ">");
+        }
+
+        if (expected.isEmpty()) {
+            // If expected is empty, so is actual here (otherwise it would have failed the last condition).
+            return;
+        }
+
+        if (expected.charAt(expected.length() - 1) != '\n') {
+            Assert.fail(cleanMessage + "expected must end up with a newline character");
+        }
+
+        if (actual.charAt(actual.length() - 1) != '\n') {
+            Assert.fail(cleanMessage + "actual must end up with a newline character");
+        }
+
+        int expLo = expected.length();
+        int actHi = -1;
+        final int actLen = actual.length();
+        while (expLo != 0) {
+            int idx = Chars.lastIndexOf(expected, 0, expLo - 1, '\n');
+            final int len = expLo - idx - 1;
+            expLo = idx + 1;
+
+            final int actLo = actHi + 1;
+            idx = Chars.indexOf(actual, actLo, actLen, '\n');
+            if (idx == -1 || idx - actHi != len) {
+                Assert.fail(cleanMessage + "expected:<" + reverseLines(expected) + "> but was:<" + actual + ">");
+            }
+            actHi = idx;
+
+            for (int j = 0; j < len; j++) {
+                if (expected.charAt(expLo + j) != actual.charAt(actLo + j)) {
+                    Assert.fail(cleanMessage + "expected:<" + reverseLines(expected) + "> but was:<" + actual + ">");
+                }
+            }
+        }
+
+        if (actHi != actLen - 1) {
+            Assert.fail(cleanMessage + "expected:<" + reverseLines(expected) + "> but was:<" + actual + ">");
+        }
+    }
+
+    public static void assertSqlCursors(
+            CairoEngine engine,
+            SqlExecutionContext sqlExecutionContext,
+            CharSequence expected,
+            CharSequence actual,
+            Log log
+    ) throws SqlException {
         try (SqlCompiler compiler = engine.getSqlCompiler()) {
             assertSqlCursors(compiler, sqlExecutionContext, expected, actual, log);
         }
     }
 
-    public static void assertSqlCursors(CairoEngine engine, SqlExecutionContext sqlExecutionContext, CharSequence expected, CharSequence actual, Log log, boolean genericStringMatch) throws SqlException {
+    public static void assertSqlCursors(
+            CairoEngine engine,
+            SqlExecutionContext sqlExecutionContext,
+            CharSequence expected,
+            CharSequence actual,
+            Log log,
+            boolean genericStringMatch
+    ) throws SqlException {
         try (SqlCompiler compiler = engine.getSqlCompiler()) {
             assertSqlCursors(compiler, sqlExecutionContext, expected, actual, log, genericStringMatch);
         }
     }
 
-    public static void assertSqlCursors(SqlCompiler compiler, SqlExecutionContext sqlExecutionContext, CharSequence expected, CharSequence actual, Log log) throws SqlException {
+    public static void assertSqlCursors(
+            SqlCompiler compiler,
+            SqlExecutionContext sqlExecutionContext,
+            CharSequence expected,
+            CharSequence actual,
+            Log log
+    ) throws SqlException {
         assertSqlCursors(compiler, sqlExecutionContext, expected, actual, log, false);
     }
 
-    public static void assertSqlCursors(SqlCompiler compiler, SqlExecutionContext sqlExecutionContext, CharSequence expected, CharSequence actual, Log log, boolean genericStringMatch) throws SqlException {
-        try (RecordCursorFactory factory = compiler.compile(expected, sqlExecutionContext).getRecordCursorFactory()) {
-            try (RecordCursorFactory factory2 = compiler.compile(actual, sqlExecutionContext).getRecordCursorFactory()) {
-                try (RecordCursor cursor1 = factory.getCursor(sqlExecutionContext)) {
-                    try (RecordCursor cursor2 = factory2.getCursor(sqlExecutionContext)) {
+    public static void assertSqlCursors(
+            SqlCompiler compiler,
+            SqlExecutionContext sqlExecutionContext,
+            CharSequence expected,
+            CharSequence actual,
+            Log log,
+            boolean genericStringMatch
+    ) throws SqlException {
+        try (
+                RecordCursorFactory factory = compiler.compile(expected, sqlExecutionContext).getRecordCursorFactory();
+                RecordCursorFactory factory2 = compiler.compile(actual, sqlExecutionContext).getRecordCursorFactory()
+        ) {
+            try (
+                    RecordCursor cursor1 = factory.getCursor(sqlExecutionContext);
+                    RecordCursor cursor2 = factory2.getCursor(sqlExecutionContext)
+            ) {
+                assertEquals(cursor1, factory.getMetadata(), cursor2, factory2.getMetadata(), genericStringMatch);
+            } catch (AssertionError e) {
+                log.error().$(e).$();
+                try (
+                        RecordCursor expectedCursor = factory.getCursor(sqlExecutionContext);
+                        RecordCursor actualCursor = factory2.getCursor(sqlExecutionContext)
+                ) {
+                    log.xDebugW().$();
+
+                    LogRecordSinkAdapter recordSinkAdapter = new LogRecordSinkAdapter();
+                    LogRecord record = log.xDebugW().$("java.lang.AssertionError: expected:<");
+                    CursorPrinter.printHeader(factory.getMetadata(), recordSinkAdapter.of(record));
+                    record.$();
+                    CursorPrinter.println(expectedCursor, factory.getMetadata(), false, log);
+
+                    record = log.xDebugW().$("> but was:<");
+                    CursorPrinter.printHeader(factory2.getMetadata(), recordSinkAdapter.of(record));
+                    record.$();
+
+                    CursorPrinter.println(actualCursor, factory2.getMetadata(), false, log);
+                    log.xDebugW().$(">").$();
+                }
+                throw e;
+            }
+        }
+    }
+
+    public static void assertSqlCursors(
+            QuestDBTestNode node,
+            ObjList<QuestDBTestNode> nodes,
+            String expected,
+            String actual,
+            Log log,
+            boolean genericStringMatch
+    ) throws SqlException {
+        try (
+                SqlCompiler compiler = node.getEngine().getSqlCompiler();
+                RecordCursorFactory factory = compiler.compile(expected, node.getSqlExecutionContext()).getRecordCursorFactory()
+        ) {
+            for (int i = 0, n = nodes.size(); i < n; i++) {
+                final QuestDBTestNode dbNode = nodes.get(i);
+                try (
+                        SqlCompiler compiler2 = dbNode.getEngine().getSqlCompiler();
+                        RecordCursorFactory factory2 = compiler2.compile(actual, dbNode.getSqlExecutionContext()).getRecordCursorFactory()
+                ) {
+                    try (
+                            RecordCursor cursor1 = factory.getCursor(node.getSqlExecutionContext());
+                            RecordCursor cursor2 = factory2.getCursor(dbNode.getSqlExecutionContext())
+                    ) {
                         assertEquals(cursor1, factory.getMetadata(), cursor2, factory2.getMetadata(), genericStringMatch);
-                    }
-                } catch (AssertionError e) {
-                    log.error().$(e).$();
-                    try (RecordCursor expectedCursor = factory.getCursor(sqlExecutionContext)) {
-                        try (RecordCursor actualCursor = factory2.getCursor(sqlExecutionContext)) {
+                    } catch (AssertionError e) {
+                        log.error().$(e).$();
+                        try (
+                                RecordCursor expectedCursor = factory.getCursor(node.getSqlExecutionContext());
+                                RecordCursor actualCursor = factory2.getCursor(dbNode.getSqlExecutionContext())
+                        ) {
                             log.xDebugW().$();
 
                             LogRecordSinkAdapter recordSinkAdapter = new LogRecordSinkAdapter();
@@ -701,42 +1270,6 @@ public final class TestUtils {
                             CursorPrinter.println(actualCursor, factory2.getMetadata(), false, log);
                             log.xDebugW().$(">").$();
                         }
-                    }
-                    throw e;
-                }
-            }
-        }
-    }
-
-    public static void assertSqlCursors(QuestDBTestNode node, ObjList<QuestDBTestNode> nodes, String expected, String actual, Log log, boolean genericStringMatch) throws SqlException {
-        try (SqlCompiler compiler = node.getEngine().getSqlCompiler(); RecordCursorFactory factory = compiler.compile(expected, node.getSqlExecutionContext()).getRecordCursorFactory()) {
-            for (int i = 0, n = nodes.size(); i < n; i++) {
-                final QuestDBTestNode dbNode = nodes.get(i);
-                try (SqlCompiler compiler2 = dbNode.getEngine().getSqlCompiler(); RecordCursorFactory factory2 = compiler2.compile(actual, dbNode.getSqlExecutionContext()).getRecordCursorFactory()) {
-                    try (RecordCursor cursor1 = factory.getCursor(node.getSqlExecutionContext())) {
-                        try (RecordCursor cursor2 = factory2.getCursor(dbNode.getSqlExecutionContext())) {
-                            assertEquals(cursor1, factory.getMetadata(), cursor2, factory2.getMetadata(), genericStringMatch);
-                        }
-                    } catch (AssertionError e) {
-                        log.error().$(e).$();
-                        try (RecordCursor expectedCursor = factory.getCursor(node.getSqlExecutionContext())) {
-                            try (RecordCursor actualCursor = factory2.getCursor(dbNode.getSqlExecutionContext())) {
-                                log.xDebugW().$();
-
-                                LogRecordSinkAdapter recordSinkAdapter = new LogRecordSinkAdapter();
-                                LogRecord record = log.xDebugW().$("java.lang.AssertionError: expected:<");
-                                CursorPrinter.printHeader(factory.getMetadata(), recordSinkAdapter.of(record));
-                                record.$();
-                                CursorPrinter.println(expectedCursor, factory.getMetadata(), false, log);
-
-                                record = log.xDebugW().$("> but was:<");
-                                CursorPrinter.printHeader(factory2.getMetadata(), recordSinkAdapter.of(record));
-                                record.$();
-
-                                CursorPrinter.println(actualCursor, factory2.getMetadata(), false, log);
-                                log.xDebugW().$(">").$();
-                            }
-                        }
                         throw e;
                     }
                 }
@@ -744,9 +1277,25 @@ public final class TestUtils {
         }
     }
 
-    public static void assertSqlWithTypes(SqlCompiler compiler, SqlExecutionContext sqlExecutionContext, CharSequence sql, MutableUtf16Sink sink, CharSequence expected) throws SqlException {
+    public static void assertSqlWithTypes(
+            SqlCompiler compiler,
+            SqlExecutionContext sqlExecutionContext,
+            CharSequence sql,
+            MutableUtf16Sink sink,
+            CharSequence expected
+    ) throws SqlException {
         printSqlWithTypes(compiler, sqlExecutionContext, sql, sink);
         assertEquals(expected, sink);
+    }
+
+    public static void assertViewState(boolean expectedInvalid, ViewState viewState) {
+        assertNotNull(viewState);
+        try {
+            viewState.lockForRead();
+            Assert.assertEquals(expectedInvalid, viewState.isInvalid());
+        } finally {
+            viewState.unlockAfterRead();
+        }
     }
 
     public static void await(CyclicBarrier barrier) {
@@ -763,12 +1312,59 @@ public final class TestUtils {
         }
     }
 
-    public static long connect(int fd, long sockAddr) {
+    // Useful for debugging
+    @SuppressWarnings("unused")
+    public static long beHexToLong(String hex) {
+        return Long.parseLong(reverseBeHex(hex), 16);
+    }
+
+    // Useful for debugging
+    @SuppressWarnings("unused")
+    public static String beHexToTs(String hex, TimestampDriver driver) {
+        long l = beHexToLong(hex);
+        return driver.toUSecString(l);
+    }
+
+    /**
+     * Generates a cartesian product from multiple sets of values.
+     * <p>
+     * This utility method creates all possible combinations of elements where each combination
+     * takes exactly one element from each input set. It's primarily used to generate comprehensive
+     * test parameters for parameterized tests.
+     * <p>
+     * Example usage:
+     * <pre>{@code
+     * Object[][] parameters = cartesianProduct(new Object[][]{
+     *     JoinType.values(),     // First set: all join types
+     *     {true, false},         // Second set: boolean values
+     *     LimitType.values(),    // Third set: all limit types
+     *     {true, false}          // Fourth set: more boolean values
+     * });
+     * }</pre>
+     *
+     * @param values A non-empty array of arrays, where each inner array represents a set of values.
+     *               None of the inner arrays can be empty.
+     * @return A two-dimensional array containing all possible combinations of the input values,
+     * where each row is one combination.
+     * @throws AssertionError If the input array is empty or any inner array is empty
+     */
+    public static Object[][] cartesianProduct(@NotNull Object[][] values) {
+        if (values.length == 0) {
+            throw new AssertionError("Expected at least one set of values");
+        }
+        return cartesianProduct(values, 0);
+    }
+
+    public static int connect(long fd, long sockAddr) {
         Assert.assertTrue(fd > -1);
+        // clients may run out of ephemeral ports, that are still lingering
+        // enable port reuse to avoid WSAEADDRINUSE(10048)
+        Net.setReusePort(fd);
+        Net.setReuseAddress(fd);
         return Net.connect(fd, sockAddr);
     }
 
-    public static long connectAddrInfo(int fd, long sockAddrInfo) {
+    public static long connectAddrInfo(long fd, long sockAddrInfo) {
         Assert.assertTrue(fd > -1);
         return Net.connectAddrInfo(fd, sockAddrInfo);
     }
@@ -796,35 +1392,64 @@ public final class TestUtils {
         }
     }
 
-    public static TableToken create(TableModel model, CairoEngine engine) {
-        int tableId = (int) engine.getTableIdGenerator().getNextId();
-        TableToken tableToken = engine.lockTableName(model.getTableName(), tableId, model.isWalEnabled());
-        if (tableToken == null) {
-            throw new RuntimeException("table already exists: " + model.getTableName());
-        }
-        createTable(model, engine.getConfiguration(), ColumnType.VERSION, tableId, tableToken);
-        engine.registerTableToken(tableToken);
-        if (model.isWalEnabled()) {
-            engine.getTableSequencerAPI().registerTable(tableId, model, tableToken);
-        }
-        return tableToken;
+    public static void createPopulateTable(
+            SqlCompiler compiler, SqlExecutionContext sqlExecutionContext, TableModel tableModel,
+            int totalRows, String startDate, int partitionCount
+    ) throws NumericException, SqlException {
+        createPopulateTable(
+                tableModel.getTableName(),
+                compiler,
+                sqlExecutionContext,
+                tableModel,
+                totalRows,
+                startDate,
+                partitionCount
+        );
     }
 
-    public static void createPopulateTable(SqlCompiler compiler, SqlExecutionContext sqlExecutionContext, TableModel tableModel, int totalRows, String startDate, int partitionCount) throws NumericException, SqlException {
-        createPopulateTable(tableModel.getTableName(), compiler, sqlExecutionContext, tableModel, totalRows, startDate, partitionCount);
+    public static void createPopulateTable(
+            CharSequence tableName,
+            SqlCompiler compiler,
+            SqlExecutionContext sqlExecutionContext,
+            TableModel tableModel,
+            int totalRows,
+            String startDate,
+            int partitionCount
+    ) throws NumericException, SqlException {
+        CairoEngine.execute(
+                compiler,
+                createPopulateTableStmt(tableName, tableModel, totalRows, startDate, partitionCount),
+                sqlExecutionContext,
+                null
+        );
     }
 
-    public static void createPopulateTable(CharSequence tableName, SqlCompiler compiler, SqlExecutionContext sqlExecutionContext, TableModel tableModel, int totalRows, String startDate, int partitionCount) throws NumericException, SqlException {
-        compiler.compile(createPopulateTableStmt(tableName, tableModel, totalRows, startDate, partitionCount), sqlExecutionContext);
-    }
-
-    public static String createPopulateTableStmt(CharSequence tableName, TableModel tableModel, int totalRows, String startDate, int partitionCount) throws NumericException {
-        long fromTimestamp = IntervalUtils.parseFloorPartialTimestamp(startDate);
-        long increment = partitionIncrement(tableModel.getPartitionBy(), fromTimestamp, totalRows, partitionCount);
-        if (PartitionBy.isPartitioned(tableModel.getPartitionBy())) {
-            final PartitionBy.PartitionAddMethod partitionAddMethod = PartitionBy.getPartitionAddMethod(tableModel.getPartitionBy());
+    public static String createPopulateTableStmt(
+            CharSequence tableName,
+            TableModel tableModel,
+            int totalRows,
+            String startDate,
+            int partitionCount
+    ) throws NumericException {
+        int timestampType = TableUtils.getTimestampType(tableModel);
+        TimestampDriver driver = ColumnType.getTimestampDriver(timestampType);
+        long fromTimestamp = driver.parseFloorLiteral(startDate);
+        int partitionBy = tableModel.getPartitionBy();
+        long increment = partitionIncrement(
+                driver,
+                partitionBy,
+                fromTimestamp,
+                totalRows,
+                partitionCount
+        );
+        if (PartitionBy.isPartitioned(partitionBy)) {
+            final TimestampDriver.PartitionAddMethod partitionAddMethod =
+                    PartitionBy.getPartitionAddMethod(
+                            timestampType,
+                            partitionBy
+                    );
             assert partitionAddMethod != null;
-            long toTs = partitionAddMethod.calculate(fromTimestamp, partitionCount) - fromTimestamp - Timestamps.SECOND_MICROS;
+            long toTs = partitionAddMethod.calculate(fromTimestamp, partitionCount) - fromTimestamp - driver.fromSeconds(1);
             increment = totalRows > 0 ? Math.max(toTs / totalRows, 1) : 0;
         }
 
@@ -851,7 +1476,8 @@ public final class TestUtils {
                     sql.append("x / 1000.0 ").append(colName);
                     break;
                 case ColumnType.TIMESTAMP:
-                    sql.append("CAST(").append(fromTimestamp).append("L AS TIMESTAMP) + x * ").append(increment).append("  ").append(colName);
+                    sql.append("CAST(").append(fromTimestamp).append("L AS ").append(ColumnType.nameOf(timestampType)).append(") + x * ")
+                            .append(increment).append("  ").append(colName);
                     break;
                 case ColumnType.SYMBOL:
                     sql.append("rnd_symbol(4,4,4,2) ").append(colName);
@@ -918,7 +1544,10 @@ public final class TestUtils {
 
     public static SqlExecutionContext createSqlExecutionCtx(CairoEngine engine, BindVariableService bindVariableService) {
         SqlExecutionContextImpl ctx = new SqlExecutionContextImpl(engine, 1);
-        ctx.with(engine.getConfiguration().getFactoryProvider().getSecurityContextFactory().getRootContext(), bindVariableService);
+        ctx.with(
+                engine.getConfiguration().getFactoryProvider().getSecurityContextFactory().getRootContext(),
+                bindVariableService
+        );
         return ctx;
     }
 
@@ -927,7 +1556,9 @@ public final class TestUtils {
                 .with(engine.getConfiguration().getFactoryProvider().getSecurityContextFactory().getRootContext());
     }
 
-    public static SqlExecutionContextImpl createSqlExecutionCtx(CairoEngine engine, BindVariableService bindVariableService, int workerCount) {
+    public static SqlExecutionContextImpl createSqlExecutionCtx(
+            CairoEngine engine, BindVariableService bindVariableService, int workerCount
+    ) {
         return new SqlExecutionContextImpl(engine, workerCount)
                 .with(
                         engine.getConfiguration().getFactoryProvider().getSecurityContextFactory().getRootContext(),
@@ -935,10 +1566,50 @@ public final class TestUtils {
                 );
     }
 
-    public static void createTable(TableModel model, CairoConfiguration configuration, int tableVersion, int tableId, TableToken tableToken) {
-        try (Path path = new Path(); MemoryMARW mem = Vm.getMARWInstance()) {
-            TableUtils.createTable(configuration, mem, path, model, tableVersion, tableId, tableToken.getDirName());
+    public static TableToken createTable(CairoEngine engine, TableStructure structure) {
+        return createTable(engine, structure, engine.getNextTableId());
+    }
+
+    public static void createTable(
+            TableModel model,
+            CairoConfiguration configuration,
+            int tableVersion,
+            int tableId,
+            TableToken tableToken
+    ) {
+        try (
+                Path path = new Path();
+                MemoryMARW mem = Vm.getCMARWInstance()
+        ) {
+            TableUtils.createTable(configuration, mem, null, path, model, tableVersion, tableId, tableToken.getDirName());
         }
+    }
+
+    public static TableToken createTable(CairoEngine engine, TableStructure structure, int tableId) {
+        try (MemoryMARW mem = Vm.getCMARWInstance(); Path path = new Path()) {
+            return TestUtils.createTable(engine, mem, path, structure, tableId, structure.getTableName());
+        }
+    }
+
+    public static TableToken createTable(
+            CairoEngine engine,
+            MemoryMARW memory,
+            Path path,
+            TableStructure structure,
+            int tableId,
+            CharSequence tableName
+    ) {
+        TableToken token = engine.lockTableName(tableName, tableId, structure.isView(), structure.isMatView(), structure.isWalEnabled());
+        if (token == null) {
+            throw new RuntimeException("table already exists: " + tableName);
+        }
+        path.of(engine.getConfiguration().getDbRoot()).concat(token);
+        TableUtils.createTable(engine.getConfiguration(), memory, engine.getTelemetry(), path, structure, ColumnType.VERSION, tableId, token.getDirName());
+        engine.registerTableToken(token);
+        if (structure.isWalEnabled()) {
+            engine.getTableSequencerAPI().registerTable(tableId, structure, token);
+        }
+        return token;
     }
 
     public static void createTestPath(CharSequence root) {
@@ -958,24 +1629,46 @@ public final class TestUtils {
         return ts;
     }
 
+    public static void drainCopyImportJobQueue(CairoEngine engine) throws Exception {
+        try (CopyImportRequestJob copyRequestJob = new CopyImportRequestJob(engine, 1)) {
+            copyRequestJob.drain(0);
+        }
+    }
+
     @SuppressWarnings("StatementWithEmptyBody")
     public static void drainCursor(RecordCursor cursor) {
         while (cursor.hasNext()) {
         }
     }
 
-    public static void drainTextImportJobQueue(CairoEngine engine) throws Exception {
-        try (CopyRequestJob copyRequestJob = new CopyRequestJob(engine, 1)) {
-            copyRequestJob.drain(0);
+    public static void drainPurgeJob(CairoEngine engine) {
+        drainPurgeJob(engine, engine.getConfiguration().getFilesFacade());
+    }
+
+    public static void drainPurgeJob(CairoEngine engine, FilesFacade filesFacade) {
+        try (WalPurgeJob job = new WalPurgeJob(
+                engine,
+                filesFacade,
+                engine.getConfiguration().getMicrosecondClock()
+        )) {
+            job.drain(0);
         }
     }
 
     public static void drainWalQueue(CairoEngine engine) {
-        try (final ApplyWal2TableJob walApplyJob = new ApplyWal2TableJob(engine, 1, 1)) {
+        try (final ApplyWal2TableJob walApplyJob = new ApplyWal2TableJob(engine, 0)) {
             walApplyJob.drain(0);
-            new CheckWalTransactionsJob(engine).run(0);
+            new CheckWalTransactionsJob(engine).run();
             // run once again as there might be notifications to handle now
             walApplyJob.drain(0);
+        }
+    }
+
+    public static String dumpMetadataCache(CairoEngine engine) {
+        try (MetadataCacheReader ro = engine.getMetadataCache().readLock()) {
+            StringSink sink = new StringSink();
+            ro.toSink(sink);
+            return sink.toString();
         }
     }
 
@@ -1004,13 +1697,12 @@ public final class TestUtils {
             @Nullable WorkerPool pool,
             CustomisableRunnable runnable,
             CairoConfiguration configuration,
-            Metrics metrics,
             Log log
     ) throws Exception {
         final int workerCount = pool != null ? pool.getWorkerCount() : 1;
         final BindVariableServiceImpl bindVariableService = new BindVariableServiceImpl(configuration);
         try (
-                final CairoEngine engine = new CairoEngine(configuration, metrics);
+                final CairoEngine engine = new CairoEngine(configuration);
                 final SqlCompiler compiler = engine.getSqlCompiler();
                 final SqlExecutionContext sqlExecutionContext = createSqlExecutionCtx(engine, bindVariableService, workerCount)
         ) {
@@ -1023,7 +1715,7 @@ public final class TestUtils {
                 runnable.run(engine, compiler, sqlExecutionContext);
             } finally {
                 if (pool != null) {
-                    pool.halt();
+                    pool.haltAndAssertCleanForTest(WorkerPool.DEFAULT_HALT_TIMEOUT_NANOS);
                 }
             }
             Assert.assertEquals(0, engine.getBusyWriterCount());
@@ -1031,13 +1723,66 @@ public final class TestUtils {
         }
     }
 
-    public static void execute(@Nullable WorkerPool pool, CustomisableRunnable runner, CairoConfiguration configuration, Log log) throws Exception {
-        execute(pool, runner, configuration, Metrics.disabled(), log);
+    public static void execute(Connection conn, String sql, String... bindVars) throws SQLException {
+        //noinspection SqlSourceToSinkFlow
+        try (PreparedStatement stmt = conn.prepareStatement(sql)) {
+            for (int i = 0; i < bindVars.length; i++) {
+                stmt.setString(i + 1, bindVars[i]);
+            }
+            stmt.execute();
+        }
+    }
+
+    public static void executeSQLViaPostgres(String username, String password, int pgPort, String... sqls) throws SQLException {
+        try (final Connection connection = getConnectionForUser(username, password, pgPort)) {
+            for (String sql : sqls) {
+                execute(connection, sql);
+            }
+        }
+    }
+
+    /**
+     * Returns the first atom found walking down the factory tree, failing when there is none.
+     */
+    public static StatefulAtom findAtom(RecordCursorFactory factory, CharSequence context) {
+        StatefulAtom atom = null;
+        for (RecordCursorFactory f = factory; f != null; f = f.getBaseFactory()) {
+            atom = f.getAtom();
+            if (atom != null) {
+                break;
+            }
+        }
+        Assert.assertNotNull(
+                "no parallel factory with an atom in the tree, top was " + factory.getClass().getSimpleName() + ": " + context,
+                atom
+        );
+        return atom;
+    }
+
+    /**
+     * Returns the per-worker locks of the first atom in the factory tree, failing when the atom
+     * guards no per-worker state. An atom that holds no locks can neither take a slot nor leak one,
+     * so asserting slot balance against it would pass for the wrong reason.
+     */
+    public static PerWorkerLocks findPerWorkerLocks(RecordCursorFactory factory, CharSequence context) {
+        final StatefulAtom atom = findAtom(factory, context);
+        Assert.assertTrue(
+                atom.getClass().getSimpleName() + " owns no per-worker locks, so this query cannot"
+                        + " exercise the slot-leak path: " + context,
+                atom instanceof PerWorkerLockOwner
+        );
+        final PerWorkerLocks locks = ((PerWorkerLockOwner) atom).getPerWorkerLocks();
+        Assert.assertNotNull(
+                atom.getClass().getSimpleName() + " built no per-worker locks, so this query cannot"
+                        + " exercise the slot-leak path: " + context,
+                locks
+        );
+        return locks;
     }
 
     @NotNull
     public static Rnd generateRandom(Log log) {
-        return generateRandom(log, System.nanoTime(), System.currentTimeMillis());
+        return generateRandom(log, seedOf("fuzz.s0", System.nanoTime()), seedOf("fuzz.s1", System.currentTimeMillis()));
     }
 
     @NotNull
@@ -1046,7 +1791,12 @@ public final class TestUtils {
             log.info().$("random seeds: ").$(s0).$("L, ").$(s1).$('L').$();
         }
         System.out.printf("random seeds: %dL, %dL%n", s0, s1);
-        return new Rnd(s0, s1);
+        Rnd rnd = new Rnd(s0, s1);
+        // Random impl is biased on first few calls, always return same bool,
+        // so we need to make a few calls to get it going randomly
+        rnd.nextBoolean();
+        rnd.nextBoolean();
+        return rnd;
     }
 
     public static String getCsvRoot() {
@@ -1066,6 +1816,21 @@ public final class TestUtils {
         return Integer.parseInt(version);
     }
 
+    public static long getMetricValue(CairoEngine engine, String tag) {
+        try (DirectUtf8Sink metricsSink = new DirectUtf8Sink(1024)) {
+            engine.getMetrics().scrapeIntoPrometheus(metricsSink);
+            String[] lines = metricsSink.toString().split("\n");
+            Optional<String> metricsLine = Arrays.stream(lines)
+                    .filter(line -> line.startsWith(tag + ' ')).findFirst();
+            Assert.assertTrue(tag + " missing", metricsLine.isPresent());
+            return Long.parseLong(metricsLine.get().substring(tag.length() + 1));
+        }
+    }
+
+    public static String getPgConnectionUri(int pgPort) {
+        return "jdbc:postgresql://127.0.0.1:" + pgPort + "/qdb";
+    }
+
     public static String getResourcePath(String resourceName) {
         URL resource = ServerMain.class.getResource(resourceName);
         assertNotNull("Someone accidentally deleted resource " + resourceName + "?", resource);
@@ -1082,7 +1847,7 @@ public final class TestUtils {
             final AtomicInteger totalSent = new AtomicInteger();
 
             @Override
-            public int sendRaw(int fd, long buffer, int bufferLen) {
+            public int sendRaw(long fd, long buffer, int bufferLen) {
                 if (startDelayDelayAfter == 0) {
                     return super.sendRaw(fd, buffer, bufferLen);
                 }
@@ -1126,6 +1891,18 @@ public final class TestUtils {
         }
     }
 
+    public static TestTimestampType getTimestampType() {
+        return getTimestampType(generateRandom(LOG));
+    }
+
+    public static TestTimestampType getTimestampType(Rnd rnd) {
+        return rnd.nextBoolean() ? TestTimestampType.MICRO : TestTimestampType.NANO;
+    }
+
+    public static WorkerPoolMode getWorkerPoolMode(Rnd rnd) {
+        return rnd.nextBoolean() ? WorkerPoolMode.FIBER_HOST : WorkerPoolMode.LEGACY;
+    }
+
     public static TableWriter getWriter(CairoEngine engine, CharSequence tableName) {
         return getWriter(engine, engine.verifyTableName(tableName));
     }
@@ -1134,12 +1911,25 @@ public final class TestUtils {
         return engine.getWriter(tableToken, "test");
     }
 
-    public static String insertFromSelectPopulateTableStmt(TableModel tableModel, int totalRows, String startDate, int partitionCount) throws NumericException {
-        long fromTimestamp = IntervalUtils.parseFloorPartialTimestamp(startDate);
-        long increment = partitionIncrement(tableModel.getPartitionBy(), fromTimestamp, totalRows, partitionCount);
+    public static String insertFromSelectPopulateTableStmt(
+            TableModel tableModel,
+            int totalRows,
+            String startDate,
+            int partitionCount
+    ) throws NumericException {
+        TimestampDriver driver = ColumnType.getTimestampDriver(TableUtils.getTimestampType(tableModel));
+        long fromTimestamp = driver.parseFloorLiteral(startDate);
+        long increment = partitionIncrement(
+                driver,
+                tableModel.getPartitionBy(),
+                fromTimestamp,
+                totalRows,
+                partitionCount
+        );
 
         StringBuilder insertFromSelect = new StringBuilder();
-        insertFromSelect.append("INSERT ATOMIC INTO ").append(tableModel.getTableName()).append(" SELECT").append(Misc.EOL);
+        insertFromSelect.append("INSERT ATOMIC INTO ")
+                .append(tableModel.getTableName()).append(" SELECT").append(Misc.EOL);
         for (int i = 0; i < tableModel.getColumnCount(); i++) {
             CharSequence colName = tableModel.getColumnName(i);
             switch (ColumnType.tagOf(tableModel.getColumnType(i))) {
@@ -1159,7 +1949,8 @@ public final class TestUtils {
                     insertFromSelect.append("x / 1000.0 ").append(colName);
                     break;
                 case ColumnType.TIMESTAMP:
-                    insertFromSelect.append("CAST(").append(fromTimestamp).append("L AS TIMESTAMP) + x * ").append(increment).append("  ").append(colName);
+                    insertFromSelect.append("CAST(").append(fromTimestamp).append("L AS ").append(ColumnType.nameOf(tableModel.getColumnType(i))).append(") + x * ")
+                            .append(increment).append("  ").append(colName);
                     break;
                 case ColumnType.SYMBOL:
                     insertFromSelect.append("rnd_symbol(4,4,4,2) ").append(colName);
@@ -1202,7 +1993,7 @@ public final class TestUtils {
             }
         }
         insertFromSelect.append(Misc.EOL + "FROM long_sequence(").append(totalRows).append(")");
-        insertFromSelect.append(")" + Misc.EOL);
+        insertFromSelect.append(";" + Misc.EOL);
         return insertFromSelect.toString();
     }
 
@@ -1220,31 +2011,35 @@ public final class TestUtils {
         return sink.toString();
     }
 
+    /**
+     * Helper method to bias probability of "wal" tests to 80%
+     *
+     * @return true when tests should run in WAL-enabled mode, false otherwise.
+     */
+    public static boolean isWal() {
+        return isWal(generateRandom(LOG));
+    }
+
+    public static boolean isWal(Rnd rnd) {
+        return rnd.nextInt(100) < 80;
+    }
+
     public static int maxDayOfMonth(int month) {
-        switch (month) {
-            case 1:
-            case 3:
-            case 5:
-            case 7:
-            case 8:
-            case 10:
-            case 12:
-                return 31;
-            case 2:
-                return 28;
-            case 4:
-            case 6:
-            case 9:
-            case 11:
-                return 30;
-            default:
-                throw new IllegalArgumentException("[1..12]");
-        }
+        return switch (month) {
+            case 1, 3, 5, 7, 8, 10, 12 -> 31;
+            case 2 -> 28;
+            case 4, 6, 9, 11 -> 30;
+            default -> throw new IllegalArgumentException("[1..12]");
+        };
     }
 
     public static void messTxnUnallocated(FilesFacade ff, Path path, Rnd rnd, TableToken tableToken) {
         path.concat(tableToken).concat(TableUtils.TXN_FILE_NAME);
-        try (MemoryMARW txFile = Vm.getCMARWInstance(ff, path.$(), Files.PAGE_SIZE, -1, MemoryTag.NATIVE_MIG_MMAP, CairoConfiguration.O_NONE)) {
+        try (MemoryMARW txFile = Vm.getCMARWInstance(
+                ff, path.$(), Files.PAGE_SIZE, -1,
+                MemoryTag.NATIVE_MIG_MMAP, CairoConfiguration.O_NONE
+        )
+        ) {
             long version = txFile.getLong(TableUtils.TX_BASE_OFFSET_VERSION_64);
             boolean isA = (version & 1L) == 0L;
             long baseOffset = isA ? txFile.getInt(TX_BASE_OFFSET_A_32) : txFile.getInt(TX_BASE_OFFSET_B_32);
@@ -1257,19 +2052,15 @@ public final class TestUtils {
         }
     }
 
-    public static TableWriter newOffPoolWriter(CairoConfiguration configuration, TableToken tableToken) {
-        return newOffPoolWriter(configuration, tableToken, Metrics.disabled());
-    }
-
-    public static TableWriter newOffPoolWriter(CairoConfiguration configuration, TableToken tableToken, Metrics metrics) {
-        return newOffPoolWriter(configuration, tableToken, metrics, new MessageBusImpl(configuration));
+    public static TableWriter newOffPoolWriter(CairoConfiguration configuration, TableToken tableToken, CairoEngine engine) {
+        return newOffPoolWriter(configuration, tableToken, new MessageBusImpl(configuration), engine);
     }
 
     public static TableWriter newOffPoolWriter(
             CairoConfiguration configuration,
             TableToken tableToken,
-            Metrics metrics,
-            MessageBus messageBus
+            MessageBus messageBus,
+            CairoEngine engine
     ) {
         return new TableWriter(
                 configuration,
@@ -1278,14 +2069,15 @@ public final class TestUtils {
                 messageBus,
                 true,
                 DefaultLifecycleManager.INSTANCE,
-                configuration.getRoot(),
+                configuration.getDbRoot(),
                 DefaultDdlListener.INSTANCE,
-                () -> false,
-                metrics
+                engine
         );
     }
 
-    public static void printSql(CairoEngine engine, SqlExecutionContext sqlExecutionContext, CharSequence sql, MutableUtf16Sink sink) throws SqlException {
+    public static void printSql(
+            CairoEngine engine, SqlExecutionContext sqlExecutionContext, CharSequence sql, MutableUtf16Sink sink
+    ) throws SqlException {
         try (SqlCompiler compiler = engine.getSqlCompiler()) {
             printSql(compiler, sqlExecutionContext, sql, sink);
         }
@@ -1308,6 +2100,15 @@ public final class TestUtils {
                     println(record, metadata, sink);
                 }
             }
+        }
+    }
+
+    public static String printSqlToString(
+            CairoEngine engine, SqlExecutionContext sqlExecutionContext, CharSequence sql, MutableUtf16Sink sink
+    ) throws SqlException {
+        try (SqlCompiler compiler = engine.getSqlCompiler()) {
+            printSql(compiler, sqlExecutionContext, sql, sink);
+            return sink.toString();
         }
     }
 
@@ -1340,7 +2141,7 @@ public final class TestUtils {
         long p = Unsafe.malloc(len, MemoryTag.NATIVE_DEFAULT);
         try {
             for (int i = 0; i < len; i++) {
-                Unsafe.getUnsafe().putByte(p + i, bytes[i]);
+                Unsafe.putByte(p + i, bytes[i]);
             }
             DirectUtf8String seq = new DirectUtf8String();
             seq.of(p, p + len);
@@ -1363,6 +2164,67 @@ public final class TestUtils {
         return seq;
     }
 
+    public static String randomSymbolIndexTypeName(Rnd rnd) {
+        return switch (rnd.nextInt(4)) {
+            case 0 -> "BITMAP";
+            case 1 -> "POSTING";
+            case 2 -> "POSTING DELTA";
+            case 3 -> "POSTING EF";
+            default -> throw new AssertionError();
+        };
+    }
+
+    public static String randomiseCase(Rnd rnd, String columName) {
+        int changeCase = rnd.nextInt(3);
+        if (changeCase == 0) {
+            return columName;
+        }
+        StringSink sink = Misc.getThreadLocalSink();
+        sink.put(columName);
+
+        for (int i = 0; i < changeCase; i++) {
+            int pos = rnd.nextInt(columName.length());
+            char ch = columName.charAt(pos);
+            if (Character.isLowerCase(ch)) {
+                sink.setCharAt(pos, Character.toUpperCase(ch));
+            } else {
+                sink.setCharAt(pos, Character.toLowerCase(ch));
+            }
+        }
+        return sink.toString();
+    }
+
+    /**
+     * Reads the {@code seqTxn} stamped into the footer of the {@code _pm}
+     * snapshot identified by {@code parquetFileSize} (the MVCC version token
+     * from {@code _txn} field 3), opening and mapping the file for the
+     * duration of the call. Returns {@code -1} when the file is missing or
+     * unreadable, when no footer in the chain matches {@code parquetFileSize},
+     * or when the matched footer carries no {@code seqTxn}.
+     */
+    public static long readSeqTxnForVersion(FilesFacade ff, LPSZ path, long parquetFileSize) {
+        final ParquetMetaFileReader reader = new ParquetMetaFileReader();
+        long addr = 0;
+        long size = 0;
+        try {
+            addr = ParquetMetaFileReader.openAndMapRO(ff, path, reader);
+            if (addr == 0) {
+                return -1;
+            }
+            // Capture the mapping size before clear() zeros it; needed for munmap.
+            size = reader.getFileSize();
+            if (!reader.resolveFooter(parquetFileSize)) {
+                return -1;
+            }
+            return reader.getResolvedSeqTxn();
+        } finally {
+            reader.clear();
+            if (addr != 0) {
+                ff.munmap(addr, size, MemoryTag.MMAP_PARQUET_METADATA_READER);
+            }
+        }
+    }
+
     public static String readStringFromFile(File file) {
         try {
             try (FileInputStream fis = new FileInputStream(file)) {
@@ -1379,18 +2241,243 @@ public final class TestUtils {
         }
     }
 
+    public static boolean remove(LPSZ lpsz) {
+        if (Files.remove(lpsz)) {
+            return true;
+        }
+
+        // could not remove file, logging error
+        final FilesFacade ff = FilesFacadeImpl.INSTANCE;
+        LOG.error().$("Could not remove file [path=").$safe(lpsz).$(", errno=").$(ff.errno()).I$();
+        return false;
+    }
+
     public static void removeTestPath(CharSequence root) {
         try (Path path = new Path()) {
             path.of(root);
             FilesFacade ff = TestFilesFacadeImpl.INSTANCE;
             path.slash();
-            Assert.assertTrue("Test dir cleanup error: " + ff.errno(), !ff.exists(path.$()) || ff.rmdir(path.slash()));
+            // Eager deletion (haltOnFail=false): some tests intentionally leave background worker threads
+            // running into teardown -- e.g. BackupTest.testBackupShutdownTimeout forces a backup-shutdown
+            // timeout that abandons its native upload/compression threads, "relying on process shutdown". Those
+            // threads race this cleanup and delete tree entries concurrently. haltOnFail=true aborts on the
+            // first already-gone entry (a benign "does not exist", errno 2/3 on Windows) and leaves the rest of
+            // the tree behind; eager mode keeps deleting and only fails if the root cannot ultimately be emptied.
+            if (ff.exists(path.$()) && !Files.rmdir(path, false)) {
+                final int errno = Os.errno();
+                // The racing deleter may have removed the root from under us -- treat "does not exist" as success.
+                // A genuine leak (an open file handle) instead leaves the root non-empty and still surfaces here.
+                if (errno != CairoException.ERRNO_FILE_DOES_NOT_EXIST && errno != CairoException.ERRNO_FILE_DOES_NOT_EXIST_WIN) {
+                    StringSink dir = new StringSink();
+                    dir.put(path.$());
+                    Assert.fail("Test dir " + dir + " cleanup error: " + errno);
+                }
+            }
+
+            path.parent().concat(RESTORE_FROM_CHECKPOINT_TRIGGER_FILE_NAME);
+            if (ff.exists(path.$()) && !ff.removeQuiet(path.$())) {
+                StringSink dir = new StringSink();
+                dir.put(path.$());
+                Assert.fail("Checkpoint dir " + dir + " trigger cleanup error:: " + ff.errno());
+            }
         }
     }
 
+    public static String replaceSizeToMatchOS(
+            String expected,
+            String tableName,
+            CairoConfiguration configuration,
+            CairoEngine engine,
+            StringSink sink
+    ) {
+        return replaceSizeToMatchOS(expected, new Utf8String(configuration.getDbRoot()), tableName, engine, sink);
+    }
+
+    public static String replaceSizeToMatchOS(
+            String expected,
+            Utf8Sequence root,
+            String tableName,
+            CairoEngine engine,
+            StringSink sink
+    ) {
+        ObjObjHashMap<String, Long> sizes = findPartitionSizes(root, tableName, engine, sink);
+        ObjObjHashMap<String, Long> seqTxns = findPartitionSeqTxns(root, tableName, engine);
+        String[] lines = expected.split("\n");
+        sink.clear();
+        sink.put(lines[0]).put('\n');
+        StringSink auxSink = new StringSink();
+        for (int i = 1; i < lines.length; i++) {
+            String line = lines[i];
+            String nameColumn = line.split("\t")[2];
+            Long s = sizes.get(nameColumn);
+            long size = s != null ? s : 0L;
+            SizePrettyFunctionFactory.toSizePretty(auxSink, size);
+            line = line.replaceAll("SIZE", String.valueOf(size));
+            line = line.replaceAll("HUMAN", auxSink.toString());
+            // no seqTxn (non-WAL/legacy native, or a detached/attachable row absent from the
+            // live _txn) renders null; only a real stamp (> 0) shows a number.
+            Long st = seqTxns.get(nameColumn);
+            line = line.replaceAll("SEQTXN", st != null && st > 0 ? String.valueOf(st) : "null");
+            sink.put(line).put('\n');
+        }
+        return sink.toString();
+    }
+
+    /**
+     * Rethrows the first worker failure collected by {@link #runConcurrently}, preserving its message and
+     * stack trace.
+     * <p>
+     * Exposed for the shape {@code runConcurrently} cannot express: readers that spin until told to stop while
+     * the calling thread drives a disturbance. Collect into an {@link AtomicReference} with
+     * {@code compareAndSet(null, th)}, join the workers with {@link #joinThreads}, then call this.
+     */
+    public static void rethrowFirst(AtomicReference<Throwable> firstError) {
+        final Throwable error = firstError.get();
+        if (error != null) {
+            throw new AssertionError("a worker thread failed: " + error, error);
+        }
+    }
+
+    // Useful for debugging
+    @SuppressWarnings("unused")
+    public static String reverseBeHex(String hex) {
+        var sb = new char[hex.length()];
+        for (int i = 0; i < hex.length(); i += 2) {
+            sb[hex.length() - i - 1] = hex.charAt(i + 1);
+            sb[hex.length() - i - 2] = hex.charAt(i);
+        }
+        return new String(sb);
+    }
+
+    /**
+     * Runs {@code worker} on {@code threadCount} threads released together by a barrier, joins them, and
+     * rethrows the first failure any of them hit. Workers use ordinary JUnit assertions.
+     * <p>
+     * The rethrow is the point. An AssertionError thrown on a spawned thread is otherwise swallowed, and
+     * counting failures instead reports them as "expected:&lt;0&gt; but was:&lt;3&gt;" -- no message, no stack
+     * trace, no failing value.
+     */
+    public static void runConcurrently(int threadCount, IntConsumer worker) throws Exception {
+        final CyclicBarrier barrier = new CyclicBarrier(threadCount);
+        final AtomicReference<Throwable> firstError = new AtomicReference<>();
+        final Thread[] threads = new Thread[threadCount];
+        for (int t = 0; t < threadCount; t++) {
+            final int index = t;
+            final Thread thread = new Thread(() -> {
+                try {
+                    barrier.await();
+                    worker.accept(index);
+                } catch (Throwable th) {
+                    firstError.compareAndSet(null, th);
+                }
+            }, "concurrent-test-worker-" + t);
+            thread.setDaemon(true);
+            threads[t] = thread;
+            thread.start();
+        }
+        joinThreads(threads);
+        rethrowFirst(firstError);
+    }
+
+    /**
+     * Joins all workers against one bounded deadline. Workers still alive at the deadline are interrupted and
+     * given a short bounded cleanup window before the method fails.
+     */
+    public static void joinThreads(Thread... threads) throws InterruptedException {
+        joinThreads(THREAD_JOIN_TIMEOUT_MILLIS, threads);
+    }
+
+    static void joinThreads(long timeoutMillis, Thread... threads) throws InterruptedException {
+        final long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMillis);
+        boolean timedOut = false;
+        try {
+            for (int i = 0, n = threads.length; i < n; i++) {
+                final Thread thread = threads[i];
+                final long remainingNanos = deadline - System.nanoTime();
+                if (thread.isAlive() && remainingNanos > 0) {
+                    joinNanos(thread, remainingNanos);
+                }
+                timedOut |= thread.isAlive();
+            }
+        } finally {
+            for (int i = 0, n = threads.length; i < n; i++) {
+                final Thread thread = threads[i];
+                if (thread.isAlive()) {
+                    thread.interrupt();
+                }
+            }
+
+            final long cleanupDeadline = System.nanoTime()
+                    + TimeUnit.MILLISECONDS.toNanos(THREAD_JOIN_CLEANUP_TIMEOUT_MILLIS);
+            for (int i = 0, n = threads.length; i < n; i++) {
+                final Thread thread = threads[i];
+                final long remainingNanos = cleanupDeadline - System.nanoTime();
+                if (thread.isAlive() && remainingNanos > 0) {
+                    joinNanos(thread, remainingNanos);
+                }
+            }
+        }
+
+        for (int i = 0, n = threads.length; i < n; i++) {
+            final Thread thread = threads[i];
+            Assert.assertFalse("worker thread did not terminate after interruption: " + thread.getName(), thread.isAlive());
+        }
+        Assert.assertFalse("worker threads did not finish within " + timeoutMillis + "ms", timedOut);
+    }
+
+    private static void joinNanos(Thread thread, long timeoutNanos) throws InterruptedException {
+        final long timeoutMillis = TimeUnit.NANOSECONDS.toMillis(timeoutNanos);
+        final int remainderNanos = (int) (timeoutNanos - TimeUnit.MILLISECONDS.toNanos(timeoutMillis));
+        thread.join(timeoutMillis, remainderNanos);
+    }
+
     public static void setupWorkerPool(WorkerPool workerPool, CairoEngine cairoEngine) throws SqlException {
-        WorkerPoolUtils.setupQueryJobs(workerPool, cairoEngine, null);
+        WorkerPoolUtils.setupQueryJobs(workerPool, cairoEngine, true);
         WorkerPoolUtils.setupWriterJobs(workerPool, cairoEngine);
+    }
+
+    /**
+     * Enables the JVM-wide thread-allocation counter, or skips the calling test when
+     * the JVM does not support it. Closing the returned scope restores the setting
+     * that the first overlapping scope observed.
+     */
+    public static ThreadMetricsScope<com.sun.management.ThreadMXBean> threadAllocationScope() {
+        if (!(ManagementFactory.getThreadMXBean() instanceof com.sun.management.ThreadMXBean bean)) {
+            throw new AssumptionViolatedException("thread allocation measurement not supported");
+        }
+        Assume.assumeTrue("thread allocation measurement not supported", bean.isThreadAllocatedMemorySupported());
+        synchronized (threadAllocationLock) {
+            if (threadAllocationScopeCount == 0) {
+                isThreadAllocationInitiallyEnabled = bean.isThreadAllocatedMemoryEnabled();
+                if (!isThreadAllocationInitiallyEnabled) {
+                    bean.setThreadAllocatedMemoryEnabled(true);
+                }
+            }
+            Assume.assumeTrue("thread allocation measurement not enabled", bean.isThreadAllocatedMemoryEnabled());
+            threadAllocationScopeCount++;
+        }
+        return new ThreadMetricsScope<>(bean, () -> releaseThreadAllocationScope(bean));
+    }
+
+    /**
+     * Enables the JVM-wide thread CPU-time counter, or skips the calling test when
+     * the JVM does not support it. Closing the returned scope restores the setting
+     * that the first overlapping scope observed.
+     */
+    public static ThreadMetricsScope<ThreadMXBean> threadCpuTimeScope() {
+        ThreadMXBean bean = ManagementFactory.getThreadMXBean();
+        Assume.assumeTrue("current thread CPU time measurement not supported", bean.isCurrentThreadCpuTimeSupported());
+        synchronized (threadCpuTimeLock) {
+            if (threadCpuTimeScopeCount == 0) {
+                isThreadCpuTimeInitiallyEnabled = bean.isThreadCpuTimeEnabled();
+                if (!isThreadCpuTimeInitiallyEnabled) {
+                    bean.setThreadCpuTimeEnabled(true);
+                }
+            }
+            Assume.assumeTrue("thread CPU time measurement not enabled", bean.isThreadCpuTimeEnabled());
+            threadCpuTimeScopeCount++;
+        }
+        return new ThreadMetricsScope<>(bean, () -> releaseThreadCpuTimeScope(bean));
     }
 
     public static long toMemory(CharSequence sequence) {
@@ -1444,7 +2531,9 @@ public final class TestUtils {
         }
     }
 
-    private static void assertCharEquals(RecordMetadata metaL, RecordMetadata metaR, Record lr, Record rr, boolean genericStringMatch, int col) {
+    private static void assertCharEquals(
+            RecordMetadata metaL, RecordMetadata metaR, Record lr, Record rr, boolean genericStringMatch, int col
+    ) {
         if (genericStringMatch && metaL.getColumnType(col) != metaR.getColumnType(col)) {
             char right = readAsChar(metaR, rr, col);
             char left = readAsChar(metaL, lr, col);
@@ -1455,12 +2544,8 @@ public final class TestUtils {
     }
 
     private static void assertColumnValues(
-            RecordMetadata metadataExpected,
-            RecordMetadata metadataActual,
-            Record lr,
-            Record rr,
-            long rowIndex,
-            boolean genericStringMatch
+            RecordMetadata metadataExpected, RecordMetadata metadataActual, Record lr, Record rr,
+            long rowIndex, boolean genericStringMatch
     ) {
         int columnType = 0;
         for (int i = 0, n = metadataExpected.getColumnCount(); i < n; i++) {
@@ -1473,8 +2558,9 @@ public final class TestUtils {
                         Assert.assertEquals(rr.getDate(i), lr.getDate(i));
                         break;
                     case ColumnType.TIMESTAMP:
+                        TimestampDriver driver = ColumnType.getTimestampDriver(columnType);
                         if (rr.getTimestamp(i) != lr.getTimestamp(i)) {
-                            Assert.assertEquals(Timestamps.toString(rr.getTimestamp(i)), Timestamps.toString(lr.getTimestamp(i)));
+                            Assert.assertEquals(driver.toMSecString(rr.getTimestamp(i)), driver.toMSecString(lr.getTimestamp(i)));
                         }
                         break;
                     case ColumnType.DOUBLE:
@@ -1533,6 +2619,41 @@ public final class TestUtils {
                         Assert.assertEquals(rr.getLong128Hi(i), lr.getLong128Hi(i));
                         Assert.assertEquals(rr.getLong128Lo(i), lr.getLong128Lo(i));
                         break;
+                    case ColumnType.ARRAY:
+                        assertEquals(rr.getArray(i, columnType), lr.getArray(i, columnType));
+                        break;
+                    case ColumnType.DECIMAL8:
+                        Assert.assertEquals(rr.getDecimal8(i), lr.getDecimal8(i));
+                        break;
+                    case ColumnType.DECIMAL16:
+                        Assert.assertEquals(rr.getDecimal16(i), lr.getDecimal16(i));
+                        break;
+                    case ColumnType.DECIMAL32:
+                        Assert.assertEquals(rr.getDecimal32(i), lr.getDecimal32(i));
+                        break;
+                    case ColumnType.DECIMAL64:
+                        Assert.assertEquals(rr.getDecimal64(i), lr.getDecimal64(i));
+                        break;
+                    case ColumnType.DECIMAL128: {
+                        Decimal128 expected = new Decimal128();
+                        Decimal128 actual = new Decimal128();
+                        rr.getDecimal128(i, expected);
+                        lr.getDecimal128(i, actual);
+                        Assert.assertEquals(expected.getHigh(), actual.getHigh());
+                        Assert.assertEquals(expected.getLow(), actual.getLow());
+                        break;
+                    }
+                    case ColumnType.DECIMAL256: {
+                        Decimal256 expected = new Decimal256();
+                        Decimal256 actual = new Decimal256();
+                        rr.getDecimal256(i, expected);
+                        lr.getDecimal256(i, actual);
+                        Assert.assertEquals(expected.getLh(), actual.getLh());
+                        Assert.assertEquals(expected.getLl(), actual.getLl());
+                        Assert.assertEquals(expected.getHh(), actual.getHh());
+                        Assert.assertEquals(expected.getHl(), actual.getHl());
+                        break;
+                    }
                     default:
                         // Unknown record type.
                         assert false;
@@ -1541,10 +2662,32 @@ public final class TestUtils {
             } catch (AssertionError e) {
                 String expected = recordToString(rr, metadataExpected, genericStringMatch);
                 String actual = recordToString(lr, metadataActual, genericStringMatch);
-                Assert.assertEquals(String.format(String.format("Row %d column %s[%s]", rowIndex, columnName, ColumnType.nameOf(columnType))), expected, actual);
+                Assert.assertEquals(
+                        String.format(String.format(
+                                "Row %d column %s[%s]",
+                                rowIndex, columnName, ColumnType.nameOf(columnType)
+                        )), expected, actual
+                );
                 // If above didn't fail because of types not included or double precision not enough, throw here anyway
-                throw new AssertionError(String.format("Row %d column %s[%s] %s", rowIndex, columnName, ColumnType.nameOf(columnType), e.getMessage()));
+                throw new AssertionError(String.format(
+                        "Row %d column %s[%s] %s", rowIndex, columnName,
+                        ColumnType.nameOf(columnType), e.getMessage()
+                ));
             }
+        }
+    }
+
+    private static void assertEquals(RecordMetadata metadataExpected, RecordMetadata metadataActual, boolean genericStringMatch) {
+        Assert.assertEquals("Column count must be same", metadataExpected.getColumnCount(), metadataActual.getColumnCount());
+        for (int i = 0, n = metadataExpected.getColumnCount(); i < n; i++) {
+            Assert.assertEquals("Column name " + i, metadataExpected.getColumnName(i), metadataActual.getColumnName(i));
+            int columnType1 = metadataExpected.getColumnType(i);
+            columnType1 = genericStringMatch && (ColumnType.isSymbol(columnType1) || columnType1 == ColumnType.VARCHAR
+                    || columnType1 == ColumnType.CHAR) ? ColumnType.STRING : columnType1;
+            int columnType2 = metadataActual.getColumnType(i);
+            columnType2 = genericStringMatch && (ColumnType.isSymbol(columnType2) || columnType2 == ColumnType.VARCHAR
+                    || columnType2 == ColumnType.CHAR) ? ColumnType.STRING : columnType2;
+            Assert.assertEquals("Column type " + i, columnType1, columnType2);
         }
     }
 
@@ -1564,19 +2707,114 @@ public final class TestUtils {
         }
     }
 
-    private static void assertEquals(RecordMetadata metadataExpected, RecordMetadata metadataActual, boolean genericStringMatch) {
-        Assert.assertEquals("Column count must be same", metadataExpected.getColumnCount(), metadataActual.getColumnCount());
-        for (int i = 0, n = metadataExpected.getColumnCount(); i < n; i++) {
-            Assert.assertEquals("Column name " + i, metadataExpected.getColumnName(i), metadataActual.getColumnName(i));
-            int columnType1 = metadataExpected.getColumnType(i);
-            columnType1 = genericStringMatch && (ColumnType.isSymbol(columnType1) || columnType1 == ColumnType.VARCHAR || columnType1 == ColumnType.CHAR) ? ColumnType.STRING : columnType1;
-            int columnType2 = metadataActual.getColumnType(i);
-            columnType2 = genericStringMatch && (ColumnType.isSymbol(columnType2) || columnType2 == ColumnType.VARCHAR || columnType2 == ColumnType.CHAR) ? ColumnType.STRING : columnType2;
-            Assert.assertEquals("Column type " + i, columnType1, columnType2);
+    private static void assertEqualsRecursive(
+            ArrayView expected,
+            ArrayView actual,
+            int dim,
+            int expectedFlatIndex,
+            int actualFlatIndex
+    ) {
+        // last dimension
+        int dimLen = actual.getDimLen(dim);
+        if (dim == actual.getDimCount() - 1) {
+            for (int i = 0; i < dimLen; i++) {
+                Assert.assertEquals(
+                        expected.getDouble(expectedFlatIndex + i * expected.getStride(dim)),
+                        actual.getDouble(actualFlatIndex + i * actual.getStride(dim)),
+                        Numbers.TOLERANCE
+                );
+            }
+        } else {
+            for (int i = 0; i < dimLen; i++) {
+                assertEqualsRecursive(
+                        expected,
+                        actual,
+                        dim + 1,
+                        expectedFlatIndex + i * expected.getStride(dim),
+                        actualFlatIndex + i * actual.getStride(dim)
+                );
+            }
         }
     }
 
-    private static void assertStringEquals(RecordMetadata metaL, RecordMetadata metaR, Record lr, Record rr, boolean genericStringMatch, int col) {
+    private static void assertInterruptedWaitTimesOutWithoutSpin0(
+            ThreadMXBean bean,
+            String operation,
+            long timeoutNanos,
+            BooleanSupplier timedWait,
+            BooleanSupplier releasedWait,
+            Runnable release
+    ) throws Exception {
+        // Resolve Os native and FFM bindings before the measured thread starts.
+        Os.sleep(1);
+
+        final AtomicLong cpuNanos = new AtomicLong(-1);
+        final AtomicLong elapsedNanos = new AtomicLong(-1);
+        final AtomicReference<Throwable> failure = new AtomicReference<>();
+        final AtomicBoolean hasCompletedAfterRelease = new AtomicBoolean();
+        final AtomicBoolean hasTimedOut = new AtomicBoolean();
+        final AtomicBoolean isInterruptedAfter = new AtomicBoolean();
+        final AtomicBoolean isInterruptedAfterTimeout = new AtomicBoolean();
+        final CountDownLatch timeoutComplete = new CountDownLatch(1);
+        final Thread waiter = new Thread(() -> {
+            try {
+                Thread.currentThread().interrupt();
+                final long cpuBefore = bean.getCurrentThreadCpuTime();
+                final long startNanos = System.nanoTime();
+                Assert.assertTrue("CPU time measurement is disabled", cpuBefore >= 0);
+                hasTimedOut.set(!timedWait.getAsBoolean());
+                elapsedNanos.set(System.nanoTime() - startNanos);
+                final long cpuAfter = bean.getCurrentThreadCpuTime();
+                Assert.assertTrue("CPU time moved backwards", cpuAfter >= cpuBefore);
+                cpuNanos.set(cpuAfter - cpuBefore);
+                isInterruptedAfterTimeout.set(Thread.currentThread().isInterrupted());
+                timeoutComplete.countDown();
+                hasCompletedAfterRelease.set(releasedWait.getAsBoolean());
+            } catch (Throwable th) {
+                failure.set(th);
+                timeoutComplete.countDown();
+            } finally {
+                isInterruptedAfter.set(Thread.currentThread().isInterrupted());
+            }
+        }, "interrupted-timed-waiter");
+        waiter.setDaemon(true);
+        waiter.start();
+
+        final boolean isTimeoutComplete;
+        try {
+            isTimeoutComplete = timeoutComplete.await(10, TimeUnit.SECONDS);
+        } finally {
+            try {
+                release.run();
+            } finally {
+                LockSupport.unpark(waiter);
+                waiter.join(TimeUnit.SECONDS.toMillis(10));
+            }
+        }
+
+        if (failure.get() != null) {
+            throw new AssertionError(operation + " waiter failed", failure.get());
+        }
+        Assert.assertTrue(operation + " timeout did not complete", isTimeoutComplete);
+        Assert.assertFalse(operation + " waiter did not stop", waiter.isAlive());
+        Assert.assertTrue(operation + " did not time out", hasTimedOut.get());
+        Assert.assertTrue(operation + " did not complete after release", hasCompletedAfterRelease.get());
+        Assert.assertTrue(operation + " did not restore the interrupt flag on timeout", isInterruptedAfterTimeout.get());
+        Assert.assertTrue(operation + " did not preserve the interrupt flag", isInterruptedAfter.get());
+        Assert.assertTrue(
+                operation + " returned after " + elapsedNanos.get() + "ns, before the " + timeoutNanos + "ns timeout",
+                elapsedNanos.get() >= timeoutNanos
+        );
+        Assert.assertTrue(operation + " CPU time was not recorded", cpuNanos.get() >= 0);
+        Assert.assertTrue(
+                operation + " burned " + cpuNanos.get() + "ns of CPU time",
+                cpuNanos.get() < TimeUnit.MILLISECONDS.toNanos(100)
+        );
+    }
+
+    private static void assertStringEquals(
+            RecordMetadata metaL, RecordMetadata metaR, Record lr, Record rr, boolean genericStringMatch, int col
+    ) {
         int colTypeL = metaL.getColumnType(col);
         int colTypeR = metaR.getColumnType(col);
         if (genericStringMatch && colTypeL != colTypeR) {
@@ -1617,18 +2855,233 @@ public final class TestUtils {
         }
     }
 
+    private static void assertWaitDoesNotSpin(
+            String operation,
+            Runnable wait,
+            @NotNull Object waitBlocker,
+            @Nullable EventualCode waitReady,
+            Runnable release,
+            boolean isInitiallyInterrupted
+    ) throws Exception {
+        try (ThreadMetricsScope<ThreadMXBean> scope = threadCpuTimeScope()) {
+            assertWaitDoesNotSpin0(
+                    scope.getBean(),
+                    operation,
+                    wait,
+                    waitBlocker,
+                    waitReady,
+                    release,
+                    isInitiallyInterrupted
+            );
+        }
+    }
+
+    private static void assertWaitDoesNotSpin0(
+            ThreadMXBean bean,
+            String operation,
+            Runnable wait,
+            @NotNull Object waitBlocker,
+            @Nullable EventualCode waitReady,
+            Runnable release,
+            boolean isInitiallyInterrupted
+    ) throws Exception {
+        // Resolve Os native and FFM bindings before the measured thread starts.
+        Os.sleep(1);
+
+        final AtomicLong cpuNanos = new AtomicLong(-1);
+        final AtomicReference<Throwable> failure = new AtomicReference<>();
+        final AtomicBoolean isInterruptedAfter = new AtomicBoolean();
+        final AtomicBoolean isWaitComplete = new AtomicBoolean();
+        final CountDownLatch waiterStarted = new CountDownLatch(1);
+        final Thread waiter = new Thread(() -> {
+            if (isInitiallyInterrupted) {
+                Thread.currentThread().interrupt();
+            }
+            final long cpuBefore = bean.getCurrentThreadCpuTime();
+            waiterStarted.countDown();
+            try {
+                Assert.assertTrue("CPU time measurement is disabled", cpuBefore >= 0);
+                wait.run();
+                isWaitComplete.set(true);
+                final long cpuAfter = bean.getCurrentThreadCpuTime();
+                Assert.assertTrue("CPU time moved backwards", cpuAfter >= cpuBefore);
+                cpuNanos.set(cpuAfter - cpuBefore);
+            } catch (Throwable th) {
+                failure.set(th);
+            } finally {
+                isInterruptedAfter.set(Thread.currentThread().isInterrupted());
+            }
+        }, "waiter");
+        waiter.setDaemon(true);
+        waiter.start();
+
+        try {
+            Assert.assertTrue(
+                    operation + " waiter did not start",
+                    waiterStarted.await(10, TimeUnit.SECONDS)
+            );
+            assertEventually(
+                    () -> Assert.assertSame(
+                            operation + " waiter did not enter the target park",
+                            waitBlocker,
+                            LockSupport.getBlocker(waiter)
+                    ),
+                    5
+            );
+            if (waitReady != null) {
+                assertEventually(waitReady, 5);
+            }
+            Thread.sleep(500);
+            Assert.assertFalse(operation + " returned before release", isWaitComplete.get());
+        } finally {
+            try {
+                release.run();
+            } finally {
+                LockSupport.unpark(waiter);
+                waiter.join(TimeUnit.SECONDS.toMillis(10));
+            }
+        }
+
+        Assert.assertFalse(operation + " waiter did not stop", waiter.isAlive());
+        if (failure.get() != null) {
+            throw new AssertionError(operation + " waiter failed", failure.get());
+        }
+        Assert.assertTrue(operation + " did not complete", isWaitComplete.get());
+        Assert.assertEquals(
+                operation + " changed the interrupt flag",
+                isInitiallyInterrupted,
+                isInterruptedAfter.get()
+        );
+        Assert.assertTrue(operation + " CPU time was not recorded", cpuNanos.get() >= 0);
+        Assert.assertTrue(
+                operation + " burned " + cpuNanos.get() + "ns of CPU time",
+                cpuNanos.get() < TimeUnit.MILLISECONDS.toNanos(100)
+        );
+    }
+
+    private static Object[][] cartesianProduct(Object[][] values, int offset) {
+        Object[] currentLvlValues = values[offset];
+        if (currentLvlValues.length == 0) {
+            throw new AssertionError("Expected at least one value [offset=" + offset + "]");
+        }
+
+        if (values.length - offset == 1) {
+            // the last level
+            Object[][] result = new Object[currentLvlValues.length][1];
+            for (int i = 0; i < currentLvlValues.length; i++) {
+                result[i][0] = currentLvlValues[i];
+            }
+            return result;
+        }
+
+        Object[][] lowerLvlValues = cartesianProduct(values, offset + 1);
+        Object[][] res = new Object[currentLvlValues.length * lowerLvlValues.length][lowerLvlValues[0].length + 1];
+        for (int i = 0; i < currentLvlValues.length; i++) {
+            for (int j = 0; j < lowerLvlValues.length; j++) {
+                int m = i * lowerLvlValues.length + j;
+                res[m][0] = currentLvlValues[i];
+                System.arraycopy(lowerLvlValues[j], 0, res[m], 1, lowerLvlValues[0].length);
+            }
+        }
+        return res;
+    }
+
+    // Independent oracle for the SHOW PARTITIONS / table_partitions() seqTxn column: reads
+    // each live partition's seqTxn straight from _txn (native) or the _pm footer (parquet),
+    // never via the factory under test. Keyed by the rendered partition name. Absent names
+    // (detached/attachable rows) resolve to -1 in the substitution loop, matching the factory.
+    private static ObjObjHashMap<String, Long> findPartitionSeqTxns(
+            Utf8Sequence root,
+            String tableName,
+            CairoEngine engine
+    ) {
+        ObjObjHashMap<String, Long> seqTxns = new ObjObjHashMap<>();
+        TableToken tableToken = engine.verifyTableName(tableName);
+        FilesFacade ff = engine.getConfiguration().getFilesFacade();
+        StringSink nameSink = new StringSink();
+        try (
+                TableReader reader = engine.getReader(tableToken);
+                Path path = new Path().of(root).concat(tableToken)
+        ) {
+            int rootLen = path.size();
+            TxReader txReader = reader.getTxFile();
+            int partitionBy = reader.getPartitionedBy();
+            int timestampType = reader.getMetadata().getTimestampType();
+            for (int i = 0, n = txReader.getPartitionCount(); i < n; i++) {
+                long timestamp = txReader.getPartitionTimestampByIndex(i);
+                nameSink.clear();
+                PartitionBy.setSinkForPartition(nameSink, timestampType, partitionBy, timestamp);
+                long seqTxn;
+                if (txReader.isPartitionParquet(i)) {
+                    // _txn field 3 holds the parquet file size; the seqTxn is in the _pm footer.
+                    path.trimTo(rootLen);
+                    TableUtils.setPathForNativePartition(path, timestampType, partitionBy, timestamp, txReader.getPartitionNameTxn(i));
+                    seqTxn = readSeqTxnForVersion(
+                            ff,
+                            path.concat(TableUtils.PARQUET_METADATA_FILE_NAME).$(),
+                            txReader.getPartitionParquetFileSize(i)
+                    );
+                } else {
+                    seqTxn = txReader.getNativePartitionSeqTxn(i);
+                }
+                seqTxns.put(nameSink.toString(), seqTxn);
+            }
+        }
+        return seqTxns;
+    }
+
+    private static ObjObjHashMap<String, Long> findPartitionSizes(
+            Utf8Sequence root,
+            String tableName,
+            CairoEngine engine,
+            StringSink sink
+    ) {
+        ObjObjHashMap<String, Long> sizes = new ObjObjHashMap<>();
+        TableToken tableToken = engine.verifyTableName(tableName);
+        try (Path path = new Path().of(root).concat(tableToken)) {
+            int len = path.size();
+            long pFind = Files.findFirst(path.$());
+            try {
+                do {
+                    long namePtr = Files.findName(pFind);
+                    if (Files.notDots(namePtr)) {
+                        sink.clear();
+                        Utf8s.utf8ToUtf16Z(namePtr, sink);
+                        path.trimTo(len).concat(sink).$();
+                        int n = sink.length();
+                        int limit = n;
+                        for (int i = 0; i < n; i++) {
+                            if (sink.charAt(i) == '.' && i < n - 1) {
+                                char c = sink.charAt(i + 1);
+                                if (c >= '0' && c <= '9') {
+                                    limit = i;
+                                    break;
+                                }
+                            }
+                        }
+                        sink.clear(limit);
+                        sizes.put(sink.toString(), Files.getDirSize(path));
+                    }
+                } while (Files.findNext(pFind) > 0);
+            } finally {
+                Files.findClose(pFind);
+            }
+        }
+        return sizes;
+    }
+
     private static StringSink getTlSink() {
         StringSink ss = tlSink.get();
         ss.clear();
         return ss;
     }
 
-    private static long partitionIncrement(int partitionBy, long fromTimestamp, int totalRows, int partitionCount) {
+    private static long partitionIncrement(TimestampDriver driver, int partitionBy, long fromTimestamp, int totalRows, int partitionCount) {
         long increment = 0;
         if (PartitionBy.isPartitioned(partitionBy)) {
-            final PartitionBy.PartitionAddMethod partitionAddMethod = PartitionBy.getPartitionAddMethod(partitionBy);
+            final TimestampDriver.PartitionAddMethod partitionAddMethod = PartitionBy.getPartitionAddMethod(driver.getTimestampType(), partitionBy);
             assert partitionAddMethod != null;
-            long toTs = partitionAddMethod.calculate(fromTimestamp, partitionCount) - fromTimestamp - Timestamps.SECOND_MICROS;
+            long toTs = partitionAddMethod.calculate(fromTimestamp, partitionCount) - fromTimestamp - driver.fromSeconds(1);
             increment = totalRows > 0 ? Math.max(toTs / totalRows, 1) : 0;
         }
         return increment;
@@ -1657,17 +3110,16 @@ public final class TestUtils {
 
     @Nullable
     private static CharSequence readAsCharSequence(int columnType, Record rr, int col) {
-        switch (columnType) {
-            case ColumnType.SYMBOL:
-                return rr.getSymA(col);
-            case ColumnType.STRING:
-                return rr.getStrA(col);
-            case ColumnType.VARCHAR:
+        return switch (columnType) {
+            case ColumnType.SYMBOL -> rr.getSymA(col);
+            case ColumnType.STRING -> rr.getStrA(col);
+            case ColumnType.VARCHAR -> {
                 Utf8Sequence vc = rr.getVarcharA(col);
-                return vc == null ? null : vc.toString();
-            default:
-                throw new UnsupportedOperationException("Unexpected column type: " + ColumnType.nameOf(columnType));
-        }
+                yield vc == null ? null : vc.toString();
+            }
+            default ->
+                    throw new UnsupportedOperationException("Unexpected column type: " + ColumnType.nameOf(columnType));
+        };
     }
 
     private static String recordToString(Record record, RecordMetadata metadata, boolean genericStringMatch) {
@@ -1679,6 +3131,52 @@ public final class TestUtils {
             }
         }
         return sink.toString();
+    }
+
+    private static void releaseThreadAllocationScope(com.sun.management.ThreadMXBean bean) {
+        synchronized (threadAllocationLock) {
+            assert threadAllocationScopeCount > 0;
+            if (--threadAllocationScopeCount == 0 && !isThreadAllocationInitiallyEnabled) {
+                bean.setThreadAllocatedMemoryEnabled(false);
+            }
+        }
+    }
+
+    private static void releaseThreadCpuTimeScope(ThreadMXBean bean) {
+        synchronized (threadCpuTimeLock) {
+            assert threadCpuTimeScopeCount > 0;
+            if (--threadCpuTimeScopeCount == 0 && !isThreadCpuTimeInitiallyEnabled) {
+                bean.setThreadCpuTimeEnabled(false);
+            }
+        }
+    }
+
+    private static CharSequence reverseLines(CharSequence expected) {
+        String[] lines = expected.toString().split("\n");
+        StringSink sink = new StringSink(expected.length());
+        for (int i = 0, n = lines.length; i < n; i++) {
+            sink.put(lines[n - i - 1]).put('\n');
+        }
+        return sink;
+    }
+
+    /**
+     * Reads a seed override off a system property, falling back to the clock-derived
+     * default. A failing fuzz run prints its seeds; passing them back through
+     * {@code -Dfuzz.s0=<s0> -Dfuzz.s1=<s1>} replays the same draw, which is what makes a
+     * CI fuzz failure actionable at all. Without an override the seeds stay clock-derived,
+     * so ordinary runs keep exploring new cases.
+     */
+    private static long seedOf(String propertyName, long defaultSeed) {
+        final String value = System.getProperty(propertyName);
+        if (value == null) {
+            return defaultSeed;
+        }
+        try {
+            return Numbers.parseLong(value);
+        } catch (NumericException e) {
+            throw new IllegalArgumentException("invalid seed override [" + propertyName + "=" + value + ']');
+        }
     }
 
     private static String toHexString(Long256 expected) {
@@ -1696,18 +3194,29 @@ public final class TestUtils {
         }
     }
 
-    static void addRecordToMap(StringSink sink, Record record, RecordMetadata metadata, Map<String, Integer> map, boolean genericStringMatch) {
+    static void addRecordToMap(
+            StringSink sink, Record record, RecordMetadata metadata, Map<String, Integer> map, boolean genericStringMatch
+    ) {
         sink.clear();
         for (int i = 0, n = metadata.getColumnCount(); i < n; i++) {
-            CursorPrinter.printColumn(record, metadata, i, sink, genericStringMatch, true);
+            CursorPrinter.printColumn(record, metadata, i, sink, genericStringMatch, true, "<null>");
         }
         String printed = sink.toString();
-        map.compute(printed, (s, i) -> {
-            if (i == null) {
-                return 1;
-            }
-            return i + 1;
-        });
+        map.compute(
+                printed, (_, i) -> {
+                    if (i == null) {
+                        return 1;
+                    }
+                    return i + 1;
+                }
+        );
+    }
+
+    static Connection getConnectionForUser(String username, String password, int pgPort) throws SQLException {
+        Properties properties = new Properties();
+        properties.setProperty("user", username);
+        properties.setProperty("password", password);
+        return DriverManager.getConnection(getPgConnectionUri(pgPort), properties);
     }
 
     public interface CheckedIntFunction {
@@ -1723,8 +3232,137 @@ public final class TestUtils {
         T get() throws Throwable;
     }
 
+    public interface EventualCode {
+        void run() throws Exception;
+    }
+
     @FunctionalInterface
     public interface LeakProneCode {
         void run() throws Exception;
+    }
+
+    public static class LeakCheck implements QuietCloseable {
+        private final int addrInfoCount;
+        private final long cachedFileCount;
+        private final long fileCount;
+        private final String fileDebugInfo;
+        private final long mem;
+        private final long[] memoryUsageByTag = new long[MemoryTag.SIZE];
+        private final int sockAddrCount;
+
+        public LeakCheck() {
+            Files.getMmapCache().asyncMunmap();
+            Path.clearThreadLocals();
+            Misc.free(O3PartitionJob.THREAD_LOCAL_CLEANER);
+            CLOSEABLE.forEach(Misc::free);
+            mem = Unsafe.getMemUsed();
+            for (int i = MemoryTag.MMAP_DEFAULT; i < MemoryTag.SIZE; i++) {
+                memoryUsageByTag[i] = Unsafe.getMemUsedByTag(i);
+            }
+
+            Assert.assertTrue("Initial file unsafe mem should be >= 0", mem >= 0);
+            fileCount = Files.getOpenFileCount();
+            cachedFileCount = Files.getOpenCachedFileCount();
+            fileDebugInfo = Files.getOpenFdDebugInfo();
+            Assert.assertTrue("Initial file count should be >= 0", fileCount >= 0);
+
+            addrInfoCount = Net.getAllocatedAddrInfoCount();
+            Assert.assertTrue("Initial allocated addrinfo count should be >= 0", addrInfoCount >= 0);
+
+            sockAddrCount = Net.getAllocatedSockAddrCount();
+            Assert.assertTrue("Initial allocated sockaddr count should be >= 0", sockAddrCount >= 0);
+        }
+
+        @Override
+        public void close() {
+            Path.clearThreadLocals();
+            Misc.free(O3PartitionJob.THREAD_LOCAL_CLEANER);
+            CLOSEABLE.forEach(Misc::free);
+            if (cachedFileCount != Files.getOpenCachedFileCount() || fileCount != Files.getOpenFileCount()) {
+                Assert.fail(
+                        "expected: cached file descriptors: " + cachedFileCount +
+                                ", expected OS file descriptors: " + fileCount +
+                                ", list: " + fileDebugInfo +
+                                " actual: cached file descriptors: " + Files.getOpenCachedFileCount() +
+                                ", OS file descriptors: " + Files.getOpenFileCount() +
+                                ", list: " + Files.getOpenFdDebugInfo()
+                );
+            }
+
+            Files.getMmapCache().asyncMunmap();
+
+            // Checks that the same tag used for allocation and freeing native memory
+            long memAfter = Unsafe.getMemUsed();
+            long memNativeSqlCompilerDiff = 0;
+            long memNativeMemoryTrackerDiff = 0;
+            Assert.assertTrue(memAfter > -1);
+            if (mem != memAfter) {
+                for (int i = MemoryTag.MMAP_DEFAULT; i < MemoryTag.SIZE; i++) {
+                    long actualMemByTag = Unsafe.getMemUsedByTag(i);
+                    if (memoryUsageByTag[i] != actualMemByTag) {
+                        if (i == MemoryTag.NATIVE_SQL_COMPILER) {
+                            // SqlCompiler memory is not released immediately as compilers are pooled
+                            Assert.assertTrue(actualMemByTag >= memoryUsageByTag[i]);
+                            memNativeSqlCompilerDiff = actualMemByTag - memoryUsageByTag[i];
+                        } else if (i == MemoryTag.NATIVE_MEMORY_TRACKER) {
+                            // A deficit is legitimate: a nested leak check can baseline a tracker the
+                            // enclosing scope pooled, then the teardown's engine.clear() drains it. A
+                            // surplus, by contrast, is a tracker acquired and never released - a leak.
+                            Assert.assertTrue(
+                                    "Memory usage by tag: " + MemoryTag.nameOf(i)
+                                            + ", difference: " + (actualMemByTag - memoryUsageByTag[i]),
+                                    actualMemByTag <= memoryUsageByTag[i]
+                            );
+                            memNativeMemoryTrackerDiff = actualMemByTag - memoryUsageByTag[i];
+                        } else {
+                            Assert.assertEquals(
+                                    "Memory usage by tag: " + MemoryTag.nameOf(i)
+                                            + ", difference: " + (actualMemByTag - memoryUsageByTag[i]),
+                                    memoryUsageByTag[i], actualMemByTag
+                            );
+                            Assert.assertTrue(actualMemByTag > -1);
+                        }
+                    }
+                }
+                Assert.assertEquals(mem + memNativeSqlCompilerDiff + memNativeMemoryTrackerDiff, memAfter);
+            }
+
+            int addrInfoCountAfter = Net.getAllocatedAddrInfoCount();
+            Assert.assertTrue(addrInfoCountAfter > -1);
+            if (addrInfoCount != addrInfoCountAfter) {
+                Assert.fail("AddrInfo allocation count before the test: " + addrInfoCount
+                        + ", after the test: " + addrInfoCountAfter);
+            }
+
+            int sockAddrCountAfter = Net.getAllocatedSockAddrCount();
+            Assert.assertTrue(sockAddrCountAfter > -1);
+            if (sockAddrCount != sockAddrCountAfter) {
+                Assert.fail("SockAddr allocation count before the test: " + sockAddrCount
+                        + ", after the test: " + sockAddrCountAfter);
+            }
+        }
+    }
+
+    public static final class ThreadMetricsScope<T extends ThreadMXBean> implements AutoCloseable {
+        private final T bean;
+        private final Runnable release;
+        private boolean isClosed;
+
+        private ThreadMetricsScope(T bean, Runnable release) {
+            this.bean = bean;
+            this.release = release;
+        }
+
+        @Override
+        public void close() {
+            if (!isClosed) {
+                isClosed = true;
+                release.run();
+            }
+        }
+
+        public T getBean() {
+            return bean;
+        }
     }
 }

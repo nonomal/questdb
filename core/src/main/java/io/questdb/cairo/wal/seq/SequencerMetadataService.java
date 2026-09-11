@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -28,7 +28,9 @@ import io.questdb.cairo.SecurityContext;
 import io.questdb.cairo.TableToken;
 import io.questdb.cairo.sql.TableRecordMetadata;
 import io.questdb.std.LongList;
+import io.questdb.std.ObjList;
 import org.jetbrains.annotations.NotNull;
+import org.jetbrains.annotations.Nullable;
 
 public class SequencerMetadataService implements MetadataServiceStub {
     private final SequencerMetadata metadata;
@@ -41,16 +43,61 @@ public class SequencerMetadataService implements MetadataServiceStub {
 
     @Override
     public void addColumn(
-            CharSequence name,
-            int type,
+            CharSequence columnName,
+            int columnType,
             int symbolCapacity,
             boolean symbolCacheFlag,
-            boolean isIndexed,
+            byte indexType,
+            int indexValueBlockCapacity,
+            boolean isSequential,
+            boolean isDedupKey,
+            SecurityContext securityContext
+    ) {
+        metadata.addColumn(
+                columnName,
+                columnType,
+                symbolCapacity,
+                symbolCacheFlag,
+                indexType,
+                indexValueBlockCapacity,
+                isDedupKey
+        );
+    }
+
+    @Override
+    public void addIndex(@NotNull CharSequence columnName, int indexValueBlockSize, byte indexType, @Nullable ObjList<CharSequence> coveringColumnNames) {
+        metadata.addIndex(columnName, indexValueBlockSize, indexType, coveringColumnNames);
+    }
+
+    @Override
+    public void changeColumnType(
+            CharSequence columnName,
+            int columnType,
+            int symbolCapacity,
+            boolean symbolCacheFlag,
+            byte indexType,
             int indexValueBlockCapacity,
             boolean isSequential,
             SecurityContext securityContext
     ) {
-        metadata.addColumn(name, type);
+        metadata.changeColumnType(
+                columnName,
+                columnType,
+                symbolCapacity,
+                symbolCacheFlag,
+                indexType,
+                indexValueBlockCapacity
+        );
+    }
+
+    @Override
+    public boolean convertPartitionNativeToParquet(long partitionTimestamp, @Nullable CharSequence bloomFilterColumns, double bloomFilterFpp) {
+        return false;
+    }
+
+    @Override
+    public boolean convertPartitionParquetToNative(long partitionTimestamp) {
+        return false;
     }
 
     @Override
@@ -59,8 +106,8 @@ public class SequencerMetadataService implements MetadataServiceStub {
     }
 
     @Override
-    public void enableDeduplicationWithUpsertKeys(LongList columnsIndexes) {
-        metadata.enableDeduplicationWithUpsertKeys();
+    public boolean enableDeduplicationWithUpsertKeys(LongList columnsIndexes) {
+        return metadata.enableDeduplicationWithUpsertKeys();
     }
 
     public TableRecordMetadata getMetadata() {
@@ -73,7 +120,12 @@ public class SequencerMetadataService implements MetadataServiceStub {
     }
 
     @Override
-    public void removeColumn(@NotNull CharSequence columnName) {
+    public int getTimestampType() {
+        return metadata.getTimestampType();
+    }
+
+    @Override
+    public void removeColumn(@NotNull CharSequence columnName, SecurityContext securityContext) {
         metadata.removeColumn(columnName);
     }
 
@@ -86,10 +138,5 @@ public class SequencerMetadataService implements MetadataServiceStub {
     public void renameTable(@NotNull CharSequence fromNameTable, @NotNull CharSequence toTableName) {
         metadata.renameTable(toTableName);
         tableToken = metadata.getTableToken();
-    }
-
-    @Override
-    public void changeColumnType(CharSequence name, int newType, int symbolCapacity, boolean symbolCacheFlag, boolean isIndexed, int indexValueBlockCapacity, boolean isSequential, SecurityContext securityContext) {
-        metadata.changeColumnType(name, newType);
     }
 }

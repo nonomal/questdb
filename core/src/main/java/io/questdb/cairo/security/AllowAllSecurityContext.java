@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -25,148 +25,35 @@
 package io.questdb.cairo.security;
 
 import io.questdb.cairo.SecurityContext;
-import io.questdb.cairo.TableToken;
 import io.questdb.griffin.engine.functions.catalogue.Constants;
-import io.questdb.std.ObjHashSet;
-import io.questdb.std.ObjList;
-import org.jetbrains.annotations.NotNull;
 
-public class AllowAllSecurityContext implements SecurityContext {
-    public static final AllowAllSecurityContext INSTANCE = new AllowAllSecurityContext();
+/**
+ * The concrete allow-all security context. The shared singletons ({@link #INSTANCE} /
+ * {@link #SETTINGS_READ_ONLY}) are instances of this class, and {@code forPrincipal} derives further
+ * instances of it, so a derived context reports the authenticated user while preserving the allow-all
+ * (and settings-read-only) behavior.
+ * <p>
+ * A subclass that overrides an {@code authorize*} or identity method MUST also override
+ * {@link #newPrincipalContext} to return its own type. This class's {@code newPrincipalContext} returns a
+ * plain {@code AllowAllSecurityContext}, so {@code forPrincipal} on a subclass that does not override it
+ * would drop the override and downgrade the context to plain allow-all -- silently turning a subclass that
+ * DENIES an operation into one that ALLOWS it. {@code forPrincipal} asserts against that (see
+ * {@code AbstractPrincipalAwareSecurityContext.newCheckedPrincipalContext}), so a subclass that forgets
+ * fails loudly under {@code -ea} instead of quietly losing its restrictions.
+ */
+public class AllowAllSecurityContext extends AbstractAllowAllSecurityContext {
+    public static final AllowAllSecurityContext INSTANCE = new AllowAllSecurityContext(false, Constants.USER_NAME);
+    public static final AllowAllSecurityContext SETTINGS_READ_ONLY = new AllowAllSecurityContext(true, Constants.USER_NAME);
 
     protected AllowAllSecurityContext() {
     }
 
-    @Override
-    public void authorizeAdminAction() {
+    protected AllowAllSecurityContext(boolean settingsReadOnly, CharSequence principal) {
+        super(settingsReadOnly, principal);
     }
 
     @Override
-    public void authorizeAlterTableAddColumn(TableToken tableToken) {
-    }
-
-    @Override
-    public void authorizeAlterTableAddIndex(TableToken tableToken, @NotNull ObjList<CharSequence> columnNames) {
-    }
-
-    @Override
-    public void authorizeAlterTableAlterColumnCache(TableToken tableToken, @NotNull ObjList<CharSequence> columnNames) {
-    }
-
-    @Override
-    public void authorizeAlterTableAlterColumnType(TableToken tableToken, @NotNull ObjList<CharSequence> columnNames) {
-    }
-
-    @Override
-    public void authorizeAlterTableAttachPartition(TableToken tableToken) {
-    }
-
-    @Override
-    public void authorizeAlterTableDedupDisable(TableToken tableToken) {
-    }
-
-    @Override
-    public void authorizeAlterTableDedupEnable(TableToken tableToken) {
-    }
-
-    @Override
-    public void authorizeAlterTableDetachPartition(TableToken tableToken) {
-    }
-
-    @Override
-    public void authorizeAlterTableDropColumn(TableToken tableToken, @NotNull ObjList<CharSequence> columnNames) {
-    }
-
-    @Override
-    public void authorizeAlterTableDropIndex(TableToken tableToken, @NotNull ObjList<CharSequence> columnNames) {
-    }
-
-    @Override
-    public void authorizeAlterTableDropPartition(TableToken tableToken) {
-    }
-
-    @Override
-    public void authorizeAlterTableRenameColumn(TableToken tableToken, @NotNull ObjList<CharSequence> columnNames) {
-    }
-
-    @Override
-    public void authorizeAlterTableSetType(TableToken tableToken) {
-    }
-
-    @Override
-    public void authorizeCopyCancel(SecurityContext cancellingSecurityContext) {
-    }
-
-    @Override
-    public void authorizeDatabaseSnapshot() {
-    }
-
-    @Override
-    public void authorizeHttp() {
-    }
-
-    @Override
-    public void authorizeInsert(TableToken tableToken) {
-    }
-
-    @Override
-    public void authorizeLineTcp() {
-    }
-
-    @Override
-    public void authorizePGWire() {
-    }
-
-    @Override
-    public void authorizeResumeWal(TableToken tableToken) {
-    }
-
-    @Override
-    public void authorizeSelect(TableToken tableToken, @NotNull ObjList<CharSequence> columnNames) {
-    }
-
-    @Override
-    public void authorizeSelectOnAnyColumn(TableToken tableToken) {
-    }
-
-    @Override
-    public void authorizeTableBackup(ObjHashSet<TableToken> tableTokens) {
-    }
-
-    @Override
-    public void authorizeTableCreate() {
-    }
-
-    @Override
-    public void authorizeTableDrop(TableToken tableToken) {
-    }
-
-    @Override
-    public void authorizeTableReindex(TableToken tableToken, @NotNull ObjList<CharSequence> columnNames) {
-    }
-
-    @Override
-    public void authorizeTableRename(TableToken tableToken) {
-    }
-
-    @Override
-    public void authorizeTableTruncate(TableToken tableToken) {
-    }
-
-    @Override
-    public void authorizeTableUpdate(TableToken tableToken, @NotNull ObjList<CharSequence> columnNames) {
-    }
-
-    @Override
-    public void authorizeTableVacuum(TableToken tableToken) {
-    }
-
-    @Override
-    public void checkEntityEnabled() {
-    }
-
-    @Override
-    public String getPrincipal() {
-        return Constants.USER_NAME;
+    protected SecurityContext newPrincipalContext(CharSequence principal) {
+        return new AllowAllSecurityContext(settingsReadOnly, principal);
     }
 }

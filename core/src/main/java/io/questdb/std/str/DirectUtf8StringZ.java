@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -44,7 +44,12 @@ public class DirectUtf8StringZ implements LPSZ {
 
     @Override
     public byte byteAt(int index) {
-        return Unsafe.getUnsafe().getByte(ptr + index);
+        return Unsafe.getByte(ptr + index);
+    }
+
+    @Override
+    public boolean isAscii() {
+        return ascii;
     }
 
     public DirectUtf8StringZ of(long address) {
@@ -52,7 +57,7 @@ public class DirectUtf8StringZ implements LPSZ {
         long p = address;
         this.ascii = true;
         byte b;
-        while ((b = Unsafe.getUnsafe().getByte(p++)) != 0) {
+        while ((b = Unsafe.getByte(p++)) != 0) {
             this.ascii &= (b >= 0);
         }
         this.size = (int) (p - address - 1);

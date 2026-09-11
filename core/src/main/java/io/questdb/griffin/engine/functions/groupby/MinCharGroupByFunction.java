@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -32,6 +32,7 @@ import io.questdb.cairo.sql.Record;
 import io.questdb.griffin.engine.functions.CharFunction;
 import io.questdb.griffin.engine.functions.GroupByFunction;
 import io.questdb.griffin.engine.functions.UnaryFunction;
+import io.questdb.std.Unsafe;
 import org.jetbrains.annotations.NotNull;
 
 public class MinCharGroupByFunction extends CharFunction implements GroupByFunction, UnaryFunction {
@@ -43,6 +44,26 @@ public class MinCharGroupByFunction extends CharFunction implements GroupByFunct
     }
 
     @Override
+    public void computeBatch(MapValue mapValue, long dataAddr, int rowCount, long startRowId) {
+        if (rowCount > 0) {
+            final long hi = dataAddr + rowCount * (long) Character.BYTES;
+            char min = 0;
+            for (; dataAddr < hi; dataAddr += Character.BYTES) {
+                char value = Unsafe.getChar(dataAddr);
+                if (value > 0 && (value < min || min == 0)) {
+                    min = value;
+                }
+            }
+            if (min != 0) {
+                final char existing = mapValue.getChar(valueIndex);
+                if (min < existing || existing == 0) {
+                    mapValue.putChar(valueIndex, min);
+                }
+            }
+        }
+    }
+
+    @Override
     public void computeFirst(MapValue mapValue, Record record, long rowId) {
         mapValue.putChar(valueIndex, arg.getChar(record));
     }
@@ -51,7 +72,7 @@ public class MinCharGroupByFunction extends CharFunction implements GroupByFunct
     public void computeNext(MapValue mapValue, Record record, long rowId) {
         char min = mapValue.getChar(valueIndex);
         char next = arg.getChar(record);
-        if (next > 0 && next < min) {
+        if (next > 0 && (next < min || min == 0)) {
             mapValue.putChar(valueIndex, next);
         }
     }
@@ -93,8 +114,8 @@ public class MinCharGroupByFunction extends CharFunction implements GroupByFunct
     }
 
     @Override
-    public boolean isReadThreadSafe() {
-        return UnaryFunction.super.isReadThreadSafe();
+    public boolean isThreadSafe() {
+        return UnaryFunction.super.isThreadSafe();
     }
 
     @Override
@@ -102,13 +123,18 @@ public class MinCharGroupByFunction extends CharFunction implements GroupByFunct
         char srcMin = srcValue.getChar(valueIndex);
         char destMin = destValue.getChar(valueIndex);
         if (srcMin != 0 && (srcMin < destMin || destMin == 0)) {
-            destValue.putInt(valueIndex, srcMin);
+            destValue.putChar(valueIndex, srcMin);
         }
     }
 
     @Override
     public void setNull(MapValue mapValue) {
         mapValue.putChar(valueIndex, (char) 0);
+    }
+
+    @Override
+    public boolean supportsBatchComputation() {
+        return true;
     }
 
     @Override

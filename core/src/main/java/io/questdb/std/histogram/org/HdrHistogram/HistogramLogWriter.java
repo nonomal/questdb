@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -67,10 +67,10 @@ import static java.nio.ByteOrder.BIG_ENDIAN;
 public class HistogramLogWriter {
     private static final String HISTOGRAM_LOG_FORMAT_VERSION = "1.3";
 
-    private static Pattern containsDelimeterPattern = Pattern.compile(".[, \\r\\n].");
+    private static final Pattern containsDelimeterPattern = Pattern.compile(".[, \\r\\n].");
     private final PrintStream log;
     private long baseTime = 0;
-    private Matcher containsDelimeterMatcher = containsDelimeterPattern.matcher("");
+    private final Matcher containsDelimeterMatcher = containsDelimeterPattern.matcher("");
     private ByteBuffer targetBuffer;
 
     /**
@@ -258,7 +258,7 @@ public class HistogramLogWriter {
     public void outputStartTime(final long startTimeMsec) {
         log.format(Locale.US, "#[StartTime: %.3f (seconds since epoch), %s]\n",
                 startTimeMsec / 1000.0,
-                (new Date(startTimeMsec)).toString());
+                (new Date(startTimeMsec)));
     }
 
     /**

@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,11 +24,13 @@
 
 package io.questdb.std.str;
 
+import io.questdb.cairo.CairoException;
 import io.questdb.std.Misc;
 import io.questdb.std.Mutable;
 import io.questdb.std.Unsafe;
 import org.jetbrains.annotations.NotNull;
 
+import static io.questdb.cairo.VarcharTypeDriver.VARCHAR_INLINED_PREFIX_BYTES;
 import static io.questdb.cairo.VarcharTypeDriver.VARCHAR_INLINED_PREFIX_MASK;
 
 /**
@@ -40,14 +42,19 @@ import static io.questdb.cairo.VarcharTypeDriver.VARCHAR_INLINED_PREFIX_MASK;
  */
 public class Utf8SplitString implements DirectUtf8Sequence, Mutable {
     private final AsciiCharSequence asciiCharSequence = new AsciiCharSequence();
-    private final boolean stable;
+    private final StableStringSource stableSource;
     private boolean ascii;
+    private long dataLim;
     private long dataLo;
     private long prefixLo;
     private int size;
 
-    public Utf8SplitString(boolean stable) {
-        this.stable = stable;
+    public Utf8SplitString() {
+        this.stableSource = StableStringSource.UNSTABLE_SOURCE;
+    }
+
+    public Utf8SplitString(StableStringSource stableSource) {
+        this.stableSource = stableSource;
     }
 
     @Override
@@ -57,7 +64,7 @@ public class Utf8SplitString implements DirectUtf8Sequence, Mutable {
 
     @Override
     public byte byteAt(int index) {
-        return Unsafe.getUnsafe().getByte(dataLo + index);
+        return Unsafe.getByte(dataLo + index);
     }
 
     @Override
@@ -67,31 +74,49 @@ public class Utf8SplitString implements DirectUtf8Sequence, Mutable {
     }
 
     @Override
+    public int intAt(int offset) {
+        return Unsafe.getInt(dataLo + offset);
+    }
+
+    @Override
     public boolean isAscii() {
         return ascii;
     }
 
     @Override
     public boolean isStable() {
-        return stable;
+        return stableSource.isStable();
     }
 
     @Override
     public long longAt(int offset) {
-        return Unsafe.getUnsafe().getLong(dataLo + offset);
+        return Unsafe.getLong(dataLo + offset);
     }
 
     /**
      * @param prefixLo address of the first UTF-8 byte of the prefix inlined into the auxiliary vector
      * @param dataLo   address of the first UTF-8 byte of the full string value.
      *                 When the full value is inlined into the auxiliary vector, this must be equal to prefixLo.
+     * @param dataLim  end ptr of the contiguously addressable buffer containing the full value.
+     *                 this is usually past the end of the full value, used to compute the `tailPadding` value.
      * @param size     size in bytes of the UTF-8 value
      * @param ascii    whether the value is all-ASCII
      * @return this
      */
-    public Utf8SplitString of(long prefixLo, long dataLo, int size, boolean ascii) {
+    public Utf8SplitString of(long prefixLo, long dataLo, long dataLim, int size, boolean ascii) {
+        if (dataLim < dataLo + size) {
+            throw CairoException.critical(0)
+                    .put("varchar is outside of file boundary [dataLim=")
+                    .put(dataLim)
+                    .put(", dataLo=")
+                    .put(dataLo)
+                    .put(", size=")
+                    .put(size)
+                    .put(']');
+        }
         this.prefixLo = prefixLo;
         this.dataLo = dataLo;
+        this.dataLim = dataLim;
         this.size = size;
         this.ascii = ascii;
         return this;
@@ -103,8 +128,18 @@ public class Utf8SplitString implements DirectUtf8Sequence, Mutable {
     }
 
     @Override
+    public short shortAt(int offset) {
+        return Unsafe.getShort(dataLo + offset);
+    }
+
+    @Override
     public int size() {
         return size;
+    }
+
+    @Override
+    public long tailPadding() {
+        return dataLim - dataLo - size;
     }
 
     @Override
@@ -116,6 +151,20 @@ public class Utf8SplitString implements DirectUtf8Sequence, Mutable {
 
     @Override
     public long zeroPaddedSixPrefix() {
-        return Unsafe.getUnsafe().getLong(prefixLo) & VARCHAR_INLINED_PREFIX_MASK;
+        // We need at least Long.BYTES (8) readable bytes from prefixLo to safely
+        // use getLong. For VarcharSlice, tailPadding is 0, so strings of 6-7 bytes
+        // would overread past the buffer boundary. Use byte-by-byte for those cases.
+        if (size + tailPadding() >= Long.BYTES) {
+            return Unsafe.getLong(prefixLo) & VARCHAR_INLINED_PREFIX_MASK;
+        }
+        // Construct the prefix byte-by-byte for short strings or strings without
+        // enough tail padding (e.g., VarcharSlice format where adjacent strings
+        // follow immediately with no zero padding).
+        long prefix = 0;
+        int n = Math.min(size, VARCHAR_INLINED_PREFIX_BYTES);
+        for (int i = 0; i < n; i++) {
+            prefix |= (Unsafe.getByte(prefixLo + i) & 0xFFL) << (i * 8);
+        }
+        return prefix;
     }
 }

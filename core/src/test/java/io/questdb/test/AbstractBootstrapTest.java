@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -27,14 +27,13 @@ package io.questdb.test;
 import io.questdb.Bootstrap;
 import io.questdb.PropBootstrapConfiguration;
 import io.questdb.PropServerConfiguration;
+import io.questdb.PropertyKey;
 import io.questdb.cairo.CairoEngine;
 import io.questdb.cairo.TableToken;
-import io.questdb.cairo.wal.ApplyWal2TableJob;
-import io.questdb.cairo.wal.CheckWalTransactionsJob;
-import io.questdb.griffin.SqlCompiler;
 import io.questdb.griffin.SqlExecutionContext;
 import io.questdb.std.Files;
 import io.questdb.std.Misc;
+import io.questdb.std.Os;
 import io.questdb.std.str.Path;
 import io.questdb.test.tools.TestUtils;
 import org.jetbrains.annotations.NotNull;
@@ -58,17 +57,18 @@ import static io.questdb.PropertyKey.*;
 
 public abstract class AbstractBootstrapTest extends AbstractTest {
     protected static final String CHARSET = "UTF8";
-    protected static final int HTTP_MIN_PORT = 9011;
-    protected static final int HTTP_PORT = 9010;
     protected static final int ILP_BUFFER_SIZE = 4 * 1024;
-    protected static final int ILP_PORT = 9009;
     protected static final Properties PG_CONNECTION_PROPERTIES = new Properties();
-    protected static final int PG_PORT = 8822;
-    protected static final String PG_CONNECTION_URI = getPgConnectionUri(PG_PORT);
     protected static int ILP_WORKER_COUNT = 1;
     protected static Path auxPath;
     protected static Path dbPath;
     protected static int dbPathLen;
+    protected static int randomPortOffset = (int) (Os.currentTimeMicros() % 100);
+    protected static final int HTTP_MIN_PORT = 9011 + randomPortOffset;
+    protected static final int HTTP_PORT = 9010 + randomPortOffset;
+    protected static final int ILP_PORT = 9009 + randomPortOffset;
+    protected static final int PG_PORT = 8822 + randomPortOffset;
+    protected static final String PG_CONNECTION_URI = getPgConnectionUri(PG_PORT);
     @Rule
     public Timeout timeout = Timeout.builder()
             .withTimeout(20 * 60 * 1000, TimeUnit.MILLISECONDS)
@@ -87,15 +87,28 @@ public abstract class AbstractBootstrapTest extends AbstractTest {
     }
 
     public static TestServerMain startWithEnvVariables(String... envs) {
+        return startWithEnvVariables(root, envs);
+    }
+
+    public static TestServerMain startWithEnvVariables(CharSequence root, String... envs) {
         assert envs.length % 2 == 0;
 
         Map<String, String> envMap = new HashMap<>();
         for (int i = 0; i < envs.length; i += 2) {
+            // PropServerConfiguration ignores QuestDB property paths in the environment map.
+            // Callers must pass recognized QuestDB settings via PropertyKey.getEnvVarName().
+            assert PropertyKey.getByString(envs[i]).isEmpty()
+                    : "QuestDB property path passed as env var; use PropertyKey.getEnvVarName(): " + envs[i];
             envMap.put(envs[i], envs[i + 1]);
         }
-        TestServerMain serverMain = new TestServerMain(newBootstrapWithEnvVariables(envMap));
-        serverMain.start();
-        return serverMain;
+        TestServerMain serverMain = new TestServerMain(newBootstrapWithEnvVariables(root, envMap));
+        try {
+            serverMain.start();
+            return serverMain;
+        } catch (Throwable th) {
+            Misc.free(serverMain, th);
+            throw th;
+        }
     }
 
     @AfterClass
@@ -105,20 +118,39 @@ public abstract class AbstractBootstrapTest extends AbstractTest {
         AbstractTest.tearDownStatic();
     }
 
-    @NotNull
-    private static Bootstrap newBootstrapWithEnvVariables(Map<String, String> envs) {
-        Map<String, String> env = new HashMap<>(System.getenv());
-
-        env.putAll(envs);
-        return new Bootstrap(
-                new PropBootstrapConfiguration() {
-                    @Override
-                    public Map<String, String> getEnv() {
-                        return env;
-                    }
-                },
-                getServerMainArgs()
-        );
+    protected static void assertMemoryLeak(TestUtils.LeakProneCode code) throws Exception {
+        // Snapshotted before the leak check baselines so the failure dump below can flag
+        // thread-local Path births that happened inside the measurement window.
+        final long tlPathBirthBaseline = Path.getThreadLocalBirthCount();
+        try {
+            TestUtils.assertMemoryLeak(() -> {
+                code.run();
+                CLOSEABLE.forEach(Misc::free);
+            });
+        } catch (AssertionError e) {
+            // A leaked native thread-local (e.g. a Path slot held by a straggler thread that
+            // outlived the leak-check baseline) is invisible in the failure message. Append the
+            // live thread names so a CI-only sighting identifies the straggler without a repro.
+            StringBuilder sb = new StringBuilder(e.getMessage() == null ? "" : e.getMessage());
+            sb.append(" [live threads at failure:");
+            Thread.getAllStackTraces().keySet().stream()
+                    .map(Thread::getName)
+                    .sorted()
+                    .forEach(name -> sb.append(' ').append(name).append(';'));
+            sb.append(']');
+            // A still-open thread-local Path whose birth thread is NOT in the live-thread list
+            // above is the leaker: its thread died without running a Path cleaner. The registry
+            // is populated only under -Dquestdb.path.tl.attribution=true (set in the surefire
+            // argLine), so a healthy run pays a registry add/remove and prints nothing.
+            if (sb.indexOf("NATIVE_PATH_THREAD_LOCAL") >= 0) {
+                sb.append(" [live thread-local Paths:")
+                        .append(Path.dumpLiveThreadLocalAttributions(tlPathBirthBaseline))
+                        .append(']');
+            }
+            AssertionError annotated = new AssertionError(sb.toString());
+            annotated.setStackTrace(e.getStackTrace());
+            throw annotated;
+        }
     }
 
     protected static void assertQueryFails(
@@ -163,6 +195,22 @@ public abstract class AbstractBootstrapTest extends AbstractTest {
             String root,
             String... extra
     ) throws Exception {
+        createDummyConfigurationWithTelemetryEnable(httpPort, httpMinPort, pgPort, ilpPort, root, false, extra);
+    }
+
+    protected static void createDummyConfigurationInRoot(String root, String... extra) throws Exception {
+        createDummyConfiguration(HTTP_PORT, HTTP_MIN_PORT, PG_PORT, ILP_PORT, root, extra);
+    }
+
+    protected static void createDummyConfigurationWithTelemetryEnable(
+            int httpPort,
+            int httpMinPort,
+            int pgPort,
+            int ilpPort,
+            String root,
+            boolean telemetryEnable,
+            String... extra
+    ) throws Exception {
         final String confPath = root + Files.SEPARATOR + "conf";
         TestUtils.createTestPath(confPath);
         String file = confPath + Files.SEPARATOR + "server.conf";
@@ -177,11 +225,11 @@ public abstract class AbstractBootstrapTest extends AbstractTest {
             writer.println(HTTP_QUERY_CACHE_ENABLED + "=false");
             writer.println(PG_SELECT_CACHE_ENABLED + "=false");
             writer.println(PG_INSERT_CACHE_ENABLED + "=false");
-            writer.println(PG_UPDATE_CACHE_ENABLED + "=false");
             writer.println(CAIRO_WAL_ENABLED_DEFAULT + "=false");
             writer.println(METRICS_ENABLED + "=false");
-            writer.println(TELEMETRY_ENABLED + "=false");
-            writer.println(TELEMETRY_DISABLE_COMPLETELY + "=true");
+            writer.println(MEMORY_USAGE_LOG_ENABLED + "=false");
+            writer.println(TELEMETRY_ENABLED + "=" + telemetryEnable);
+            writer.println(TELEMETRY_DISABLE_COMPLETELY + "=" + !telemetryEnable);
 
             // configure endpoints
             writer.println(HTTP_BIND_TO + "=0.0.0.0:" + httpPort);
@@ -192,13 +240,8 @@ public abstract class AbstractBootstrapTest extends AbstractTest {
             writer.println(LINE_UDP_RECEIVE_BUFFER_SIZE + "=" + ILP_BUFFER_SIZE);
             writer.println(HTTP_FROZEN_CLOCK + "=true");
 
-            // configure worker pools
+            // Do not configure worker pools, use default values, e.g. 3 shared pools
             writer.println(SHARED_WORKER_COUNT + "=2");
-            writer.println(HTTP_WORKER_COUNT + "=1");
-            writer.println(HTTP_MIN_WORKER_COUNT + "=1");
-            writer.println(PG_WORKER_COUNT + "=1");
-            writer.println(LINE_TCP_WRITER_WORKER_COUNT + "=1");
-            writer.println(LINE_TCP_IO_WORKER_COUNT + "=" + ILP_WORKER_COUNT);
 
             // extra
             if (extra != null) {
@@ -228,10 +271,6 @@ public abstract class AbstractBootstrapTest extends AbstractTest {
         }
     }
 
-    protected static void createDummyConfigurationInRoot(String root, String... extra) throws Exception {
-        createDummyConfiguration(HTTP_PORT, HTTP_MIN_PORT, PG_PORT, ILP_PORT, root, extra);
-    }
-
     protected static long createDummyWebConsole() throws Exception {
         final String publicPath = root + Files.SEPARATOR + "public";
         TestUtils.createTestPath(publicPath);
@@ -246,17 +285,10 @@ public abstract class AbstractBootstrapTest extends AbstractTest {
         }
     }
 
-    protected static void drainWalQueue(CairoEngine engine) {
-        try (final ApplyWal2TableJob walApplyJob = new ApplyWal2TableJob(engine, 1, 1)) {
-            walApplyJob.drain(0);
-            new CheckWalTransactionsJob(engine).run(0);
-            // run once again as there might be notifications to handle now
-            walApplyJob.drain(0);
-        }
-    }
-
-    static void dropTable(SqlCompiler compiler, SqlExecutionContext context, TableToken tableToken) throws Exception {
-        compiler.compile("DROP TABLE '" + tableToken.getTableName() + '\'', context);
+    static void dropTable(SqlExecutionContext context, TableToken tableToken) throws Exception {
+        CairoEngine cairoEngine = context.getCairoEngine();
+        CharSequence dropSql = "DROP TABLE '" + tableToken.getTableName() + '\'';
+        cairoEngine.execute(dropSql, context);
     }
 
     static String[] extendArgsWith(String[] args, String... moreArgs) {
@@ -282,6 +314,22 @@ public abstract class AbstractBootstrapTest extends AbstractTest {
 
     protected static String getPgConnectionUri(int pgPort) {
         return "jdbc:postgresql://127.0.0.1:" + pgPort + "/qdb";
+    }
+
+    @NotNull
+    protected static Bootstrap newBootstrapWithEnvVariables(CharSequence root, Map<String, String> envs) {
+        Map<String, String> env = new HashMap<>(System.getenv());
+        env.putAll(envs);
+        env.put(PropertyKey.CAIRO_SQL_COLUMN_ALIAS_EXPRESSION_ENABLED.getEnvVarName(), "false");
+        return new Bootstrap(
+                new PropBootstrapConfiguration() {
+                    @Override
+                    public Map<String, String> getEnv() {
+                        return env;
+                    }
+                },
+                getServerMainArgs(root)
+        );
     }
 
     void assertFail(String message, String... args) {

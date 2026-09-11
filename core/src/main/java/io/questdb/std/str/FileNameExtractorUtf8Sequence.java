@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -25,12 +25,12 @@
 package io.questdb.std.str;
 
 import io.questdb.std.Files;
-import io.questdb.std.ThreadLocal;
+import io.questdb.std.CarrierLocal;
 import org.jetbrains.annotations.NotNull;
 
 public class FileNameExtractorUtf8Sequence implements Utf8Sequence {
 
-    private final static ThreadLocal<FileNameExtractorUtf8Sequence> SINGLETON = new ThreadLocal<>(FileNameExtractorUtf8Sequence::new);
+    private final static CarrierLocal<FileNameExtractorUtf8Sequence> SINGLETON = new CarrierLocal<>(FileNameExtractorUtf8Sequence::new);
     private Utf8Sequence base;
     private int hi;
     private int lo;
@@ -49,6 +49,11 @@ public class FileNameExtractorUtf8Sequence implements Utf8Sequence {
         return base.byteAt(lo + index);
     }
 
+    @Override
+    public boolean isAscii() {
+        return base.isAscii();
+    }
+
     public Utf8Sequence of(Utf8Sequence base) {
         this.base = base;
         this.hi = base.size();
@@ -60,11 +65,6 @@ public class FileNameExtractorUtf8Sequence implements Utf8Sequence {
             }
         }
         return this;
-    }
-
-    @Override
-    public boolean isAscii() {
-        return base.isAscii();
     }
 
     @Override

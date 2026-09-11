@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -44,18 +44,27 @@ public class SOUnboundedCountDownLatch implements CountDownLatchSPI {
     public void await(int count) {
         this.awaitedCount = count;
         this.waiter = Thread.currentThread();
-        while (this.count > -count) {
-            // Don't use LockSupport.park() here.
-            // Once in a while there can be a delay between check of this.count > -count
-            // and parking and unparkWaiter() will be called before park().
-            // Limit the parking time by using Os.park() instead of LockSupport.park()
-            Os.park();
+        boolean isInterrupted = false;
+        try {
+            while (this.count > -count) {
+                // Don't use LockSupport.park() here.
+                // Once in a while there can be a delay between check of this.count > -count
+                // and parking and unparkWaiter() will be called before park().
+                // Limit the parking time by using Os.park() instead of LockSupport.park()
+                Os.park(this);
+                // Consume interrupts so the next park can block; restore the flag on exit.
+                isInterrupted |= Thread.interrupted();
+            }
+        } finally {
+            if (isInterrupted) {
+                Thread.currentThread().interrupt();
+            }
         }
     }
 
     @Override
     public void countDown() {
-        final int prevCount = Unsafe.getUnsafe().getAndAddInt(this, COUNT_OFFSET, -1);
+        final int prevCount = Unsafe.getAndAddInt(this, COUNT_OFFSET, -1);
         final int awaitedCount = this.awaitedCount;
         if ((prevCount - 1) <= -awaitedCount) {
             unparkWaiter();

@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -26,14 +26,16 @@ package io.questdb.cutlass.http;
 
 import io.questdb.DefaultFactoryProvider;
 import io.questdb.FactoryProvider;
+import io.questdb.Metrics;
 import io.questdb.network.NetworkFacade;
 import io.questdb.network.NetworkFacadeImpl;
-import io.questdb.std.NanosecondClock;
-import io.questdb.std.NanosecondClockImpl;
+import io.questdb.std.datetime.NanosecondClock;
 import io.questdb.std.datetime.millitime.MillisecondClock;
 import io.questdb.std.datetime.millitime.MillisecondClockImpl;
+import io.questdb.std.datetime.nanotime.NanosecondClockImpl;
 
 public class DefaultHttpContextConfiguration implements HttpContextConfiguration {
+
     @Override
     public boolean allowDeflateBeforeSend() {
         return false;
@@ -60,6 +62,11 @@ public class DefaultHttpContextConfiguration implements HttpContextConfiguration
     }
 
     @Override
+    public int getExportConnectionLimit() {
+        return -1;
+    }
+
+    @Override
     public FactoryProvider getFactoryProvider() {
         return DefaultFactoryProvider.INSTANCE;
     }
@@ -78,6 +85,21 @@ public class DefaultHttpContextConfiguration implements HttpContextConfiguration
     public String getHttpVersion() {
         // trailing space is important
         return "HTTP/1.1 ";
+    }
+
+    @Override
+    public int getIlpConnectionLimit() {
+        return -1;
+    }
+
+    @Override
+    public int getJsonQueryConnectionLimit() {
+        return -1;
+    }
+
+    @Override
+    public Metrics getMetrics() {
+        return Metrics.ENABLED;
     }
 
     @Override
@@ -106,23 +128,18 @@ public class DefaultHttpContextConfiguration implements HttpContextConfiguration
     }
 
     @Override
-    public int getRecvBufferSize() {
-        return 1024 * 1024;
-    }
-
-    @Override
     public int getRequestHeaderBufferSize() {
         return 4096;
     }
 
     @Override
-    public int getSendBufferSize() {
-        return 1024 * 1024;
+    public boolean getServerKeepAlive() {
+        return true;
     }
 
     @Override
-    public boolean getServerKeepAlive() {
-        return true;
+    public long getSessionTimeout() {
+        return 1_800_000_000L; // 30 minutes
     }
 
     @Override

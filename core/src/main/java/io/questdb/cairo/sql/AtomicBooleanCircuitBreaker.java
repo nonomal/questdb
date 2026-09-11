@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,33 +24,59 @@
 
 package io.questdb.cairo.sql;
 
+import io.questdb.cairo.CairoEngine;
 import io.questdb.cairo.CairoException;
+import io.questdb.mp.continuation.CancellationBinding;
 import org.jetbrains.annotations.Nullable;
 
 import java.util.concurrent.atomic.AtomicBoolean;
 
-// Circuit breaker that doesn't check network connection status or timeout and only allows cancelling statement via CANCEL QUERY command .
+/**
+ * Circuit breaker that doesn't check network connection status or timeout
+ * and only allows cancelling statement via CANCEL QUERY command.
+ */
 public class AtomicBooleanCircuitBreaker implements SqlExecutionCircuitBreaker {
+    @Deprecated
+    protected volatile AtomicBoolean cancelledFlag = new AtomicBoolean(false);
+    private final CancellationBinding cancellationBinding;
+    private final CairoEngine engine;
     private final int throttle;
-    private AtomicBoolean cancelledFlag;
-    private int fd = -1;
+    private long fd = -1;
     private int testCount = 0;
 
-    public AtomicBooleanCircuitBreaker() {
-        this(0);
-        cancelledFlag = new AtomicBoolean(false);
+    public AtomicBooleanCircuitBreaker(CairoEngine engine) {
+        this(engine, 0);
     }
 
-    public AtomicBooleanCircuitBreaker(int throttle) {
+    public AtomicBooleanCircuitBreaker(CairoEngine engine, int throttle) {
+        this.cancellationBinding = new CancellationBinding(cancelledFlag);
+        this.engine = engine;
         this.throttle = throttle;
     }
 
-    public void cancel() {
-        cancelledFlag.set(true);
+    public synchronized void cancel() {
+        cancellationBinding.cancel();
     }
 
     @Override
-    public boolean checkIfTripped(long millis, int fd) {
+    public synchronized void clearCancelledFlag(AtomicBoolean expected) {
+        cancellationBinding.clear(expected);
+        cancelledFlag = cancellationBinding.getFlag();
+    }
+
+    @Override
+    public synchronized void clearCancelledFlag(AtomicBoolean expected, long expectedGeneration) {
+        cancellationBinding.clear(expected, expectedGeneration);
+        cancelledFlag = cancellationBinding.getFlag();
+    }
+
+    @Override
+    public void copyCancelledFlagTo(CancellationBinding target) {
+        cancellationBinding.copyTo(target);
+    }
+
+    @Override
+    public boolean checkIfTripped(long millis, long fd) {
         return isCancelled();
     }
 
@@ -65,12 +91,17 @@ public class AtomicBooleanCircuitBreaker implements SqlExecutionCircuitBreaker {
     }
 
     @Override
+    public AtomicBoolean getCancelledFlag() {
+        return cancellationBinding.getFlag();
+    }
+
+    @Override
     public @Nullable SqlExecutionCircuitBreakerConfiguration getConfiguration() {
         return null;
     }
 
     @Override
-    public int getFd() {
+    public long getFd() {
         return fd;
     }
 
@@ -80,8 +111,18 @@ public class AtomicBooleanCircuitBreaker implements SqlExecutionCircuitBreaker {
     }
 
     @Override
-    public int getState(long millis, int fd) {
+    public int getState(long millis, long fd) {
         return getState();
+    }
+
+    @Override
+    public long getTimeout() {
+        throw new UnsupportedOperationException("AtomicBooleanCircuitBreaker does not support timeout");
+    }
+
+    @Override
+    public boolean isThreadSafe() {
+        return true;
     }
 
     @Override
@@ -89,31 +130,48 @@ public class AtomicBooleanCircuitBreaker implements SqlExecutionCircuitBreaker {
         return true;
     }
 
-    public void reset() {
-        cancelledFlag.set(false);
+    public synchronized void reset() {
+        cancellationBinding.reset();
     }
 
     @Override
     public void resetTimer() {
-        // ignore
+        // No timer to reset, but start a fresh throttle window for the new query so the next breaker
+        // consultation performs a real cancellation check.
+        testCount = 0;
     }
 
     @Override
-    public void setCancelledFlag(AtomicBoolean cancelledFlag) {
+    public synchronized void setCancelledFlag(AtomicBoolean cancelledFlag) {
+        cancellationBinding.set(cancelledFlag);
         this.cancelledFlag = cancelledFlag;
     }
 
     @Override
-    public void setFd(int fd) {
+    public synchronized void setCancelledFlag(CancellationBinding source) {
+        source.copyTo(cancellationBinding);
+        cancelledFlag = cancellationBinding.getFlag();
+    }
+
+    @Override
+    public synchronized void setCancelledFlag(AtomicBoolean cancelledFlag, long generation) {
+        cancellationBinding.set(cancelledFlag, generation);
+        this.cancelledFlag = cancelledFlag;
+    }
+
+    @Override
+    public void setFd(long fd) {
         this.fd = fd;
     }
 
     public void statefulThrowExceptionIfTripped() {
-        if (testCount < throttle) {
-            testCount++;
-        } else {
-            statefulThrowExceptionIfTrippedNoThrottle();
+        // Always perform a real check on the first call after a reset (testCount == 0), so empty/instant
+        // queries that consult the breaker only a handful of times still observe cancellation. Otherwise
+        // test once per throttle window to keep hot per-row/per-frame loops cheap.
+        if (testCount == 0 || testCount >= throttle) {
+            statefulThrowExceptionIfTrippedNoThrottle(); // performs the real test and resets testCount to 0
         }
+        testCount++;
     }
 
     @Override
@@ -130,6 +188,6 @@ public class AtomicBooleanCircuitBreaker implements SqlExecutionCircuitBreaker {
     }
 
     private boolean isCancelled() {
-        return cancelledFlag.get();
+        return cancellationBinding.isCancelledOrUnbound() || engine.isClosing();
     }
 }

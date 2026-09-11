@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -25,7 +25,6 @@
 package io.questdb.test.cutlass.line.tcp;
 
 import io.questdb.FreeOnExit;
-import io.questdb.Metrics;
 import io.questdb.PropServerConfiguration;
 import io.questdb.cairo.CairoEngine;
 import io.questdb.cairo.pool.PoolListener;
@@ -45,20 +44,20 @@ import io.questdb.std.Unsafe;
 import io.questdb.std.str.DirectUtf8String;
 import io.questdb.test.AbstractCairoTest;
 import io.questdb.test.tools.TestUtils;
-import org.junit.*;
-import org.junit.runner.RunWith;
-import org.junit.runners.Parameterized;
+import org.junit.After;
+import org.junit.AfterClass;
+import org.junit.Assert;
+import org.junit.Before;
+import org.junit.BeforeClass;
+import org.junit.Test;
 
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
-import java.util.Arrays;
-import java.util.Collection;
 import java.util.Properties;
 import java.util.zip.GZIPInputStream;
 
-@RunWith(Parameterized.class)
 public class LineTcpO3Test extends AbstractCairoTest {
     private final static Log LOG = LogFactory.getLog(LineTcpO3Test.class);
     private final FreeOnExit freeOnExit = new FreeOnExit();
@@ -68,15 +67,8 @@ public class LineTcpO3Test extends AbstractCairoTest {
     private int resourceSize;
     private WorkerPoolConfiguration sharedWorkerPoolConfiguration;
 
-    public LineTcpO3Test(WalMode walMode) {
-        this.walEnabled = (walMode == WalMode.WITH_WAL);
-    }
-
-    @Parameterized.Parameters(name = "{0}")
-    public static Collection<Object[]> data() {
-        return Arrays.asList(new Object[][]{
-                {WalMode.WITH_WAL}, {WalMode.NO_WAL}
-        });
+    public LineTcpO3Test() {
+        this.walEnabled = TestUtils.isWal();
     }
 
     @BeforeClass
@@ -121,9 +113,8 @@ public class LineTcpO3Test extends AbstractCairoTest {
         }
         configuration = serverConf.getCairoConfiguration();
         lineConfiguration = serverConf.getLineTcpReceiverConfiguration();
-        sharedWorkerPoolConfiguration = serverConf.getWorkerPoolConfiguration();
-        metrics = Metrics.enabled();
-        engine = new CairoEngine(configuration, metrics);
+        sharedWorkerPoolConfiguration = serverConf.getSharedWorkerPoolNetworkConfiguration();
+        engine = new CairoEngine(configuration);
         serverConf.init(engine, freeOnExit);
         messageBus = engine.getMessageBus();
         LOG.info().$("setup engine completed").$();
@@ -179,7 +170,7 @@ public class LineTcpO3Test extends AbstractCairoTest {
             resourceNLines = 0;
             for (int i = 0; i < resourceSize; i++) {
                 byte b = bytes[i];
-                Unsafe.getUnsafe().putByte(resourceAddress + i, b);
+                Unsafe.putByte(resourceAddress + i, b);
                 if (b == '\n') {
                     resourceNLines++;
                 }
@@ -192,17 +183,17 @@ public class LineTcpO3Test extends AbstractCairoTest {
 
     private void test(String ilpResourceName) throws Exception {
         assertMemoryLeak(() -> {
-            int clientFd = Net.socketTcp(true);
+            long clientFd = Net.socketTcp(true);
             Assert.assertTrue(clientFd >= 0);
 
-            long ilpSockAddr = Net.sockaddr(Net.parseIPv4("127.0.0.1"), lineConfiguration.getDispatcherConfiguration().getBindPort());
-            WorkerPool sharedWorkerPool = new WorkerPool(sharedWorkerPoolConfiguration, metrics);
+            long ilpSockAddr = Net.sockaddr(Net.parseIPv4("127.0.0.1"), lineConfiguration.getBindPort());
+            WorkerPool sharedWorkerPool = new WorkerPool(sharedWorkerPoolConfiguration);
             try (
                     LineTcpReceiver ignored = new LineTcpReceiver(lineConfiguration, engine, sharedWorkerPool, sharedWorkerPool);
                     SqlExecutionContext sqlExecutionContext = TestUtils.createSqlExecutionCtx(engine)
             ) {
                 SOCountDownLatch haltLatch = new SOCountDownLatch(1);
-                engine.setPoolListener((factoryType, thread, name, event, segment, position) -> {
+                engine.setPoolListener((factoryType, _, name, event, _, _) -> {
                     if (PoolListener.isWalOrWriter(factoryType)) {
                         if (event == PoolListener.EV_RETURN && Chars.equalsNc(name.getTableName(), "cpu")) {
                             haltLatch.countDown();

@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -40,6 +40,22 @@ public interface QuaternaryFunction extends Function {
         getFunc3().close();
     }
 
+    @Override
+    default void cursorClosed() {
+        getFunc0().cursorClosed();
+        getFunc1().cursorClosed();
+        getFunc2().cursorClosed();
+        getFunc3().cursorClosed();
+    }
+
+    @Override
+    default int getComplexity() {
+        return Function.addComplexity(
+                Function.addComplexity(getFunc0().getComplexity(), getFunc1().getComplexity()),
+                Function.addComplexity(getFunc2().getComplexity(), getFunc3().getComplexity())
+        );
+    }
+
     Function getFunc0();
 
     Function getFunc1();
@@ -57,14 +73,6 @@ public interface QuaternaryFunction extends Function {
     }
 
     @Override
-    default void initCursor() {
-        getFunc0().initCursor();
-        getFunc1().initCursor();
-        getFunc2().initCursor();
-        getFunc3().initCursor();
-    }
-
-    @Override
     default boolean isConstant() {
         return getFunc0().isConstant()
                 && getFunc1().isConstant()
@@ -73,26 +81,68 @@ public interface QuaternaryFunction extends Function {
     }
 
     @Override
-    default boolean isReadThreadSafe() {
-        return getFunc0().isReadThreadSafe()
-                && getFunc1().isReadThreadSafe()
-                && getFunc2().isReadThreadSafe()
-                && getFunc3().isReadThreadSafe();
+    default boolean isNonDeterministic() {
+        return getFunc0().isNonDeterministic()
+                || getFunc1().isNonDeterministic()
+                || getFunc2().isNonDeterministic()
+                || getFunc3().isNonDeterministic();
+    }
+
+    @Override
+    default boolean isRandom() {
+        return getFunc0().isRandom() || getFunc1().isRandom() || getFunc2().isRandom() || getFunc3().isRandom();
+    }
+
+    // Within-execution stability composes independently of determinism: an arg may be
+    // non-deterministic yet stable (bind variable, now()), or appear deterministic through
+    // isNonDeterministic() yet be unstable (a cursor arg wrapping an rnd_* projection).
+    @Override
+    default boolean isStableWithinExecution() {
+        return getFunc0().isStableWithinExecution()
+                && getFunc1().isStableWithinExecution()
+                && getFunc2().isStableWithinExecution()
+                && getFunc3().isStableWithinExecution();
     }
 
     @Override
     default boolean isRuntimeConstant() {
-        boolean arc = getFunc0().isRuntimeConstant();
-        boolean brc = getFunc1().isRuntimeConstant();
-        boolean crc = getFunc2().isRuntimeConstant();
-        boolean drc = getFunc3().isRuntimeConstant();
+        final boolean arc = getFunc0().isRuntimeConstant();
+        final boolean brc = getFunc1().isRuntimeConstant();
+        final boolean crc = getFunc2().isRuntimeConstant();
+        final boolean drc = getFunc3().isRuntimeConstant();
 
-        boolean ac = getFunc0().isConstant();
-        boolean bc = getFunc1().isConstant();
-        boolean cc = getFunc2().isConstant();
-        boolean dc = getFunc3().isConstant();
+        final boolean ac = getFunc0().isConstant();
+        final boolean bc = getFunc1().isConstant();
+        final boolean cc = getFunc2().isConstant();
+        final boolean dc = getFunc3().isConstant();
 
         return (ac || arc) && (bc || brc) && (cc || crc) && (dc || drc) && (arc || brc || crc || drc);
+    }
+
+    @Override
+    default boolean isThreadSafe() {
+        return getFunc0().isThreadSafe()
+                && getFunc1().isThreadSafe()
+                && getFunc2().isThreadSafe()
+                && getFunc3().isThreadSafe();
+    }
+
+    @Override
+    default void offerStateTo(Function that) {
+        if (that instanceof QuaternaryFunction other) {
+            getFunc0().offerStateTo(other.getFunc0());
+            getFunc1().offerStateTo(other.getFunc1());
+            getFunc2().offerStateTo(other.getFunc2());
+            getFunc3().offerStateTo(other.getFunc3());
+        }
+    }
+
+    @Override
+    default boolean shouldMemoize() {
+        return getFunc0().shouldMemoize()
+                || getFunc1().shouldMemoize()
+                || getFunc2().shouldMemoize()
+                || getFunc3().shouldMemoize();
     }
 
     @Override
@@ -101,6 +151,14 @@ public interface QuaternaryFunction extends Function {
                 && getFunc1().supportsParallelism()
                 && getFunc2().supportsParallelism()
                 && getFunc3().supportsParallelism();
+    }
+
+    @Override
+    default boolean supportsRandomAccess() {
+        return getFunc0().supportsRandomAccess()
+                && getFunc1().supportsRandomAccess()
+                && getFunc2().supportsRandomAccess()
+                && getFunc3().supportsRandomAccess();
     }
 
     @Override

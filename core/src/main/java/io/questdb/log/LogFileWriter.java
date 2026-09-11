@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -44,7 +44,7 @@ public class LogFileWriter extends SynchronizedJob implements Closeable, LogWrit
     private long buf;
     private int bufSize;
     private String bufferSize;
-    private int fd = -1;
+    private long fd = -1;
     private long lim;
     private String location;
     private QueueConsumer<LogRecordUtf8Sink> myConsumer = this::copyToBuffer;
@@ -71,6 +71,14 @@ public class LogFileWriter extends SynchronizedJob implements Closeable, LogWrit
         }
         this.buf = _wptr = Unsafe.malloc(bufSize, MemoryTag.NATIVE_LOGGER);
         this.lim = buf + bufSize;
+        int pidTokenIndex = location.indexOf("%p");
+        if (pidTokenIndex > -1) {
+            // The %p token expands to the JVM pid so concurrent or respawned processes
+            // (e.g. a surefire replacement fork after a fork death) never collide on the
+            // same log file; on Windows the dead process lazily holds its handle and a
+            // same-path reopen fails with ERROR_SHARING_VIOLATION.
+            location = location.substring(0, pidTokenIndex) + Os.getPid() + location.substring(pidTokenIndex + 2);
+        }
         try (Path path = new Path()) {
             path.of(location);
             if (truncate != null && Chars.equalsLowerCaseAscii(truncate, "true")) {

@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -26,21 +26,40 @@ package io.questdb.griffin.engine.functions.groupby;
 
 import io.questdb.cairo.ArrayColumnTypes;
 import io.questdb.cairo.ColumnType;
+import io.questdb.cairo.map.Map;
 import io.questdb.cairo.map.MapValue;
 import io.questdb.cairo.sql.Function;
+import io.questdb.cairo.sql.PageFrameMemoryRecord;
 import io.questdb.cairo.sql.Record;
 import io.questdb.griffin.engine.functions.GroupByFunction;
 import io.questdb.griffin.engine.functions.TimestampFunction;
 import io.questdb.griffin.engine.functions.UnaryFunction;
+import io.questdb.griffin.engine.groupby.FlyweightPackedMapValue;
+import io.questdb.griffin.engine.groupby.GroupByUtils;
 import io.questdb.std.Numbers;
+import io.questdb.std.Unsafe;
 import org.jetbrains.annotations.NotNull;
 
 public class FirstTimestampGroupByFunction extends TimestampFunction implements GroupByFunction, UnaryFunction {
     protected final Function arg;
+    protected final int argColumnIndex;
     protected int valueIndex;
 
-    public FirstTimestampGroupByFunction(@NotNull Function arg) {
+    public FirstTimestampGroupByFunction(@NotNull Function arg, int timestampType) {
+        super(timestampType);
         this.arg = arg;
+        this.argColumnIndex = GroupByUtils.directArgColumnIndex(arg, timestampType);
+    }
+
+    @Override
+    public void computeBatch(MapValue mapValue, long dataAddr, int rowCount, long startRowId) {
+        if (rowCount > 0) {
+            long existingRowId = mapValue.getLong(valueIndex);
+            if (startRowId < existingRowId || existingRowId == Numbers.LONG_NULL) {
+                mapValue.putLong(valueIndex, startRowId);
+                mapValue.putLong(valueIndex + 1, Unsafe.getLong(dataAddr));
+            }
+        }
     }
 
     @Override
@@ -50,8 +69,54 @@ public class FirstTimestampGroupByFunction extends TimestampFunction implements 
     }
 
     @Override
+    public void computeKeyedBatch(
+            PageFrameMemoryRecord record,
+            FlyweightPackedMapValue mapValue,
+            long baseValueAddr,
+            long batchAddr,
+            long rowCount,
+            long baseRowId
+    ) {
+        // setEmpty pre-seeds rowId = LONG_NULL, so new entries win the "first" comparison
+        // as long as we keep the explicit LONG_NULL check.
+        final long rowIdOffset = mapValue.getOffset(valueIndex);
+        final long valueColumnOffset = mapValue.getOffset(valueIndex + 1);
+        // Fast path: arg is a direct timestamp column with data on the current frame.
+        // Zero page address means a column top; fall through to the record-based path.
+        final long argAddr = argColumnIndex >= 0 ? record.getPageAddress(argColumnIndex) : 0;
+        if (argAddr != 0) {
+            for (long i = 0; i < rowCount; i++) {
+                final long encoded = Unsafe.getLong(batchAddr + (i << 3));
+                final long rowIndex = Map.decodeBatchRowIndex(encoded);
+                final long rowId = baseRowId + rowIndex;
+                final long entryBase = baseValueAddr + Map.decodeBatchOffset(encoded);
+                final long existingRowId = Unsafe.getLong(entryBase + rowIdOffset);
+                if (existingRowId == Numbers.LONG_NULL || rowId < existingRowId) {
+                    Unsafe.putLong(entryBase + rowIdOffset, rowId);
+                    Unsafe.putLong(entryBase + valueColumnOffset, Unsafe.getLong(argAddr + (rowIndex << 3)));
+                }
+            }
+        } else {
+            for (long i = 0; i < rowCount; i++) {
+                final long encoded = Unsafe.getLong(batchAddr + (i << 3));
+                final long rowIndex = Map.decodeBatchRowIndex(encoded);
+                final long rowId = baseRowId + rowIndex;
+                final long entryBase = baseValueAddr + Map.decodeBatchOffset(encoded);
+                final long existingRowId = Unsafe.getLong(entryBase + rowIdOffset);
+                if (existingRowId == Numbers.LONG_NULL || rowId < existingRowId) {
+                    record.setRowIndex(rowIndex);
+                    Unsafe.putLong(entryBase + rowIdOffset, rowId);
+                    Unsafe.putLong(entryBase + valueColumnOffset, arg.getTimestamp(record));
+                }
+            }
+        }
+    }
+
+    @Override
     public void computeNext(MapValue mapValue, Record record, long rowId) {
-        // empty
+        if (rowId < mapValue.getLong(valueIndex)) {
+            computeFirst(mapValue, record, rowId);
+        }
     }
 
     @Override
@@ -62,6 +127,11 @@ public class FirstTimestampGroupByFunction extends TimestampFunction implements 
     @Override
     public String getName() {
         return "first";
+    }
+
+    @Override
+    public int getSampleByFlags() {
+        return GroupByFunction.SAMPLE_BY_FILL_ALL;
     }
 
     @Override
@@ -83,12 +153,17 @@ public class FirstTimestampGroupByFunction extends TimestampFunction implements 
     public void initValueTypes(ArrayColumnTypes columnTypes) {
         this.valueIndex = columnTypes.getColumnCount();
         columnTypes.add(ColumnType.LONG);      // row id
-        columnTypes.add(ColumnType.TIMESTAMP); // value
+        columnTypes.add(timestampType); // value
     }
 
     @Override
-    public boolean isReadThreadSafe() {
-        return UnaryFunction.super.isReadThreadSafe();
+    public boolean isConstant() {
+        return false;
+    }
+
+    @Override
+    public boolean isThreadSafe() {
+        return UnaryFunction.super.isThreadSafe();
     }
 
     @Override
@@ -105,6 +180,11 @@ public class FirstTimestampGroupByFunction extends TimestampFunction implements 
     public void setNull(MapValue mapValue) {
         mapValue.putLong(valueIndex, Numbers.LONG_NULL);
         mapValue.putTimestamp(valueIndex + 1, Numbers.LONG_NULL);
+    }
+
+    @Override
+    public boolean supportsBatchComputation() {
+        return true;
     }
 
     @Override

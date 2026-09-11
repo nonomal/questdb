@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -119,6 +119,11 @@ public class ApproxCountDistinctLongGroupByFunction extends LongFunction impleme
     }
 
     @Override
+    public int getSampleByFlags() {
+        return GroupByFunction.SAMPLE_BY_FILL_ALL;
+    }
+
+    @Override
     public int getValueIndex() {
         return valueIndex;
     }
@@ -144,7 +149,7 @@ public class ApproxCountDistinctLongGroupByFunction extends LongFunction impleme
     }
 
     @Override
-    public boolean isReadThreadSafe() {
+    public boolean isThreadSafe() {
         return false;
     }
 
@@ -204,7 +209,11 @@ public class ApproxCountDistinctLongGroupByFunction extends LongFunction impleme
 
     @Override
     public void setEmpty(MapValue mapValue) {
-        overwrite(mapValue, 0L);
+        // overwrittenFlag stays false: empty means "no value observed yet",
+        // distinct from setLong/setNull which force an explicit value via overwrite().
+        mapValue.putLong(valueIndex, 0L);
+        mapValue.putLong(hllPtrIndex, 0);
+        mapValue.putBool(overwrittenFlagIndex, false);
     }
 
     @Override
@@ -219,7 +228,7 @@ public class ApproxCountDistinctLongGroupByFunction extends LongFunction impleme
 
     @Override
     public boolean supportsParallelism() {
-        return true;
+        return UnaryFunction.super.supportsParallelism();
     }
 
     private void overwrite(MapValue mapValue, long value) {

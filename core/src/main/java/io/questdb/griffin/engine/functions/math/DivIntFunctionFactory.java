@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -30,24 +30,46 @@ import io.questdb.cairo.sql.Record;
 import io.questdb.griffin.FunctionFactory;
 import io.questdb.griffin.PlanSink;
 import io.questdb.griffin.SqlExecutionContext;
-import io.questdb.griffin.engine.functions.BinaryFunction;
 import io.questdb.griffin.engine.functions.IntFunction;
+import io.questdb.griffin.engine.functions.constants.IntConstant;
 import io.questdb.std.IntList;
+import io.questdb.std.Misc;
 import io.questdb.std.Numbers;
 import io.questdb.std.ObjList;
+import io.questdb.std.Transient;
 
 public class DivIntFunctionFactory implements FunctionFactory {
+
     @Override
     public String getSignature() {
         return "/(II)";
     }
 
     @Override
-    public Function newInstance(int position, ObjList<Function> args, IntList argPositions, CairoConfiguration configuration, SqlExecutionContext sqlExecutionContext) {
-        return new Func(args.getQuick(0), args.getQuick(1));
+    public Function newInstance(
+            int position,
+            @Transient ObjList<Function> args,
+            @Transient IntList argPositions,
+            CairoConfiguration configuration,
+            SqlExecutionContext sqlExecutionContext
+    ) {
+        final Function left = args.getQuick(0);
+        final Function right = args.getQuick(1);
+        // null / x and x / null always evaluate to null. Fold at construction time so the
+        // non-null operand (potentially a column reference) is never evaluated with a null
+        // record via FunctionParser.functionToConstant().
+        if (left.isNullConstant()) {
+            Misc.free(right);
+            return IntConstant.NULL;
+        }
+        if (right.isNullConstant()) {
+            Misc.free(left);
+            return IntConstant.NULL;
+        }
+        return new Func(left, right);
     }
 
-    private static class Func extends IntFunction implements BinaryFunction {
+    private static class Func extends IntFunction implements ArithmeticBinaryFunction {
         private final Function left;
         private final Function right;
 
@@ -60,7 +82,6 @@ public class DivIntFunctionFactory implements FunctionFactory {
         public int getInt(Record rec) {
             final int l = left.getInt(rec);
             final int r = right.getInt(rec);
-
             if (l == Numbers.INT_NULL || r == Numbers.INT_NULL || r == 0) {
                 return Numbers.INT_NULL;
             }

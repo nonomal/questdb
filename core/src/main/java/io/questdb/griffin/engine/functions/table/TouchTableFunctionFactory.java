@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,10 +24,15 @@
 
 package io.questdb.griffin.engine.functions.table;
 
-import io.questdb.cairo.BitmapIndexReader;
 import io.questdb.cairo.CairoConfiguration;
+import io.questdb.cairo.idx.IndexReader;
+import io.questdb.cairo.sql.Function;
+import io.questdb.cairo.sql.PageFrame;
+import io.questdb.cairo.sql.PageFrameCursor;
 import io.questdb.cairo.sql.Record;
-import io.questdb.cairo.sql.*;
+import io.questdb.cairo.sql.RecordCursorFactory;
+import io.questdb.cairo.sql.RecordMetadata;
+import io.questdb.cairo.sql.SymbolTableSource;
 import io.questdb.griffin.FunctionFactory;
 import io.questdb.griffin.SqlException;
 import io.questdb.griffin.SqlExecutionContext;
@@ -44,7 +49,7 @@ import io.questdb.std.str.Sinkable;
 import io.questdb.std.str.StringSink;
 import io.questdb.std.str.Utf16Sink;
 
-import static io.questdb.cairo.sql.DataFrameCursorFactory.ORDER_ASC;
+import static io.questdb.cairo.sql.PartitionFrameCursorFactory.ORDER_ASC;
 
 public class TouchTableFunctionFactory implements FunctionFactory {
 
@@ -99,27 +104,16 @@ public class TouchTableFunctionFactory implements FunctionFactory {
         }
 
         @Override
-        public void getStr(Record rec, Utf16Sink utf16Sink) {
-            touchTable();
-            utf16Sink.put("{\"data_pages\": ")
-                    .put(dataPages)
-                    .put(", \"index_key_pages\":")
-                    .put(indexKeyPages)
-                    .put(", \"index_values_pages\": ")
-                    .put(indexValuePages).put("}");
-        }
-
-        @Override
         public CharSequence getStrA(Record rec) {
             sinkA.clear();
-            getStr(rec, sinkA);
+            getStr(sinkA);
             return sinkA;
         }
 
         @Override
         public CharSequence getStrB(Record rec) {
             sinkB.clear();
-            getStr(rec, sinkB);
+            getStr(sinkB);
             return sinkB;
         }
 
@@ -129,17 +123,35 @@ public class TouchTableFunctionFactory implements FunctionFactory {
             this.sqlExecutionContext = executionContext;
         }
 
+        @Override
+        public boolean isThreadSafe() {
+            return false;
+        }
+
         private void clearCounters() {
             dataPages = 0;
             indexKeyPages = 0;
             indexValuePages = 0;
         }
 
+        private void getStr(Utf16Sink utf16Sink) {
+            touchTable();
+            utf16Sink.put("{\"data_pages\": ")
+                    .put(dataPages)
+                    .put(", \"index_key_pages\":")
+                    .put(indexKeyPages)
+                    .put(", \"index_values_pages\": ")
+                    .put(indexValuePages).put("}");
+        }
+
         private long touchMemory(long pageSize, long baseAddress, long memorySize) {
+            if (baseAddress == 0) {
+                return 0;
+            }
             final long pageCount = (memorySize + pageSize - 1) / pageSize;
 
             for (long i = 0; i < pageCount; i++) {
-                final byte v = Unsafe.getUnsafe().getByte(baseAddress + i * pageSize);
+                final byte v = Unsafe.getByte(baseAddress + i * pageSize);
                 // Use the same blackhole as in async offload's column pre-touch.
                 AsyncFilterAtom.PRE_TOUCH_BLACK_HOLE.add(v);
             }
@@ -163,7 +175,7 @@ public class TouchTableFunctionFactory implements FunctionFactory {
                         dataPages += touchMemory(pageSize, columnBaseAddress, columnMemorySize);
 
                         if (metadata.isColumnIndexed(columnIndex)) {
-                            final BitmapIndexReader indexReader = frame.getBitmapIndexReader(columnIndex, BitmapIndexReader.DIR_BACKWARD);
+                            final IndexReader indexReader = frame.getIndexReader(columnIndex, IndexReader.DIR_BACKWARD);
 
                             final long keyBaseAddress = indexReader.getKeyBaseAddress();
                             final long keyMemorySize = indexReader.getKeyMemorySize();

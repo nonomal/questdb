@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -25,6 +25,7 @@
 package io.questdb.test.cairo;
 
 import io.questdb.cairo.ColumnType;
+import io.questdb.cairo.IndexType;
 import io.questdb.cairo.TableColumnMetadata;
 import org.junit.Assert;
 import org.junit.Test;
@@ -32,7 +33,7 @@ import org.junit.Test;
 public class TableColumnMetadataTest {
     @Test
     public void testHasIndex() {
-        TableColumnMetadata metadata = new TableColumnMetadata("x", ColumnType.INT, true, 0, true, null);
+        TableColumnMetadata metadata = new TableColumnMetadata("x", ColumnType.INT, IndexType.BITMAP, 0, true, null);
         Assert.assertEquals(0, metadata.getIndexValueBlockCapacity());
         Assert.assertTrue(metadata.isIndexed());
         Assert.assertTrue(metadata.isSymbolTableStatic());
@@ -40,7 +41,7 @@ public class TableColumnMetadataTest {
 
     @Test
     public void testNoIndex() {
-        TableColumnMetadata metadata = new TableColumnMetadata("x", ColumnType.INT, false, 0, false, null);
+        TableColumnMetadata metadata = new TableColumnMetadata("x", ColumnType.INT, IndexType.NONE, 0, false, null);
         Assert.assertEquals(0, metadata.getIndexValueBlockCapacity());
         Assert.assertFalse(metadata.isIndexed());
         Assert.assertFalse(metadata.isSymbolTableStatic());

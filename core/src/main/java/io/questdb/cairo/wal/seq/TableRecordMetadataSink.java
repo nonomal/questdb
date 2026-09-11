@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -34,19 +34,25 @@ public interface TableRecordMetadataSink extends Mutable {
     void addColumn(
             String columnName,
             int columnType,
-            boolean columnIndexed,
+            byte indexType,
             int indexValueBlockCapacity,
             boolean symbolTableStatic,
             int writerIndex,
-            boolean isDedupKey
+            boolean isDedupKey,
+            boolean symbolIsCached,
+            int symbolCapacity,
+            @Transient IntList coveringColumnIndices
     );
+
+    default boolean requiresFullReadColumnOrder() {
+        return false;
+    }
 
     void of(
             TableToken tableToken,
             int tableId,
             int timestampIndex,
             int compressedTimestampIndex,
-            boolean suspended,
             long structureVersion,
             int columnCount,
             @Transient IntList readColumnOrder

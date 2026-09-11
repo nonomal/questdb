@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -25,7 +25,14 @@
 package io.questdb.test.griffin;
 
 import io.questdb.PropertyKey;
-import io.questdb.cairo.*;
+import io.questdb.cairo.CairoError;
+import io.questdb.cairo.CairoException;
+import io.questdb.cairo.ColumnType;
+import io.questdb.cairo.PartitionBy;
+import io.questdb.cairo.TableReader;
+import io.questdb.cairo.TableUtils;
+import io.questdb.cairo.TableWriter;
+import io.questdb.griffin.SqlCompilerImpl;
 import io.questdb.griffin.SqlException;
 import io.questdb.std.Files;
 import io.questdb.std.NumericException;
@@ -47,10 +54,12 @@ public class AlterTableO3MaxLagTest extends AbstractCairoTest {
             createX(tbl);
             try (TableReader rdr = getReader(tableName)) {
                 String alterCommand = "ALTER TABLE " + tableName + " SET PARAM maxUncommittedRows = 11111";
-                ddl(alterCommand, sqlExecutionContext);
+                execute(alterCommand, sqlExecutionContext);
 
-                assertSql("maxUncommittedRows\n11111\n", "SELECT maxUncommittedRows FROM tables() WHERE table_name = '" + tableName + "'"
-                );
+                assertQuery("SELECT maxUncommittedRows FROM tables() WHERE table_name = '" + tableName + "'")
+                        .noLeakCheck()
+                        .noRandomAccess()
+                        .returns("maxUncommittedRows\n11111\n");
                 rdr.reload();
                 Assert.assertEquals(11111, rdr.getMetadata().getMaxUncommittedRows());
             }
@@ -66,13 +75,17 @@ public class AlterTableO3MaxLagTest extends AbstractCairoTest {
             createX(tbl);
             try (TableReader rdr = getReader(tableName)) {
                 String alterCommand2 = "ALTER TABLE " + tableName + " SET PARAM o3MaxLag = 1s";
-                ddl(alterCommand2, sqlExecutionContext);
+                execute(alterCommand2, sqlExecutionContext);
                 String alterCommand = "ALTER TABLE " + tableName + " SET PARAM maxUncommittedRows = 11111";
-                ddl(alterCommand, sqlExecutionContext);
+                execute(alterCommand, sqlExecutionContext);
 
-                assertSql("maxUncommittedRows\to3MaxLag\n" +
-                        "11111\t1000000\n", "SELECT maxUncommittedRows, o3MaxLag FROM tables() WHERE table_name = '" + tableName + "'"
-                );
+                assertQuery("SELECT maxUncommittedRows, o3MaxLag FROM tables() WHERE table_name = '" + tableName + "'")
+                        .noLeakCheck()
+                        .noRandomAccess()
+                        .returns("""
+                                maxUncommittedRows\to3MaxLag
+                                11111\t1000000
+                                """);
                 rdr.reload();
                 Assert.assertEquals(11111, rdr.getMetadata().getMaxUncommittedRows());
                 Assert.assertEquals(1000000, rdr.getMetadata().getO3MaxLag());
@@ -85,13 +98,17 @@ public class AlterTableO3MaxLagTest extends AbstractCairoTest {
 
             try (TableReader rdr = getReader(tableName)) {
                 String alterCommand = "ALTER TABLE " + tableName + " SET PARAM maxUncommittedRows = 0";
-                ddl(alterCommand, sqlExecutionContext);
+                execute(alterCommand, sqlExecutionContext);
                 String alterCommand2 = "ALTER TABLE " + tableName + " SET PARAM o3MaxLag = 0s";
-                ddl(alterCommand2, sqlExecutionContext);
+                execute(alterCommand2, sqlExecutionContext);
 
-                assertSql("maxUncommittedRows\to3MaxLag\n" +
-                        "0\t0\n", "SELECT maxUncommittedRows, o3MaxLag FROM tables() WHERE table_name = '" + tableName + "'"
-                );
+                assertQuery("SELECT maxUncommittedRows, o3MaxLag FROM tables() WHERE table_name = '" + tableName + "'")
+                        .noLeakCheck()
+                        .noRandomAccess()
+                        .returns("""
+                                maxUncommittedRows\to3MaxLag
+                                0\t0
+                                """);
                 rdr.reload();
                 Assert.assertEquals(0, rdr.getMetadata().getMaxUncommittedRows());
                 Assert.assertEquals(0, rdr.getMetadata().getO3MaxLag());
@@ -103,30 +120,31 @@ public class AlterTableO3MaxLagTest extends AbstractCairoTest {
 
     @Test
     public void setMaxUncommittedRowsFailsToReopenBackMetaFile() throws Exception {
+        node1.setProperty(PropertyKey.CAIRO_SPIN_LOCK_TIMEOUT, 1);
+        spinLockTimeout = 1;
         assertMemoryLeak(() -> {
             TableModel tbl = new TableModel(configuration, "X", PartitionBy.DAY);
             createX(tbl);
             engine.releaseAllWriters();
-            node1.setProperty(PropertyKey.CAIRO_SPIN_LOCK_TIMEOUT, 1);
 
             ff = new TestFilesFacadeImpl() {
                 int attempt = 0;
 
                 @Override
-                public int openRO(LPSZ path) {
-                    if (Utf8s.endsWithAscii(path, TableUtils.META_FILE_NAME) && (attempt++ == 2)) {
+                public int rename(LPSZ from, LPSZ to) {
+                    if (Utf8s.endsWithAscii(to, TableUtils.META_FILE_NAME) && attempt++ < 2) {
                         return -1;
                     }
-                    return super.openRO(path);
+                    return super.rename(from, to);
                 }
 
             };
             String alterCommand = "ALTER TABLE X SET PARAM maxUncommittedRows = 11111";
             try {
-                ddl(alterCommand, sqlExecutionContext);
+                execute(alterCommand, sqlExecutionContext);
                 Assert.fail("Alter table should fail");
             } catch (CairoError e) {
-                TestUtils.assertContains(e.getFlyweightMessage(), "could not open read-only");
+                TestUtils.assertContains(e.getFlyweightMessage(), "could not rename");
             }
 
             engine.releaseAllReaders();
@@ -168,7 +186,7 @@ public class AlterTableO3MaxLagTest extends AbstractCairoTest {
             };
             String alterCommand = "ALTER TABLE X SET PARAM maxUncommittedRows = 11111";
             try {
-                ddl(alterCommand, sqlExecutionContext);
+                execute(alterCommand, sqlExecutionContext);
                 Assert.fail("Alter table should fail");
             } catch (CairoException e) {
                 Assert.assertEquals(12, e.getPosition());
@@ -181,8 +199,11 @@ public class AlterTableO3MaxLagTest extends AbstractCairoTest {
 
             // Now try with success.
             ff = new TestFilesFacadeImpl();
-            ddl(alterCommand, sqlExecutionContext);
-            assertSql("maxUncommittedRows\n11111\n", "SELECT maxUncommittedRows FROM tables() WHERE table_name = 'X'");
+            execute(alterCommand, sqlExecutionContext);
+            assertQuery("SELECT maxUncommittedRows FROM tables() WHERE table_name = 'X'")
+                    .noLeakCheck()
+                    .noRandomAccess()
+                    .returns("maxUncommittedRows\n11111\n");
         });
     }
 
@@ -190,6 +211,7 @@ public class AlterTableO3MaxLagTest extends AbstractCairoTest {
     public void setMaxUncommittedRowsFailsToSwapMetadataUntilWriterReopen() throws Exception {
         assertMemoryLeak(() -> {
             node1.setProperty(PropertyKey.CAIRO_SPIN_LOCK_TIMEOUT, 1);
+            spinLockTimeout = 1;
             TableModel tbl = new TableModel(configuration, "X", PartitionBy.DAY);
             AbstractCairoTest.create(tbl.timestamp("ts")
                     .col("i", ColumnType.INT)
@@ -207,7 +229,7 @@ public class AlterTableO3MaxLagTest extends AbstractCairoTest {
             };
             String alterCommand = "ALTER TABLE X SET PARAM maxUncommittedRows = 11111";
             try {
-                ddl(alterCommand, sqlExecutionContext);
+                execute(alterCommand, sqlExecutionContext);
                 Assert.fail("Alter table should fail");
             } catch (CairoError e) {
                 TestUtils.assertContains(e.getFlyweightMessage(), "could not rename");
@@ -222,8 +244,11 @@ public class AlterTableO3MaxLagTest extends AbstractCairoTest {
             // Now try with success.
             engine.clear();
             ff = new TestFilesFacadeImpl();
-            ddl(alterCommand, sqlExecutionContext);
-            assertSql("maxUncommittedRows\n11111\n", "SELECT maxUncommittedRows FROM tables() WHERE table_name = 'X'");
+            execute(alterCommand, sqlExecutionContext);
+            assertQuery("SELECT maxUncommittedRows FROM tables() WHERE table_name = 'X'")
+                    .noLeakCheck()
+                    .noRandomAccess()
+                    .returns("maxUncommittedRows\n11111\n");
         });
     }
 
@@ -231,6 +256,7 @@ public class AlterTableO3MaxLagTest extends AbstractCairoTest {
     public void setMaxUncommittedRowsFailsToSwapMetadataUntilWriterReopen2() throws Exception {
         assertMemoryLeak(() -> {
             node1.setProperty(PropertyKey.CAIRO_SPIN_LOCK_TIMEOUT, 1);
+            spinLockTimeout = 1;
             TableModel tbl = new TableModel(configuration, "X", PartitionBy.DAY);
             AbstractCairoTest.create(tbl.timestamp("ts")
                     .col("i", ColumnType.INT)
@@ -248,13 +274,15 @@ public class AlterTableO3MaxLagTest extends AbstractCairoTest {
             };
             String alterCommand = "ALTER TABLE X SET PARAM maxUncommittedRows = 11111";
             try {
-                ddl(alterCommand, sqlExecutionContext);
+                execute(alterCommand, sqlExecutionContext);
                 Assert.fail("Alter table should fail");
             } catch (CairoError e) {
                 TestUtils.assertContains(e.getFlyweightMessage(), "could not rename");
             }
 
             engine.releaseAllReaders();
+            // change spin timeout for the test to fail faster
+            spinLockTimeout = 100;
             try (TableReader ignored = getReader("X")) {
                 Assert.fail();
             } catch (CairoException ignored) {
@@ -265,7 +293,7 @@ public class AlterTableO3MaxLagTest extends AbstractCairoTest {
             engine.releaseAllWriters();
             ff = new TestFilesFacadeImpl() {
                 @Override
-                public int openRO(LPSZ from) {
+                public long openRO(LPSZ from) {
                     if (Utf8s.endsWithAscii(from, TableUtils.META_FILE_NAME)) {
                         return -1;
                     }
@@ -273,28 +301,26 @@ public class AlterTableO3MaxLagTest extends AbstractCairoTest {
                 }
             };
             try {
-                ddl(alterCommand, sqlExecutionContext);
+                execute(alterCommand, sqlExecutionContext);
                 Assert.fail();
             } catch (CairoException | SqlException ex) {
-                TestUtils.assertContains(ex.getFlyweightMessage(), "could not open read-only");
+                TestUtils.assertContains(ex.getFlyweightMessage(), "could not open");
             }
         });
     }
 
     @Test
     public void setMaxUncommittedRowsMissingEquals() throws Exception {
-        assertException("ALTER TABLE X SET PARAM maxUncommittedRows 100",
-                "CREATE TABLE X (ts TIMESTAMP, i INT, l LONG) timestamp(ts) PARTITION BY MONTH",
-                43,
-                "'=' expected");
+        assertQuery("ALTER TABLE X SET PARAM maxUncommittedRows 100")
+                .ddl("CREATE TABLE X (ts TIMESTAMP, i INT, l LONG) timestamp(ts) PARTITION BY MONTH")
+                .fails(43, "'=' expected");
     }
 
     @Test
     public void setMaxUncommittedRowsNegativeValue() throws Exception {
-        assertException("ALTER TABLE X SET PARAM maxUncommittedRows = -1",
-                "CREATE TABLE X (ts TIMESTAMP, i INT, l LONG) timestamp(ts) PARTITION BY MONTH",
-                24,
-                "invalid value [value=-,parameter=maxUncommittedRows]");
+        assertQuery("ALTER TABLE X SET PARAM maxUncommittedRows = -1")
+                .ddl("CREATE TABLE X (ts TIMESTAMP, i INT, l LONG) timestamp(ts) PARTITION BY MONTH")
+                .fails(24, "invalid value [value=-,parameter=maxUncommittedRows]");
     }
 
     @Test
@@ -305,10 +331,12 @@ public class AlterTableO3MaxLagTest extends AbstractCairoTest {
             createX(tbl);
             try (TableReader rdr = getReader(tableName)) {
                 String alterCommand = "ALTER TABLE " + tableName + " SET PARAM o3MaxLag = 111s";
-                ddl(alterCommand, sqlExecutionContext);
+                execute(alterCommand, sqlExecutionContext);
 
-                assertSql("o3MaxLag\n111000000\n", "SELECT o3MaxLag FROM tables() WHERE table_name = '" + tableName + "'"
-                );
+                assertQuery("SELECT o3MaxLag FROM tables() WHERE table_name = '" + tableName + "'")
+                        .noLeakCheck()
+                        .noRandomAccess()
+                        .returns("o3MaxLag\n111000000\n");
                 rdr.reload();
                 Assert.assertEquals(111000000L, rdr.getMetadata().getO3MaxLag());
             }
@@ -318,34 +346,30 @@ public class AlterTableO3MaxLagTest extends AbstractCairoTest {
 
     @Test
     public void setO3MaxLagWrongSetSyntax() throws Exception {
-        assertException("ALTER TABLE X SET o3MaxLag = 111ms",
-                "CREATE TABLE X (ts TIMESTAMP, i INT, l LONG) timestamp(ts) PARTITION BY MONTH",
-                18,
-                "'param' or 'type' expected");
+        assertQuery("ALTER TABLE X SET o3MaxLag = 111ms")
+                .ddl("CREATE TABLE X (ts TIMESTAMP, i INT, l LONG) timestamp(ts) PARTITION BY MONTH")
+                .fails(18, "'param', 'ttl', 'format' or 'type' expected");
     }
 
     @Test
     public void setO3MaxLagWrongSetSyntax2() throws Exception {
-        assertException("ALTER TABLE X PARAM o3MaxLag = 111ms",
-                "CREATE TABLE X (ts TIMESTAMP, i INT, l LONG) timestamp(ts) PARTITION BY MONTH",
-                14,
-                "'add', 'alter', 'attach', 'detach', 'drop', 'resume', 'rename', 'set' or 'squash' expected");
+        assertQuery("ALTER TABLE X PARAM o3MaxLag = 111ms")
+                .ddl("CREATE TABLE X (ts TIMESTAMP, i INT, l LONG) timestamp(ts) PARTITION BY MONTH")
+                .fails(14, SqlCompilerImpl.ALTER_TABLE_EXPECTED_TOKEN_DESCR);
     }
 
     @Test
     public void setO3MaxLagWrongTimeQualifier() throws Exception {
-        assertException("ALTER TABLE X SET PARAM o3MaxLag = 111days",
-                "CREATE TABLE X (ts TIMESTAMP, i INT, l LONG) timestamp(ts) PARTITION BY MONTH",
-                27,
-                "interval qualifier");
+        assertQuery("ALTER TABLE X SET PARAM o3MaxLag = 111days")
+                .ddl("CREATE TABLE X (ts TIMESTAMP, i INT, l LONG) timestamp(ts) PARTITION BY MONTH")
+                .fails(27, "interval qualifier");
     }
 
     @Test
     public void setO3MaxLagWrongTimeQualifier2() throws Exception {
-        assertException("ALTER TABLE X SET PARAM o3MaxLag = 111ml",
-                "CREATE TABLE X (ts TIMESTAMP, i INT, l LONG) timestamp(ts) PARTITION BY MONTH",
-                29,
-                "interval qualifier");
+        assertQuery("ALTER TABLE X SET PARAM o3MaxLag = 111ml")
+                .ddl("CREATE TABLE X (ts TIMESTAMP, i INT, l LONG) timestamp(ts) PARTITION BY MONTH")
+                .fails(29, "interval qualifier");
     }
 
     @Test
@@ -355,7 +379,7 @@ public class AlterTableO3MaxLagTest extends AbstractCairoTest {
             createX(tbl);
             try (TableReader ignored = getReader("X")) {
                 try {
-                    ddl("alter TABLE X SET PARAM vommitLag = 111s");
+                    execute("alter TABLE X SET PARAM vommitLag = 111s");
                     Assert.fail();
                 } catch (SqlException e) {
                     TestUtils.assertContains(e.getFlyweightMessage(), "unknown parameter 'vommitLag'");
@@ -394,22 +418,28 @@ public class AlterTableO3MaxLagTest extends AbstractCairoTest {
     public void testSetMaxUncommitted() throws Exception {
         assertMemoryLeak(
                 () -> {
-                    ddl("create table x1(a int, b double, ts timestamp) timestamp(ts) partition by DAY");
-                    ddl("alter table x1 set param maxUncommittedRows = 150", sqlExecutionContext);
-                    assertSql(
-                            "id\ttable_name\tdesignatedTimestamp\tpartitionBy\tmaxUncommittedRows\to3MaxLag\n" +
-                                    "1\tx1\tts\tDAY\t150\t300000000\n", "select id,table_name,designatedTimestamp,partitionBy,maxUncommittedRows,o3MaxLag from tables() where table_name = 'x1'"
-                    );
+                    execute("create table x1(a int, b double, ts timestamp) timestamp(ts) partition by DAY");
+                    execute("alter table x1 set param maxUncommittedRows = 150", sqlExecutionContext);
+                    assertQuery("select id,table_name,designatedTimestamp,partitionBy,maxUncommittedRows,o3MaxLag from tables() where table_name = 'x1'")
+                            .noLeakCheck()
+                            .noRandomAccess()
+                            .returns("""
+                                    id\ttable_name\tdesignatedTimestamp\tpartitionBy\tmaxUncommittedRows\to3MaxLag
+                                    1\tx1\tts\tDAY\t150\t300000000
+                                    """);
 
                     // test open table writer
                     engine.releaseInactive();
                     engine.releaseAllWriters();
                     getWriter("x1").close();
 
-                    assertSql(
-                            "id\ttable_name\tdesignatedTimestamp\tpartitionBy\tmaxUncommittedRows\to3MaxLag\n" +
-                                    "1\tx1\tts\tDAY\t150\t300000000\n", "select id,table_name,designatedTimestamp,partitionBy,maxUncommittedRows,o3MaxLag from tables() where table_name = 'x1'"
-                    );
+                    assertQuery("select id,table_name,designatedTimestamp,partitionBy,maxUncommittedRows,o3MaxLag from tables() where table_name = 'x1'")
+                            .noLeakCheck()
+                            .noRandomAccess()
+                            .returns("""
+                                    id\ttable_name\tdesignatedTimestamp\tpartitionBy\tmaxUncommittedRows\to3MaxLag
+                                    1\tx1\tts\tDAY\t150\t300000000
+                                    """);
                 }
         );
     }
@@ -417,40 +447,47 @@ public class AlterTableO3MaxLagTest extends AbstractCairoTest {
     private void assertLagUnits(String sql, String expected) throws Exception {
         assertMemoryLeak(
                 () -> {
-                    ddl("create table x1(a int, b double, ts timestamp) timestamp(ts) partition by DAY");
-                    ddl(sql, sqlExecutionContext);
-                    assertSql(
-                            "id\ttable_name\tdesignatedTimestamp\tpartitionBy\tmaxUncommittedRows\to3MaxLag\n" +
-                                    expected, "select id,table_name,designatedTimestamp,partitionBy,maxUncommittedRows,o3MaxLag from tables() where table_name = 'x1'"
-                    );
+                    execute("create table x1(a int, b double, ts timestamp) timestamp(ts) partition by DAY");
+                    execute(sql, sqlExecutionContext);
+                    assertQuery("select id,table_name,designatedTimestamp,partitionBy,maxUncommittedRows,o3MaxLag from tables() where table_name = 'x1'")
+                            .noLeakCheck()
+                            .noRandomAccess()
+                            .returns("id\ttable_name\tdesignatedTimestamp\tpartitionBy\tmaxUncommittedRows\to3MaxLag\n" +
+                                    expected);
 
                     // test open table writer
                     engine.releaseInactive();
                     engine.releaseAllWriters();
                     getWriter("x1").close();
 
-                    assertSql(
-                            "id\ttable_name\tdesignatedTimestamp\tpartitionBy\tmaxUncommittedRows\to3MaxLag\n" +
-                                    expected, "select id,table_name,designatedTimestamp,partitionBy,maxUncommittedRows,o3MaxLag from tables() where table_name = 'x1'"
-                    );
+                    assertQuery("select id,table_name,designatedTimestamp,partitionBy,maxUncommittedRows,o3MaxLag from tables() where table_name = 'x1'")
+                            .noLeakCheck()
+                            .noRandomAccess()
+                            .returns("id\ttable_name\tdesignatedTimestamp\tpartitionBy\tmaxUncommittedRows\to3MaxLag\n" +
+                                    expected);
                 }
         );
     }
 
-    private void assertX(String tableName) throws SqlException {
+    private void assertX(String tableName) throws Exception {
         engine.releaseAllReaders();
-        assertSql("ts\ti\tl\n" +
-                "2020-01-01T02:23:59.900000Z\t1\t1\n" +
-                "2020-01-01T04:47:59.800000Z\t2\t2\n" +
-                "2020-01-01T07:11:59.700000Z\t3\t3\n" +
-                "2020-01-01T09:35:59.600000Z\t4\t4\n" +
-                "2020-01-01T11:59:59.500000Z\t5\t5\n" +
-                "2020-01-01T14:23:59.400000Z\t6\t6\n" +
-                "2020-01-01T16:47:59.300000Z\t7\t7\n" +
-                "2020-01-01T19:11:59.200000Z\t8\t8\n" +
-                "2020-01-01T21:35:59.100000Z\t9\t9\n" +
-                "2020-01-01T23:59:59.000000Z\t10\t10\n", "select * from " + tableName
-        );
+        assertQuery("select * from " + tableName)
+                .noLeakCheck()
+                .expectSize()
+                .timestamp("ts")
+                .returns("""
+                        ts\ti\tl
+                        2020-01-01T02:23:59.900000Z\t1\t1
+                        2020-01-01T04:47:59.800000Z\t2\t2
+                        2020-01-01T07:11:59.700000Z\t3\t3
+                        2020-01-01T09:35:59.600000Z\t4\t4
+                        2020-01-01T11:59:59.500000Z\t5\t5
+                        2020-01-01T14:23:59.400000Z\t6\t6
+                        2020-01-01T16:47:59.300000Z\t7\t7
+                        2020-01-01T19:11:59.200000Z\t8\t8
+                        2020-01-01T21:35:59.100000Z\t9\t9
+                        2020-01-01T23:59:59.000000Z\t10\t10
+                        """);
     }
 
     private void createX(TableModel tbl) throws NumericException, SqlException {

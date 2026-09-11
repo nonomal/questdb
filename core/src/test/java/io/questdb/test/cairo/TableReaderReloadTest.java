@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,9 +24,11 @@
 
 package io.questdb.test.cairo;
 
+import io.questdb.cairo.ColumnType;
 import io.questdb.cairo.PartitionBy;
 import io.questdb.cairo.TableReader;
 import io.questdb.cairo.TableWriter;
+import io.questdb.cairo.TimestampDriver;
 import io.questdb.cairo.sql.Record;
 import io.questdb.cairo.sql.RecordCursor;
 import io.questdb.std.MemoryTag;
@@ -40,7 +42,6 @@ import org.junit.Assert;
 import org.junit.Test;
 
 import static io.questdb.test.cairo.TableReaderTest.assertOpenPartitionCount;
-
 
 public class TableReaderReloadTest extends AbstractCairoTest {
 
@@ -154,8 +155,7 @@ public class TableReaderReloadTest extends AbstractCairoTest {
         AbstractCairoTest.create(model);
 
         long timestamp = 0;
-        try (TableWriter writer = newOffPoolWriter(configuration, "all", metrics)) {
-
+        try (TableWriter writer = newOffPoolWriter(configuration, "all")) {
             try (TableReader reader = newOffPoolReader(configuration, "all")) {
                 Assert.assertFalse(reader.reload());
             }
@@ -163,8 +163,10 @@ public class TableReaderReloadTest extends AbstractCairoTest {
             populateTable(rnd, buffer, timestamp, increment, writer);
             rnd.reset();
 
-            try (TableReader reader = newOffPoolReader(configuration, "all")) {
-                RecordCursor cursor = reader.getCursor();
+            try (
+                    TableReader reader = newOffPoolReader(configuration, "all");
+                    TestTableReaderRecordCursor cursor = new TestTableReaderRecordCursor().of(reader)
+            ) {
                 final Record record = cursor.getRecord();
                 assertTable(rnd, buffer, cursor, record);
                 assertOpenPartitionCount(reader);
@@ -176,7 +178,7 @@ public class TableReaderReloadTest extends AbstractCairoTest {
                 }
                 Assert.assertTrue(reader.reload());
                 assertOpenPartitionCount(reader);
-                cursor = reader.getCursor();
+                cursor.toTop();
                 Assert.assertFalse(cursor.hasNext());
 
                 rnd.reset();
@@ -185,7 +187,7 @@ public class TableReaderReloadTest extends AbstractCairoTest {
                 assertOpenPartitionCount(reader);
 
                 rnd.reset();
-                cursor = reader.getCursor();
+                cursor.toTop();
                 assertTable(rnd, buffer, cursor, record);
                 assertOpenPartitionCount(reader);
             }
@@ -199,14 +201,16 @@ public class TableReaderReloadTest extends AbstractCairoTest {
 
         final Rnd rnd = new Rnd();
         final int bufferSize = 1024;
+        int timestampType = TestUtils.generateRandom(LOG).nextBoolean() ? ColumnType.TIMESTAMP_MICRO : ColumnType.TIMESTAMP_NANO;
+        TimestampDriver timestampDriver = ColumnType.getTimestampDriver(timestampType);
+        increment = timestampDriver.fromMicros(increment);
         long buffer = Unsafe.malloc(bufferSize, MemoryTag.NATIVE_DEFAULT);
         TableModel model = CreateTableTestUtils.getAllTypesModel(configuration, partitionBy);
-        model.timestamp();
+        model.timestamp(timestampType);
         AbstractCairoTest.create(model);
 
         long timestamp = 0;
-        try (TableWriter writer = newOffPoolWriter(configuration, "all", metrics)) {
-
+        try (TableWriter writer = newOffPoolWriter(configuration, "all")) {
             try (TableReader reader = newOffPoolReader(configuration, "all")) {
                 Assert.assertFalse(reader.reload());
             }
@@ -214,8 +218,10 @@ public class TableReaderReloadTest extends AbstractCairoTest {
             populateTable(rnd, buffer, timestamp, increment, writer);
             rnd.reset();
 
-            try (TableReader reader = newOffPoolReader(configuration, "all")) {
-                RecordCursor cursor = reader.getCursor();
+            try (
+                    TableReader reader = newOffPoolReader(configuration, "all");
+                    TestTableReaderRecordCursor cursor = new TestTableReaderRecordCursor().of(reader)
+            ) {
                 final Record record = cursor.getRecord();
                 assertTable(rnd, buffer, cursor, record);
                 assertOpenPartitionCount(reader);
@@ -234,7 +240,7 @@ public class TableReaderReloadTest extends AbstractCairoTest {
 
                 // Assert the data is what was written the second time
                 rnd.reset(123, 123);
-                cursor = reader.getCursor();
+                cursor.toTop();
                 assertTable(rnd, buffer, cursor, record);
                 assertOpenPartitionCount(reader);
             }

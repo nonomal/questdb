@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -31,17 +31,23 @@ public class GroupByAllocatorFactory {
     private GroupByAllocatorFactory() {
     }
 
-    public static GroupByAllocator createThreadSafeAllocator(CairoConfiguration configuration) {
-        return new GroupByAllocatorImpl(
-                configuration.getGroupByAllocatorDefaultChunkSize(),
-                configuration.getGroupByAllocatorMaxChunkSize()
-        );
+    public static GroupByAllocator createAllocator(CairoConfiguration configuration) {
+        return createAllocator(configuration, true);
     }
 
-    public static GroupByAllocator createThreadUnsafeAllocator(CairoConfiguration configuration) {
-        return new GroupByAllocatorArena(
+    /**
+     * Creates a GROUP BY allocator. When {@code openOnInit} is {@code false},
+     * the allocator's chunk-index backing is not allocated at construction
+     * time; the first {@link GroupByAllocator#reopen()} allocates it on the
+     * global counter (the index is never charged to the per-query tracker), so
+     * the per-query counter stays clean across cursors.
+     */
+    public static GroupByAllocator createAllocator(CairoConfiguration configuration, boolean openOnInit) {
+        return new FastGroupByAllocator(
                 configuration.getGroupByAllocatorDefaultChunkSize(),
-                configuration.getGroupByAllocatorMaxChunkSize()
+                configuration.getGroupByAllocatorMaxChunkSize(),
+                true,
+                openOnInit
         );
     }
 }

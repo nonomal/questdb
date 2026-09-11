@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -36,66 +36,64 @@ public class SimulateCrashFunctionTest extends AbstractCairoTest {
     @Test
     public void testCrashDisabled() throws Exception {
         assertMemoryLeak(() -> {
-            assertSql(
-                    "simulate_crash\n" +
-                            "false\n",
-                    "select simulate_crash('0')"
-            );
+            assertQuery("select simulate_crash('C')")
+                    .noLeakCheck()
+                    .expectSize()
+                    .returns("simulate_crash\n" +
+                            "false\n");
 
-            assertSql(
-                    "simulate_crash\n" +
-                            "false\n",
-                    "select simulate_crash('D')"
-            );
+            assertQuery("select simulate_crash('M')")
+                    .noLeakCheck()
+                    .expectSize()
+                    .returns("simulate_crash\n" +
+                            "false\n");
 
-            assertSql(
-                    "simulate_crash\n" +
-                            "false\n",
-                    "select simulate_crash('C')"
-            );
+            assertQuery("select simulate_crash('E')")
+                    .noLeakCheck()
+                    .expectSize()
+                    .returns("simulate_crash\n" +
+                            "false\n");
 
-            assertSql(
-                    "simulate_crash\n" +
-                            "false\n",
-                    "select simulate_crash('M')"
-            );
+            assertQuery("select simulate_crash('0')")
+                    .noLeakCheck()
+                    .expectSize()
+                    .returns("simulate_crash\n" +
+                            "false\n");
         });
     }
 
     @Test
     public void testCrashEnabled() throws Exception {
-        node1.setProperty(PropertyKey.CAIRO_SIMULATE_CRASH_ENABLED, true);
-
-        // select simulate_crash('0'), This is total crash, don't simulate it
+        node1.setProperty(PropertyKey.DEV_MODE_ENABLED, true);
+        // select simulate_crash('C'), This is total crash, don't simulate it
 
         assertMemoryLeak(() -> {
             try {
-                assertSql(
-                        "simulate_crash\n" +
-                                "false\n",
-                        "select simulate_crash('C')"
-                );
-                Assert.fail();
-            } catch (CairoError ignore) {
-            }
-
-            // This is total crash, don't use it
-            try {
-                assertSql(
-                        "simulate_crash\n" +
-                                "false\n",
-                        "select simulate_crash('M')"
-                );
+                assertQuery("select simulate_crash('M')")
+                        .noLeakCheck()
+                        .expectSize()
+                        .returns("simulate_crash\n" +
+                                "false\n");
                 Assert.fail();
             } catch (OutOfMemoryError ignore) {
             }
 
             try {
-                assertSql(
-                        "simulate_crash\n" +
-                                "false\n",
-                        "select simulate_crash('D')"
-                );
+                assertQuery("select simulate_crash('E')")
+                        .noLeakCheck()
+                        .expectSize()
+                        .returns("simulate_crash\n" +
+                                "false\n");
+                Assert.fail();
+            } catch (CairoError ignore) {
+            }
+
+            try {
+                assertQuery("select simulate_crash('0')")
+                        .noLeakCheck()
+                        .expectSize()
+                        .returns("simulate_crash\n" +
+                                "false\n");
                 Assert.fail();
             } catch (CairoException ignore) {
             }

@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,15 +24,39 @@
 
 package io.questdb.cutlass.text;
 
-import io.questdb.cairo.*;
+import io.questdb.cairo.CairoConfiguration;
+import io.questdb.cairo.CairoEngine;
+import io.questdb.cairo.CairoException;
+import io.questdb.cairo.ColumnType;
+import io.questdb.cairo.GenericRecordMetadata;
+import io.questdb.cairo.IndexType;
+import io.questdb.cairo.PartitionBy;
+import io.questdb.cairo.SecurityContext;
+import io.questdb.cairo.TableStructure;
+import io.questdb.cairo.TableToken;
+import io.questdb.cairo.TableUtils;
+import io.questdb.cairo.TableWriter;
+import io.questdb.cairo.TableWriterAPI;
 import io.questdb.cairo.sql.RecordMetadata;
 import io.questdb.cairo.vm.Vm;
 import io.questdb.cairo.vm.api.MemoryMARW;
-import io.questdb.cutlass.text.types.*;
+import io.questdb.cutlass.text.types.BadDateAdapter;
+import io.questdb.cutlass.text.types.BadTimestampAdapter;
+import io.questdb.cutlass.text.types.OtherToTimestampAdapter;
+import io.questdb.cutlass.text.types.TimestampAdapter;
+import io.questdb.cutlass.text.types.TimestampCompatibleAdapter;
+import io.questdb.cutlass.text.types.TypeAdapter;
+import io.questdb.cutlass.text.types.TypeManager;
 import io.questdb.log.Log;
 import io.questdb.log.LogFactory;
 import io.questdb.log.LogRecord;
-import io.questdb.std.*;
+import io.questdb.std.Chars;
+import io.questdb.std.IntList;
+import io.questdb.std.LongList;
+import io.questdb.std.Misc;
+import io.questdb.std.Mutable;
+import io.questdb.std.ObjList;
+import io.questdb.std.ObjectPool;
 import io.questdb.std.str.DirectUtf8Sequence;
 import io.questdb.std.str.DirectUtf8String;
 import io.questdb.std.str.Path;
@@ -45,12 +69,13 @@ public class CairoTextWriter implements Closeable, Mutable {
     private static final String WRITER_LOCK_REASON = "textWriter";
     private final LongList columnErrorCounts = new LongList();
     private final CairoConfiguration configuration;
-    private final MemoryMARW ddlMem = Vm.getMARWInstance();
+    private final MemoryMARW ddlMem = Vm.getCMARWInstance();
     private final CairoEngine engine;
     private final ObjectPool<OtherToTimestampAdapter> otherToTimestampAdapterPool = new ObjectPool<>(OtherToTimestampAdapter::new, 4);
     private final IntList remapIndex = new IntList();
     private final TableStructureAdapter tableStructureAdapter = new TableStructureAdapter();
     private int atomicity;
+    private boolean create = true;
     private CharSequence designatedTimestampColumnName;
     private int designatedTimestampIndex;
     private CharSequence importedTimestampColumnName;
@@ -58,7 +83,6 @@ public class CairoTextWriter implements Closeable, Mutable {
     private RecordMetadata metadata;
     private long o3MaxLag = -1;
     private boolean overwrite;
-    private boolean create = true;
     private int partitionBy;
     private CharSequence tableName;
     private TimestampAdapter timestampAdapter;
@@ -115,6 +139,10 @@ public class CairoTextWriter implements Closeable, Mutable {
         return columnErrorCounts;
     }
 
+    public boolean getCreate() {
+        return create;
+    }
+
     public int getMaxUncommittedRows() {
         return maxUncommittedRows;
     }
@@ -129,10 +157,6 @@ public class CairoTextWriter implements Closeable, Mutable {
 
     public int getPartitionBy() {
         return partitionBy;
-    }
-
-    public boolean getCreate() {
-        return create;
     }
 
     public CharSequence getTableName() {
@@ -203,7 +227,21 @@ public class CairoTextWriter implements Closeable, Mutable {
             checkUncommittedRowCount();
         } catch (Exception e) {
             logError(line, timestampIndex, dus);
+            if (atomicity == Atomicity.SKIP_ALL) {
+                // No row to cancel here: newRow() rejects the designated timestamp before the
+                // row exists, and onField() cancels the row and rolls back before it throws, so
+                // this rollback is a no-op for it. The rollback also covers an append() failure.
+                writer.rollback();
+                if (e instanceof CairoException ce) {
+                    throw ce;
+                }
+                throw CairoException.nonCritical().put("bad syntax [line=").put(line).put(", col=").put(timestampIndex).put(']');
+            }
         }
+    }
+
+    public void setCreate(boolean create) {
+        this.create = create;
     }
 
     public void setMaxUncommittedRows(int maxUncommittedRows) {
@@ -212,10 +250,6 @@ public class CairoTextWriter implements Closeable, Mutable {
 
     public void setO3MaxLag(long o3MaxLag) {
         this.o3MaxLag = o3MaxLag;
-    }
-
-    public void setCreate(boolean create) {
-        this.create = create;
     }
 
     private void checkUncommittedRowCount() {
@@ -236,7 +270,8 @@ public class CairoTextWriter implements Closeable, Mutable {
                 path,
                 false,
                 tableStructureAdapter.of(names, detectedTypes),
-                false
+                false,
+                TableUtils.TABLE_KIND_REGULAR_TABLE
         );
         this.types = detectedTypes;
         return tableToken;
@@ -285,21 +320,24 @@ public class CairoTextWriter implements Closeable, Mutable {
                 switch (ColumnType.tagOf(columnType)) {
                     case ColumnType.DATE:
                         logTypeError(i);
-                        this.types.setQuick(i, BadDateAdapter.INSTANCE);
+                        types.setQuick(i, BadDateAdapter.INSTANCE);
                         break;
                     case ColumnType.TIMESTAMP:
-                        if (detectedAdapter instanceof TimestampCompatibleAdapter) {
-                            this.types.setQuick(i, otherToTimestampAdapterPool.next().of((TimestampCompatibleAdapter) detectedAdapter));
+                        // different timestamp type
+                        if (detectedAdapter instanceof TimestampAdapter) {
+                            ((TimestampAdapter) detectedAdapter).reCompileDateFormat(ColumnType.getTimestampDriver(columnType).getTimestampDateFormatFactory());
+                        } else if (detectedAdapter instanceof TimestampCompatibleAdapter) {
+                            types.setQuick(i, otherToTimestampAdapterPool.next().of((TimestampCompatibleAdapter) detectedAdapter, columnType));
                         } else {
                             logTypeError(i);
-                            this.types.setQuick(i, BadTimestampAdapter.INSTANCE);
+                            types.setQuick(i, BadTimestampAdapter.INSTANCE);
                         }
                         break;
                     case ColumnType.BINARY:
                         writer.close();
                         throw CairoException.nonCritical().put("cannot import text into BINARY column [index=").put(i).put(']');
                     default:
-                        this.types.setQuick(i, typeManager.getTypeAdapter(columnType));
+                        types.setQuick(i, typeManager.getTypeAdapter(columnType));
                         break;
                 }
             }
@@ -317,7 +355,7 @@ public class CairoTextWriter implements Closeable, Mutable {
 
     private void logTypeError(int i) {
         LOG.info()
-                .$("mis-detected [table=").$(tableName)
+                .$("mis-detected [table=").$safe(tableName)
                 .$(", column=").$(i)
                 .$(", type=").$(ColumnType.nameOf(types.getQuick(i).getType()))
                 .$(']').$();
@@ -331,6 +369,7 @@ public class CairoTextWriter implements Closeable, Mutable {
             logError(line, i, dus);
             switch (atomicity) {
                 case Atomicity.SKIP_ALL:
+                    w.cancel();
                     writer.rollback();
                     throw CairoException.nonCritical().put("bad syntax [line=").put(line).put(", col=").put(i).put(']');
                 case Atomicity.SKIP_ROW:
@@ -374,9 +413,13 @@ public class CairoTextWriter implements Closeable, Mutable {
                 break;
             case TableUtils.TABLE_EXISTS:
                 tableToken = engine.getTableTokenIfExists(tableName);
+                if (tableToken != null && tableToken.getType() != TableToken.Type.TABLE) {
+                    throw CairoException.nonCritical().put("cannot modify ").put(tableToken.getType().keyword())
+                            .put(" [view=").put(tableToken.getTableName()).put(']');
+                }
                 if (overwrite) {
                     securityContext.authorizeTableDrop(tableToken);
-                    engine.drop(path, tableToken);
+                    engine.dropTableOrViewOrMatView(path, tableToken);
                     tableToken = createTable(names, detectedTypes, securityContext, path);
                     tableReCreated = true;
                     writer = engine.getTableWriterAPI(tableToken, WRITER_LOCK_REASON);
@@ -409,11 +452,11 @@ public class CairoTextWriter implements Closeable, Mutable {
             // to use table's maxUncommittedRows and o3MaxLag if they're not set.
             if (o3MaxLag == -1 && !writer.getMetadata().isWalEnabled()) {
                 o3MaxLag = TableUtils.getO3MaxLag(writer.getMetadata(), engine);
-                LOG.info().$("using table's o3MaxLag ").$(o3MaxLag).$(", table=").utf8(tableName).$();
+                LOG.info().$("using table's o3MaxLag ").$(o3MaxLag).$(", table=").$safe(tableName).$();
             }
             if (maxUncommittedRows == -1) {
                 maxUncommittedRows = TableUtils.getMaxUncommittedRows(writer.getMetadata(), engine);
-                LOG.info().$("using table's maxUncommittedRows ").$(maxUncommittedRows).$(", table=").utf8(tableName).$();
+                LOG.info().$("using table's maxUncommittedRows ").$(maxUncommittedRows).$(", table=").$safe(tableName).$();
             }
         }
         columnErrorCounts.seed(writer.getMetadata().getColumnCount(), 0);
@@ -492,13 +535,8 @@ public class CairoTextWriter implements Closeable, Mutable {
         }
 
         @Override
-        public boolean isIndexed(int columnIndex) {
-            return types.getQuick(columnIndex).isIndexed();
-        }
-
-        @Override
-        public boolean isSequential(int columnIndex) {
-            return false;
+        public byte getIndexType(int columnIndex) {
+            return types.getQuick(columnIndex).isIndexed() ? IndexType.BITMAP : IndexType.NONE;
         }
 
         @Override

@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,9 +24,33 @@
 
 package io.questdb.cairo;
 
-public interface TableStructure extends TableDescriptor {
+import io.questdb.cairo.lv.LiveViewDefinition;
+import io.questdb.cairo.mv.MatViewDefinition;
+import io.questdb.std.IntList;
+import io.questdb.cairo.view.ViewDefinition;
+import org.jetbrains.annotations.NotNull;
+
+public interface TableStructure {
+
+    int getColumnCount();
+
+    CharSequence getColumnName(int columnIndex);
+
+    int getColumnType(int columnIndex);
 
     int getIndexBlockCapacity(int columnIndex);
+
+    default int getParquetEncodingConfig(int columnIndex) {
+        return 0;
+    }
+
+    default LiveViewDefinition getLiveViewDefinition() {
+        return null;
+    }
+
+    default MatViewDefinition getMatViewDefinition() {
+        return null;
+    }
 
     int getMaxUncommittedRows();
 
@@ -38,13 +62,77 @@ public interface TableStructure extends TableDescriptor {
 
     int getSymbolCapacity(int columnIndex);
 
+    /**
+     * Returns the default storage format for new partitions.
+     * {@link TableUtils#TABLE_FORMAT_NATIVE} (default) or
+     * {@link TableUtils#TABLE_FORMAT_PARQUET}.
+     */
+    default int getTableFormat() {
+        return TableUtils.TABLE_FORMAT_NATIVE;
+    }
+
     CharSequence getTableName();
+
+    int getTimestampIndex();
+
+    /**
+     * Returns the time-to-live (TTL) of the data in this table:
+     * if positive, it's in hours;
+     * if negative, it's in months (and the actual value is positive);
+     * zero means "no TTL".
+     */
+    default int getTtlHoursOrMonths() {
+        return 0; // TTL disabled by default
+    }
+
+    default ViewDefinition getViewDefinition() {
+        return null;
+    }
+
+    default boolean hasParquetPartitions() {
+        return false;
+    }
+
+    default void init(TableToken tableToken) {
+    }
+
+    /**
+     * Returns the index type for the column.
+     *
+     * @param columnIndex the column index
+     * @return the index type (see {@link IndexType})
+     */
+    byte getIndexType(int columnIndex);
+
+    default IntList getCoveringColumnIndices(int columnIndex) {
+        return null;
+    }
+
+    default boolean isCovering(int columnIndex) {
+        IntList indices = getCoveringColumnIndices(columnIndex);
+        return indices != null && indices.size() > 0;
+    }
 
     boolean isDedupKey(int columnIndex);
 
-    boolean isIndexed(int columnIndex);
+    default boolean isIndexed(int columnIndex) {
+        return IndexType.isIndexed(getIndexType(columnIndex));
+    }
 
-    boolean isSequential(int columnIndex);
+    default boolean isLiveView() {
+        return false;
+    }
+
+    default boolean isMatView() {
+        return false;
+    }
+
+    default boolean isView() {
+        return false;
+    }
 
     boolean isWalEnabled();
+
+    default void onCreated(@NotNull CairoEngine engine, @NotNull TableToken tableToken) {
+    }
 }

@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -22,6 +22,11 @@
  *
  ******************************************************************************/
 
+// Must precede every system header so glibc's <poll.h> exposes POLLRDHUP.
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
 #include <jni.h>
 #include <sys/socket.h>
 #include <sys/fcntl.h>
@@ -30,11 +35,27 @@
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <sys/errno.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include "net.h"
 #include <netdb.h>
 #include "sysutil.h"
+#include <poll.h>
+#include <stdint.h>
+#ifndef __APPLE__
+#include <sys/un.h>
+#endif
+#if defined(__APPLE__) || defined(__FreeBSD__)
+#include <sys/event.h>
+#include <sys/time.h>
+#include <pthread.h>
+#endif
+#ifndef POLLRDHUP
+#define POLLRDHUP 0x2000
+#endif
+
+jint handleEintrInConnect(jint fd, int result);
 
 int set_int_sockopt(int fd, int level, int opt, int value) {
     return setsockopt(fd, level, opt, &value, sizeof(value));
@@ -45,19 +66,19 @@ JNIEXPORT jint JNICALL Java_io_questdb_network_Net_setKeepAlive0
     if (set_int_sockopt(fd, SOL_SOCKET, SO_KEEPALIVE, 1) < 0) {
         return -1;
     }
-    #if defined(__linux__) || defined(__FreeBSD__)
-        if (set_int_sockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, idle_sec) < 0) {
-            return -1;
-        }
-        if (set_int_sockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, idle_sec) < 0) {
-            return -1;
-        }
-    #endif
-    #ifdef __APPLE__
-        if (set_int_sockopt(fd, IPPROTO_TCP, TCP_KEEPALIVE, idle_sec) < 0) {
-            return -1;
-        }
-    #endif
+#if defined(__linux__) || defined(__FreeBSD__)
+    if (set_int_sockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, idle_sec) < 0) {
+        return -1;
+    }
+    if (set_int_sockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, idle_sec) < 0) {
+        return -1;
+    }
+#endif
+#ifdef __APPLE__
+    if (set_int_sockopt(fd, IPPROTO_TCP, TCP_KEEPALIVE, idle_sec) < 0) {
+        return -1;
+    }
+#endif
     return fd;
 }
 
@@ -214,6 +235,104 @@ JNIEXPORT jboolean JNICALL Java_io_questdb_network_Net_isDead
     return (jboolean) (res < 1);
 }
 
+#if defined(__APPLE__) || defined(__FreeBSD__)
+// Per-thread kqueue for isPeerDisconnected, closed when the thread exits. A plain __thread int
+// would leak the descriptor: worker threads terminate on WorkerPool.halt() with no cleanup hook,
+// and a kqueue fd is not auto-closed on thread exit, so each ServerMain create->halt cycle would
+// leak one fd per probing worker (toward EMFILE across a long macOS test run). A pthread_key
+// destructor closes it. The stored value is (kq + 1) so the unset default (NULL) is
+// distinguishable from a valid kqueue fd of 0.
+static pthread_key_t peer_probe_kq_key;
+static int peer_probe_kq_key_ready = 0;
+static pthread_once_t peer_probe_kq_once = PTHREAD_ONCE_INIT;
+
+static void close_peer_probe_kq(void *value) {
+    intptr_t stored = (intptr_t) value;
+    if (stored > 0) {
+        close((int) (stored - 1));
+    }
+}
+
+static void make_peer_probe_kq_key(void) {
+    if (pthread_key_create(&peer_probe_kq_key, close_peer_probe_kq) == 0) {
+        peer_probe_kq_key_ready = 1;
+    } else {
+        // One-time, process-wide: every peer-disconnect probe fails open from here on.
+        fprintf(stderr, "questdb: pthread_key_create failed, peer disconnect detection disabled\n");
+    }
+}
+#endif
+
+JNIEXPORT jboolean JNICALL Java_io_questdb_network_Net_isPeerDisconnected
+        (JNIEnv *e, jclass cl, jint fd) {
+#if defined(__APPLE__) || defined(__FreeBSD__)
+    // Reuse one kqueue per thread instead of creating and destroying one on every probe.
+    // isPeerDisconnected sits on query hot paths -- unthrottled breaker checks fire once per
+    // continuation wake and once per page frame, and every per-worker wrapper keeps its own
+    // throttle window -- so a per-call kqueue()+close() would add a syscall pair plus
+    // file-descriptor table churn to those loops.
+    pthread_once(&peer_probe_kq_once, make_peer_probe_kq_key);
+    if (!peer_probe_kq_key_ready) {
+        return JNI_FALSE;
+    }
+    intptr_t stored = (intptr_t) pthread_getspecific(peer_probe_kq_key);
+    int cached_kq;
+    if (stored > 0) {
+        cached_kq = (int) (stored - 1);
+    } else {
+        cached_kq = kqueue();
+        if (cached_kq < 0) {
+            return JNI_FALSE;
+        }
+        if (pthread_setspecific(peer_probe_kq_key, (void *) (intptr_t) (cached_kq + 1)) != 0) {
+            close(cached_kq);
+            return JNI_FALSE;
+        }
+    }
+    struct kevent change;
+    struct kevent event;
+    struct timespec immediate = {0, 0};
+    int n;
+    // Register the read filter and poll for a pending EOF/error in a single call. A bad fd
+    // surfaces as an EV_ERROR event in the eventlist (kevent returns it rather than failing).
+    EV_SET(&change, (uintptr_t) fd, EVFILT_READ, EV_ADD, 0, 0, NULL);
+    RESTARTABLE(kevent(cached_kq, &change, 1, &event, 1, &immediate), n);
+    // event.ident == fd is defensive: EV_DELETE below leaves the kqueue empty at rest, so only
+    // this fd is ever registered, but the check makes the result robust to a future delete gap.
+    jboolean disconnected = JNI_FALSE;
+    if (n > 0 && event.ident == (uintptr_t) fd) {
+        if ((event.flags & EV_ERROR) != 0) {
+            disconnected = (jboolean) (event.data == EBADF);
+        } else {
+            disconnected = (jboolean) ((event.flags & EV_EOF) != 0);
+        }
+    }
+    // Drop the registration so a later probe of a different fd on this thread cannot pick up
+    // this fd's event by mistake. ENOENT (the socket already closed) is harmless and ignored.
+    EV_SET(&change, (uintptr_t) fd, EVFILT_READ, EV_DELETE, 0, 0, NULL);
+    RESTARTABLE(kevent(cached_kq, &change, 1, NULL, 0, &immediate), n);
+    return disconnected;
+#elif defined(__linux__)
+    struct pollfd pfd;
+    pfd.fd = (int) fd;
+    pfd.events = POLLRDHUP;
+    pfd.revents = 0;
+    int n;
+    RESTARTABLE(poll(&pfd, 1, 0), n);
+    return (jboolean) (n > 0 && (pfd.revents & (POLLRDHUP | POLLHUP | POLLERR | POLLNVAL)) != 0);
+#else
+    // Peek-quality fallback for unsupported platforms: cannot see a FIN behind buffered data
+    // and blocks on a blocking socket. Ports must add a poll-style branch above instead.
+    char c;
+    ssize_t n;
+    RESTARTABLE(recv((int) fd, &c, 1, MSG_PEEK), n);
+    if (n == 0) {
+        return JNI_TRUE;
+    }
+    return (jboolean) (n < 0 && errno != EWOULDBLOCK && errno != EAGAIN);
+#endif
+}
+
 JNIEXPORT jint JNICALL Java_io_questdb_network_Net_configureNonBlocking
         (JNIEnv *e, jclass cl, jint fd) {
     int flags;
@@ -237,9 +356,85 @@ JNIEXPORT jint JNICALL Java_io_questdb_network_Net_configureLinger
     return setsockopt((int) fd, SOL_SOCKET, SO_LINGER, &sl, sizeof(sl));
 }
 
-JNIEXPORT jint JNICALL Java_io_questdb_network_Net_connect
+JNIEXPORT jint handleEintrInConnect(jint fd, int result) {
+    if (result == -1 && errno == EINTR) {
+        // Connection was interrupted but continues in background
+        // Wait for it to complete using select()
+        fd_set writefds, exceptfds;
+        struct timeval timeout;
+
+        FD_ZERO(&writefds);
+        FD_ZERO(&exceptfds);
+        FD_SET(fd, &writefds);
+        FD_SET(fd, &exceptfds);
+
+        // Set a reasonable timeout (e.g., 30 seconds)
+        timeout.tv_sec = 30;
+        timeout.tv_usec = 0;
+
+        int select_result = select(fd + 1, NULL, &writefds, &exceptfds, &timeout);
+
+        if (select_result > 0) {
+            if (FD_ISSET(fd, &exceptfds)) {
+                // Exception occurred
+                int error = 0;
+                socklen_t len = sizeof(error);
+                if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &len) == 0 && error != 0) {
+                    errno = error;
+                }
+                return -1;
+            } else if (FD_ISSET(fd, &writefds)) {
+                // Socket is writable, check for connection error
+                int error = 0;
+                socklen_t len = sizeof(error);
+                if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &len) == 0) {
+                    if (error == 0) {
+                        return 0; // Success
+                    } else {
+                        errno = error;
+                        return -1;
+                    }
+                }
+                return -1;
+            }
+        } else if (select_result == 0) {
+            // Timeout
+            errno = ETIMEDOUT;
+            return -1;
+        } else {
+            // select() failed
+            return -1;
+        }
+    }
+
+    return result;
+}
+
+jint JNICALL Java_io_questdb_network_Net_connect
         (JNIEnv *e, jclass cl, jint fd, jlong sockAddr) {
-    return connect((int) fd, (const struct sockaddr *) sockAddr, sizeof(struct sockaddr));
+    int result;
+
+    struct sockaddr *addr = (struct sockaddr *) sockAddr;
+    socklen_t addrlen;
+
+    switch (addr->sa_family) {
+        case AF_INET:
+            addrlen = sizeof(struct sockaddr_in);
+            break;
+        case AF_INET6:
+            addrlen = sizeof(struct sockaddr_in6);
+            break;
+#ifndef __APPLE__
+            case AF_UNIX:
+                addrlen = sizeof(struct sockaddr_un);
+                break;
+#endif
+        default:
+            return -2;
+    }
+
+    result = connect((int) fd, (const struct sockaddr *) sockAddr, addrlen);
+    return handleEintrInConnect(fd, result);
 }
 
 JNIEXPORT jint JNICALL Java_io_questdb_network_Net_setSndBuf
@@ -353,7 +548,10 @@ JNIEXPORT jint JNICALL Java_io_questdb_network_Net_getPeerPort
 JNIEXPORT jint JNICALL Java_io_questdb_network_Net_connectAddrInfo
         (JNIEnv *e, jclass cl, jint fd, jlong lpAddrInfo) {
     struct addrinfo *addr = (struct addrinfo *) lpAddrInfo;
-    return connect((int) fd, addr->ai_addr, (int) addr->ai_addrlen);
+    int result;
+
+    result = connect((int) fd, addr->ai_addr, (int) addr->ai_addrlen);
+    return handleEintrInConnect(fd, result);
 }
 
 JNIEXPORT void JNICALL Java_io_questdb_network_Net_freeAddrInfo0
@@ -373,7 +571,7 @@ JNIEXPORT jlong JNICALL Java_io_questdb_network_Net_getAddrInfo0
     struct addrinfo *addr = NULL;
 
     char _port[13];
-    snprintf(_port,  sizeof(_port)/sizeof(_port[0]), "%d", port);
+    snprintf(_port, sizeof(_port) / sizeof(_port[0]), "%d", port);
     int gai_err_code = getaddrinfo((const char *) host, (const char *) &_port, &hints, &addr);
 
     if (gai_err_code == 0) {
@@ -389,7 +587,7 @@ JNIEXPORT jint JNICALL Java_io_questdb_network_Net_resolvePort
     socklen_t resolved_addr_len = sizeof(resolved_addr);
     if (getsockname(
             fd,
-            (struct sockaddr *)&resolved_addr,
+            (struct sockaddr *) &resolved_addr,
             &resolved_addr_len) == -1)
         return -1;
     return ntohs(resolved_addr.sin_port);

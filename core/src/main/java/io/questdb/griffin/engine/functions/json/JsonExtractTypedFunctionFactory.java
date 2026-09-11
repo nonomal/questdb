@@ -1,0 +1,129 @@
+/*+*****************************************************************************
+ *     ___                  _   ____  ____
+ *    / _ \ _   _  ___  ___| |_|  _ \| __ )
+ *   | | | | | | |/ _ \/ __| __| | | |  _ \
+ *   | |_| | |_| |  __/\__ \ |_| |_| | |_) |
+ *    \__\_\\__,_|\___||___/\__|____/|____/
+ *
+ *  Copyright (c) 2014-2019 Appsicle
+ *  Copyright (c) 2019-2026 QuestDB
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *
+ *  http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ *
+ ******************************************************************************/
+
+package io.questdb.griffin.engine.functions.json;
+
+import io.questdb.cairo.CairoConfiguration;
+import io.questdb.cairo.ColumnType;
+import io.questdb.cairo.sql.Function;
+import io.questdb.griffin.FunctionFactory;
+import io.questdb.griffin.SqlException;
+import io.questdb.griffin.SqlExecutionContext;
+import io.questdb.std.IntList;
+import io.questdb.std.Misc;
+import io.questdb.std.ObjList;
+
+/**
+ * Hidden function that intrusively handles typed (i.e. non-VARCHAR) JSON extraction.
+ * This is exclusively to be called via a SQL rewrite of from the form `json_extract(json, path)::type`,
+ * as performed by the SqlParser.
+ */
+public class JsonExtractTypedFunctionFactory implements FunctionFactory {
+
+    private static final String SIGNATURE = JsonExtractSupportingState.EXTRACT_FUNCTION_NAME + "(ØØi)";
+
+    public static boolean isIntrusivelyOptimized(int columnType) {
+        switch (ColumnType.tagOf(columnType)) {
+            case ColumnType.BOOLEAN:
+            case ColumnType.SHORT:
+            case ColumnType.INT:
+            case ColumnType.LONG:
+            case ColumnType.FLOAT:
+            case ColumnType.DOUBLE:
+            case ColumnType.DATE:
+            case ColumnType.TIMESTAMP:
+            case ColumnType.IPv4:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    @Override
+    public String getSignature() {
+        return SIGNATURE;
+    }
+
+    @Override
+    public Function newInstance(
+            int position,
+            ObjList<Function> args,
+            IntList argPositions,
+            CairoConfiguration configuration,
+            SqlExecutionContext sqlExecutionContext
+    ) throws SqlException {
+        final Function json = args.getQuick(0);
+        final Function path = args.getQuick(1);
+
+        if (path.getType() != ColumnType.UNDEFINED && !path.isConstant() && !path.isRuntimeConstant()) {
+            Misc.freeObjList(args);
+            throw SqlException.$(argPositions.getQuick(1), "constant or bind variable expected");
+        }
+
+        final int targetType = parseTargetType(position, args.getQuick(2));
+        final int maxSize = configuration.getStrFunctionMaxBufferLength();
+        // A json_extract expression carries exactly one value per row, so every read of it has to
+        // derive from its declared width rather than parse the JSON again at the width being read.
+        // BOOLEAN, SHORT, INT, LONG, FLOAT, DATE and TIMESTAMP each get a one-value variant for that.
+        // DOUBLE keeps the base because it promotes to nothing wider - every CastDoubleTo* reads
+        // getDouble(). IPv4 keeps it for a different reason: every CastIPv4To* reads getIPv4(), and
+        // although its overload row does carry STRING and VARCHAR, IPv4Function throws on getStrA
+        // and getVarcharA, so there is no reference behaviour at string width to disagree with.
+        // The unit question DATE and TIMESTAMP raise - DATE is milliseconds and TIMESTAMP is micros or
+        // nanos, so a read at another width has to agree on a unit and not just on a number - is
+        // answered the way DateFunction and TimestampFunction already answer it: the promoted read
+        // scales the declared type's own value, LONG carrying the declared unit unchanged.
+        switch (ColumnType.tagOf(targetType)) {
+            case ColumnType.BOOLEAN:
+                return new JsonExtractBooleanFunction(targetType, json, path, maxSize);
+            case ColumnType.SHORT:
+                return new JsonExtractShortFunction(targetType, json, path, maxSize);
+            case ColumnType.INT:
+                return new JsonExtractIntFunction(targetType, json, path, maxSize);
+            case ColumnType.LONG:
+                return new JsonExtractLongFunction(targetType, json, path, maxSize);
+            case ColumnType.FLOAT:
+                return new JsonExtractFloatFunction(targetType, json, path, maxSize);
+            case ColumnType.DATE:
+                return new JsonExtractDateFunction(targetType, json, path, maxSize);
+            case ColumnType.TIMESTAMP:
+                return new JsonExtractTimestampFunction(targetType, json, path, maxSize);
+            default:
+                return new JsonExtractFunction(targetType, json, path, maxSize);
+        }
+    }
+
+    private static int parseTargetType(int position, Function targetTypeFn) throws SqlException {
+        // this is internal undocumented function, which is triggered via SQL rewrite.
+        // The invocation is triggered by calling `json_extract(json,path)::type`.
+        // Therefore, we have to validate type input to provide user with actionable error message.
+        if (targetTypeFn != null && targetTypeFn.isConstant()) {
+            final int targetType = targetTypeFn.getInt(null);
+            if (isIntrusivelyOptimized(ColumnType.tagOf(targetType))) {
+                return targetType;
+            }
+        }
+        throw SqlException.position(position).put("please use json_extract(json,path)::type semantic");
+    }
+}

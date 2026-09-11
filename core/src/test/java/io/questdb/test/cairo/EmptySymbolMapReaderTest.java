@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -41,6 +41,8 @@ public class EmptySymbolMapReaderTest {
         }
         Assert.assertEquals(0, reader.getSymbolCount());
         Assert.assertEquals(SymbolTable.VALUE_NOT_FOUND, reader.keyOf("abc"));
+        // A null symbol reverse-maps to the null key (matching SymbolMapReaderImpl), not "not found".
+        Assert.assertEquals(SymbolTable.VALUE_IS_NULL, reader.keyOf(null));
 
         Assert.assertEquals(0, reader.getSymbolCapacity());
         Assert.assertFalse(reader.isCached());

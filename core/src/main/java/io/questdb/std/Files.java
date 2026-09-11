@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -25,15 +25,20 @@
 package io.questdb.std;
 
 import io.questdb.cairo.CairoException;
-import io.questdb.std.str.*;
+import io.questdb.log.Log;
+import io.questdb.std.str.LPSZ;
+import io.questdb.std.str.MutableUtf8Sink;
+import io.questdb.std.str.Path;
+import io.questdb.std.str.Utf8Sequence;
+import io.questdb.std.str.Utf8s;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
+import org.jetbrains.annotations.TestOnly;
 
 import java.io.File;
 import java.net.URL;
 import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
-import java.util.concurrent.atomic.AtomicInteger;
 
 public final class Files {
     // The default varies across kernel versions and distros, so we use the same value as for vm.max_map_count.
@@ -52,112 +57,110 @@ public final class Files {
     public static final long PAGE_SIZE;
     public static final int POSIX_FADV_RANDOM;
     public static final int POSIX_FADV_SEQUENTIAL;
+    public static final int POSIX_MADV_DONTNEED;
+    // Pre-fault pages for writing. Linux 5.14+. On older kernels, madvise() returns
+    // EINVAL which the caller ignores, so using this flag is safe on any kernel version.
+    public static final int POSIX_MADV_POPULATE_WRITE;
     // Apart from obvious random read use case, MADV_RANDOM/FADV_RANDOM should be used for write-only
     // append-only files. Otherwise, OS starts reading adjacent pages under memory pressure generating
     // wasted disk read ops.
     public static final int POSIX_MADV_RANDOM;
     public static final int POSIX_MADV_SEQUENTIAL;
     public static final char SEPARATOR;
+    // https://github.com/torvalds/linux/blob/e2f48c48090dea172c0c571101041de64634dae5/include/uapi/linux/magic.h#L18
+    public static final int TMPFS_MAGIC = 0x01021994;
     public static final Charset UTF_8;
     public static final int WINDOWS_ERROR_FILE_EXISTS = 0x50;
-    private static final AtomicInteger OPEN_FILE_COUNT = new AtomicInteger();
     private static final int VIRTIO_FS_MAGIC = 0x6a656a63;
+    private static final FdCache fdCache = new FdCache();
+    private static final MmapCache mmapCache = MmapCache.INSTANCE;
+    public static boolean ASYNC_MUNMAP_ENABLED = false;
+    public static boolean FS_CACHE_ENABLED = true;
+
+    // Maximum recursion depth when deleting the database directory.
+    // Recursion starts at depth 0 for the root directory (e.g., "db").
+    // A value of 5 allows recursing through 5 subdirectory levels beneath the root
+    // (i.e., depths 0-4 are allowed, depth 5 triggers the limit).
+    // Example structures within the allowed depth:
+    //   db/tableDir/partitionDir
+    //   db/tableDir/wal/segmentDir
+    //   db/.download/tableDir/wal/segmentDir
+    public static int RMDIR_MAX_DEPTH = 5;
+
+    // To be set in tests to check every call for using OPEN file descriptor
     public static boolean VIRTIO_FS_DETECTED = false;
-    static IntHashSet openFds;
 
     private Files() {
         // Prevent construction.
     }
 
-    public native static boolean allocate(int fd, long size);
-
-    public native static long append(int fd, long address, long len);
-
-    public static synchronized boolean auditClose(int fd) {
-        if (fd < 0) {
-            throw new IllegalStateException("Invalid fd " + fd);
-        }
-        if (openFds.remove(fd) == -1) {
-            throw new IllegalStateException("fd " + fd + " is already closed!");
-        }
-        return true;
+    public static boolean allocate(long fd, long size) {
+        return allocate(toOsFd(fd), size);
     }
 
-    public static synchronized boolean auditOpen(int fd) {
-        if (openFds == null) {
-            openFds = new IntHashSet();
-        }
-        if (fd < 0) {
-            throw new IllegalStateException("Invalid fd " + fd);
-        }
-        if (openFds.contains(fd)) {
-            throw new IllegalStateException("fd " + fd + " is already open");
-        }
-        openFds.add(fd);
-        return true;
-    }
-
-    public static int bumpFileCount(int fd) {
-        if (fd != -1) {
-            //noinspection AssertWithSideEffects
-            assert auditOpen(fd);
-            OPEN_FILE_COUNT.incrementAndGet();
-        }
-        return fd;
+    public static long append(long fd, long address, long len) {
+        return append(toOsFd(fd), address, len);
     }
 
     public static long ceilPageSize(long size) {
         return ((size + PAGE_SIZE - 1) / PAGE_SIZE) * PAGE_SIZE;
     }
 
-    public static int close(int fd) {
+    public static int close(long fd) {
         // do not close `stdin` and `stdout`
-        if (fd > 1) {
-            assert auditClose(fd);
-            int res = close0(fd);
-            if (res == 0) {
-                OPEN_FILE_COUNT.decrementAndGet();
-            }
-            return res;
+        if (fd > 0 && toOsFd(fd) > 2) {
+            return fdCache.close(fd);
         }
         // failed to close
         return -1;
     }
 
-    public static native int copy(long from, long to);
+    public static int closeDetached(int osFd) {
+        return close0(osFd);
+    }
 
     public static int copy(LPSZ from, LPSZ to) {
         return copy(from.ptr(), to.ptr());
     }
 
-    public static native long copyData(int srcFd, int destFd, long offsetSrc, long length);
-
-    public static native long copyDataToOffset(int srcFd, int destFd, long offsetSrc, long offsetDest, long length);
-
-    /**
-     * close(fd) should be used instead of this method in most cases
-     * unless you don't need close() sys call to happen.
-     *
-     * @param fd file descriptor
-     */
-    public static void decrementFileCount(int fd) {
-        assert auditClose(fd);
-        OPEN_FILE_COUNT.decrementAndGet();
+    public static long copyData(long srcFd, long destFd, long offsetSrc, long length) {
+        return copyData(toOsFd(srcFd), toOsFd(destFd), offsetSrc, length);
     }
 
-    public static native boolean exists(int fd);
+    public static long copyDataToOffset(long srcFd, long destFd, long offsetSrc, long offsetDest, long length) {
+        return copyDataToOffset(toOsFd(srcFd), toOsFd(destFd), offsetSrc, offsetDest, length);
+    }
+
+    public static long createUniqueFd(int fd) {
+        if (fd != -1) {
+            return fdCache.createUniqueFdNonCached(fd);
+        }
+        return fd;
+    }
+
+    public static int detach(long fd) {
+        int osFd = toOsFd(fd);
+        // do not detach `stdin` and `stdout`
+        if (osFd > 1) {
+            fdCache.detach(fd);
+            return osFd;
+        }
+        return -1;
+    }
+
+    public static boolean exists(long fd) {
+        return exists(toOsFd(fd));
+    }
 
     public static boolean exists(LPSZ lpsz) {
         return lpsz != null && exists0(lpsz.ptr());
     }
 
-    public static void fadvise(int fd, long offset, long len, int advise) {
+    public static void fadvise(long fd, long offset, long len, int advise) {
         if (Os.isLinux()) {
-            fadvise0(fd, offset, len, advise);
+            fadvise0(toOsFd(fd), offset, len, advise);
         }
     }
-
-    public static native void fadvise0(int fd, long offset, long len, int advise);
 
     public native static void findClose(long findPtr);
 
@@ -175,7 +178,9 @@ public final class Files {
         return size - size % PAGE_SIZE;
     }
 
-    public static native int fsync(int fd);
+    public static int fsync(long fd) {
+        return fsync(toOsFd(fd));
+    }
 
     public static long getDirSize(Path path) {
         long pFind = findFirst(path.$().ptr());
@@ -210,6 +215,10 @@ public final class Files {
         return 0L;
     }
 
+    public static long getFdReuseCount() {
+        return fdCache.getReuseCount();
+    }
+
     /**
      * Returns fs.file-max kernel limit on Linux or 0 on other OSes.
      */
@@ -241,15 +250,24 @@ public final class Files {
      */
     public native static long getMapCountLimit();
 
+    public static MmapCache getMmapCache() {
+        return mmapCache;
+    }
+
+    public static long getMmapReuseCount() {
+        return mmapCache.getReuseCount();
+    }
+
+    public static long getOpenCachedFileCount() {
+        return fdCache.getOpenCachedFileCount();
+    }
+
     public static String getOpenFdDebugInfo() {
-        if (openFds != null) {
-            return openFds.toString();
-        }
-        return null;
+        return fdCache.getOpenFdDebugInfo();
     }
 
     public static long getOpenFileCount() {
-        return OPEN_FILE_COUNT.get();
+        return fdCache.getOpenOsFileCount();
     }
 
     public @NotNull
@@ -261,7 +279,10 @@ public final class Files {
         return file;
     }
 
-    public native static int getStdOutFd();
+    public synchronized static long getStdOutFdInternal() {
+        int stdoutFd = getStdOutFd();
+        return fdCache.createUniqueFdNonCachedStdOut(stdoutFd);
+    }
 
     public static native int hardLink(long lpszSrc, long lpszHardLink);
 
@@ -270,16 +291,7 @@ public final class Files {
     }
 
     public static boolean isDirOrSoftLinkDir(LPSZ path) {
-        long ptr = findFirst(path);
-        if (ptr < 1L) {
-            return false;
-        }
-        try {
-            int type = findType(ptr);
-            return type == DT_DIR || (type == DT_LNK && isDir(path.ptr()));
-        } finally {
-            findClose(ptr);
-        }
+        return isDir(path.ptr());
     }
 
     public static boolean isDirOrSoftLinkDirNoDots(Path path, int rootLen, long pUtf8NameZ, int type) {
@@ -294,6 +306,17 @@ public final class Files {
         return Chars.equals(name, '.') || Chars.equals(name, "..");
     }
 
+    public static boolean isErrnoFileCannotRead(int errno) {
+        return isErrnoFileDoesNotExist(errno)
+                || (Os.isWindows() && errno == CairoException.ERRNO_ACCESS_DENIED_WIN)
+                || (Os.isOSX() && errno == CairoException.ERRNO_FILE_READ_TIMEOUT_MACOS);
+    }
+
+    public static boolean isErrnoFileDoesNotExist(int errno) {
+        return errno == CairoException.ERRNO_FILE_DOES_NOT_EXIST ||
+                (Os.isWindows() && errno == CairoException.ERRNO_FILE_DOES_NOT_EXIST_WIN);
+    }
+
     public native static boolean isSoftLink(long lpszPath);
 
     public static boolean isSoftLink(LPSZ path) {
@@ -304,12 +327,16 @@ public final class Files {
         return length0(lpsz.ptr());
     }
 
-    public native static long length(int fd);
+    public static long length(long fd) {
+        return length(toOsFd(fd));
+    }
 
-    public static native int lock(int fd);
+    public static int lock(long fd) {
+        return lock(toOsFd(fd));
+    }
 
     public static void madvise(long address, long len, int advise) {
-        if (Os.isLinux()) {
+        if (Os.isLinux() && mmapCache.isSingleUse(address)) {
             madvise0(address, len, advise);
         }
     }
@@ -346,36 +373,41 @@ public final class Files {
         return 0;
     }
 
-    public static long mmap(int fd, long len, long offset, int flags, int memoryTag) {
-        long address = mmap0(fd, len, offset, flags, 0);
-        if (address != -1) {
-            Unsafe.recordMemAlloc(len, memoryTag);
-        }
-        return address;
+    public static long mmap(long fd, long len, long offset, int flags, int memoryTag) {
+        int osFd = fdCache.toOsFd(fd, (flags & MAP_RW) != 0);
+        long mmapCacheKey = fdCache.toMmapCacheKey(fd);
+        return mmapCache.cacheMmap(osFd, mmapCacheKey, len, offset, flags, memoryTag);
     }
 
-    public static long mremap(int fd, long address, long previousSize, long newSize, long offset, int flags, int memoryTag) {
-        if (newSize < 1) {
-            throw CairoException.critical(0).put("could not remap file, invalid newSize [previousSize=").put(previousSize)
-                    .put(", newSize=").put(newSize)
-                    .put(", offset=").put(offset)
-                    .put(", fd=").put(fd)
-                    .put(']');
-        }
+    /**
+     * Memory map without using the MmapCache. Useful for streaming reads where
+     * we want each mapping to be independent and release page cache via madvise.
+     */
+    public static long mmapNoCache(long fd, long len, long offset, int flags, int memoryTag) {
+        int osFd = fdCache.toOsFd(fd, (flags & MAP_RW) != 0);
+        // Pass mmapCacheKey=0 to bypass the mmap cache
+        return mmapCache.cacheMmap(osFd, 0, len, offset, flags, memoryTag);
+    }
 
-        address = mremap0(fd, address, previousSize, newSize, offset, flags);
-        if (address != -1) {
-            Unsafe.recordMemAlloc(newSize - previousSize, memoryTag);
-        }
-        return address;
+    public static long mremap(long fd, long address, long previousSize, long newSize, long offset, int flags, int memoryTag) {
+        int osFd = fdCache.toOsFd(fd, (flags & MAP_RW) != 0);
+        long mmapCacheKey = fdCache.toMmapCacheKey(fd);
+        return mmapCache.mremap(osFd, mmapCacheKey, address, previousSize, newSize, offset, flags, memoryTag);
+    }
+
+    /**
+     * Remap memory without using the MmapCache. Useful for streaming reads.
+     */
+    public static long mremapNoCache(long fd, long address, long previousSize, long newSize, long offset, int flags, int memoryTag) {
+        int osFd = fdCache.toOsFd(fd, (flags & MAP_RW) != 0);
+        // Pass mmapCacheKey=0 to bypass the mmap cache
+        return mmapCache.mremap(osFd, 0, address, previousSize, newSize, offset, flags, memoryTag);
     }
 
     public static native int msync(long addr, long len, boolean async);
 
     public static void munmap(long address, long len, int memoryTag) {
-        if (address != 0 && munmap0(address, len) != -1) {
-            Unsafe.recordMemAlloc(-len, memoryTag);
-        }
+        mmapCache.unmap(address, len, memoryTag);
     }
 
     public static native long noop();
@@ -392,41 +424,53 @@ public final class Files {
     }
 
     public static boolean notDots(long pUtf8NameZ) {
-        final byte b0 = Unsafe.getUnsafe().getByte(pUtf8NameZ);
+        final byte b0 = Unsafe.getByte(pUtf8NameZ);
 
         if (b0 != '.') {
             return true;
         }
 
-        final byte b1 = Unsafe.getUnsafe().getByte(pUtf8NameZ + 1);
-        return b1 != 0 && (b1 != '.' || Unsafe.getUnsafe().getByte(pUtf8NameZ + 2) != 0);
+        final byte b1 = Unsafe.getByte(pUtf8NameZ + 1);
+        return b1 != 0 && (b1 != '.' || Unsafe.getByte(pUtf8NameZ + 2) != 0);
     }
 
-    public static int openAppend(LPSZ lpsz) {
-        return bumpFileCount(openAppend(lpsz.ptr()));
+    public static long openAppend(LPSZ lpsz) {
+        return fdCache.createUniqueFdNonCached(openAppend(lpsz.ptr()));
     }
 
-    public static int openCleanRW(LPSZ lpsz, long size) {
-        return bumpFileCount(openCleanRW(lpsz.ptr(), size));
+    public static long openCleanRW(LPSZ lpsz, long size) {
+        return fdCache.createUniqueFdNonCached(openCleanRW(lpsz.ptr(), size));
     }
 
     public native static int openCleanRW(long lpszName, long size);
 
-    public static int openRO(LPSZ lpsz) {
-        return bumpFileCount(openRO(lpsz.ptr()));
+    public static long openRO(LPSZ lpsz) {
+        if (FS_CACHE_ENABLED) {
+            return fdCache.openROCached(lpsz);
+        } else {
+            return fdCache.createUniqueFdNonCached(openRO(lpsz.ptr()));
+        }
     }
 
-    public static int openRW(LPSZ lpsz) {
-        return bumpFileCount(openRW(lpsz.ptr()));
+    public static long openRONoCache(LPSZ path) {
+        return fdCache.createUniqueFdNonCached(openRO(path.ptr()));
     }
 
-    public static int openRW(LPSZ lpsz, long opts) {
-        return bumpFileCount(openRWOpts(lpsz.ptr(), opts));
+    public static long openRW(LPSZ lpsz) {
+        return fdCache.createUniqueFdNonCached(openRW(lpsz.ptr()));
     }
 
-    public native static long read(int fd, long address, long len, long offset);
+    public static long openRW(LPSZ lpsz, int opts) {
+        return fdCache.createUniqueFdNonCached(openRWOpts(lpsz.ptr(), opts));
+    }
 
-    public native static long readIntAsUnsignedLong(int fd, long offset);
+    public static long read(long fd, long address, long len, long offset) {
+        return read(fdCache.toOsFd(fd), address, len, offset);
+    }
+
+    public static long readIntAsUnsignedLong(long fd, long offset) {
+        return readIntAsUnsignedLong(toOsFd(fd), offset);
+    }
 
     public static boolean readLink(Path softLink, Path readTo) {
         final int len = readTo.size();
@@ -453,72 +497,38 @@ public final class Files {
         return false;
     }
 
-    public native static byte readNonNegativeByte(int fd, long offset);
+    public static byte readNonNegativeByte(long fd, long offset) {
+        return readNonNegativeByte(toOsFd(fd), offset);
+    }
 
-    public native static int readNonNegativeInt(int fd, long offset);
+    public static int readNonNegativeInt(long fd, long offset) {
+        return readNonNegativeInt(toOsFd(fd), offset);
+    }
 
-    public native static long readNonNegativeLong(int fd, long offset);
+    public static long readNonNegativeLong(long fd, long offset) {
+        return readNonNegativeLong(toOsFd(fd), offset);
+    }
 
-    public native static short readNonNegativeShort(int fd, long offset);
+    public static short readNonNegativeShort(long fd, long offset) {
+        return readNonNegativeShort(toOsFd(fd), offset);
+    }
 
     public static boolean remove(LPSZ lpsz) {
-        return remove(lpsz.ptr());
+        return fdCache.remove(lpsz);
     }
 
     public static int rename(LPSZ oldName, LPSZ newName) {
-        return rename(oldName.ptr(), newName.ptr());
+        return fdCache.rename(oldName, newName);
     }
 
-    /**
-     * Removes directory recursively. When function fails the caller has to check Os.errno() for the diagnostics.
-     * The function can operate in two modes, eager and haltOnFail. In haltOnFail mode function fails fast, providing precise
-     * error number. In eager mode function will free most of the disk space but likely to fail on deleting non-empty
-     * directory, should some files remain. Thus, not providing correct diagnostics.
-     * <p>
-     * rmdir() will fail if directory does not exist
-     *
-     * @param path       path to the directory, must include trailing slash (/)
-     * @param haltOnFail when true removing directory will halt on first failed attempt to remove directory contents. When
-     *                   false, the function will remove as many files and subdirectories as possible. That might be useful
-     *                   when the intent is too free up as much disk space as possible.
-     * @return true on success
-     */
+    @TestOnly
     public static boolean rmdir(Path path, boolean haltOnFail) {
-        path.$();
-        long pFind = findFirst(path.ptr());
-        if (pFind > 0L) {
-            int len = path.size();
-            boolean res;
-            int type;
-            long nameUtf8Ptr;
-            try {
-                do {
-                    nameUtf8Ptr = findName(pFind);
-                    path.trimTo(len).concat(nameUtf8Ptr).$();
-                    type = findType(pFind);
-                    if (type == Files.DT_FILE) {
-                        if (!remove(path.ptr()) && haltOnFail) {
-                            return false;
-                        }
-                    } else if (notDots(nameUtf8Ptr)) {
-                        res = type == Files.DT_LNK ? unlink(path.ptr()) == 0 : rmdir(path, haltOnFail);
-                        if (!res && haltOnFail) {
-                            return false;
-                        }
-                    }
-                }
-                while (findNext(pFind) > 0);
-            } finally {
-                findClose(pFind);
-                path.trimTo(len).$();
-            }
+        return rmdir(path, haltOnFail, 0, 10, null) > -1;
+    }
 
-            if (isSoftLink(path.ptr())) {
-                return unlink(path.ptr()) == 0;
-            }
-            return rmdir(path.ptr());
-        }
-        return false;
+    @TestOnly
+    public static void setFDCacheCounter(int newValue) {
+        fdCache.setFDCounter(newValue);
     }
 
     public static boolean setLastModified(LPSZ lpsz, long millis) {
@@ -533,8 +543,12 @@ public final class Files {
 
     public static native int sync();
 
+    public static int toOsFd(long fd) {
+        return fdCache.toOsFd(fd);
+    }
+
     public static boolean touch(LPSZ lpsz) {
-        int fd = openRW(lpsz);
+        long fd = openRW(lpsz);
         boolean result = fd > 0;
         if (result) {
             close(fd);
@@ -542,7 +556,9 @@ public final class Files {
         return result;
     }
 
-    public native static boolean truncate(int fd, long size);
+    public static boolean truncate(long fd, long size) {
+        return truncate(toOsFd(fd), size);
+    }
 
     public static int typeDirOrSoftLinkDirNoDots(Path path, int rootLen, long pUtf8NameZ, int type, @Nullable MutableUtf8Sink nameSink) {
         if (!notDots(pUtf8NameZ)) {
@@ -601,14 +617,30 @@ public final class Files {
         }
     }
 
-    public native static long write(int fd, long address, long len, long offset);
+    public static long write(long fd, long address, long len, long offset) {
+        return write(toOsFd(fd), address, len, offset);
+    }
 
-    private native static int close0(int fd);
+    private native static boolean allocate(int fd, long size);
+
+    private native static long append(int fd, long address, long len);
+
+    private static native int copy(long from, long to);
+
+    private static native long copyData(int srcFd, int destFd, long offsetSrc, long length);
+
+    private static native long copyDataToOffset(int srcFd, int destFd, long offsetSrc, long offsetDest, long length);
+
+    private static native boolean exists(int fd);
 
     private static native boolean exists0(long lpsz);
 
+    private static native void fadvise0(int fd, long offset, long len, int advise);
+
     // caller must call findClose to free allocated struct
     private native static long findFirst(long lpszName);
+
+    private static native int fsync(int fd);
 
     private static native long getDiskSize(long lpszPath);
 
@@ -622,39 +654,167 @@ public final class Files {
 
     private native static int getPosixFadvSequential();
 
+    private native static int getMadvPopulateWrite();
+
+    private native static int getPosixMadvDontneed();
+
     private native static int getPosixMadvRandom();
 
     private native static int getPosixMadvSequential();
 
+    private native static int getStdOutFd();
+
     private native static boolean isDir(long pUtf8PathZ);
+
+    private native static long length(int fd);
 
     private native static long length0(long lpszName);
 
+    private static native int lock(int fd);
+
     private native static int mkdir(long lpszPath, int mode);
-
-    private static native long mmap0(int fd, long len, long offset, int flags, long baseAddress);
-
-    private static native long mremap0(int fd, long address, long previousSize, long newSize, long offset, int flags);
-
-    private static native int munmap0(long address, long len);
 
     private native static int openAppend(long lpszName);
 
-    private native static int openRO(long lpszName);
-
     private native static int openRW(long lpszName);
 
-    private native static int openRWOpts(long lpszName, long opts);
+    private native static int openRWOpts(long lpszName, int opts);
+
+    private native static long read(int fd, long address, long len, long offset);
+
+    private native static long readIntAsUnsignedLong(int fd, long offset);
 
     private static native int readLink0(long lpszPath, long buffer, int len);
 
-    private native static boolean remove(long lpsz);
+    private native static byte readNonNegativeByte(int fd, long offset);
 
-    private static native int rename(long lpszOld, long lpszNew);
+    private native static int readNonNegativeInt(int fd, long offset);
+
+    private native static long readNonNegativeLong(int fd, long offset);
+
+    private native static short readNonNegativeShort(int fd, long offset);
 
     private native static boolean rmdir(long lpsz);
 
+    private static int rmdir(Path path, boolean haltOnFail, int recursiveDepth, int maxRecursiveDepth, Log log) {
+        if (recursiveDepth >= maxRecursiveDepth) {
+            if (log != null) {
+                log.critical().$("maximum recursive depth of ").$(maxRecursiveDepth).$(" exceeded when deleting ").$(path).$();
+            }
+            return -recursiveDepth - 1;
+        }
+        int maxDepth = recursiveDepth;
+        path.$();
+        long pFind = findFirst(path.ptr());
+        if (pFind > 0L) {
+            int len = path.size();
+            int res;
+            int type;
+            long nameUtf8Ptr;
+            try {
+                do {
+                    nameUtf8Ptr = findName(pFind);
+                    path.trimTo(len).concat(nameUtf8Ptr).$();
+                    type = findType(pFind);
+                    if (type == Files.DT_FILE) {
+                        if (!remove(path.ptr())) {
+                            if (haltOnFail || Files.isSecurityError(Os.errno())) {
+                                return -maxDepth - 1;
+                            }
+                        }
+                    } else if (notDots(nameUtf8Ptr)) {
+                        res = type == Files.DT_LNK ? unlink0(path, recursiveDepth) : rmdir(path, haltOnFail, recursiveDepth + 1, maxRecursiveDepth, log);
+                        if (res < 0) {
+                            if (haltOnFail || Files.isSecurityError(Os.errno())) {
+                                return Math.min(-maxDepth - 1, res);
+                            }
+                            maxDepth = Math.max(maxDepth, -res - 1);
+                        } else {
+                            maxDepth = Math.max(maxDepth, res);
+                        }
+                    }
+                }
+                while (findNext(pFind) > 0);
+            } finally {
+                findClose(pFind);
+                path.trimTo(len).$();
+            }
+
+            if (isSoftLink(path.ptr())) {
+                res = unlink0(path, recursiveDepth);
+                if (res < 0) {
+                    if (haltOnFail || Files.isSecurityError(Os.errno())) {
+                        return Math.min(-maxDepth - 1, res);
+                    }
+                    maxDepth = Math.max(maxDepth, -res - 1);
+                } else {
+                    return Math.max(maxDepth, res);
+                }
+            } else {
+                return rmdir(path.ptr()) ? maxDepth : -maxDepth - 1;
+            }
+        }
+        return -maxDepth - 1;
+    }
+
     private native static boolean setLastModified(long lpszName, long millis);
+
+    private native static boolean truncate(int fd, long size);
+
+    private static int unlink0(Path path, int recursiveDepth) {
+        int unlinkRes = unlink(path.ptr());
+        if (unlinkRes != 0) {
+            return -recursiveDepth - 1;
+        } else {
+            return recursiveDepth;
+        }
+    }
+
+    private native static long write(int fd, long address, long len, long offset);
+
+    native static int close0(int fd);
+
+    static boolean isSecurityError(int errno) {
+        if (Os.isLinux()) {
+            return errno == CairoException.ERRNO_EACCES_LINUX || errno == CairoException.ERRNO_EPERM_LINUX;
+        } else if (Os.isWindows()) {
+            return errno == CairoException.ERRNO_ACCESS_DENIED_WIN;
+        } else if (Os.isOSX()) {
+            return errno == CairoException.ERRNO_EACCES_MACOS || errno == CairoException.ERRNO_EPERM_MACOS;
+        }
+        return false;
+    }
+
+    static native long mmap0(int fd, long len, long offset, int flags, long baseAddress);
+
+    static native long mremap0(int fd, long address, long previousSize, long newSize, long offset, int flags);
+
+    static native int munmap0(long address, long len);
+
+    native static int openRO(long lpszName);
+
+    native static boolean remove(long lpsz);
+
+    static native int rename(long lpszOld, long lpszNew);
+
+    /**
+     * Removes directory recursively. When function fails the caller has to check Os.errno() for the diagnostics.
+     * The function can operate in two modes, eager and haltOnFail. In haltOnFail mode function fails fast, providing precise
+     * error number. In eager mode function will free most of the disk space but likely to fail on deleting non-empty
+     * directory, should some files remain. Thus, not providing correct diagnostics.
+     * <p>
+     * rmdir() will fail if directory does not exist
+     *
+     * @param path       path to the directory, must include trailing slash (/)
+     * @param haltOnFail when true removing directory will halt on first failed attempt to remove directory contents. When
+     *                   false, the function will remove as many files and subdirectories as possible. That might be useful
+     *                   when the intent is to free up as much disk space as possible.
+     * @param log        log instance to report critical errors to, can be null
+     * @return >=0 depth of the removed directory on success, negative number indicates failure
+     */
+    static int rmdir(Path path, boolean haltOnFail, Log log) {
+        return rmdir(path, haltOnFail, 0, RMDIR_MAX_DEPTH, log);
+    }
 
     static {
         Os.init();
@@ -666,11 +826,15 @@ public final class Files {
             POSIX_FADV_SEQUENTIAL = getPosixFadvSequential();
             POSIX_MADV_RANDOM = getPosixMadvRandom();
             POSIX_MADV_SEQUENTIAL = getPosixMadvSequential();
+            POSIX_MADV_DONTNEED = getPosixMadvDontneed();
+            POSIX_MADV_POPULATE_WRITE = getMadvPopulateWrite();
         } else {
             POSIX_FADV_SEQUENTIAL = -1;
             POSIX_FADV_RANDOM = -1;
             POSIX_MADV_SEQUENTIAL = -1;
             POSIX_MADV_RANDOM = -1;
+            POSIX_MADV_DONTNEED = -1;
+            POSIX_MADV_POPULATE_WRITE = -1;
         }
     }
 }

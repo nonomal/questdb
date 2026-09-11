@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -25,6 +25,7 @@
 package io.questdb.test.mp;
 
 import io.questdb.mp.SOCountDownLatch;
+import io.questdb.test.tools.TestUtils;
 import org.junit.Assert;
 import org.junit.Test;
 
@@ -47,64 +48,6 @@ public class SOCountDownLatchTest {
     }
 
     @Test
-    public void testAwait_concurrentCountDown() {
-        int concLevel = 200;
-
-        SOCountDownLatch latch = new SOCountDownLatch(concLevel);
-        CyclicBarrier barrier = new CyclicBarrier(concLevel);
-        AtomicInteger countDownCounter = new AtomicInteger();
-        AtomicInteger errorCounter = new AtomicInteger();
-        for (int i = 0; i < concLevel; i++) {
-            new Thread(() -> {
-                try {
-                    barrier.await();
-                    countDownCounter.incrementAndGet();
-                    latch.countDown();
-                } catch (InterruptedException | BrokenBarrierException e) {
-                    errorCounter.incrementAndGet();
-                    throw new RuntimeException(e);
-                }
-            }).start();
-        }
-
-        latch.await(); // make sure we don't get stuck on await()
-        Assert.assertEquals("await() returned prematurely", concLevel, countDownCounter.get());
-        Assert.assertEquals(0, latch.getCount());
-        Assert.assertEquals(0, errorCounter.get());
-    }
-
-    @Test
-    public void testAwaitTimeout_timingOut() {
-        SOCountDownLatch latch = new SOCountDownLatch();
-        latch.setCount(2);
-        new Thread(latch::countDown).start();
-        Assert.assertFalse(latch.await(TimeUnit.MILLISECONDS.toNanos(100)));
-    }
-
-    @Test
-    public void testConcurrentCountDown_countIsNeverNegative() throws Exception {
-        int count = 50;
-        int concLevel = 2 * count; // intentionally more than count
-
-        SOCountDownLatch latch = new SOCountDownLatch(count);
-        CyclicBarrier barrier = new CyclicBarrier(concLevel + 1);
-        for (int i = 0; i < concLevel; i++) {
-            new Thread(() -> {
-                try {
-                    barrier.await();
-                } catch (InterruptedException | BrokenBarrierException e) {
-                    throw new RuntimeException(e);
-                }
-                latch.countDown();
-            }).start();
-        }
-
-        barrier.await();
-        latch.await();
-        Assert.assertEquals(0, latch.getCount());
-    }
-
-    @Test
     public void testAwaitTimeout() {
         int concLevel = 200;
 
@@ -118,6 +61,27 @@ public class SOCountDownLatchTest {
         // now we have 0 count, so await() should return immediately, we still wait for a bit
         // to prevent false negative due to OS/JVM hiccups
         Assert.assertTrue(latch.await(TimeUnit.SECONDS.toNanos(5)));
+    }
+
+    @Test
+    public void testAwaitTimeoutWhileInterrupted() throws Exception {
+        final SOCountDownLatch latch = new SOCountDownLatch(1);
+        final long timeoutNanos = TimeUnit.MILLISECONDS.toNanos(500);
+        TestUtils.assertInterruptedWaitTimesOutWithoutSpin(
+                "SOCountDownLatch await",
+                timeoutNanos,
+                () -> latch.await(timeoutNanos),
+                () -> latch.await(TimeUnit.SECONDS.toNanos(30)),
+                latch::countDown
+        );
+    }
+
+    @Test
+    public void testAwaitTimeout_timingOut() {
+        SOCountDownLatch latch = new SOCountDownLatch();
+        latch.setCount(2);
+        new Thread(latch::countDown).start();
+        Assert.assertFalse(latch.await(TimeUnit.MILLISECONDS.toNanos(100)));
     }
 
     @Test
@@ -151,5 +115,55 @@ public class SOCountDownLatchTest {
         Assert.assertTrue("Elapsed time should be close to timeout. " +
                         "Expected=" + awaitTimeoutNanos + "ns, actual = " + elapsed + "ns",
                 elapsed <= maxElapsed);
+    }
+
+    @Test
+    public void testAwait_concurrentCountDown() {
+        int concLevel = 200;
+
+        SOCountDownLatch latch = new SOCountDownLatch(concLevel);
+        CyclicBarrier barrier = new CyclicBarrier(concLevel);
+        AtomicInteger countDownCounter = new AtomicInteger();
+        AtomicInteger errorCounter = new AtomicInteger();
+        for (int i = 0; i < concLevel; i++) {
+            new Thread(() -> {
+                try {
+                    barrier.await();
+                    countDownCounter.incrementAndGet();
+                    latch.countDown();
+                } catch (InterruptedException | BrokenBarrierException e) {
+                    errorCounter.incrementAndGet();
+                    throw new RuntimeException(e);
+                }
+            }).start();
+        }
+
+        latch.await(); // make sure we don't get stuck on await()
+        Assert.assertEquals("await() returned prematurely", concLevel, countDownCounter.get());
+        Assert.assertEquals(0, latch.getCount());
+        Assert.assertEquals(0, errorCounter.get());
+    }
+
+    @Test
+    public void testConcurrentCountDown_countIsNeverNegative() throws Exception {
+        int count = 50;
+        int concLevel = 2 * count; // intentionally more than count
+
+        SOCountDownLatch latch = new SOCountDownLatch(count);
+        CyclicBarrier barrier = new CyclicBarrier(concLevel + 1);
+        for (int i = 0; i < concLevel; i++) {
+            new Thread(() -> {
+                try {
+                    barrier.await();
+                } catch (InterruptedException | BrokenBarrierException e) {
+                    throw new RuntimeException(e);
+                }
+                latch.countDown();
+            }).start();
+        }
+
+        barrier.await();
+        latch.await();
+        Assert.assertEquals(0, latch.getCount());
     }
 }

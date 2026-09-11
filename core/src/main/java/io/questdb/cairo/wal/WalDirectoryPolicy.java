@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,12 +24,32 @@
 
 package io.questdb.cairo.wal;
 
+import io.questdb.cairo.TableToken;
 import io.questdb.std.str.Path;
 
 public interface WalDirectoryPolicy {
     void initDirectory(Path dirPath);
 
+    /**
+     * Initializes a WAL segment or sequencer directory the given table owns. Editions that mark a
+     * directory as owing work elsewhere (Enterprise writes an {@code upload.pending} marker that
+     * pins the directory against {@link WalPurgeJob}) need the token to tell whether the table
+     * participates in that work at all -- a node-local table such as a live view never ships its
+     * WAL, so a marker on it would pin the directory with nothing left to clear it.
+     */
+    default void initDirectory(Path dirPath, TableToken tableToken) {
+        initDirectory(dirPath);
+    }
+
+    default void initSequencerPart(Path seqDirPath, long partId) {
+    }
+
     boolean isInUse(Path path);
+
+    @SuppressWarnings("SameReturnValue")
+    default boolean isSeqPartInUse(Path seqDirPath, long partId) {
+        return false;
+    }
 
     void rollbackDirectory(Path path);
 

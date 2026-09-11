@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -63,7 +63,7 @@ public class NotEqStrFunctionFactoryTest extends AbstractCairoTest {
                 "KF\tOP\t0.6797562990945702\n";
 
         assertMemoryLeak(() -> {
-            ddl("create table x as (" +
+            execute("create table x as (" +
                     " select" +
                     " rnd_str(2,2,1) a," +
                     " rnd_str(2,2,1) b," +
@@ -71,9 +71,9 @@ public class NotEqStrFunctionFactoryTest extends AbstractCairoTest {
                     " from long_sequence(30)" +
                     ")");
 
-            assertSql(
-                    expected, "x where a <> b"
-            );
+            assertQuery("x where a <> b")
+                    .noLeakCheck()
+                    .returns(expected);
         });
     }
 
@@ -92,7 +92,7 @@ public class NotEqStrFunctionFactoryTest extends AbstractCairoTest {
                 "RY\tFB\t0.0011075361080621349\n";
 
         assertMemoryLeak(() -> {
-            ddl("create table x as (" +
+            execute("create table x as (" +
                     " select" +
                     " rnd_str(2,2,0) a," +
                     " rnd_str(2,2,0) b," +
@@ -100,9 +100,9 @@ public class NotEqStrFunctionFactoryTest extends AbstractCairoTest {
                     " from long_sequence(10)" +
                     ")");
 
-            assertSql(
-                    expected, "x where a <> 'TJ'"
-            );
+            assertQuery("x where a <> 'TJ'")
+                    .noLeakCheck()
+                    .returns(expected);
         });
     }
 
@@ -120,7 +120,7 @@ public class NotEqStrFunctionFactoryTest extends AbstractCairoTest {
                 "RY\tFB\t0.0011075361080621349\n";
 
         assertMemoryLeak(() -> {
-            ddl("create table x as (" +
+            execute("create table x as (" +
                     " select" +
                     " rnd_str(2,2,0) a," +
                     " rnd_str(2,2,0) b," +
@@ -128,9 +128,9 @@ public class NotEqStrFunctionFactoryTest extends AbstractCairoTest {
                     " from long_sequence(10)" +
                     ")");
 
-            assertSql(
-                    expected, "x where 'TJ' <> a"
-            );
+            assertQuery("x where 'TJ' <> a")
+                    .noLeakCheck()
+                    .returns(expected);
         });
     }
 
@@ -155,7 +155,7 @@ public class NotEqStrFunctionFactoryTest extends AbstractCairoTest {
                 "HO\tNV\t0.8940917126581895\n";
 
         assertMemoryLeak(() -> {
-            ddl("create table x as (" +
+            execute("create table x as (" +
                     " select" +
                     " rnd_str(2,2,1) a," +
                     " rnd_str(2,2,0) b," +
@@ -163,9 +163,9 @@ public class NotEqStrFunctionFactoryTest extends AbstractCairoTest {
                     " from long_sequence(20)" +
                     ")");
 
-            assertSql(
-                    expected, "x where a <> null"
-            );
+            assertQuery("x where a <> null")
+                    .noLeakCheck()
+                    .returns(expected);
         });
     }
 
@@ -190,7 +190,7 @@ public class NotEqStrFunctionFactoryTest extends AbstractCairoTest {
                 "HO\tNV\t0.8940917126581895\n";
 
         assertMemoryLeak(() -> {
-            ddl("create table x as (" +
+            execute("create table x as (" +
                     " select" +
                     " rnd_str(2,2,1) a," +
                     " rnd_str(2,2,0) b," +
@@ -198,9 +198,9 @@ public class NotEqStrFunctionFactoryTest extends AbstractCairoTest {
                     " from long_sequence(20)" +
                     ")");
 
-            assertSql(
-                    expected, "x where null <> a"
-            );
+            assertQuery("x where null <> a")
+                    .noLeakCheck()
+                    .returns(expected);
         });
     }
 }

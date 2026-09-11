@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -31,7 +31,12 @@ import io.questdb.cairo.vm.api.MemoryCMARW;
 import io.questdb.cairo.vm.api.MemoryMAR;
 import io.questdb.log.Log;
 import io.questdb.log.LogFactory;
-import io.questdb.std.*;
+import io.questdb.std.Files;
+import io.questdb.std.FilesFacade;
+import io.questdb.std.Long256Acceptor;
+import io.questdb.std.MemoryTag;
+import io.questdb.std.Numbers;
+import io.questdb.std.Vect;
 import io.questdb.std.str.LPSZ;
 import io.questdb.std.str.Utf8Sequence;
 import org.jetbrains.annotations.NotNull;
@@ -44,18 +49,21 @@ public class MemoryCMARWImpl extends AbstractMemoryCR implements MemoryCMARW, Me
     private long appendAddress = 0;
     private boolean closeFdOnClose = true;
     private long extendSegmentMsb;
-    private int fd = -1;
+    private long fd = -1;
     private int madviseOpts = -1;
     private int memoryTag = MemoryTag.MMAP_DEFAULT;
     private long minMappedMemorySize = -1;
 
-    public MemoryCMARWImpl(FilesFacade ff, LPSZ name, long extendSegmentSize, long size, int memoryTag, long opts) {
-        super(false);
-        of(ff, name, extendSegmentSize, size, memoryTag, opts, -1);
+    public MemoryCMARWImpl(FilesFacade ff, LPSZ name, long extendSegmentSizePow2, long size, int memoryTag, int opts) {
+        of(ff, name, extendSegmentSizePow2, size, memoryTag, opts, -1);
     }
 
     public MemoryCMARWImpl() {
-        super(false);
+    }
+
+    @Override
+    public long addressHi() {
+        return lim;
     }
 
     @Override
@@ -70,6 +78,11 @@ public class MemoryCMARWImpl extends AbstractMemoryCR implements MemoryCMARW, Me
     public long appendAddressFor(long offset, long bytes) {
         checkAndExtend(pageAddress + offset + bytes);
         return pageAddress + offset;
+    }
+
+    @Override
+    public void changeSize(long dataSize) {
+        throw new UnsupportedOperationException();
     }
 
     @Override
@@ -92,8 +105,8 @@ public class MemoryCMARWImpl extends AbstractMemoryCR implements MemoryCMARW, Me
                         }
                     } catch (CairoException e) {
                         LOG.error().$("cannot determine file length to safely truncate [fd=").$(fd)
+                                .$(", msg=").$safe(e.getFlyweightMessage())
                                 .$(", errno=").$(e.getErrno())
-                                .$(", error=").$(e.getFlyweightMessage())
                                 .I$();
                     }
                 }
@@ -121,17 +134,29 @@ public class MemoryCMARWImpl extends AbstractMemoryCR implements MemoryCMARW, Me
         }
         size = 0;
         ff = null;
+        // Drop the append bounds of the mapping we no longer own. checkAndExtend() returns
+        // early for any address at or below lim, so a stale lim lets jumpTo()/appendAddressFor()
+        // hand out pointers into unmapped space instead of failing, and zero() -- which memsets
+        // lim - pageAddress bytes from pageAddress, already nulled above -- would memset lim
+        // bytes starting at address 0. Reset unconditionally: a close on an instance that never
+        // mapped anything must end in the same clean state, same as size and ff.
+        lim = 0;
+        appendAddress = 0;
     }
 
     @Override
     public void close() {
+        // we have to clear the underling memory
+        // to ensure direct strings obtained from
+        // this memory do not segfault
+        clear();
         close(true);
     }
 
     @Override
-    public int detachFdClose() {
+    public long detachFdClose() {
         try {
-            int fd = this.fd;
+            long fd = this.fd;
             this.closeFdOnClose = false;
             close();
             assert this.fd == -1;
@@ -169,7 +194,7 @@ public class MemoryCMARWImpl extends AbstractMemoryCR implements MemoryCMARW, Me
     }
 
     @Override
-    public int getFd() {
+    public long getFd() {
         return fd;
     }
 
@@ -186,37 +211,39 @@ public class MemoryCMARWImpl extends AbstractMemoryCR implements MemoryCMARW, Me
     }
 
     @Override
-    public void of(FilesFacade ff, LPSZ name, long extendSegmentSize, int memoryTag, long opts) {
+    public void of(FilesFacade ff, LPSZ name, long extendSegmentSize, int memoryTag, int opts) {
         of(ff, name, extendSegmentSize, -1, memoryTag, opts);
     }
 
     @Override
-    public void of(FilesFacade ff, LPSZ name, long extendSegmentSize, long size, int memoryTag, long opts, int madviseOpts) {
-        this.extendSegmentMsb = Numbers.msb(extendSegmentSize);
-        this.minMappedMemorySize = extendSegmentSize;
+    public void of(FilesFacade ff, LPSZ name, long extendSegmentSizePow2, long size, int memoryTag, int opts, int madviseOpts) {
+        this.extendSegmentMsb = Numbers.msb(extendSegmentSizePow2);
+        this.minMappedMemorySize = extendSegmentSizePow2;
         this.madviseOpts = madviseOpts;
         openFile(ff, name, opts);
         try {
             map(ff, name, size, memoryTag);
         } catch (Throwable th) {
             ff.close(fd);
+            fd = -1;
             throw th;
         }
     }
 
     @Override
-    public void of(FilesFacade ff, int fd, @Nullable LPSZ fileName, long size, int memoryTag) {
+    public void of(FilesFacade ff, long fd, @Nullable LPSZ fileName, long size, int memoryTag) {
         close();
         assert fd > 0;
         this.ff = ff;
-        this.extendSegmentMsb = ff.getMapPageSize();
-        this.minMappedMemorySize = this.extendSegmentMsb;
+        this.extendSegmentMsb = Numbers.msb(ff.getMapPageSize());
+        this.minMappedMemorySize = ff.getMapPageSize();
         this.fd = fd;
         map(ff, fileName, size, memoryTag);
     }
 
     @Override
-    public void of(FilesFacade ff, int fd, @Nullable LPSZ fileName, long extendSegmentSize, long size, int memoryTag) {
+    public void of(FilesFacade ff, long fd, boolean keepFdOpen, @Nullable LPSZ fileName, long extendSegmentSize, long size, int memoryTag) {
+        this.closeFdOnClose = !keepFdOpen;
         of(ff, fd, null, size, memoryTag);
         this.extendSegmentMsb = Numbers.msb(extendSegmentSize);
     }
@@ -237,10 +264,56 @@ public class MemoryCMARWImpl extends AbstractMemoryCR implements MemoryCMARW, Me
         appendAddress += bytes;
     }
 
+    public void swapState(MemoryCMARWImpl other) {
+        long tFd = this.fd;
+        this.fd = other.fd;
+        other.fd = tFd;
+
+        long tPage = this.pageAddress;
+        this.pageAddress = other.pageAddress;
+        other.pageAddress = tPage;
+
+        long tLim = this.lim;
+        this.lim = other.lim;
+        other.lim = tLim;
+
+        long tSize = this.size;
+        this.size = other.size;
+        other.size = tSize;
+
+        long tApp = this.appendAddress;
+        this.appendAddress = other.appendAddress;
+        other.appendAddress = tApp;
+
+        FilesFacade tFf = this.ff;
+        this.ff = other.ff;
+        other.ff = tFf;
+
+        long tSeg = this.extendSegmentMsb;
+        this.extendSegmentMsb = other.extendSegmentMsb;
+        other.extendSegmentMsb = tSeg;
+
+        long tMin = this.minMappedMemorySize;
+        this.minMappedMemorySize = other.minMappedMemorySize;
+        other.minMappedMemorySize = tMin;
+
+        int tMad = this.madviseOpts;
+        this.madviseOpts = other.madviseOpts;
+        other.madviseOpts = tMad;
+
+        int tTag = this.memoryTag;
+        this.memoryTag = other.memoryTag;
+        other.memoryTag = tTag;
+
+        boolean tCof = this.closeFdOnClose;
+        this.closeFdOnClose = other.closeFdOnClose;
+        other.closeFdOnClose = tCof;
+    }
+
     @Override
-    public void switchTo(FilesFacade ff, int fd, long extendSegmentSize, long offset, boolean truncate, byte truncateMode) {
+    public void switchTo(FilesFacade ff, long fd, long extendSegmentSizePow2, long offset, boolean truncate, byte truncateMode) {
         this.ff = ff;
-        this.extendSegmentMsb = Numbers.msb(extendSegmentSize);
+        this.extendSegmentMsb = Numbers.msb(extendSegmentSizePow2);
         close(truncate, truncateMode);
         this.fd = fd;
         map(ff, null, offset, memoryTag);
@@ -354,7 +427,7 @@ public class MemoryCMARWImpl extends AbstractMemoryCR implements MemoryCMARW, Me
         }
     }
 
-    private void openFile(FilesFacade ff, LPSZ name, long opts) {
+    private void openFile(FilesFacade ff, LPSZ name, int opts) {
         close();
         this.ff = ff;
         fd = TableUtils.openFileRWOrFail(ff, name, opts);

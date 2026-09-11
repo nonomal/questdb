@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,7 +24,11 @@
 
 package io.questdb.test;
 
-import io.questdb.*;
+import io.questdb.ConfigPropertyKey;
+import io.questdb.DefaultTelemetryConfiguration;
+import io.questdb.MessageBus;
+import io.questdb.Metrics;
+import io.questdb.TelemetryConfiguration;
 import io.questdb.cairo.CairoConfiguration;
 import io.questdb.cairo.CairoEngine;
 import io.questdb.cairo.sql.BindVariableService;
@@ -75,7 +79,7 @@ public class QuestDBTestNode {
     }
 
     public Metrics getMetrics() {
-        return cairo.metrics;
+        return cairo.configuration.getMetrics();
     }
 
     public CharSequence getRoot() {
@@ -110,15 +114,15 @@ public class QuestDBTestNode {
         griffin = new Griffin(cairo, circuitBreaker);
     }
 
-    public void setProperty(PropertyKey propertyKey, long value) {
+    public void setProperty(ConfigPropertyKey propertyKey, long value) {
         getConfigurationOverrides().setProperty(propertyKey, value);
     }
 
-    public void setProperty(PropertyKey propertyKey, String value) {
+    public void setProperty(ConfigPropertyKey propertyKey, String value) {
         getConfigurationOverrides().setProperty(propertyKey, value);
     }
 
-    public void setProperty(PropertyKey propertyKey, boolean value) {
+    public void setProperty(ConfigPropertyKey propertyKey, boolean value) {
         getConfigurationOverrides().setProperty(propertyKey, value);
     }
 
@@ -146,7 +150,6 @@ public class QuestDBTestNode {
     private static class Cairo {
         private final CairoConfiguration configuration;
         private final MessageBus messageBus;
-        private final Metrics metrics;
         private final Overrides overrides;
         private final boolean ownRoot;
         private final CharSequence root;
@@ -170,8 +173,7 @@ public class QuestDBTestNode {
             };
 
             configuration = configurationFactory.getInstance(root, telemetryConfiguration, overrides);
-            metrics = Metrics.enabled();
-            engine = engineFactory.getInstance(configuration, metrics);
+            engine = engineFactory.getInstance(configuration);
             messageBus = engine.getMessageBus();
         }
 
@@ -182,13 +184,16 @@ public class QuestDBTestNode {
             engine.getTableIdGenerator().open();
             engine.getTableIdGenerator().reset();
             engine.resetNameRegistryMemory();
+            engine.getWalLocker().clear();
             engine.setUp();
         }
 
         public void tearDown(boolean removeDir) {
             engine.getTableIdGenerator().close();
             engine.clear();
+            engine.getViewStateStore().clear();
             engine.closeNameRegistry();
+            engine.getMetrics().clear();
             if (removeDir && ownRoot) {
                 TestUtils.removeTestPath(root);
             }
@@ -214,6 +219,7 @@ public class QuestDBTestNode {
                             -1,
                             circuitBreaker
                     );
+            sqlExecutionContext.initNow();
             bindVariableService.clear();
         }
 

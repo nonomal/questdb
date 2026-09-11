@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,35 +24,34 @@
 
 package io.questdb.griffin.engine.table;
 
-import io.questdb.cairo.BitmapIndexReader;
 import io.questdb.cairo.EmptyRowCursor;
 import io.questdb.cairo.TableUtils;
-import io.questdb.cairo.sql.DataFrame;
+import io.questdb.cairo.idx.IndexReader;
+import io.questdb.cairo.sql.PageFrame;
+import io.questdb.cairo.sql.PageFrameMemory;
 import io.questdb.cairo.sql.RowCursor;
 import io.questdb.cairo.sql.RowCursorFactory;
 import io.questdb.griffin.PlanSink;
 
 public class LatestByValueIndexedRowCursorFactory implements RowCursorFactory {
-    private final boolean cachedIndexReaderCursor;
     private final int columnIndex;
     private final LatestByValueIndexedRowCursor cursor = new LatestByValueIndexedRowCursor();
     private final int symbolKey;
 
-    public LatestByValueIndexedRowCursorFactory(int columnIndex, int symbolKey, boolean cachedIndexReaderCursor) {
+    public LatestByValueIndexedRowCursorFactory(int columnIndex, int symbolKey) {
         this.columnIndex = columnIndex;
         this.symbolKey = TableUtils.toIndexKey(symbolKey);
-        this.cachedIndexReaderCursor = cachedIndexReaderCursor;
     }
 
     @Override
-    public RowCursor getCursor(DataFrame dataFrame) {
-        RowCursor cursor = dataFrame
-                .getBitmapIndexReader(columnIndex, BitmapIndexReader.DIR_BACKWARD)
-                .getCursor(cachedIndexReaderCursor, symbolKey, dataFrame.getRowLo(), dataFrame.getRowHi() - 1);
-
-        if (cursor.hasNext()) {
-            this.cursor.of(cursor.next());
-            return this.cursor;
+    public RowCursor getCursor(PageFrame pageFrame, PageFrameMemory pageFrameMemory) {
+        try (RowCursor indexReaderCursor = pageFrame
+                .getIndexReader(columnIndex, IndexReader.DIR_BACKWARD)
+                .getCursor(symbolKey, pageFrame.getPartitionLo(), pageFrame.getPartitionHi() - 1)) {
+            if (indexReaderCursor.hasNext()) {
+                cursor.of(indexReaderCursor.next());
+                return cursor;
+            }
         }
         return EmptyRowCursor.INSTANCE;
     }
@@ -69,7 +68,7 @@ public class LatestByValueIndexedRowCursorFactory implements RowCursorFactory {
 
     @Override
     public void toPlan(PlanSink sink) {
-        sink.type("Index ").type(BitmapIndexReader.NAME_BACKWARD).type(" scan").meta("on").putBaseColumnNameNoRemap(columnIndex);
-        sink.attr("filter").putBaseColumnNameNoRemap(columnIndex).val('=').val(symbolKey);
+        sink.type("Index ").type(IndexReader.NAME_BACKWARD).type(" scan").meta("on").putBaseColumnName(columnIndex);
+        sink.attr("filter").putBaseColumnName(columnIndex).val('=').val(symbolKey);
     }
 }

@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -108,6 +108,7 @@ public class TxSerializer {
             final int symbolsSize = tx.TX_OFFSET_MAP_WRITER_COUNT * Long.BYTES;
             final int partitionSegmentSize = tx.ATTACHED_PARTITIONS_COUNT * LONGS_PER_TX_ATTACHED_PARTITION * Long.BYTES;
             final long fileSize = calculateTxRecordSize(symbolsSize, partitionSegmentSize);
+            rwTxMem.jumpTo(fileSize);
             Vect.memset(rwTxMem.addressOf(0), fileSize, 0);
             rwTxMem.setTruncateSize(fileSize);
 
@@ -156,7 +157,7 @@ public class TxSerializer {
                     long maskedSize = ((part.MASK << 44) & TxReader.PARTITION_FLAGS_MASK) | (part.SIZE & TxReader.PARTITION_SIZE_MASK);
                     rwTxMem.putLong(maskedSize);
                     rwTxMem.putLong(part.NAME_TX);
-                    rwTxMem.putLong(part.DATA_TX);
+                    rwTxMem.putLong(part.PM_FILE_SIZE);
                 }
             }
         }
@@ -170,7 +171,7 @@ public class TxSerializer {
                 System.err.printf("file does not exist: %s%n", srcTxFilePath);
                 return null;
             }
-            try (MemoryMR roTxMem = Vm.getMRInstance(ff, path.$(), ff.length(path.$()), MemoryTag.MMAP_DEFAULT)) {
+            try (MemoryMR roTxMem = Vm.getCMRInstance(ff, path.$(), ff.length(path.$()), MemoryTag.MMAP_DEFAULT)) {
                 roTxMem.growToFileSize();
                 final long version = roTxMem.getLong(TX_BASE_OFFSET_VERSION_64);
                 final boolean isA = (version & 1L) == 0L;
@@ -233,7 +234,7 @@ public class TxSerializer {
                         offset += Long.BYTES;
                     }
                     if (offset + 7 < roTxMem.size()) {
-                        partition.DATA_TX = roTxMem.getLong(offset);
+                        partition.PM_FILE_SIZE = roTxMem.getLong(offset);
                         offset += Long.BYTES;
                     }
                 }

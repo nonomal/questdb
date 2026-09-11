@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -25,9 +25,30 @@
 package io.questdb.log;
 
 import io.questdb.Metrics;
-import io.questdb.mp.*;
-import io.questdb.std.*;
-import io.questdb.std.datetime.microtime.MicrosecondClock;
+import io.questdb.cairo.CairoException;
+import io.questdb.cairo.TimestampDriver;
+import io.questdb.mp.FanOut;
+import io.questdb.mp.Job;
+import io.questdb.mp.MPSequence;
+import io.questdb.mp.RingQueue;
+import io.questdb.mp.SCSequence;
+import io.questdb.mp.Sequence;
+import io.questdb.mp.WorkerPool;
+import io.questdb.mp.WorkerPoolConfiguration;
+import io.questdb.std.CharSequenceHashSet;
+import io.questdb.std.CharSequenceObjHashMap;
+import io.questdb.std.Chars;
+import io.questdb.std.IntObjHashMap;
+import io.questdb.std.MemoryTag;
+import io.questdb.std.Misc;
+import io.questdb.std.Numbers;
+import io.questdb.std.NumericException;
+import io.questdb.std.ObjHashSet;
+import io.questdb.std.ObjList;
+import io.questdb.std.Os;
+import io.questdb.std.ReadOnlyObjList;
+import io.questdb.std.Unsafe;
+import io.questdb.std.datetime.Clock;
 import io.questdb.std.datetime.microtime.MicrosecondClockImpl;
 import io.questdb.std.str.DirectUtf8Sequence;
 import io.questdb.std.str.Sinkable;
@@ -37,7 +58,12 @@ import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 import org.jetbrains.annotations.TestOnly;
 
-import java.io.*;
+import java.io.Closeable;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.Serializable;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
 import java.nio.file.Paths;
@@ -50,10 +76,10 @@ public class LogFactory implements Closeable {
     public static final String CONFIG_SYSTEM_PROPERTY = "out";
     public static final String DEBUG_TRIGGER = "ebug";
     public static final String DEBUG_TRIGGER_ENV = "QDB_DEBUG";
+    // name of default logging configuration file (in jar and in $root/conf/ dir)
     public static final String DEFAULT_CONFIG_NAME = "log.conf";
     // placeholder that can be used in log.conf to point to $root/log/ dir
     public static final String LOG_DIR_VAR = "${log.dir}";
-    // name of default logging configuration file (in jar and in $root/conf/ dir)
     private static final String DEFAULT_CONFIG = "/io/questdb/site/conf/" + DEFAULT_CONFIG_NAME;
     private static final int DEFAULT_LOG_LEVEL = LogLevel.INFO | LogLevel.ERROR | LogLevel.CRITICAL | LogLevel.ADVISORY;
     private static final int DEFAULT_MSG_SIZE = 4 * 1024;
@@ -65,26 +91,34 @@ public class LogFactory implements Closeable {
     private static boolean envEnabled = true;
     private static boolean guaranteedLogging = false;
     private static String rootDir;
-    private final MicrosecondClock clock;
+    private final Clock clock;
     private final AtomicBoolean closed = new AtomicBoolean();
     private final ObjList<DeferredLogger> deferredLoggers = new ObjList<>();
     private final ObjHashSet<LogWriter> jobs = new ObjHashSet<>();
+    private final WorkerPool loggingWorkerPool;
     private final AtomicBoolean running = new AtomicBoolean();
     private final CharSequenceObjHashMap<ScopeConfiguration> scopeConfigMap = new CharSequenceObjHashMap<>();
     private final ObjList<ScopeConfiguration> scopeConfigs = new ObjList<>();
     private final StringSink sink = new StringSink();
-    private final WorkerPool workerPool;
     private boolean configured = false;
+    private boolean isThreadHaltComplete;
+    private boolean isThreadHaltStarted;
     private int queueDepth = DEFAULT_QUEUE_DEPTH;
     private int recordLength = DEFAULT_MSG_SIZE;
+    private long workerPoolHaltTimeoutNanos = WorkerPool.DEFAULT_HALT_TIMEOUT_NANOS;
 
     public LogFactory() {
         this(MicrosecondClockImpl.INSTANCE);
     }
 
-    private LogFactory(MicrosecondClock clock) {
+    private LogFactory(Clock clock) {
         this.clock = clock;
-        workerPool = new WorkerPool(new WorkerPoolConfiguration() {
+        loggingWorkerPool = new WorkerPool(new WorkerPoolConfiguration() {
+            @Override
+            public Metrics getMetrics() {
+                return Metrics.DISABLED;
+            }
+
             @Override
             public String getPoolName() {
                 return "logging";
@@ -99,15 +133,27 @@ public class LogFactory implements Closeable {
             public boolean isDaemonPool() {
                 return true;
             }
-        }, Metrics.disabled());
+        });
     }
 
     public static synchronized void closeInstance() {
-        LogFactory logFactory = INSTANCE;
-        if (logFactory != null) {
-            logFactory.close(true);
-            INSTANCE = null;
+        final LogFactory logFactory = INSTANCE;
+        if (logFactory == null) {
+            return;
         }
+        logFactory.close(true);
+        INSTANCE = null;
+    }
+
+    public static synchronized void closeInstanceWithin(long timeoutNanos) {
+        final LogFactory logFactory = INSTANCE;
+        if (logFactory == null) {
+            return;
+        }
+        if (!logFactory.closeWithin(true, timeoutNanos)) {
+            throw new IllegalStateException("logging worker pool did not halt");
+        }
+        INSTANCE = null;
     }
 
     public static void configureRootDir(String rootDir) {
@@ -206,7 +252,7 @@ public class LogFactory implements Closeable {
         for (int i = 0, n = jobs.size(); i < n; i++) {
             LogWriter job = jobs.get(i);
             job.bindProperties(this);
-            workerPool.assign(job);
+            loggingWorkerPool.assign(job);
         }
     }
 
@@ -216,15 +262,29 @@ public class LogFactory implements Closeable {
     }
 
     public void close(boolean flush) {
+        if (!closeInternal(flush, 0, false)) {
+            throw new IllegalStateException("logging worker pool did not halt within timeout");
+        }
+    }
+
+    private synchronized boolean closeInternal(boolean flush, long deadlineNanos, boolean isBounded) {
         if (closed.compareAndSet(false, true)) {
-            haltThread();
+            try {
+                if (isBounded ? !haltThreadBy(deadlineNanos) : !haltThread()) {
+                    closed.set(false);
+                    return false;
+                }
+            } catch (Throwable th) {
+                closed.set(false);
+                throw th;
+            }
             for (int i = 0, n = jobs.size(); i < n; i++) {
                 LogWriter job = jobs.get(i);
                 try {
                     if (job != null && flush) {
                         try {
                             // noinspection StatementWithEmptyBody
-                            while (job.run(0, Job.TERMINATING_STATUS)) {
+                            while (job.run(Job.TERMINATING_STATUS)) {
                                 // Keep running the job until it returns false to log all the buffered messages
                             }
                         } catch (Exception th) {
@@ -240,6 +300,11 @@ public class LogFactory implements Closeable {
                 Misc.free(scopeConfigs.getQuick(i));
             }
         }
+        return true;
+    }
+
+    private boolean closeWithin(boolean flush, long timeoutNanos) {
+        return closeInternal(flush, System.nanoTime() + Math.max(0, timeoutNanos), true);
     }
 
     public Log create(Class<?> clazz) {
@@ -326,23 +391,13 @@ public class LogFactory implements Closeable {
         }
 
         boolean initialized = false;
-        // prevent creating blank log dir from unit tests
-        String logDir = ".";
         if (rootDir != null && DEFAULT_CONFIG.equals(conf)) {
-            logDir = Paths.get(rootDir, "log").toAbsolutePath().toString();
-            File logDirFile = new File(logDir);
-            if (!logDirFile.exists() && logDirFile.mkdir()) {
-                System.err.printf("Created log directory: %s%n", logDir);
-            }
-
             String logPath = Paths.get(rootDir, "conf", DEFAULT_CONFIG_NAME).toAbsolutePath().toString();
             File f = new File(logPath);
             if (f.isFile() && f.canRead()) {
                 System.err.printf("Reading log configuration from %s%n", logPath);
                 try (FileInputStream fis = new FileInputStream(logPath)) {
-                    Properties properties = new Properties();
-                    properties.load(fis);
-                    configureFromProperties(properties, logDir);
+                    configure(fis, rootDir);
                     initialized = true;
                 } catch (IOException e) {
                     throw new LogError("Cannot read " + logPath, e);
@@ -354,17 +409,13 @@ public class LogFactory implements Closeable {
             // in this order of initialization specifying -Dout might end up using internal jar resources ...
             try (InputStream is = LogFactory.class.getResourceAsStream(conf)) {
                 if (is != null) {
-                    Properties properties = new Properties();
-                    properties.load(is);
-                    configureFromProperties(properties, logDir);
+                    configure(is, rootDir);
                     System.err.println("Log configuration loaded from default internal file.");
                 } else {
                     File f = new File(conf);
                     if (f.canRead()) {
                         try (FileInputStream fis = new FileInputStream(f)) {
-                            Properties properties = new Properties();
-                            properties.load(fis);
-                            configureFromProperties(properties, logDir);
+                            configure(fis, rootDir);
                             System.err.printf("Log configuration loaded from: %s%n", conf);
                         }
                     } else {
@@ -390,13 +441,24 @@ public class LogFactory implements Closeable {
         startThread();
     }
 
+    @TestOnly
+    public void setWorkerPoolHaltTimeoutForTesting(long timeoutNanos) {
+        if (timeoutNanos < 0) {
+            throw new IllegalArgumentException("timeoutNanos must be non-negative");
+        }
+        workerPoolHaltTimeoutNanos = timeoutNanos;
+    }
+
     public void startThread() {
         assert !closed.get();
+        if (isThreadHaltStarted) {
+            throw new IllegalStateException("logging worker pool cannot restart after halt");
+        }
         if (running.compareAndSet(false, true)) {
             for (int i = 0, n = jobs.size(); i < n; i++) {
-                workerPool.assign(jobs.get(i));
+                loggingWorkerPool.assign(jobs.get(i));
             }
-            workerPool.start();
+            loggingWorkerPool.start();
         }
     }
 
@@ -437,7 +499,7 @@ public class LogFactory implements Closeable {
     }
 
     @SuppressWarnings("rawtypes")
-    private static LogWriterConfig createWriter(final Properties properties, String writerName, String logDir) {
+    private static LogWriterConfig createWriter(final Properties properties, String writerName) {
         final String writer = "w." + writerName + '.';
         final String clazz = getProperty(properties, writer + "class");
         final String levelStr = getProperty(properties, writer + "level");
@@ -499,7 +561,6 @@ public class LogFactory implements Closeable {
                 for (String n : properties.stringPropertyNames()) {
                     if (n.startsWith(writer)) {
                         String p = n.substring(writer.length());
-
                         if (reserved.contains(p)) {
                             continue;
                         }
@@ -507,13 +568,8 @@ public class LogFactory implements Closeable {
                         try {
                             Field f = cl.getDeclaredField(p);
                             if (f.getType() == String.class) {
-
                                 String value = getProperty(properties, n);
-                                if (logDir != null && value.contains(LOG_DIR_VAR)) {
-                                    value = value.replace(LOG_DIR_VAR, logDir);
-                                }
-
-                                Unsafe.getUnsafe().putObject(w1, Unsafe.getUnsafe().objectFieldOffset(f), value);
+                                Unsafe.putObject(w1, Unsafe.objectFieldOffset(f), value);
                             }
                         } catch (Exception e) {
                             throw new LogError("Unknown property: " + n, e);
@@ -561,6 +617,39 @@ public class LogFactory implements Closeable {
         }
     }
 
+    private void configure(InputStream fis, String rootDir) throws IOException {
+        Properties properties = new Properties();
+        properties.load(fis);
+
+        // QDB_LOG_LOG_DIR env variable can be used to override log directory
+        String logDir = getProperty(properties, "log.dir");
+        if (logDir == null) {
+            if (rootDir != null) {
+                logDir = Paths.get(rootDir, "log").toAbsolutePath().toString();
+            } else {
+                logDir = ".";
+            }
+        }
+        boolean usesLogDirVar = false;
+        for (String n : properties.stringPropertyNames()) {
+            String value = getProperty(properties, n);
+            if (value.contains(LOG_DIR_VAR)) {
+                usesLogDirVar = true;
+                value = value.replace(LOG_DIR_VAR, logDir);
+                properties.put(n, value);
+            }
+        }
+
+        if (usesLogDirVar) {
+            File logDirFile = new File(logDir);
+            if (!logDirFile.exists() && logDirFile.mkdirs()) {
+                System.err.printf("Created log directory: %s%n", logDir);
+            }
+        }
+
+        configureFromProperties(properties);
+    }
+
     private void configureDefaultWriter() {
         int level = DEFAULT_LOG_LEVEL;
         if (isForcedDebug()) {
@@ -570,7 +659,7 @@ public class LogFactory implements Closeable {
         bind();
     }
 
-    private void configureFromProperties(Properties properties, String logDir) {
+    private void configureFromProperties(Properties properties) {
         String writers = getProperty(properties, "writers");
 
         if (writers == null) {
@@ -596,8 +685,13 @@ public class LogFactory implements Closeable {
             }
         }
 
+        // ensure that file location is set, so the env var can be picked up later
+        if (properties.getProperty("w.file.location") == null) {
+            properties.put("w.file.location", "");
+        }
+
         for (String w : writers.split(",")) {
-            LogWriterConfig conf = createWriter(properties, w.trim(), logDir);
+            LogWriterConfig conf = createWriter(properties, w.trim());
             if (conf != null) {
                 add(conf);
             }
@@ -643,7 +737,7 @@ public class LogFactory implements Closeable {
     }
 
     private ScopeConfiguration find(CharSequence key) {
-        ObjList<CharSequence> keys = scopeConfigMap.keys();
+        ReadOnlyObjList<CharSequence> keys = scopeConfigMap.keys();
         CharSequence k = null;
 
         for (int i = 0, n = keys.size(); i < n; i++) {
@@ -661,16 +755,30 @@ public class LogFactory implements Closeable {
         return scopeConfigMap.get(k);
     }
 
-    private void haltThread() {
-        if (running.compareAndSet(true, false)) {
-            workerPool.halt();
+    private boolean haltThread() {
+        if (isThreadHaltComplete) {
+            return true;
         }
+        isThreadHaltStarted = true;
+        running.set(false);
+        isThreadHaltComplete = loggingWorkerPool.haltWithin(workerPoolHaltTimeoutNanos);
+        return isThreadHaltComplete;
+    }
+
+    private boolean haltThreadBy(long deadlineNanos) {
+        if (isThreadHaltComplete) {
+            return true;
+        }
+        isThreadHaltStarted = true;
+        running.set(false);
+        isThreadHaltComplete = loggingWorkerPool.haltBy(deadlineNanos);
+        return isThreadHaltComplete;
     }
 
     @TestOnly
     private void pauseThread() {
         if (running.compareAndSet(true, false)) {
-            workerPool.pause();
+            loggingWorkerPool.pause();
         }
     }
 
@@ -865,6 +973,7 @@ public class LogFactory implements Closeable {
     }
 
     private static class NoOpLogRecord implements LogRecord {
+        private int[] ryuE10;
 
         @Override
         public void $() {
@@ -882,11 +991,6 @@ public class LogFactory implements Closeable {
 
         @Override
         public LogRecord $(@Nullable DirectUtf8Sequence sequence) {
-            return this;
-        }
-
-        @Override
-        public LogRecord $(@NotNull CharSequence sequence, int lo, int hi) {
             return this;
         }
 
@@ -931,11 +1035,6 @@ public class LogFactory implements Closeable {
         }
 
         @Override
-        public LogRecord $uuid(long lo, long hi) {
-            return this;
-        }
-
-        @Override
         public LogRecord $(@Nullable Sinkable x) {
             return this;
         }
@@ -961,7 +1060,37 @@ public class LogFactory implements Closeable {
         }
 
         @Override
+        public LogRecord $safe(@NotNull CharSequence sequence, int lo, int hi) {
+            return this;
+        }
+
+        @Override
+        public LogRecord $safe(@Nullable DirectUtf8Sequence sequence) {
+            return this;
+        }
+
+        @Override
+        public LogRecord $safe(@Nullable Utf8Sequence sequence) {
+            return this;
+        }
+
+        @Override
+        public LogRecord $safe(long lo, long hi) {
+            return this;
+        }
+
+        @Override
+        public LogRecord $safe(@Nullable CharSequence sequence) {
+            return this;
+        }
+
+        @Override
         public LogRecord $size(long memoryBytes) {
+            return this;
+        }
+
+        @Override
+        public LogRecord $substr(int from, @Nullable DirectUtf8Sequence sequence) {
             return this;
         }
 
@@ -971,7 +1100,12 @@ public class LogFactory implements Closeable {
         }
 
         @Override
-        public LogRecord $utf8(long lo, long hi) {
+        public LogRecord $ts(TimestampDriver driver, long x) {
+            return this;
+        }
+
+        @Override
+        public LogRecord $uuid(long lo, long hi) {
             return this;
         }
 
@@ -1006,12 +1140,15 @@ public class LogFactory implements Closeable {
         }
 
         @Override
-        public LogRecord ts() {
-            return this;
+        public int[] ryuScratch() {
+            if (ryuE10 == null) {
+                ryuE10 = new int[1];
+            }
+            return ryuE10;
         }
 
         @Override
-        public LogRecord utf8(@Nullable CharSequence sequence) {
+        public LogRecord ts() {
             return this;
         }
     }
@@ -1046,6 +1183,9 @@ public class LogFactory implements Closeable {
                 // all bits in level mask will point to the same queue,
                 // so we just get most significant bit number
                 // and dereference queue on its index
+                if (c.getLevel() < 1) {
+                    throw CairoException.nonCritical().put("logging level not set"); // when `QDB_LOG_W_FILE_LEVEL` is missing (or on another driver)
+                }
                 Holder h = holderMap.get(channels[Numbers.msb(c.getLevel())]);
                 // check if this queue was used by another writer
                 if (h.wSeq != null) {

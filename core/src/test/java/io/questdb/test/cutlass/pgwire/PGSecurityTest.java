@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -26,20 +26,26 @@ package io.questdb.test.cutlass.pgwire;
 
 import io.questdb.DefaultFactoryProvider;
 import io.questdb.FactoryProvider;
+import io.questdb.cairo.CairoException;
 import io.questdb.cairo.security.SecurityContextFactory;
-import io.questdb.cutlass.pgwire.PGWireConfiguration;
-import io.questdb.cutlass.pgwire.PGWireServer;
+import io.questdb.cutlass.pgwire.PGConfiguration;
+import io.questdb.cutlass.pgwire.PGServer;
 import io.questdb.cutlass.pgwire.ReadOnlyUsersAwareSecurityContextFactory;
 import io.questdb.mp.WorkerPool;
 import io.questdb.std.Os;
 import io.questdb.test.tools.TestUtils;
 import org.jetbrains.annotations.NotNull;
-import org.junit.*;
+import org.junit.Assert;
+import org.junit.Assume;
+import org.junit.BeforeClass;
+import org.junit.Ignore;
+import org.junit.Test;
 import org.postgresql.PGProperty;
 import org.postgresql.util.PSQLException;
 
 import java.sql.Connection;
 import java.sql.DriverManager;
+import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
 import java.util.Properties;
@@ -56,7 +62,7 @@ public class PGSecurityTest extends BasePGTest {
             return READ_ONLY_SECURITY_CONTEXT_FACTORY;
         }
     };
-    private static final PGWireConfiguration READ_ONLY_CONF = new Port0PGWireConfiguration() {
+    private static final PGConfiguration READ_ONLY_CONF = new Port0PGConfiguration() {
         @Override
         public FactoryProvider getFactoryProvider() {
             return READ_ONLY_FACTORY_PROVIDER;
@@ -69,7 +75,7 @@ public class PGSecurityTest extends BasePGTest {
             return READ_ONLY_USER_SECURITY_CONTEXT_FACTORY;
         }
     };
-    private static final PGWireConfiguration READ_ONLY_USER_CONF = new Port0PGWireConfiguration() {
+    private static final PGConfiguration READ_ONLY_USER_CONF = new Port0PGConfiguration() {
         @Override
         public FactoryProvider getFactoryProvider() {
             return READ_ONLY_USER_FACTORY_PROVIDER;
@@ -94,22 +100,44 @@ public class PGSecurityTest extends BasePGTest {
     @Test
     public void testAllowsSelect() throws Exception {
         assertMemoryLeak(() -> {
-            ddl("create table src (ts TIMESTAMP)");
+            execute("create table src (ts TIMESTAMP)");
             executeWithPg("select * from src");
+        });
+    }
+
+    @Test
+    public void testCurrentUserReflectsConfiguredPrincipal() throws Exception {
+        // current_user() must report the authenticated pgwire user, not the hardcoded "admin" default
+        assertMemoryLeak(() -> {
+            try (
+                    final PGServer server = createPGServer(READ_ONLY_USER_CONF);
+                    final WorkerPool workerPool = server.getWorkerPool()
+            ) {
+                workerPool.start(LOG);
+                try (
+                        final Connection defaultUserConnection = getConnection(server.getPort(), false, true);
+                        final Connection roUserConnection = getConnectionWithReadOnlyUser(server.getPort())
+                ) {
+                    // the read-only user "user" gets a read-only context that still reports its own name
+                    assertCurrentUser(roUserConnection, "user");
+                    // the default admin user maps to the shared singleton and reports the default name
+                    assertCurrentUser(defaultUserConnection, "admin");
+                }
+            }
         });
     }
 
     @Test
     public void testDisallowAddNewColumn() throws Exception {
         assertMemoryLeak(() -> {
-            ddl("create table src (ts TIMESTAMP)");
+            execute("create table src (ts TIMESTAMP)");
             assertQueryDisallowed("alter table src add column newCol string");
         });
     }
 
     @Test
     public void testDisallowCopy() throws Exception {
-        ddl("create table testDisallowCopySerial (l long)");
+        execute("create table testDisallowCopySerial (l long)");
         assertMemoryLeak(() -> assertQueryDisallowed("copy testDisallowCopySerial from '/test-alltypes.csv' with header true"));
     }
 
@@ -123,7 +151,7 @@ public class PGSecurityTest extends BasePGTest {
         // we don't support DELETE yet. this test exists as a reminder to check read-only security context is honoured
         // when/if DELETE is implemented.
         assertMemoryLeak(() -> {
-            ddl("create table src (ts TIMESTAMP)");
+            execute("create table src (ts TIMESTAMP)");
             try {
                 executeWithPg("delete from src");
                 assertExceptionNoLeakCheck("It appears delete are implemented. Please change this test to check DELETE are refused with the read-only context");
@@ -137,7 +165,7 @@ public class PGSecurityTest extends BasePGTest {
     @Test
     public void testDisallowDrop() throws Exception {
         assertMemoryLeak(() -> {
-            ddl("create table src (ts TIMESTAMP)");
+            execute("create table src (ts TIMESTAMP)");
             assertQueryDisallowed("drop table src");
         });
     }
@@ -145,7 +173,7 @@ public class PGSecurityTest extends BasePGTest {
     @Test
     public void testDisallowInsert() throws Exception {
         assertMemoryLeak(() -> {
-            ddl("create table src (ts TIMESTAMP, name string) timestamp(ts) PARTITION BY DAY");
+            execute("create table src (ts TIMESTAMP, name string) timestamp(ts) PARTITION BY DAY");
             assertQueryDisallowed("insert into src values (now(), 'foo')");
         });
     }
@@ -153,8 +181,8 @@ public class PGSecurityTest extends BasePGTest {
     @Test
     public void testDisallowInsertAsSelect() throws Exception {
         assertMemoryLeak(() -> {
-            ddl("create table src (ts TIMESTAMP, name string) timestamp(ts) PARTITION BY DAY");
-            insert("insert into src values (now(), 'foo')");
+            execute("create table src (ts TIMESTAMP, name string) timestamp(ts) PARTITION BY DAY");
+            execute("insert into src values (now(), 'foo')");
             assertQueryDisallowed("insert into src select now(), name from src");
         });
     }
@@ -164,12 +192,12 @@ public class PGSecurityTest extends BasePGTest {
         // snapshot is not supported on Windows at all
         Assume.assumeTrue(Os.type != Os.WINDOWS);
         assertMemoryLeak(() -> {
-            ddl("create table src (ts TIMESTAMP, name string) timestamp(ts) PARTITION BY day");
-            ddl("snapshot prepare");
+            execute("create table src (ts TIMESTAMP, name string) timestamp(ts) PARTITION BY day");
+            execute("checkpoint create");
             try {
-                assertQueryDisallowed("snapshot complete");
+                assertQueryDisallowed("checkpoint release");
             } finally {
-                ddl("snapshot complete");
+                execute("checkpoint release");
             }
         });
     }
@@ -178,16 +206,16 @@ public class PGSecurityTest extends BasePGTest {
     public void testDisallowSnapshotPrepare() throws Exception {
         // snapshot is not supported on Windows at all
         assertMemoryLeak(() -> {
-            ddl("create table src (ts TIMESTAMP, name string) timestamp(ts) PARTITION BY day");
-            assertQueryDisallowed("snapshot prepare");
+            execute("create table src (ts TIMESTAMP, name string) timestamp(ts) PARTITION BY day");
+            assertQueryDisallowed("checkpoint create");
         });
     }
 
     @Test
     public void testDisallowTruncate() throws Exception {
         assertMemoryLeak(() -> {
-            ddl("create table src (ts TIMESTAMP, name string) timestamp(ts) PARTITION BY day");
-            insert("insert into src values (now(), 'foo')");
+            execute("create table src (ts TIMESTAMP, name string) timestamp(ts) PARTITION BY day");
+            execute("insert into src values (now(), 'foo')");
             assertQueryDisallowed("truncate table src");
         });
     }
@@ -195,8 +223,8 @@ public class PGSecurityTest extends BasePGTest {
     @Test
     public void testDisallowUpdate() throws Exception {
         assertMemoryLeak(() -> {
-            ddl("create table src (ts TIMESTAMP, name string) timestamp(ts) PARTITION BY DAY");
-            insert("insert into src values ('2022-04-12T17:30:45.145921Z', 'foo')");
+            execute("create table src (ts TIMESTAMP, name string) timestamp(ts) PARTITION BY DAY");
+            execute("insert into src values ('2022-04-12T17:30:45.145921Z', 'foo')");
 
             try {
                 executeWithPg("update src set name = 'bar'");
@@ -209,36 +237,20 @@ public class PGSecurityTest extends BasePGTest {
             // if this asserts fails then it means UPDATE are already implemented
             // please change this test to check the update throws an exception in the read-only mode
             // this is in place, so we won't forget to test UPDATE honours read-only security context
-            assertSql("ts\tname\n" +
-                    "2022-04-12T17:30:45.145921Z\tfoo\n", "select * from src");
+            assertQuery("select * from src")
+                    .noLeakCheck()
+                    .returnsOnce("""
+                            ts\tname
+                            2022-04-12T17:30:45.145921Z\tfoo
+                            """);
         });
     }
 
     @Test
     public void testDisallowVacuum() throws Exception {
         assertMemoryLeak(() -> {
-            ddl("create table src (ts TIMESTAMP, name string) timestamp(ts) PARTITION BY day");
+            execute("create table src (ts TIMESTAMP, name string) timestamp(ts) PARTITION BY day");
             assertQueryDisallowed("vacuum partitions src");
-        });
-    }
-
-    @Test
-    public void testDisallowsBackupDatabase() throws Exception {
-        assertMemoryLeak(() -> {
-            configureForBackups();
-            ddl("create table src (ts TIMESTAMP, name string) timestamp(ts) PARTITION BY day");
-            insert("insert into src values (now(), 'foo')");
-            assertQueryDisallowed("backup database");
-        });
-    }
-
-    @Test
-    public void testDisallowsBackupTable() throws Exception {
-        assertMemoryLeak(() -> {
-            configureForBackups();
-            ddl("create table src (ts TIMESTAMP, name string) timestamp(ts) PARTITION BY day");
-            insert("insert into src values (now(), 'foo')");
-            assertQueryDisallowed("backup table src");
         });
     }
 
@@ -246,8 +258,8 @@ public class PGSecurityTest extends BasePGTest {
     @Ignore("This is failing, but repair is nop so that's ok")
     public void testDisallowsRepairTable() throws Exception {
         assertMemoryLeak(() -> {
-            ddl("create table src (ts TIMESTAMP, name string) timestamp(ts) PARTITION BY day");
-            insert("insert into src values (now(), 'foo')");
+            execute("create table src (ts TIMESTAMP, name string) timestamp(ts) PARTITION BY day");
+            execute("insert into src values (now(), 'foo')");
             assertQueryDisallowed("repair table src");
         });
     }
@@ -266,25 +278,15 @@ public class PGSecurityTest extends BasePGTest {
         // because the out of thin air property would overwrite the user set by the client. Example:
         // 2022-05-17T15:58:38.973955Z I i.q.c.p.PGConnectionContext property [name=user, value=user] <-- client indicates username is "user"
         // 2022-05-17T15:58:38.974236Z I i.q.c.p.PGConnectionContext property [name=user, value=database] <-- buggy pgwire parser overwrites username with out of thin air value
-        assertMemoryLeak(() -> {
-            try (
-                    final PGWireServer server = createPGServer(1);
-                    final WorkerPool workerPool = server.getWorkerPool()
-            ) {
-                workerPool.start(LOG);
-                // Postgres JDBC clients ignores unknown properties and does not send them to a server
-                // so have to use a property which actually exists
-                getConnectionWithCustomProperty(server.getPort(), PGProperty.OPTIONS.getName()).close();
-            }
-        });
+        assertWithPgServer(CONN_AWARE_ALL, (_, _, _, port) -> getConnectionWithCustomProperty(port, PGProperty.OPTIONS.getName()).close());
     }
 
     @Test
     public void testReadOnlyUser() throws Exception {
         assertMemoryLeak(() -> {
-            ddl("create table src (ts TIMESTAMP)");
+            execute("create table src (ts TIMESTAMP)");
             try (
-                    final PGWireServer server = createPGServer(READ_ONLY_USER_CONF);
+                    final PGServer server = createPGServer(READ_ONLY_USER_CONF);
                     final WorkerPool workerPool = server.getWorkerPool()
             ) {
                 workerPool.start(LOG);
@@ -307,6 +309,51 @@ public class PGSecurityTest extends BasePGTest {
         });
     }
 
+    @Test
+    public void testSecurityContextFactoryThrowsCairoException() throws Exception {
+        final PGConfiguration conf = new Port0PGConfiguration() {
+            @Override
+            public FactoryProvider getFactoryProvider() {
+                return new DefaultFactoryProvider() {
+                    @Override
+                    public @NotNull SecurityContextFactory getSecurityContextFactory() {
+                        return (_, _) -> {
+                            throw CairoException.nonCritical().put("test security context error");
+                        };
+                    }
+                };
+            }
+        };
+
+        assertMemoryLeak(() -> {
+            try (
+                    final PGServer server = createPGServer(conf);
+                    final WorkerPool workerPool = server.getWorkerPool()
+            ) {
+                workerPool.start(LOG);
+                try {
+                    getConnection(server.getPort(), false, true);
+                    Assert.fail("Connection should have been denied");
+                } catch (PSQLException e) {
+                    assertContains(e.getMessage(), "test security context error");
+                }
+            }
+        });
+    }
+
+    private static void assertCurrentUser(Connection connection, String expectedUser) throws SQLException {
+        try (
+                final Statement statement = connection.createStatement();
+                // current_user() and session_user() must both reflect the authenticated user
+                final ResultSet rs = statement.executeQuery("SELECT current_user(), session_user()")
+        ) {
+            Assert.assertTrue(rs.next());
+            Assert.assertEquals(expectedUser, rs.getString(1));
+            Assert.assertEquals(expectedUser, rs.getString(2));
+            Assert.assertFalse(rs.next());
+        }
+    }
+
     private void assertQueryDisallowed(String query) throws Exception {
         try {
             executeWithPg(query);
@@ -318,7 +365,7 @@ public class PGSecurityTest extends BasePGTest {
 
     private void executeWithPg(String query) throws Exception {
         try (
-                final PGWireServer server = createPGServer(READ_ONLY_CONF);
+                final PGServer server = createPGServer(READ_ONLY_CONF);
                 final WorkerPool workerPool = server.getWorkerPool()
         ) {
             workerPool.start(LOG);

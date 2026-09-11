@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -25,9 +25,20 @@
 package io.questdb;
 
 import io.questdb.cutlass.http.client.HttpClientCookieHandlerFactory;
-import io.questdb.network.*;
+import io.questdb.network.EpollFacade;
+import io.questdb.network.EpollFacadeImpl;
+import io.questdb.network.KqueueFacade;
+import io.questdb.network.KqueueFacadeImpl;
+import io.questdb.network.NetworkFacade;
+import io.questdb.network.NetworkFacadeImpl;
+import io.questdb.network.SelectFacade;
+import io.questdb.network.SelectFacadeImpl;
 
 public interface HttpClientConfiguration {
+    default boolean fixBrokenConnection() {
+        return true;
+    }
+
     HttpClientCookieHandlerFactory getCookieHandlerFactory();
 
     default EpollFacade getEpollFacade() {
@@ -58,8 +69,12 @@ public interface HttpClientConfiguration {
         return SelectFacadeImpl.INSTANCE;
     }
 
+    default String getSettingsPath() {
+        return "/settings";
+    }
+
     default int getTimeout() {
-        return 60_000;
+        return 600_000;
     }
 
     default int getWaitQueueCapacity() {

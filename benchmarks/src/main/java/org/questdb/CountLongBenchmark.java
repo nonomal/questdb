@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -67,7 +67,7 @@ public class CountLongBenchmark {
                 l = Numbers.LONG_NULL;
             }
 
-            Unsafe.getUnsafe().putLong(p, l);
+            Unsafe.putLong(p, l);
             longArr[i] = l;
             p += Long.BYTES;
         }
@@ -91,7 +91,7 @@ public class CountLongBenchmark {
     public long testJavaNativeCount() {
         long result = 0;
         for (int i = 0; i < longCount; i++) {
-            result += Unsafe.getUnsafe().getLong(mem + i * Long.BYTES) != Numbers.LONG_NULL ? 1 : 0;
+            result += Unsafe.getLong(mem + i * Long.BYTES) != Numbers.LONG_NULL ? 1 : 0;
         }
         return result;
     }

@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -25,6 +25,7 @@
 package io.questdb.griffin.engine.functions.date;
 
 import io.questdb.cairo.CairoConfiguration;
+import io.questdb.cairo.ColumnType;
 import io.questdb.cairo.sql.Function;
 import io.questdb.cairo.sql.Record;
 import io.questdb.griffin.FunctionFactory;
@@ -44,13 +45,14 @@ public class SystimestampFunctionFactory implements FunctionFactory {
 
     @Override
     public Function newInstance(int position, ObjList<Function> args, IntList argPositions, CairoConfiguration configuration, SqlExecutionContext sqlExecutionContext) {
-        return new Func(sqlExecutionContext);
+        return new Func(sqlExecutionContext, ColumnType.TIMESTAMP_MICRO);
     }
 
-    private static class Func extends TimestampFunction implements Function {
-        private final SqlExecutionContext context;
+    static class Func extends TimestampFunction implements Function {
+        protected final SqlExecutionContext context;
 
-        public Func(SqlExecutionContext context) {
+        public Func(SqlExecutionContext context, int columnType) {
+            super(columnType);
             this.context = context;
         }
 
@@ -60,7 +62,12 @@ public class SystimestampFunctionFactory implements FunctionFactory {
         }
 
         @Override
-        public boolean isReadThreadSafe() {
+        public boolean isNonDeterministic() {
+            return true;
+        }
+
+        @Override
+        public boolean isThreadSafe() {
             return true;
         }
 

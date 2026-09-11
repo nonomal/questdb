@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -31,34 +31,32 @@ public class CursorDereferenceFunctionFactoryTest extends AbstractCairoTest {
     @Test
     public void testCatalogue() throws Exception {
         assertMemoryLeak(() -> {
-            ddl("create table pg_test(a int)");
-            assertQuery(
-                    "x\tpg_class\n" +
-                            "11\t\n" +
-                            "2200\t\n" +
-                            "11\t\n" +
-                            "2200\t\n" +
-                            "11\t\n" +
-                            "2200\t\n" +
-                            "11\t\n" +
-                            "2200\t\n" +
-                            "11\t\n" +
-                            "2200\t\n" +
-                            "11\t\n" +
-                            "2200\t\n" +
-                            "11\t\n" +
-                            "2200\t\n" +
-                            "11\t\n" +
-                            "2200\t\n" +
-                            "11\t\n" +
-                            "2200\t\n" +
-                            "11\t\n" +
-                            "2200\t\n",
-                    "select (pg_catalog.pg_class()).relnamespace x, pg_catalog.pg_class() from long_sequence(10);",
-                    null,
-                    false,
-                    false
-            );
+            execute("create table pg_test(a int)");
+            assertQuery("select (pg_catalog.pg_class()).relnamespace x, pg_catalog.pg_class() from long_sequence(10);")
+                    .noRandomAccess()
+                    .returns("""
+                            x\tpg_class
+                            11\t
+                            2200\t
+                            11\t
+                            2200\t
+                            11\t
+                            2200\t
+                            11\t
+                            2200\t
+                            11\t
+                            2200\t
+                            11\t
+                            2200\t
+                            11\t
+                            2200\t
+                            11\t
+                            2200\t
+                            11\t
+                            2200\t
+                            11\t
+                            2200\t
+                            """);
         });
     }
 }

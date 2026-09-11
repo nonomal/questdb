@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,21 +24,36 @@
 
 package io.questdb.test.log;
 
-import io.questdb.log.*;
+import io.questdb.log.LogAlertSocket;
+import io.questdb.log.LogAlertSocketWriter;
+import io.questdb.log.LogError;
+import io.questdb.log.LogFactory;
+import io.questdb.log.LogLevel;
+import io.questdb.log.LogRecordUtf8Sink;
 import io.questdb.mp.SOCountDownLatch;
 import io.questdb.network.NetworkError;
 import io.questdb.network.NetworkFacade;
 import io.questdb.network.NetworkFacadeImpl;
-import io.questdb.std.*;
+import io.questdb.std.CharSequenceObjHashMap;
+import io.questdb.std.Files;
+import io.questdb.std.FilesFacade;
+import io.questdb.std.MemoryTag;
+import io.questdb.std.Rnd;
+import io.questdb.std.Unsafe;
+import io.questdb.std.datetime.Clock;
 import io.questdb.std.datetime.DateLocaleFactory;
-import io.questdb.std.datetime.microtime.MicrosecondClock;
+import io.questdb.std.datetime.MicrosecondClock;
 import io.questdb.std.datetime.microtime.MicrosecondClockImpl;
 import io.questdb.std.str.Path;
 import io.questdb.std.str.Utf8Sequence;
 import io.questdb.std.str.Utf8StringSink;
 import io.questdb.test.std.TestFilesFacadeImpl;
 import io.questdb.test.tools.TestUtils;
-import org.junit.*;
+import org.junit.Assert;
+import org.junit.Before;
+import org.junit.BeforeClass;
+import org.junit.ClassRule;
+import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
 
 import java.util.concurrent.CyclicBarrier;
@@ -271,7 +286,7 @@ public class LogAlertSocketWriterTest {
     @Test
     public void testOnLogRecordInternationalTemplate() throws Exception {
         withLogAlertSocketWriter(
-                () -> 1637091363010000L,
+                (MicrosecondClock) () -> 1637091363010000L,
                 writer -> {
                     // this test does not interact with server
                     final int logRecordBuffSize = 1024; // plenty, to allow for encoding/escaping
@@ -355,20 +370,21 @@ public class LogAlertSocketWriterTest {
     public void testReadFile() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             final String fileName = rand.nextString(10);
-            final String fileContent = "யாமறிந்த மொழிகளிலே தமிழ்மொழி போல் இனிதாவது எங்கும் காணோம்,\n" +
-                    "பாமரராய் விலங்குகளாய், உலகனைத்தும் இகழ்ச்சிசொலப் பான்மை கெட்டு,\n" +
-                    "நாமமது தமிழரெனக் கொண்டு இங்கு வாழ்ந்திடுதல் நன்றோ? சொல்லீர்!\n" +
-                    "தேமதுரத் தமிழோசை உலகமெலாம் பரவும்வகை செய்தல் வேண்டும்.";
+            final String fileContent = """
+                    யாமறிந்த மொழிகளிலே தமிழ்மொழி போல் இனிதாவது எங்கும் காணோம்,
+                    பாமரராய் விலங்குகளாய், உலகனைத்தும் இகழ்ச்சிசொலப் பான்மை கெட்டு,
+                    நாமமது தமிழரெனக் கொண்டு இங்கு வாழ்ந்திடுதல் நன்றோ? சொல்லீர்!
+                    தேமதுரத் தமிழோசை உலகமெலாம் பரவும்வகை செய்தல் வேண்டும்.""";
             final int buffSize = fileContent.length() * 3;
             final long buffPtr = Unsafe.malloc(buffSize, MemoryTag.NATIVE_DEFAULT);
             final byte[] bytes = fileContent.getBytes(Files.UTF_8);
             long p = buffPtr;
             for (int i = 0, n = bytes.length; i < n; i++) {
-                Unsafe.getUnsafe().putByte(p++, bytes[i]);
+                Unsafe.putByte(p++, bytes[i]);
             }
             try (Path path = new Path()) {
                 path.put(fileName).$();
-                int fd = ff.openAppend(path.$());
+                long fd = ff.openAppend(path.$());
                 ff.truncate(fd, 0);
                 ff.append(fd, buffPtr, bytes.length);
                 ff.close(fd);
@@ -376,7 +392,7 @@ public class LogAlertSocketWriterTest {
                 // clear buffer
                 p = buffPtr;
                 for (int i = 0; i < bytes.length; i++) {
-                    Unsafe.getUnsafe().putByte(p++, (byte) 0);
+                    Unsafe.putByte(p++, (byte) 0);
                 }
                 LogAlertSocketWriter.readFile(fileName, buffPtr, buffSize, ff, sink);
                 TestUtils.assertEquals(fileContent, sink);
@@ -414,13 +430,13 @@ public class LogAlertSocketWriterTest {
             final int buffSize = fileContent.length() * 4;
             final long buffPtr = Unsafe.malloc(buffSize, MemoryTag.NATIVE_DEFAULT);
             Path path = new Path();
-            int fd = -1;
+            long fd = -1;
             try {
                 final byte[] bytes = fileContent.getBytes(Files.UTF_8);
                 final int len = bytes.length;
                 long p = buffPtr;
                 for (int i = 0; i < len; i++) {
-                    Unsafe.getUnsafe().putByte(p++, bytes[i]);
+                    Unsafe.putByte(p++, bytes[i]);
                 }
 
                 path.put(fileName).$();
@@ -447,7 +463,7 @@ public class LogAlertSocketWriterTest {
     private static void withLogAlertSocketWriter(Consumer<LogAlertSocketWriter> consumer) throws Exception {
         final NetworkFacade nf = new NetworkFacadeImpl() {
             @Override
-            public int connect(int fd, long pSockaddr) {
+            public int connect(long fd, long pSockaddr) {
                 return -1;
             }
         };
@@ -455,14 +471,14 @@ public class LogAlertSocketWriterTest {
     }
 
     private static void withLogAlertSocketWriter(
-            MicrosecondClock clock,
+            Clock clock,
             Consumer<LogAlertSocketWriter> consumer
     ) throws Exception {
         withLogAlertSocketWriter(clock, consumer, NetworkFacadeImpl.INSTANCE);
     }
 
     private static void withLogAlertSocketWriter(
-            MicrosecondClock clock,
+            Clock clock,
             Consumer<LogAlertSocketWriter> consumer,
             NetworkFacade nf
     ) throws Exception {
@@ -475,7 +491,7 @@ public class LogAlertSocketWriterTest {
     }
 
     private static void withLogAlertSocketWriter(
-            MicrosecondClock clock,
+            Clock clock,
             Consumer<LogAlertSocketWriter> consumer,
             NetworkFacade nf,
             CharSequenceObjHashMap<CharSequence> properties
@@ -503,7 +519,7 @@ public class LogAlertSocketWriterTest {
         // replace build info
 
         withLogAlertSocketWriter(
-                () -> 1637091363010000L,
+                (MicrosecondClock) () -> 1637091363010000L,
                 writer -> {
 
                     final int logRecordBuffSize = 1024; // plenty, to allow for encoding/escaping

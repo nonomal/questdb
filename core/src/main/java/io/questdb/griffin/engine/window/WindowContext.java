@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -27,9 +27,9 @@ package io.questdb.griffin.engine.window;
 import io.questdb.cairo.ColumnTypes;
 import io.questdb.cairo.RecordSink;
 import io.questdb.cairo.sql.VirtualRecord;
+import io.questdb.griffin.SqlException;
 
 public interface WindowContext {
-    boolean baseSupportsRandomAccess();
 
     int getExclusionKind();
 
@@ -37,7 +37,20 @@ public interface WindowContext {
 
     int getFramingMode();
 
+    int getNullsDescPos();
+
     int getOrderByPos();
+
+    /**
+     * The base cursor's scan direction when the compiler dismissed this window's ORDER BY
+     * against it, and {@code RecordCursorFactory.SCAN_DIRECTION_OTHER} when it did not -
+     * which is also what a window carrying no ORDER BY at all reports.
+     * <p>
+     * {@link #isOrderedByDesignatedTimestamp()} is the same field read as a boolean, and is
+     * what a RANGE frame asks. This returns the direction itself, for a caller that has to
+     * record which way the rows arrive rather than only that they arrive ordered.
+     */
+    int getOrderByScanDirection();
 
     ColumnTypes getPartitionByKeyTypes();
 
@@ -55,11 +68,23 @@ public interface WindowContext {
 
     int getTimestampIndex();
 
+    int getTimestampType();
+
     boolean isDefaultFrame();
 
     boolean isEmpty();
 
+    boolean isIgnoreNulls();
+
+    // True when this window is being compiled as part of a live view's SELECT.
+    // Drives opt-in value-layout slots that only live views need (e.g. the
+    // tombstone slot that RowNumberFunctionFactory and
+    // RankFunctionFactory.RankOverPartitionFunction use for anchor-driven compaction).
+    boolean isLiveView();
+
     boolean isOrdered();
 
     boolean isOrderedByDesignatedTimestamp();
+
+    void validate(int position, boolean supportTNullsDesc) throws SqlException;
 }

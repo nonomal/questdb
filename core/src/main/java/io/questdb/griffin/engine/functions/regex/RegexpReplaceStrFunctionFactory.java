@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -43,7 +43,6 @@ import org.jetbrains.annotations.NotNull;
 import java.util.regex.Matcher;
 
 public class RegexpReplaceStrFunctionFactory implements FunctionFactory {
-
     private static final String SIGNATURE = "regexp_replace(SSS)";
 
     @Override
@@ -67,7 +66,7 @@ public class RegexpReplaceStrFunctionFactory implements FunctionFactory {
 
         final Function value = args.getQuick(0);
         final int maxLength = configuration.getStrFunctionMaxBufferLength();
-        return new Func(value, pattern, patternPos, replacement, replacementPos, maxLength, position);
+        return new RegexpReplaceStrFunction(value, pattern, patternPos, replacement, maxLength, position);
     }
 
     protected void validateInputs(Function pattern, int patternPos, Function replacement, int replacementPos) throws SqlException {
@@ -79,25 +78,30 @@ public class RegexpReplaceStrFunctionFactory implements FunctionFactory {
         }
     }
 
-    protected static class Func extends StrFunction implements UnaryFunction {
+    protected static class RegexpReplaceStrFunction extends StrFunction implements UnaryFunction {
         private final int functionPos;
         private final int maxLength;
         private final Function pattern;
         private final int patternPos;
         private final Function replacement;
-        private final int replacementPos;
-        private final StringBuilderSink sink = new StringBuilderSink();
+        private final StringBuilderSink sinkA = new StringBuilderSink();
         private final StringBuilderSink sinkB = new StringBuilderSink();
         private final Function value;
         private Matcher matcher;
         private String replacementStr;
 
-        public Func(Function value, Function pattern, int patternPos, Function replacement, int replacementPos, int maxLength, int functionPos) {
+        public RegexpReplaceStrFunction(
+                Function value,
+                Function pattern,
+                int patternPos,
+                Function replacement,
+                int maxLength,
+                int functionPos
+        ) {
             this.value = value;
             this.pattern = pattern;
             this.patternPos = patternPos;
             this.replacement = replacement;
-            this.replacementPos = replacementPos;
             this.maxLength = maxLength;
             this.functionPos = functionPos;
         }
@@ -107,40 +111,14 @@ public class RegexpReplaceStrFunctionFactory implements FunctionFactory {
             return value;
         }
 
-        public CharSequence getStr(Record rec, StringBuilderSink sink) {
-            CharSequence cs = value.getStrA(rec);
-            if (cs == null) {
-                return null;
-            }
-
-            matcher.reset(cs);
-            sink.clear();
-
-            try {
-                boolean result = matcher.find();
-                if (!result) {
-                    sink.buffer.append(cs);
-                } else {
-                    do {
-                        if (sink.length() > maxLength) {
-                            throw CairoException.nonCritical()
-                                    .put("breached memory limit set for ").put(SIGNATURE)
-                                    .put(" [maxLength=").put(maxLength).put(']');
-                        }
-                        matcher.appendReplacement(sink.buffer, replacementStr);
-                        result = matcher.find();
-                    } while (result);
-                    matcher.appendTail(sink.buffer);
-                }
-                return sink;
-            } catch (Exception e) {
-                throw CairoException.nonCritical().put("regexp_replace failed [position=").put(functionPos).put(", ex=").put(e.getMessage()).put(']');
-            }
+        @Override
+        public int getComplexity() {
+            return Function.addComplexity(COMPLEXITY_REGEX, UnaryFunction.super.getComplexity());
         }
 
         @Override
         public CharSequence getStrA(Record rec) {
-            return getStr(rec, sink);
+            return getStr(rec, sinkA);
         }
 
         @Override
@@ -156,18 +134,14 @@ public class RegexpReplaceStrFunctionFactory implements FunctionFactory {
             replacement.init(symbolTableSource, executionContext);
             CharSequence cs = replacement.getStrA(null);
             if (cs == null) {
-                throw SqlException.$(replacementPos, "NULL replacement");
+                replacementStr = null;
+            } else {
+                replacementStr = cs.toString();
             }
-            replacementStr = cs.toString();
         }
 
         @Override
         public boolean isConstant() {
-            return false;
-        }
-
-        @Override
-        public boolean isReadThreadSafe() {
             return false;
         }
 
@@ -177,17 +151,58 @@ public class RegexpReplaceStrFunctionFactory implements FunctionFactory {
         }
 
         @Override
+        public boolean isThreadSafe() {
+            return false;
+        }
+
+        @Override
         public void toPlan(PlanSink sink) {
             sink.val("regexp_replace(").val(value).val(',').val(pattern).val(',').val(replacement).val(')');
+        }
+
+        private CharSequence getStr(Record rec, StringBuilderSink sink) {
+            if (matcher == null || replacementStr == null) {
+                return null;
+            }
+
+            CharSequence cs = value.getStrA(rec);
+            if (cs == null) {
+                return null;
+            }
+
+            matcher.reset(cs);
+            sink.clear();
+
+            try {
+                boolean result = matcher.find();
+                if (!result) {
+                    sink.buffer.append(cs);
+                } else {
+                    do {
+                        if (sink.length() > maxLength) {
+                            throw CairoException.critical(0)
+                                    .put("breached memory limit set for ").put(SIGNATURE)
+                                    .put(" [maxLength=").put(maxLength).put(']');
+                        }
+                        matcher.appendReplacement(sink.buffer, replacementStr);
+                        result = matcher.find();
+                    } while (result);
+                    matcher.appendTail(sink.buffer);
+                }
+                return sink;
+            } catch (CairoException e) {
+                throw e;
+            } catch (Throwable e) {
+                throw CairoException.critical(0)
+                        .put("regexp_replace failed [position=").put(functionPos)
+                        .put(", ex=").put(e.getMessage())
+                        .put(']');
+            }
         }
     }
 
     private static class StringBuilderSink implements CharSequence {
-//#if jdk.version==8
-//$        private final StringBuffer buffer = new StringBuffer();
-//#else
         private final StringBuilder buffer = new StringBuilder();
-//#endif
 
         @Override
         public char charAt(int index) {

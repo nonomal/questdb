@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,8 +24,10 @@
 
 package io.questdb.cairo.map;
 
+import io.questdb.cairo.sql.Function;
 import io.questdb.cairo.sql.Record;
 import io.questdb.cairo.sql.SqlExecutionCircuitBreaker;
+import io.questdb.std.DirectLongLongSortedList;
 
 public final class UnorderedVarcharMapCursor implements MapRecordCursor {
     private final long entrySize;
@@ -34,9 +36,9 @@ public final class UnorderedVarcharMapCursor implements MapRecordCursor {
     private final UnorderedVarcharMapRecord recordB;
     private long address;
     private int count;
-    private long limit;
+    private long memLimit;
+    private long memStart;
     private int remaining;
-    private long topAddress;
 
     UnorderedVarcharMapCursor(UnorderedVarcharMapRecord record, UnorderedVarcharMap map) {
         this.recordA = record;
@@ -80,6 +82,22 @@ public final class UnorderedVarcharMapCursor implements MapRecordCursor {
     }
 
     @Override
+    public void longTopK(DirectLongLongSortedList list, Function recordFunction) {
+        for (long addr = memStart; addr < memLimit; addr += entrySize) {
+            if (!map.isZeroKey(addr)) {
+                recordA.of(addr);
+                long v = recordFunction.getLong(recordA);
+                list.add(addr, v);
+            }
+        }
+    }
+
+    @Override
+    public long preComputedStateSize() {
+        return 0;
+    }
+
+    @Override
     public void recordAt(Record record, long atRowId) {
         ((UnorderedVarcharMapRecord) record).of(atRowId);
     }
@@ -91,7 +109,7 @@ public final class UnorderedVarcharMapCursor implements MapRecordCursor {
 
     @Override
     public void toTop() {
-        address = topAddress;
+        address = memStart;
         remaining = count;
         if (count > 0 && map.isZeroKey(address)) {
             skipToNonZeroKey();
@@ -101,16 +119,14 @@ public final class UnorderedVarcharMapCursor implements MapRecordCursor {
     private void skipToNonZeroKey() {
         do {
             address += entrySize;
-        } while (address < limit && map.isZeroKey(address));
+        } while (address < memLimit && map.isZeroKey(address));
     }
 
-    UnorderedVarcharMapCursor init(long address, long limit, int count) {
-        this.topAddress = address;
-        this.limit = limit;
+    UnorderedVarcharMapCursor init(long memStart, long memLimit, int count) {
+        this.memStart = memStart;
+        this.memLimit = memLimit;
         this.count = count;
         toTop();
-        recordA.setLimit(limit);
-        recordB.setLimit(limit);
         return this;
     }
 }

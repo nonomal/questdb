@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -25,10 +25,10 @@
 package io.questdb.cairo.pool.ex;
 
 import io.questdb.cairo.CairoException;
-import io.questdb.std.ThreadLocal;
+import io.questdb.std.CarrierLocal;
 
 public class EntryLockedException extends CairoException {
-    private static final ThreadLocal<EntryLockedException> tlException = new ThreadLocal<>(EntryLockedException::new);
+    private static final CarrierLocal<EntryLockedException> tlException = new CarrierLocal<>(EntryLockedException::new);
 
     public static EntryLockedException instance(CharSequence reason) {
         EntryLockedException ex = tlException.get();

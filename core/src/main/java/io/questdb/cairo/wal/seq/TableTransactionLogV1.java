@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,7 +24,9 @@
 
 package io.questdb.cairo.wal.seq;
 
+import io.questdb.cairo.CairoConfiguration;
 import io.questdb.cairo.CairoException;
+import io.questdb.cairo.CommitMode;
 import io.questdb.cairo.MemorySerializer;
 import io.questdb.cairo.TableUtils;
 import io.questdb.cairo.vm.Vm;
@@ -32,11 +34,17 @@ import io.questdb.cairo.vm.api.MemoryCMARW;
 import io.questdb.cairo.wal.WalUtils;
 import io.questdb.log.Log;
 import io.questdb.log.LogFactory;
-import io.questdb.std.*;
+import io.questdb.std.CarrierLocal;
+import io.questdb.std.Files;
+import io.questdb.std.FilesFacade;
+import io.questdb.std.MemoryTag;
+import io.questdb.std.Os;
+import io.questdb.std.Transient;
+import io.questdb.std.Unsafe;
 import io.questdb.std.str.Path;
 import org.jetbrains.annotations.NotNull;
+import org.jetbrains.annotations.Nullable;
 
-import java.lang.ThreadLocal;
 import java.util.concurrent.atomic.AtomicLong;
 
 import static io.questdb.cairo.TableUtils.openSmallFile;
@@ -45,7 +53,7 @@ import static io.questdb.cairo.wal.WalUtils.WAL_SEQUENCER_FORMAT_VERSION_V1;
 
 /**
  * This class is used to read/write transactions to the disk.
- * This is V1 implementation of the sequencer transaction log storage and it will be used
+ * This is V1 implementation of the sequencer transaction log storage, and it will be used
  * in parallel with the new V2 for backward compatibility.
  * <p>
  * All transactions are stored in the single file table_dir\\txn_seq\\_txnlog, the file structure is
@@ -53,21 +61,23 @@ import static io.questdb.cairo.wal.WalUtils.WAL_SEQUENCER_FORMAT_VERSION_V1;
  * Header: 76 bytes
  * Transaction record: 28 bytes
  * <p>
- * See the format of the header and transaction record in @link TableTransactionLogFile
+ * See the format of the header and transaction record in {@link TableTransactionLogFile}
  */
 public class TableTransactionLogV1 implements TableTransactionLogFile {
-    public static long RECORD_SIZE = TX_LOG_COMMIT_TIMESTAMP_OFFSET + Long.BYTES;
     private static final Log LOG = LogFactory.getLog(TableTransactionLogV1.class);
-    private static final ThreadLocal<TransactionLogCursorImpl> tlTransactionLogCursor = new ThreadLocal<>();
+    private static final CarrierLocal<TransactionLogCursorImpl> tlTransactionLogCursor = new CarrierLocal<>();
+    public static long RECORD_SIZE = TX_LOG_COMMIT_TIMESTAMP_OFFSET + Long.BYTES;
+    private final CairoConfiguration configuration;
     private final FilesFacade ff;
     private final AtomicLong maxTxn = new AtomicLong();
     private final MemoryCMARW txnMem = Vm.getCMARWInstance();
 
-    public TableTransactionLogV1(FilesFacade ff) {
-        this.ff = ff;
+    public TableTransactionLogV1(CairoConfiguration configuration) {
+        this.configuration = configuration;
+        this.ff = configuration.getFilesFacade();
     }
 
-    public static long readMaxStructureVersion(int logFileFd, FilesFacade ff) {
+    public static long readMaxStructureVersion(long logFileFd, FilesFacade ff) {
         long maxTxn = ff.readNonNegativeLong(logFileFd, TableTransactionLogFile.MAX_TXN_OFFSET_64);
         if (maxTxn < 0) {
             return -1;
@@ -77,17 +87,26 @@ public class TableTransactionLogV1 implements TableTransactionLogFile {
     }
 
     @Override
-    public long addEntry(long structureVersion, int walId, int segmentId, int segmentTxn, long timestamp, long txnMinTimestamp, long txnMaxTimestamp, long txnRowCount) {
+    public long addEntry(
+            long structureVersion,
+            int walId,
+            int segmentId,
+            int segmentTxn,
+            long timestamp,
+            long txnMinTimestamp,
+            long txnMaxTimestamp,
+            long txnRowCount
+    ) {
         txnMem.putLong(structureVersion);
         txnMem.putInt(walId);
         txnMem.putInt(segmentId);
         txnMem.putInt(segmentTxn);
         txnMem.putLong(timestamp);
 
-        Unsafe.getUnsafe().storeFence();
+        Unsafe.storeFence();
         long maxTxn = this.maxTxn.incrementAndGet();
         txnMem.putLong(MAX_TXN_OFFSET_64, maxTxn);
-        txnMem.sync(false);
+        sync0();
         // Transactions are 1 based here
         return maxTxn;
     }
@@ -122,8 +141,7 @@ public class TableTransactionLogV1 implements TableTransactionLogFile {
         txnMem.putLong(0L);
         txnMem.putLong(tableCreateTimestamp);
         txnMem.putInt(0);
-        txnMem.sync(false);
-
+        sync0();
         txnMem.jumpTo(HEADER_SIZE);
     }
 
@@ -136,15 +154,35 @@ public class TableTransactionLogV1 implements TableTransactionLogFile {
     }
 
     @Override
+    public void fullSync() {
+        txnMem.sync(false);
+    }
+
+    @Override
     public TransactionLogCursor getCursor(long txnLo, @Transient Path path) {
-        TransactionLogCursorImpl cursor = tlTransactionLogCursor.get();
+        return getCursor(txnLo, path, null);
+    }
+
+    @Override
+    public TransactionLogCursor getCursor(
+            long txnLo,
+            @Transient Path path,
+            @Nullable TableSequencerCursorPool cursorPool
+    ) {
+        TransactionLogCursorImpl cursor = cursorPool != null
+                ? (TransactionLogCursorImpl) cursorPool.getTransactionLogCursor(WAL_SEQUENCER_FORMAT_VERSION_V1)
+                : tlTransactionLogCursor.get();
         if (cursor == null) {
-            cursor = new TransactionLogCursorImpl(ff, txnLo, path);
-            tlTransactionLogCursor.set(cursor);
+            cursor = new TransactionLogCursorImpl(configuration, txnLo, path);
+            if (cursorPool != null) {
+                cursorPool.registerTransactionLogCursor(WAL_SEQUENCER_FORMAT_VERSION_V1, cursor);
+            } else {
+                tlTransactionLogCursor.set(cursor);
+            }
             return cursor;
         }
         try {
-            return cursor.of(ff, txnLo, path);
+            return cursor.of(ff, configuration.getBypassWalFdCache(), txnLo, path);
         } catch (Throwable th) {
             cursor.close();
             throw th;
@@ -155,7 +193,7 @@ public class TableTransactionLogV1 implements TableTransactionLogFile {
     public boolean isDropped() {
         long lastTxn = maxTxn.get();
         if (lastTxn > 0) {
-            return WalUtils.DROP_TABLE_WALID == txnMem.getInt(HEADER_SIZE + (lastTxn - 1) * RECORD_SIZE + TX_LOG_WAL_ID_OFFSET);
+            return WalUtils.DROP_TABLE_WAL_ID == txnMem.getInt(HEADER_SIZE + (lastTxn - 1) * RECORD_SIZE + TX_LOG_WAL_ID_OFFSET);
         }
         return false;
     }
@@ -180,23 +218,25 @@ public class TableTransactionLogV1 implements TableTransactionLogFile {
         return maxStructureVersion;
     }
 
-    @Override
-    public void sync() {
-        txnMem.sync(false);
+    private void sync0() {
+        int commitMode = configuration.getCommitMode();
+        if (commitMode != CommitMode.NOSYNC) {
+            txnMem.sync(commitMode == CommitMode.ASYNC);
+        }
     }
 
     private static class TransactionLogCursorImpl implements TransactionLogCursor {
         private long address;
-        private int fd;
+        private long fd;
         private FilesFacade ff;
         private long txn;
         private long txnCount = -1;
         private long txnLo;
         private long txnOffset;
 
-        public TransactionLogCursorImpl(FilesFacade ff, long txnLo, final Path path) {
+        public TransactionLogCursorImpl(CairoConfiguration configuration, long txnLo, final Path path) {
             try {
-                of(ff, txnLo, path);
+                of(configuration.getFilesFacade(), configuration.getBypassWalFdCache(), txnLo, path);
             } catch (Throwable th) {
                 close();
                 throw th;
@@ -207,6 +247,7 @@ public class TableTransactionLogV1 implements TableTransactionLogFile {
         public void close() {
             if (fd > 0) {
                 ff.close(fd);
+                fd = 0;
             }
             if (txnCount > -1 && address > 0) {
                 ff.munmap(address, getMappedLen(), MemoryTag.MMAP_TX_LOG_CURSOR);
@@ -230,27 +271,32 @@ public class TableTransactionLogV1 implements TableTransactionLogFile {
 
         @Override
         public long getCommitTimestamp() {
-            return Unsafe.getUnsafe().getLong(address + txnOffset + TX_LOG_COMMIT_TIMESTAMP_OFFSET);
+            return Unsafe.getLong(address + txnOffset + TX_LOG_COMMIT_TIMESTAMP_OFFSET);
         }
 
         @Override
         public long getMaxTxn() {
-            return txnCount - 1;
+            return txnCount;
+        }
+
+        @Override
+        public int getPartitionSize() {
+            return 0;
         }
 
         @Override
         public int getSegmentId() {
-            return Unsafe.getUnsafe().getInt(address + txnOffset + TX_LOG_SEGMENT_OFFSET);
+            return Unsafe.getInt(address + txnOffset + TX_LOG_SEGMENT_OFFSET);
         }
 
         @Override
         public int getSegmentTxn() {
-            return Unsafe.getUnsafe().getInt(address + txnOffset + TX_LOG_SEGMENT_TXN_OFFSET);
+            return Unsafe.getInt(address + txnOffset + TX_LOG_SEGMENT_TXN_OFFSET);
         }
 
         @Override
         public long getStructureVersion() {
-            return Unsafe.getUnsafe().getLong(address + txnOffset + TX_LOG_STRUCTURE_VERSION_OFFSET);
+            return Unsafe.getLong(address + txnOffset + TX_LOG_STRUCTURE_VERSION_OFFSET);
         }
 
         @Override
@@ -280,7 +326,7 @@ public class TableTransactionLogV1 implements TableTransactionLogFile {
 
         @Override
         public int getWalId() {
-            return Unsafe.getUnsafe().getInt(address + txnOffset + TX_LOG_WAL_ID_OFFSET);
+            return Unsafe.getInt(address + txnOffset + TX_LOG_WAL_ID_OFFSET);
         }
 
         @Override
@@ -309,11 +355,6 @@ public class TableTransactionLogV1 implements TableTransactionLogFile {
         }
 
         @Override
-        public int getPartitionSize() {
-            return 0;
-        }
-
-        @Override
         public void toTop() {
             if (txnCount > -1L) {
                 this.txnOffset = HEADER_SIZE + (txnLo - 1) * RECORD_SIZE;
@@ -321,8 +362,10 @@ public class TableTransactionLogV1 implements TableTransactionLogFile {
             }
         }
 
-        private static int openFileRO(final FilesFacade ff, final Path path, final String fileName) {
-            return TableUtils.openRO(ff, path, fileName, LOG);
+        private static long openFileRO(final FilesFacade ff, final Path path, boolean bypassFdCache) {
+            return bypassFdCache
+                    ? TableUtils.openRONoCache(ff, path, WalUtils.TXNLOG_FILE_NAME, LOG)
+                    : TableUtils.openRO(ff, path, WalUtils.TXNLOG_FILE_NAME, LOG);
         }
 
         private long getMappedLen() {
@@ -339,13 +382,18 @@ public class TableTransactionLogV1 implements TableTransactionLogFile {
         }
 
         @NotNull
-        private TransactionLogCursorImpl of(FilesFacade ff, long txnLo, Path path) {
+        private TransactionLogCursorImpl of(FilesFacade ff, boolean bypassFdCache, long txnLo, Path path) {
             this.ff = ff;
-            this.fd = openFileRO(ff, path, TXNLOG_FILE_NAME);
+            close();
+            this.fd = openFileRO(ff, path, bypassFdCache);
             long newTxnCount = ff.readNonNegativeLong(fd, MAX_TXN_OFFSET_64);
             if (newTxnCount > -1L) {
                 this.txnCount = newTxnCount;
-                this.address = ff.mmap(fd, getMappedLen(), 0, Files.MAP_RO, MemoryTag.MMAP_TX_LOG_CURSOR);
+                long newAddr = ff.mmap(fd, getMappedLen(), 0, Files.MAP_RO, MemoryTag.MMAP_TX_LOG_CURSOR);
+                if (newAddr == FilesFacade.MAP_FAILED) {
+                    throw CairoException.critical(Os.errno()).put("cannot mmap transaction log [path=").put(path).put(']');
+                }
+                this.address = newAddr;
                 this.txnOffset = HEADER_SIZE + (txnLo - 1) * RECORD_SIZE;
             } else {
                 throw CairoException.critical(ff.errno()).put("cannot read sequencer transactions [path=").put(path).put(']');
@@ -359,7 +407,11 @@ public class TableTransactionLogV1 implements TableTransactionLogFile {
             final long oldSize = getMappedLen();
             txnCount = newTxnCount;
             final long newSize = getMappedLen();
-            address = ff.mremap(fd, address, oldSize, newSize, 0, Files.MAP_RO, MemoryTag.MMAP_TX_LOG_CURSOR);
+            long newAddr = ff.mremap(fd, address, oldSize, newSize, 0, Files.MAP_RO, MemoryTag.MMAP_TX_LOG_CURSOR);
+            if (newAddr == FilesFacade.MAP_FAILED) {
+                throw CairoException.critical(Os.errno()).put("cannot remap transaction log [fd=").put(fd).put(']');
+            }
+            address = newAddr;
         }
     }
 }

@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -23,6 +23,8 @@
  ******************************************************************************/
 
 package io.questdb.std;
+
+import org.jetbrains.annotations.NotNull;
 
 import java.util.Arrays;
 
@@ -52,49 +54,25 @@ public class LowerCaseCharSequenceIntHashMap extends AbstractLowerCaseCharSequen
         Arrays.fill(values, noEntryValue);
     }
 
-    @Override
-    public boolean equals(Object o) {
-        if (this == o) return true;
-        if (o == null || getClass() != o.getClass()) return false;
-        LowerCaseCharSequenceIntHashMap that = (LowerCaseCharSequenceIntHashMap) o;
-        if (size() != that.size()) {
-            return false;
-        }
-        for (CharSequence key : keys) {
-            if (key == null) {
-                continue;
-            }
-            if (that.excludes(key)) {
-                return false;
-            }
-            int value = get(key);
-            if (value != noEntryValue) {
-                int thatValue = that.get(key);
-                if (value != thatValue) {
-                    return false;
-                }
-            }
-        }
-        return true;
-    }
-
     public int get(CharSequence key) {
         return valueAt(keyIndex(key));
     }
 
-    @Override
-    public int hashCode() {
-        int hashCode = 0;
-        for (int i = 0, n = keys.length; i < n; i++) {
-            if (keys[i] != noEntryKey) {
-                hashCode += Chars.hashCode(keys[i]) ^ values[i];
-            }
+    public void inc(@NotNull CharSequence key) {
+        int index = keyIndex(key);
+        if (index < 0) {
+            values[-index - 1] = values[-index - 1] + 1;
+        } else {
+            putAt0(index, Chars.toString(key), 1);
         }
-        return hashCode;
     }
 
     public boolean put(CharSequence key, int value) {
         return putAt(keyIndex(key), key, value);
+    }
+
+    public boolean put(CharSequence key, int value, int lo, int hi) {
+        return putAt(keyIndex(key, lo, hi), key, value, lo, hi);
     }
 
     public boolean putAt(int index, CharSequence key, int value) {
@@ -103,6 +81,16 @@ public class LowerCaseCharSequenceIntHashMap extends AbstractLowerCaseCharSequen
             return false;
         }
         final String keyString = Chars.toString(key);
+        putAt0(index, keyString, value);
+        return true;
+    }
+
+    public boolean putAt(int index, CharSequence key, int value, int lo, int hi) {
+        if (index < 0) {
+            values[-index - 1] = value;
+            return false;
+        }
+        final String keyString = Chars.toString(key, lo, hi);
         putAt0(index, keyString, value);
         return true;
     }

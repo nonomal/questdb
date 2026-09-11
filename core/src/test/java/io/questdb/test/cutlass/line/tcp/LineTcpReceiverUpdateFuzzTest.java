@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -25,6 +25,7 @@
 package io.questdb.test.cutlass.line.tcp;
 
 import io.questdb.PropertyKey;
+import io.questdb.cairo.EntryUnavailableException;
 import io.questdb.cairo.TableReader;
 import io.questdb.cairo.TableReaderMetadata;
 import io.questdb.griffin.SqlException;
@@ -61,10 +62,6 @@ public class LineTcpReceiverUpdateFuzzTest extends AbstractLineTcpReceiverFuzzTe
     private int numOfUpdates;
     private SOCountDownLatch updatesDone;
 
-    public LineTcpReceiverUpdateFuzzTest(WalMode walMode) {
-        super(walMode);
-    }
-
     @BeforeClass
     public static void setUpStatic() throws Exception {
         setProperty(PropertyKey.CAIRO_WRITER_COMMAND_QUEUE_CAPACITY, 1024);
@@ -80,6 +77,7 @@ public class LineTcpReceiverUpdateFuzzTest extends AbstractLineTcpReceiverFuzzTe
         node1.setProperty(CAIRO_WRITER_ALTER_BUSY_WAIT_TIMEOUT, 5000);
         Overrides overrides = node1.getConfigurationOverrides();
         overrides.setProperty(PropertyKey.CAIRO_SPIN_LOCK_TIMEOUT, 5000);
+        spinLockTimeout = 5000;
     }
 
     @Test
@@ -198,6 +196,7 @@ public class LineTcpReceiverUpdateFuzzTest extends AbstractLineTcpReceiverFuzzTe
                     updateSqlQueue.add(updateSql);
                 }
             } catch (Exception e) {
+                LOG.error().$(e).$();
                 Assert.fail("Update failed [e=" + e + ", updateSql=" + updateSql + "]");
                 failureCounter.incrementAndGet();
             } finally {
@@ -235,7 +234,15 @@ public class LineTcpReceiverUpdateFuzzTest extends AbstractLineTcpReceiverFuzzTe
 
         // repeat all updates after all lines are guaranteed to be landed in the tables
         for (String updateSql : updateSqlQueue) {
-            update(updateSql);
+            while (true) {
+                try {
+                    update(updateSql);
+                    break;
+                } catch (EntryUnavailableException ex) {
+                    // ILP may be a bit slow to release the table writer
+                    Os.sleep(1);
+                }
+            }
         }
         mayDrainWalQueue();
     }

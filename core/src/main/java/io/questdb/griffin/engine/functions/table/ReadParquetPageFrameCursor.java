@@ -1,0 +1,310 @@
+/*+*****************************************************************************
+ *     ___                  _   ____  ____
+ *    / _ \ _   _  ___  ___| |_|  _ \| __ )
+ *   | | | | | | |/ _ \/ __| __| | | |  _ \
+ *   | |_| | |_| |  __/\__ \ |_| |_| | |_) |
+ *    \__\_\\__,_|\___||___/\__|____/|____/
+ *
+ *  Copyright (c) 2014-2019 Appsicle
+ *  Copyright (c) 2019-2026 QuestDB
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *
+ *  http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ *
+ ******************************************************************************/
+
+package io.questdb.griffin.engine.functions.table;
+
+import io.questdb.cairo.TableUtils;
+import io.questdb.cairo.idx.IndexReader;
+import io.questdb.cairo.sql.ColumnMapping;
+import io.questdb.cairo.sql.PageFrame;
+import io.questdb.cairo.sql.PageFrameCursor;
+import io.questdb.cairo.sql.PartitionFormat;
+import io.questdb.cairo.sql.RecordCursor;
+import io.questdb.cairo.sql.RecordMetadata;
+import io.questdb.cairo.sql.StaticSymbolTable;
+import io.questdb.cairo.sql.SymbolTable;
+import io.questdb.cairo.sql.TableReferenceOutOfDateException;
+import io.questdb.cairo.vm.MemoryCARWImpl;
+import io.questdb.griffin.SqlException;
+import io.questdb.griffin.SqlExecutionContext;
+import io.questdb.griffin.engine.table.ParquetRowGroupFilter;
+import io.questdb.griffin.engine.table.PushdownFilterExtractor;
+import io.questdb.griffin.engine.table.parquet.ParquetFileDecoder;
+import io.questdb.log.Log;
+import io.questdb.log.LogFactory;
+import io.questdb.std.DirectLongList;
+import io.questdb.std.FilesFacade;
+import io.questdb.std.MemoryTag;
+import io.questdb.std.Misc;
+import io.questdb.std.Mutable;
+import io.questdb.std.ObjList;
+import io.questdb.std.str.LPSZ;
+import org.jetbrains.annotations.Nullable;
+
+import static io.questdb.griffin.engine.functions.table.ReadParquetRecordCursor.canProjectMetadata;
+
+/**
+ * Page frame cursor for parallel read_parquet() SQL function.
+ */
+public class ReadParquetPageFrameCursor implements PageFrameCursor {
+    private static final Log LOG = LogFactory.getLog(ReadParquetPageFrameCursor.class);
+    private final ColumnMapping columnMapping = new ColumnMapping();
+    private final ParquetFileDecoder decoder;
+    private final FilesFacade ff;
+    private final DirectLongList filterList;
+    private final MemoryCARWImpl filterValues;
+    private final ReadParquetPageFrame frame = new ReadParquetPageFrame();
+    private final RecordMetadata metadata;
+    private final @Nullable ObjList<PushdownFilterExtractor.PushdownFilterCondition> pushdownFilterConditions;
+    private long addr = 0;
+    private long fd = -1;
+    private long fileSize = 0;
+    private long filterBufEnd;
+    private boolean isFilterListPrepared;
+    private long rowCount;
+    private int rowGroupCount;
+
+    public ReadParquetPageFrameCursor(FilesFacade ff, RecordMetadata metadata, @Nullable ObjList<PushdownFilterExtractor.PushdownFilterCondition> pushdownFilterConditions) {
+        this.ff = ff;
+        this.metadata = metadata;
+        this.decoder = new ParquetFileDecoder();
+        this.pushdownFilterConditions = pushdownFilterConditions;
+        if (pushdownFilterConditions != null && pushdownFilterConditions.size() > 0) {
+            this.filterList = new DirectLongList(
+                    (long) pushdownFilterConditions.size() * ParquetRowGroupFilter.LONGS_PER_FILTER,
+                    MemoryTag.NATIVE_PARQUET_PARTITION_DECODER,
+                    true
+            );
+            this.filterValues = new MemoryCARWImpl(
+                    ParquetRowGroupFilter.FILTER_BUFFER_PAGE_SIZE,
+                    ParquetRowGroupFilter.FILTER_BUFFER_MAX_PAGES,
+                    MemoryTag.NATIVE_PARQUET_PARTITION_DECODER
+            );
+        } else {
+            this.filterList = null;
+            this.filterValues = null;
+        }
+    }
+
+    @Override
+    public void calculateSize(RecordCursor.Counter counter) {
+        counter.add(rowCount - frame.partitionHi);
+    }
+
+    @Override
+    public void close() {
+        Misc.free(decoder);
+        Misc.free(filterList);
+        Misc.free(filterValues);
+        if (fd != -1) {
+            ff.close(fd);
+            fd = -1;
+        }
+        if (addr != 0) {
+            ff.munmap(addr, fileSize, MemoryTag.MMAP_PARQUET_PARTITION_DECODER);
+            addr = 0;
+        }
+    }
+
+    @Override
+    public ColumnMapping getColumnMapping() {
+        return columnMapping;
+    }
+
+    @Override
+    public long getRemainingRowsInInterval() {
+        return 0L;
+    }
+
+    @Override
+    public StaticSymbolTable getSymbolTable(int columnIndex) {
+        return null;
+    }
+
+    @Override
+    public boolean hasActivePushdownFilter() {
+        return pushdownFilterConditions != null && pushdownFilterConditions.size() > 0;
+    }
+
+    @Override
+    public boolean isExternal() {
+        return true;
+    }
+
+    @Override
+    public SymbolTable newSymbolTable(int columnIndex) {
+        return null;
+    }
+
+    @Override
+    public @Nullable PageFrame next(long skipTarget) {
+        while (true) {
+            final int rowGroupIndex = ++frame.rowGroupIndex;
+            if (rowGroupIndex >= rowGroupCount) {
+                return null;
+            }
+
+            if (isFilterListPrepared && ParquetRowGroupFilter.canSkipRowGroup(
+                    rowGroupIndex,
+                    decoder,
+                    filterList,
+                    filterBufEnd
+            )) {
+                frame.partitionHi += decoder.metadata().getRowGroupSize(rowGroupIndex);
+                continue;
+            }
+
+            frame.rowGroupSize = decoder.metadata().getRowGroupSize(rowGroupIndex);
+            frame.partitionLo = frame.partitionHi;
+            frame.partitionHi = frame.partitionHi + frame.rowGroupSize;
+            return frame;
+        }
+    }
+
+    public void of(LPSZ path, SqlExecutionContext executionContext) throws SqlException {
+        // Reopen the file, it could have changed
+        this.fd = TableUtils.openRO(ff, path, LOG);
+        this.fileSize = ff.length(fd);
+        this.addr = TableUtils.mapRO(ff, fd, fileSize, MemoryTag.MMAP_PARQUET_PARTITION_DECODER);
+        decoder.of(addr, fileSize, MemoryTag.NATIVE_PARQUET_PARTITION_DECODER);
+        columnMapping.clear();
+        if (!canProjectMetadata(metadata, decoder, null, columnMapping)) {
+            // We need to recompile the factory as the Parquet metadata has changed.
+            throw TableReferenceOutOfDateException.of(path);
+        }
+        this.rowCount = decoder.metadata().getRowCount();
+        isFilterListPrepared = false;
+        this.rowGroupCount = decoder.metadata().getRowGroupCount();
+        if (pushdownFilterConditions != null) {
+            for (int i = 0, n = pushdownFilterConditions.size(); i < n; ++i) {
+                pushdownFilterConditions.getQuick(i).init(executionContext);
+            }
+            isFilterListPrepared = filterList != null && ParquetRowGroupFilter.prepareFilterList(
+                    decoder.metadata(),
+                    pushdownFilterConditions,
+                    filterList,
+                    filterValues,
+                    // read_parquet() projects external files by name; resolve by name too.
+                    false
+            );
+            if (isFilterListPrepared) {
+                filterBufEnd = filterValues.getAddress() + filterValues.getAppendOffset();
+            } else {
+                filterBufEnd = 0;
+            }
+        }
+
+        toTop();
+    }
+
+    @Override
+    public long size() {
+        return rowCount;
+    }
+
+    @Override
+    public boolean supportsSizeCalculation() {
+        return true;
+    }
+
+    @Override
+    public void toTop() {
+        frame.clear();
+    }
+
+    private class ReadParquetPageFrame implements PageFrame, Mutable {
+        private long partitionHi;
+        private long partitionLo;
+        private int rowGroupIndex;
+        private int rowGroupSize;
+
+        @Override
+        public void clear() {
+            rowGroupIndex = -1;
+            rowGroupSize = 0;
+            partitionLo = 0;
+            partitionHi = 0;
+        }
+
+        @Override
+        public long getAuxPageAddress(int columnIndex) {
+            return 0;
+        }
+
+        @Override
+        public long getAuxPageSize(int columnIndex) {
+            return 0;
+        }
+
+        @Override
+        public int getColumnCount() {
+            return columnMapping.getColumnCount();
+        }
+
+        @Override
+        public byte getFormat() {
+            return PartitionFormat.PARQUET;
+        }
+
+        @Override
+        public IndexReader getIndexReader(int columnIndex, int direction) {
+            return null;
+        }
+
+        @Override
+        public long getPageAddress(int columnIndex) {
+            return 0;
+        }
+
+        @Override
+        public long getPageSize(int columnIndex) {
+            return 0;
+        }
+
+        @Override
+        public ParquetFileDecoder getParquetDecoder() {
+            return decoder;
+        }
+
+        @Override
+        public int getParquetRowGroup() {
+            return rowGroupIndex;
+        }
+
+        @Override
+        public int getParquetRowGroupHi() {
+            return rowGroupSize;
+        }
+
+        @Override
+        public int getParquetRowGroupLo() {
+            return 0;
+        }
+
+        @Override
+        public long getPartitionHi() {
+            return partitionHi;
+        }
+
+        @Override
+        public int getPartitionIndex() {
+            return 0;
+        }
+
+        @Override
+        public long getPartitionLo() {
+            return partitionLo;
+        }
+    }
+}

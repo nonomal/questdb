@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -28,6 +28,7 @@ import io.questdb.cairo.sql.RecordCursor;
 import io.questdb.cairo.sql.RecordCursorFactory;
 import io.questdb.griffin.SqlException;
 import io.questdb.test.AbstractCairoTest;
+import io.questdb.test.tools.TestUtils;
 import org.junit.Assert;
 import org.junit.Test;
 
@@ -35,101 +36,96 @@ public class MinStrGroupByFunctionFactoryTest extends AbstractCairoTest {
 
     @Test
     public void testConstant() throws Exception {
-        assertQuery(
-                "a\tmin\n" +
-                        "a\t42\n" +
-                        "b\t42\n" +
-                        "c\t42\n",
-                "select a, min('42') from x order by a",
-                "create table x as (select * from (select rnd_symbol('a','b','c') a from long_sequence(20)))",
-                null,
-                true,
-                true
-        );
+        assertQuery("select a, min('42') from x order by a")
+                .ddl("create table x as (select * from (select rnd_symbol('a','b','c') a from long_sequence(20)))")
+                .expectSize()
+                .returns("""
+                        a\tmin
+                        a\t42
+                        b\t42
+                        c\t42
+                        """);
     }
 
     @Test
     public void testExpression() throws Exception {
-        assertQuery(
-                "a\tmin\n" +
-                        "a\taaaaaa\n" +
-                        "b\taaaaaa\n" +
-                        "c\taaaaaa\n",
-                "select a, min(concat(s, s)) from x order by a",
-                "create table x as (select * from (select rnd_symbol('a','b','c') a, rnd_str('aaa','bbb','ccc') s from long_sequence(20)))",
-                null,
-                true,
-                true
-        );
+        assertQuery("select a, min(concat(s, s)) from x order by a")
+                .ddl("create table x as (select * from (select rnd_symbol('a','b','c') a, rnd_str('aaa','bbb','ccc') s from long_sequence(20)))")
+                .expectSize()
+                .returns("""
+                        a\tmin
+                        a\taaaaaa
+                        b\taaaaaa
+                        c\taaaaaa
+                        """);
     }
 
     @Test
     public void testGroupKeyed() throws Exception {
-        assertQuery(
-                "a\tmin\n" +
-                        "a\t111\n" +
-                        "b\t111\n" +
-                        "c\t111\n",
-                "select a, min(s) from x order by a",
-                "create table x as (select * from (select rnd_symbol('a','b','c') a, rnd_str('111','222','333') s, timestamp_sequence(0, 100000) ts from long_sequence(20)) timestamp(ts))",
-                null,
-                true,
-                true
-        );
+        assertQuery("select a, min(s) from x order by a")
+                .ddl("create table x as (select * from (select rnd_symbol('a','b','c') a, rnd_str('111','222','333') s, timestamp_sequence(0, 100000) ts from long_sequence(20)) timestamp(ts))")
+                .expectSize()
+                .returns("""
+                        a\tmin
+                        a\t111
+                        b\t111
+                        c\t111
+                        """);
     }
 
     @Test
     public void testGroupNotKeyed() throws Exception {
-        assertQuery(
-                "min\n" +
-                        "a\n",
-                "select min(s) from x",
-                "create table x as (select * from (select rnd_str('a','a1','a2') s, timestamp_sequence(0, 100000) ts from long_sequence(100)) timestamp(ts))",
-                null,
-                false,
-                true
-        );
+        assertQuery("select min(s) from x")
+                .ddl("create table x as (select * from (select rnd_str('a','a1','a2') s, timestamp_sequence(0, 100000) ts from long_sequence(100)) timestamp(ts))")
+                .noRandomAccess()
+                .expectSize()
+                .returns("""
+                        min
+                        a
+                        """);
     }
 
     @Test
     public void testGroupNotKeyedWithNulls() throws Exception {
         assertMemoryLeak(() -> {
-            String expected = "min\n" +
-                    "a\n";
-            assertQueryNoLeakCheck(
-                    expected,
-                    "select min(s) from x",
-                    "create table x as (select * from (select rnd_str('a','b','c') s, timestamp_sequence(10, 100000) ts from long_sequence(100)) timestamp(ts)) timestamp(ts) PARTITION BY YEAR",
-                    null,
-                    false,
-                    true
-            );
+            String expected = """
+                    min
+                    a
+                    """;
+            assertQuery("select min(s) from x")
+                    .noLeakCheck()
+                    .ddl("create table x as (select * from (select rnd_str('a','b','c') s, timestamp_sequence(10, 100000) ts from long_sequence(100)) timestamp(ts)) timestamp(ts) PARTITION BY YEAR")
+                    .noRandomAccess()
+                    .expectSize()
+                    .returns(expected);
 
-            insert("insert into x values(cast(null as STRING), '2021-05-21')");
-            insert("insert into x values(cast(null as STRING), '1970-01-01')");
-            assertSql(expected, "select min(s) from x");
+            execute("insert into x values(cast(null as STRING), '2021-05-21')");
+            execute("insert into x values(cast(null as STRING), '1970-01-01')");
+            assertQuery("select min(s) from x")
+                    .noLeakCheck()
+                    .noRandomAccess()
+                    .expectSize()
+                    .returns(expected);
         });
     }
 
     @Test
     public void testNullConstant() throws Exception {
-        assertQuery(
-                "a\tmin\n" +
-                        "a\t\n" +
-                        "b\t\n" +
-                        "c\t\n",
-                "select a, min(cast(null as STRING)) from x order by a",
-                "create table x as (select * from (select rnd_symbol('a','b','c') a from long_sequence(20)))",
-                null,
-                true,
-                true
-        );
+        assertQuery("select a, min(cast(null as STRING)) from x order by a")
+                .ddl("create table x as (select * from (select rnd_symbol('a','b','c') a from long_sequence(20)))")
+                .expectSize()
+                .returns("""
+                        a\tmin
+                        a\t
+                        b\t
+                        c\t
+                        """);
     }
 
     @Test
     public void testSampleFillLinearNotSupported() throws Exception {
         assertMemoryLeak(() -> {
-            ddl("create table x as (select * from (select rnd_int() i, rnd_str('a','b','c') s, timestamp_sequence(0, 100000) ts from long_sequence(100)) timestamp(ts))");
+            execute("create table x as (select * from (select rnd_int() i, rnd_str('a','b','c') s, timestamp_sequence(0, 100000) ts from long_sequence(100)) timestamp(ts))");
             try (
                     final RecordCursorFactory factory = select("select ts, avg(i), min(s) from x sample by 1s fill(linear)");
                     final RecordCursor cursor = factory.getCursor(sqlExecutionContext)
@@ -137,31 +133,31 @@ public class MinStrGroupByFunctionFactoryTest extends AbstractCairoTest {
                 cursor.hasNext();
                 Assert.fail();
             } catch (SqlException e) {
-                Assert.assertEquals("[0] interpolation is not supported for function: io.questdb.griffin.engine.functions.groupby.MinStrGroupByFunction", e.getMessage());
+                TestUtils.assertContains(e.getFlyweightMessage(), "support for LINEAR fill is not yet implemented");
             }
         });
     }
 
     @Test
     public void testSampleKeyed() throws Exception {
-        assertQuery(
-                "a\tmin\tts\n" +
-                        "a\tдве\t1970-01-01T00:00:00.000000Z\n" +
-                        "b\tдве\t1970-01-01T00:00:00.000000Z\n" +
-                        "f\tдве\t1970-01-01T00:00:00.000000Z\n" +
-                        "c\tдве\t1970-01-01T00:00:00.000000Z\n" +
-                        "e\tдве\t1970-01-01T00:00:00.000000Z\n" +
-                        "d\tдве\t1970-01-01T00:00:00.000000Z\n" +
-                        "d\tдве\t1970-01-01T00:00:05.000000Z\n" +
-                        "b\tдве\t1970-01-01T00:00:05.000000Z\n" +
-                        "a\tедно\t1970-01-01T00:00:05.000000Z\n" +
-                        "c\tдве\t1970-01-01T00:00:05.000000Z\n" +
-                        "f\tдве\t1970-01-01T00:00:05.000000Z\n" +
-                        "e\tдве\t1970-01-01T00:00:05.000000Z\n",
-                "select a, min(s), ts from x sample by 5s align to first observation",
-                "create table x as (select * from (select rnd_symbol('a','b','c','d','e','f') a, rnd_str('едно','две','три') s, timestamp_sequence(0, 100000) ts from long_sequence(100)) timestamp(ts))",
-                "ts",
-                false
-        );
+        assertQuery("select a, min(s), ts from x sample by 5s align to first observation")
+                .ddl("create table x as (select * from (select rnd_symbol('a','b','c','d','e','f') a, rnd_str('едно','две','три') s, timestamp_sequence(0, 100000) ts from long_sequence(100)) timestamp(ts))")
+                .timestamp("ts")
+                .noRandomAccess()
+                .returns("""
+                        a\tmin\tts
+                        a\tдве\t1970-01-01T00:00:00.000000Z
+                        b\tдве\t1970-01-01T00:00:00.000000Z
+                        f\tдве\t1970-01-01T00:00:00.000000Z
+                        c\tдве\t1970-01-01T00:00:00.000000Z
+                        e\tдве\t1970-01-01T00:00:00.000000Z
+                        d\tдве\t1970-01-01T00:00:00.000000Z
+                        d\tдве\t1970-01-01T00:00:05.000000Z
+                        b\tдве\t1970-01-01T00:00:05.000000Z
+                        a\tедно\t1970-01-01T00:00:05.000000Z
+                        c\tдве\t1970-01-01T00:00:05.000000Z
+                        f\tдве\t1970-01-01T00:00:05.000000Z
+                        e\tдве\t1970-01-01T00:00:05.000000Z
+                        """);
     }
 }

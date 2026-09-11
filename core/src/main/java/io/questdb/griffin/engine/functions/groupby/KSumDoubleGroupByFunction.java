@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -33,6 +33,8 @@ import io.questdb.griffin.engine.functions.DoubleFunction;
 import io.questdb.griffin.engine.functions.GroupByFunction;
 import io.questdb.griffin.engine.functions.UnaryFunction;
 import io.questdb.std.Numbers;
+import io.questdb.std.Unsafe;
+import io.questdb.std.Vect;
 import org.jetbrains.annotations.NotNull;
 
 /**
@@ -44,6 +46,48 @@ public class KSumDoubleGroupByFunction extends DoubleFunction implements GroupBy
 
     public KSumDoubleGroupByFunction(@NotNull Function arg) {
         this.arg = arg;
+    }
+
+    @Override
+    public void computeBatch(MapValue mapValue, long dataAddr, int rowCount, long startRowId) {
+        if (rowCount > 0) {
+            double batchSum = Vect.sumDoubleKahan(dataAddr, rowCount);
+            if (!Numbers.isFinite(batchSum)) {
+                // Native sumDoubleKahan only filters NaN. A single +/-Inf row poisons the
+                // whole batch sum (sum stays Inf or collapses to NaN when +Inf and -Inf cancel).
+                // computeNext skips both NaN and Inf via Numbers.isFinite; re-sum in Java to
+                // match that semantics for the batched path.
+                batchSum = 0;
+                double bc = 0;
+                boolean hasFinite = false;
+                for (int i = 0; i < rowCount; i++) {
+                    final double v = Unsafe.getDouble(dataAddr + ((long) i << 3));
+                    if (Numbers.isFinite(v)) {
+                        final double y = v - bc;
+                        final double t = batchSum + y;
+                        bc = (t - batchSum) - y;
+                        batchSum = t;
+                        hasFinite = true;
+                    }
+                }
+                if (!hasFinite) {
+                    return;
+                }
+            }
+            final long existingCount = mapValue.getLong(valueIndex + 2);
+            if (existingCount > 0) {
+                final double sum = mapValue.getDouble(valueIndex);
+                final double c = mapValue.getDouble(valueIndex + 1);
+                final double y = batchSum - c;
+                final double t = sum + y;
+                mapValue.putDouble(valueIndex, t);
+                mapValue.putDouble(valueIndex + 1, t - sum - y);
+            } else {
+                mapValue.putDouble(valueIndex, batchSum);
+                mapValue.putDouble(valueIndex + 1, 0.0);
+            }
+            mapValue.addLong(valueIndex + 2, 1);
+        }
     }
 
     @Override
@@ -112,22 +156,30 @@ public class KSumDoubleGroupByFunction extends DoubleFunction implements GroupBy
     }
 
     @Override
-    public boolean isReadThreadSafe() {
-        return UnaryFunction.super.isReadThreadSafe();
+    public boolean isThreadSafe() {
+        return UnaryFunction.super.isThreadSafe();
     }
 
     @Override
     public void merge(MapValue destValue, MapValue srcValue) {
-        double srcSum = srcValue.getDouble(valueIndex);
-        double srcC = srcValue.getDouble(valueIndex + 1);
-        long srcCount = srcValue.getLong(valueIndex + 2);
-
-        double destSum = destValue.getDouble(valueIndex);
-        double y = srcSum - srcC;
-        double t = destSum + y;
-        destValue.putDouble(valueIndex, t);
-        destValue.putDouble(valueIndex + 1, t - destSum - y);
-        destValue.addLong(valueIndex + 2, srcCount);
+        final double srcSum = srcValue.getDouble(valueIndex);
+        final double srcC = srcValue.getDouble(valueIndex + 1);
+        final long srcCount = srcValue.getLong(valueIndex + 2);
+        if (srcCount > 0) {
+            final long destCount = destValue.getLong(valueIndex + 2);
+            if (destCount > 0) {
+                final double destSum = destValue.getDouble(valueIndex);
+                final double y = srcSum - srcC;
+                final double t = destSum + y;
+                destValue.putDouble(valueIndex, t);
+                destValue.putDouble(valueIndex + 1, t - destSum - y);
+                destValue.putLong(valueIndex + 2, destCount + srcCount);
+            } else {
+                destValue.putDouble(valueIndex, srcSum);
+                destValue.putDouble(valueIndex + 1, srcC);
+                destValue.putLong(valueIndex + 2, srcCount);
+            }
+        }
     }
 
     @Override
@@ -140,6 +192,11 @@ public class KSumDoubleGroupByFunction extends DoubleFunction implements GroupBy
     public void setNull(MapValue mapValue) {
         mapValue.putDouble(valueIndex, Double.NaN);
         mapValue.putLong(valueIndex + 2, 0);
+    }
+
+    @Override
+    public boolean supportsBatchComputation() {
+        return true;
     }
 
     @Override

@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,40 +24,28 @@
 
 package io.questdb.griffin.engine.functions.bind;
 
+import io.questdb.cairo.ColumnType;
+import io.questdb.cairo.TimestampDriver;
 import io.questdb.cairo.sql.Record;
-import io.questdb.cairo.sql.ScalarFunction;
 import io.questdb.griffin.PlanSink;
 import io.questdb.griffin.SqlUtil;
 import io.questdb.griffin.engine.functions.StrFunction;
 import io.questdb.std.Mutable;
 import io.questdb.std.Numbers;
-import io.questdb.std.datetime.microtime.TimestampFormatUtils;
-import io.questdb.std.str.*;
+import io.questdb.std.str.StringSink;
+import io.questdb.std.str.Utf8Sequence;
+import io.questdb.std.str.Utf8StringSink;
 
-public class StrBindVariable extends StrFunction implements ScalarFunction, Mutable {
-    private final int floatScale;
+public class StrBindVariable extends StrFunction implements Mutable {
     private final StringSink utf16Sink = new StringSink();
     private final Utf8StringSink utf8Sink = new Utf8StringSink();
     private boolean isNull = true;
-
-    public StrBindVariable(int floatScale) {
-        this.floatScale = floatScale;
-    }
 
     @Override
     public void clear() {
         isNull = true;
         utf16Sink.clear();
         utf8Sink.clear();
-    }
-
-    @Override
-    public void getStr(Record rec, Utf16Sink utf16Sink) {
-        if (isNull) {
-            utf16Sink.put((CharSequence) null);
-        } else {
-            utf16Sink.put(this.utf16Sink);
-        }
     }
 
     @Override
@@ -79,15 +67,6 @@ public class StrBindVariable extends StrFunction implements ScalarFunction, Muta
     }
 
     @Override
-    public void getVarchar(Record rec, Utf8Sink utf8Sink) {
-        if (isNull) {
-            utf8Sink.put((CharSequence) null);
-        } else {
-            utf8Sink.put(this.utf8Sink);
-        }
-    }
-
-    @Override
     public Utf8Sequence getVarcharA(Record rec) {
         return isNull ? null : utf8Sink;
     }
@@ -106,7 +85,7 @@ public class StrBindVariable extends StrFunction implements ScalarFunction, Muta
     }
 
     @Override
-    public boolean isReadThreadSafe() {
+    public boolean isNonDeterministic() {
         return true;
     }
 
@@ -115,13 +94,25 @@ public class StrBindVariable extends StrFunction implements ScalarFunction, Muta
         return true;
     }
 
-    public void setTimestamp(long value) {
+    @Override
+    public boolean isStableWithinExecution() {
+        // the bound value is set before execution starts and is immutable while it runs
+        return true;
+    }
+
+    @Override
+    public boolean isThreadSafe() {
+        return true;
+    }
+
+    public void setTimestamp(long value, int timestampType) {
         isNull = value == Numbers.LONG_NULL;
         if (!isNull) {
             utf16Sink.clear();
-            TimestampFormatUtils.appendDateTimeUSec(utf16Sink, value);
+            TimestampDriver timestampDriver = ColumnType.getTimestampDriver(timestampType);
+            timestampDriver.append(utf16Sink, value);
             utf8Sink.clear();
-            TimestampFormatUtils.appendDateTimeUSec(utf8Sink, value);
+            timestampDriver.append(utf8Sink, value);
         }
     }
 
@@ -208,9 +199,9 @@ public class StrBindVariable extends StrFunction implements ScalarFunction, Muta
         isNull = Numbers.isNull(value);
         if (!isNull) {
             utf16Sink.clear();
-            utf16Sink.put(value, floatScale);
+            utf16Sink.put(value);
             utf8Sink.clear();
-            utf8Sink.put(value, floatScale);
+            utf8Sink.put(value);
         }
     }
 

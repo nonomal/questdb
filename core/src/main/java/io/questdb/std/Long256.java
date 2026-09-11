@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -30,6 +30,20 @@ package io.questdb.std;
  */
 public interface Long256 extends Long256Acceptor {
     int BYTES = 32;
+
+    static void putLong256(Long256 value, long p) {
+        Unsafe.putLong(p, value.getLong0());
+        Unsafe.putLong(p + 8L, value.getLong1());
+        Unsafe.putLong(p + 16L, value.getLong2());
+        Unsafe.putLong(p + 24L, value.getLong3());
+    }
+
+    static void putLong256(long l0, long l1, long l2, long l3, long addr) {
+        Unsafe.putLong(addr, l0);
+        Unsafe.putLong(addr + Long.BYTES, l1);
+        Unsafe.putLong(addr + Long.BYTES * 2, l2);
+        Unsafe.putLong(addr + Long.BYTES * 3, l3);
+    }
 
     long getLong0();
 

@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,17 +24,18 @@
 
 package io.questdb.griffin.engine.table;
 
-import io.questdb.cairo.BitmapIndexReader;
 import io.questdb.cairo.EmptyRowCursor;
-import io.questdb.cairo.TableReader;
-import io.questdb.cairo.sql.DataFrame;
+import io.questdb.cairo.idx.IndexReader;
 import io.questdb.cairo.sql.Function;
+import io.questdb.cairo.sql.PageFrame;
+import io.questdb.cairo.sql.PageFrameCursor;
+import io.questdb.cairo.sql.PageFrameMemory;
 import io.questdb.cairo.sql.RowCursor;
 import io.questdb.cairo.sql.SymbolTable;
 import io.questdb.griffin.PlanSink;
 import io.questdb.griffin.SqlException;
 import io.questdb.griffin.SqlExecutionContext;
-import io.questdb.std.IntList;
+import io.questdb.std.Misc;
 
 public class DeferredSymbolIndexFilteredRowCursorFactory implements FunctionBasedRowCursorFactory {
     private final int columnIndex;
@@ -46,21 +47,24 @@ public class DeferredSymbolIndexFilteredRowCursorFactory implements FunctionBase
             int columnIndex,
             Function symbolFunction,
             Function filter,
-            boolean cachedIndexReaderCursor,
-            int indexDirection,
-            IntList columnIndexes
+            int indexDirection
     ) {
         this.columnIndex = columnIndex;
         this.symbolFunction = symbolFunction;
-        cursor = new SymbolIndexFilteredRowCursor(columnIndex, filter, cachedIndexReaderCursor, indexDirection, columnIndexes);
+        cursor = new SymbolIndexFilteredRowCursor(columnIndex, filter, indexDirection);
     }
 
     @Override
-    public RowCursor getCursor(DataFrame dataFrame) {
+    public void close() {
+        Misc.free(symbolFunction);
+    }
+
+    @Override
+    public RowCursor getCursor(PageFrame pageFrame, PageFrameMemory pageFrameMemory) {
         if (symbolKey == SymbolTable.VALUE_NOT_FOUND) {
             return EmptyRowCursor.INSTANCE;
         }
-        return cursor.of(dataFrame);
+        return cursor.of(pageFrame, pageFrameMemory);
     }
 
     @Override
@@ -69,13 +73,21 @@ public class DeferredSymbolIndexFilteredRowCursorFactory implements FunctionBase
     }
 
     @Override
-    public void init(TableReader tableReader, SqlExecutionContext sqlExecutionContext) throws SqlException {
-        symbolFunction.init(tableReader, sqlExecutionContext);
+    public void init(PageFrameCursor pageFrameCursor, SqlExecutionContext sqlExecutionContext) throws SqlException {
+        symbolFunction.init(pageFrameCursor, sqlExecutionContext);
     }
 
     @Override
     public boolean isEntity() {
         return false;
+    }
+
+    // Both selecting values must be stable: the deferred symbol key AND the residual index filter.
+    @Override
+    public boolean isStableWithinExecution() {
+        final Function filter = cursor.getFilter();
+        return (symbolFunction == null || symbolFunction.isStableWithinExecution())
+                && (filter == null || filter.isStableWithinExecution());
     }
 
     @Override
@@ -84,19 +96,19 @@ public class DeferredSymbolIndexFilteredRowCursorFactory implements FunctionBase
     }
 
     @Override
-    public void prepareCursor(TableReader tableReader) {
-        symbolKey = tableReader.getSymbolMapReader(columnIndex).keyOf(symbolFunction.getStrA(null));
+    public void prepareCursor(PageFrameCursor pageFrameCursor) {
+        symbolKey = pageFrameCursor.getSymbolTable(columnIndex).keyOf(symbolFunction.getStrA(null));
         if (symbolKey != SymbolTable.VALUE_NOT_FOUND) {
             cursor.of(symbolKey);
-            cursor.prepare(tableReader);
+            cursor.prepare(pageFrameCursor);
         }
     }
 
     @Override
     public void toPlan(PlanSink sink) {
-        sink.type("Index ").type(BitmapIndexReader.nameOf(cursor.getIndexDirection())).type(" scan").meta("on").putBaseColumnName(cursor.getColumnIndex());
+        sink.type("Index ").type(IndexReader.nameOf(cursor.getIndexDirection())).type(" scan").meta("on").putBaseColumnName(columnIndex);
         sink.meta("deferred").val(true);
-        sink.attr("symbolFilter").putBaseColumnName(cursor.getColumnIndex()).val('=').val(symbolFunction);
+        sink.attr("symbolFilter").putBaseColumnName(columnIndex).val('=').val(symbolFunction);
         sink.optAttr("filter", cursor.getFilter());
     }
 }

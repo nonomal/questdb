@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -26,28 +26,32 @@ package io.questdb.test.griffin.engine.functions.regex;
 
 import io.questdb.cairo.sql.RecordCursor;
 import io.questdb.cairo.sql.RecordCursorFactory;
+import io.questdb.std.str.StringSink;
 import io.questdb.test.AbstractCairoTest;
 import io.questdb.test.tools.TestUtils;
 import org.junit.Assert;
-import org.junit.Ignore;
 import org.junit.Test;
 
 public class RegexpReplaceStrFunctionFactoryTest extends AbstractCairoTest {
 
     @Test
     public void testNullRegex() throws Exception {
-        assertFailure(
-                "[29] NULL regex",
-                "select regexp_replace('abc', null, 'def')"
-        );
+        assertQuery("select regexp_replace('abc', null, 'def')")
+                .expectSize()
+                .returns("""
+                        regexp_replace
+                        
+                        """);
     }
 
     @Test
     public void testNullReplacement() throws Exception {
-        assertFailure(
-                "[34] NULL replacement",
-                "select regexp_replace('abc', 'a', null)"
-        );
+        assertQuery("select regexp_replace('abc', 'a', null)")
+                .expectSize()
+                .returns("""
+                        regexp_replace
+                        
+                        """);
     }
 
     @Test
@@ -61,34 +65,41 @@ public class RegexpReplaceStrFunctionFactoryTest extends AbstractCairoTest {
     @Test
     public void testSimple() throws Exception {
         assertMemoryLeak(() -> {
-            final String expected = "regexp_replace\n" +
-                    "example1.com\n" +
-                    "http://example3.com\n" +
-                    "example2.com\n" +
-                    "\n" +
-                    "example2.com\n";
-            ddl("create table x as (select rnd_str('https://example1.com/abc','https://example2.com/def','http://example3.com',null) url from long_sequence(5))");
-            assertSql(
-                    expected,
-                    "select regexp_replace(url, '^https?://(?:www\\.)?([^/]+)/.*$', '$1') from x"
-            );
+            final String expected = """
+                    regexp_replace
+                    example1.com
+                    http://example3.com
+                    example2.com
+                    
+                    example2.com
+                    """;
+            execute("create table x as (select rnd_str('https://example1.com/abc','https://example2.com/def','http://example3.com',null) url from long_sequence(5))");
+            assertQuery("select regexp_replace(url, '^https?://(?:www\\.)?([^/]+)/.*$', '$1') from x")
+                    .noLeakCheck()
+                    .expectSize()
+                    .returns(expected);
         });
     }
 
     @Test
-    @Ignore("Flaky")
     public void testStackOverFlowError() throws Exception {
-        assertFailure(
-                "stack overflow error",
-                "select regexp_replace('test(address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address,address)', " +
-                        "'\\s*\\(([^()]|\\(([^()])*\\))*\\)\\s*', '()')"
-        );
+        StringSink sink1 = new StringSink(8192);
+        sink1.put("select regexp_replace('test(");
+        for (int i = 0; i < 2000; i++) {
+            if (i > 0) {
+                sink1.put(',');
+            }
+            sink1.put("address");
+        }
+        sink1.put(")', ");
+        sink1.put("'\\s*\\(([^()]|\\(([^()])*\\))*\\)\\s*', '()')");
+        assertFailure("regexp_replace failed [position=", sink1);
     }
 
     @Test
     public void testWhenChainedCallsExceedsMaxLengthExceptionIsThrown() throws Exception {
         assertFailure(
-                "[-1] breached memory limit set for regexp_replace(SSS) [maxLength=1048576]",
+                "breached memory limit set for regexp_replace(SSS) [maxLength=1048576]",
                 "select regexp_replace(regexp_replace(regexp_replace(regexp_replace( 'aaaaaaaaaaaaaaaaaaaa', 'a', 'aaaaaaaaaaaaaaaaaaaa'), 'a', 'aaaaaaaaaaaaaaaaaaaa'), 'a', 'aaaaaaaaaaaaaaaaaaaa'), 'a', 'aaaaaaaaaaaaaaaaaaaa')"
         );
     }

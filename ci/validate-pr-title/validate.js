@@ -19,10 +19,13 @@ const allowedSubTypes = [
   "core",
   "ilp",
   "pgwire",
+  "qwp",
   "http",
   "conf",
   "ui",
   "wal",
+  "parquet",
+    "utils"
 ];
 
 const errorMessage = `

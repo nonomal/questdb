@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -25,41 +25,92 @@
 package io.questdb.griffin.engine.table;
 
 import io.questdb.cairo.CairoConfiguration;
-import io.questdb.cairo.sql.DataFrameCursor;
-import io.questdb.cairo.sql.DataFrameCursorFactory;
+import io.questdb.cairo.CairoException;
+import io.questdb.cairo.sql.PageFrameCursor;
+import io.questdb.cairo.sql.PartitionFrameCursorFactory;
 import io.questdb.cairo.sql.RecordCursor;
 import io.questdb.cairo.sql.RecordMetadata;
 import io.questdb.griffin.SqlException;
 import io.questdb.griffin.SqlExecutionContext;
 import io.questdb.std.DirectLongList;
+import io.questdb.std.IntList;
 import io.questdb.std.MemoryTag;
 import io.questdb.std.Misc;
+import org.jetbrains.annotations.NotNull;
 
-abstract class AbstractTreeSetRecordCursorFactory extends AbstractDataFrameRecordCursorFactory {
-    final DirectLongList rows;
-    protected DataFrameRecordCursor cursor;
+/**
+ * Abstract base class for tree set record cursor factories.
+ */
+abstract class AbstractTreeSetRecordCursorFactory extends AbstractPageFrameRecordCursorFactory {
+    /**
+     * The row list for the tree set.
+     */
+    DirectLongList rows;
+    /**
+     * The page frame record cursor.
+     */
+    protected PageFrameRecordCursor cursor;
 
+    /**
+     * Constructs a new tree set record cursor factory.
+     *
+     * @param configuration               the Cairo configuration
+     * @param metadata                    the record metadata
+     * @param partitionFrameCursorFactory the partition frame cursor factory
+     * @param columnIndexes               the column indexes
+     * @param columnSizeShifts            the column size shifts
+     */
     public AbstractTreeSetRecordCursorFactory(
-            RecordMetadata metadata,
-            DataFrameCursorFactory dataFrameCursorFactory,
-            CairoConfiguration configuration
+            @NotNull CairoConfiguration configuration,
+            @NotNull RecordMetadata metadata,
+            @NotNull PartitionFrameCursorFactory partitionFrameCursorFactory,
+            @NotNull IntList columnIndexes,
+            @NotNull IntList columnSizeShifts
     ) {
-        super(metadata, dataFrameCursorFactory);
-        this.rows = new DirectLongList(configuration.getSqlLatestByRowCount(), MemoryTag.NATIVE_LATEST_BY_LONG_LIST);
+        super(metadata, partitionFrameCursorFactory, columnIndexes, columnSizeShifts);
+        // keepClosed=true: the backing array is allocated lazily on the first cursor's reopen(),
+        // under whatever per-query MemoryTracker is bound at that time, keeping malloc and free
+        // charged symmetrically on the per-query counter.
+        this.rows = new DirectLongList(configuration.getSqlLatestByRowCount(), MemoryTag.NATIVE_LATEST_BY_LONG_LIST, true);
     }
 
     @Override
     protected void _close() {
-        super._close();
-        Misc.free(rows);
+        final DirectLongList rows = this.rows;
+        this.rows = null;
+        Throwable failure = null;
+        try {
+            super._close();
+        } catch (Throwable th) {
+            failure = th;
+        }
+        // Cursors free rows at their own close, under the bound tracker. This is a safety net for
+        // the never-opened case; unbind first so it never charges a recycled per-query tracker.
+        try {
+            rows.setMemoryTracker(null);
+        } catch (Throwable th) {
+            if (failure == null) {
+                failure = th;
+            } else if (failure != th) {
+                failure.addSuppressed(th);
+            }
+        }
+        failure = Misc.freeBestEffort(failure, rows);
+        CairoException.rethrowCleanupFailure(failure);
     }
 
     @Override
-    protected RecordCursor getCursorInstance(
-            DataFrameCursor dataFrameCursor,
+    protected RecordCursor initRecordCursor(
+            PageFrameCursor pageFrameCursor,
             SqlExecutionContext executionContext
     ) throws SqlException {
-        cursor.of(dataFrameCursor, executionContext);
+        try {
+            cursor.of(pageFrameCursor, executionContext);
+        } catch (Throwable th) {
+            // free partial allocations under the still-bound per-query tracker on a failed open
+            cursor.close();
+            throw th;
+        }
         return cursor;
     }
 }

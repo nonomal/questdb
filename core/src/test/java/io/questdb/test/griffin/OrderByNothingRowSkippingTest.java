@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -38,102 +38,108 @@ public class OrderByNothingRowSkippingTest extends AbstractCairoTest {
     @Test
     public void testSelectAll() throws Exception {
         prepare_unordered_noTs_table();
-        assertQuery(
-                "l\n1\n4\n7\n9\n3\n6\n10\n8\n2\n5\n",
-                "select l from tab",
-                null,
-                null,
-                true,
-                true
-        );
+        assertQuery("select l from tab")
+                .expectSize()
+                .returns("l\n1\n4\n7\n9\n3\n6\n10\n8\n2\n5\n");
     }
 
     @Test
     public void testSelectFirstN() throws Exception {
         prepare_unordered_noTs_table();
 
-        assertQuery("l\n1\n4\n7\n", "select l from tab limit 3");
+        assertQuery("select l from tab limit 3")
+                .expectSize()
+                .returns("l\n1\n4\n7\n");
     }
 
     @Test
     public void testSelectFirstNwithSameLoHiReturnsNoRows() throws Exception {
         prepare_unordered_noTs_table();
 
-        assertQuery("l\n", "select l from tab limit 8,8");
+        assertQuery("select l from tab limit 8,8")
+                .expectSize()
+                .returns("l\n");
     }
 
     @Test
     public void testSelectLastN() throws Exception {
         prepare_unordered_noTs_table();
 
-        assertQuery("l\n8\n2\n5\n", "select l from tab limit -3");
+        assertQuery("select l from tab limit -3")
+                .expectSize()
+                .returns("l\n8\n2\n5\n");
     }
 
     @Test
     public void testSelectLastNwithSameLoHiReturnsNoRows() throws Exception {
         prepare_unordered_noTs_table();
 
-        assertQuery("l\n", "select l from tab limit -8,-8");
+        assertQuery("select l from tab limit -8,-8")
+                .expectSize()
+                .returns("l\n");
     }
 
     @Test
     public void testSelectMiddleNfromBothDirections() throws Exception {
         prepare_unordered_noTs_table();
 
-        assertQuery("l\n3\n6\n", "select l from tab limit 4,-4");
+        assertQuery("select l from tab limit 4,-4")
+                .expectSize()
+                .returns("l\n3\n6\n");
     }
 
     @Test
     public void testSelectMiddleNfromEnd() throws Exception {
         prepare_unordered_noTs_table();
 
-        assertQuery("l\n7\n9\n3\n", "select l from tab limit -8,-5");
+        assertQuery("select l from tab limit -8,-5")
+                .expectSize()
+                .returns("l\n7\n9\n3\n");
     }
 
     @Test
     public void testSelectMiddleNfromStart() throws Exception {
         prepare_unordered_noTs_table();
 
-        assertQuery("l\n6\n10\n8\n", "select l from tab limit 5,8");
+        assertQuery("select l from tab limit 5,8")
+                .expectSize()
+                .returns("l\n6\n10\n8\n");
     }
 
     @Test
     public void testSelectNbeforeStartReturnsEmptyResult() throws Exception {
         prepare_unordered_noTs_table();
 
-        assertQuery("l\n", "select l from tab limit -11,-15");
+        assertQuery("select l from tab limit -11,-15")
+                .expectSize()
+                .returns("l\n");
     }
 
     @Test
     public void testSelectNbeyondEndreturnsEmptyResult() throws Exception {
         prepare_unordered_noTs_table();
 
-        assertQuery("l\n", "select l from tab limit 11,12");
+        assertQuery("select l from tab limit 11,12")
+                .expectSize()
+                .returns("l\n");
     }
 
     @Test
     public void testSelectNintersectingEnd() throws Exception {
         prepare_unordered_noTs_table();
 
-        assertQuery("l\n2\n5\n", "select l from tab limit 8,12");
+        assertQuery("select l from tab limit 8,12")
+                .expectSize()
+                .returns("l\n2\n5\n");
     }
 
     @Test
     public void testSelectNintersectingStart() throws Exception {
         prepare_unordered_noTs_table();
 
-        assertQuery("l\n1\n4\n", "select l from tab limit -12,-8");
-    }
-
-    private void assertQuery(String expected, String query) throws Exception {
-        assertQuery(
-                expected,
-                query,
-                null,
-                null,
-                true,
-                false
-        );
+        assertQuery("select l from tab limit -12,-8")
+                .expectSize()
+                .returns("l\n1\n4\n");
     }
 
     // table with x reflecting timestamp position  in descending order
@@ -154,7 +160,7 @@ public class OrderByNothingRowSkippingTest extends AbstractCairoTest {
     private void runInserts(String... statements) throws Exception {
         assertMemoryLeak(() -> {
             for (String query : statements) {
-                insert(query);
+                execute(query);
             }
         });
     }
@@ -162,7 +168,7 @@ public class OrderByNothingRowSkippingTest extends AbstractCairoTest {
     private void runQueries(String... queries) throws Exception {
         assertMemoryLeak(() -> {
             for (String query : queries) {
-                compile(query);
+                execute(query);
             }
         });
     }

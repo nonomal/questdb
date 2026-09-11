@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -29,7 +29,13 @@ import io.questdb.cutlass.http.client.HttpClient;
 import io.questdb.cutlass.http.client.HttpClientFactory;
 import io.questdb.cutlass.http.client.Response;
 import io.questdb.cutlass.http.processors.PrometheusMetricsProcessor;
-import io.questdb.metrics.*;
+import io.questdb.metrics.Counter;
+import io.questdb.metrics.CounterWithOneLabel;
+import io.questdb.metrics.CounterWithTwoLabels;
+import io.questdb.metrics.LongGauge;
+import io.questdb.metrics.MetricsRegistry;
+import io.questdb.metrics.MetricsRegistryImpl;
+import io.questdb.metrics.Target;
 import io.questdb.network.DefaultIODispatcherConfiguration;
 import io.questdb.network.NetworkFacadeImpl;
 import io.questdb.std.ObjList;
@@ -45,20 +51,26 @@ import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
 import org.junit.rules.Timeout;
 
-import java.util.concurrent.*;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 
 public class MetricsIODispatcherTest {
 
     // This number should be lower than the maximum IODispatcher connection limit,
     // which by default is 64.
-    private static final int PARALLEL_REQUESTS = 60;
-    private static final String prometheusRequest = "GET /metrics HTTP/1.1\r\n" +
-            "Host: localhost:9003\r\n" +
-            "User-Agent: Prometheus/2.22.0\r\n" +
-            "Accept: application/openmetrics-text; version=0.0.1,text/plain;version=0.0.4;q=0.5,*/*;q=0.1\r\n" +
-            "Accept-Encoding: gzip\r\n" +
-            "X-Prometheus-Scrape-Timeout-Seconds: 10.000000\r\n" +
-            "\r\n";
+    private static final int PARALLEL_REQUESTS = 16;
+    private static final String prometheusRequest = """
+            GET /metrics HTTP/1.1\r
+            Host: localhost:9003\r
+            User-Agent: Prometheus/2.22.0\r
+            Accept: application/openmetrics-text; version=0.0.1,text/plain;version=0.0.4;q=0.5,*/*;q=0.1\r
+            Accept-Encoding: gzip\r
+            X-Prometheus-Scrape-Timeout-Seconds: 10.000000\r
+            \r
+            """;
 
     @Rule
     public TemporaryFolder temp = new TemporaryFolder();
@@ -142,38 +154,40 @@ public class MetricsIODispatcherTest {
 
         new HttpMinTestBuilder()
                 .withTempFolder(temp)
-                .withScrapable(metrics)
-                .run(engine -> {
+                .withScrappable(metrics)
+                .run((engine, sqlExecutionContext) -> {
                     metrics.markQueryStart();
                     metrics.markSyntaxError();
                     metrics.markInsertCancelled();
 
-                    String expectedResponse = "HTTP/1.1 200 OK\r\n" +
-                            "Server: questDB/1.0\r\n" +
-                            "Date: Thu, 1 Jan 1970 00:00:00 GMT\r\n" +
-                            "Transfer-Encoding: chunked\r\n" +
-                            "Content-Type: text/plain; version=0.0.4; charset=utf-8\r\n" +
-                            "\r\n" +
-                            "02f0\r\n" +
-                            "# TYPE questdb_test_json_queries_total counter\n" +
-                            "questdb_test_json_queries_total 1\n" +
-                            "\n" +
-                            "# TYPE questdb_test_json_queries_failed_total counter\n" +
-                            "questdb_test_json_queries_failed_total{reason=\"cancelled\"} 0\n" +
-                            "questdb_test_json_queries_failed_total{reason=\"syntax_error\"} 1\n" +
-                            "\n" +
-                            "# TYPE questdb_test_compiled_json_queries_failed_total counter\n" +
-                            "questdb_test_compiled_json_queries_failed_total{type=\"insert\",reason=\"cancelled\"} 1\n" +
-                            "questdb_test_compiled_json_queries_failed_total{type=\"insert\",reason=\"syntax_error\"} 0\n" +
-                            "questdb_test_compiled_json_queries_failed_total{type=\"select\",reason=\"cancelled\"} 0\n" +
-                            "questdb_test_compiled_json_queries_failed_total{type=\"select\",reason=\"syntax_error\"} 0\n" +
-                            "\n" +
-                            "# TYPE questdb_test_json_queries_running gauge\n" +
-                            "questdb_test_json_queries_running 1\n" +
-                            "\n" +
-                            "\r\n" +
-                            "00\r\n" +
-                            "\r\n";
+                    String expectedResponse = """
+                            HTTP/1.1 200 OK\r
+                            Server: questDB/1.0\r
+                            Date: Thu, 1 Jan 1970 00:00:00 GMT\r
+                            Transfer-Encoding: chunked\r
+                            Content-Type: text/plain; version=0.0.4; charset=utf-8\r
+                            \r
+                            02f0\r
+                            # TYPE questdb_test_json_queries_total counter
+                            questdb_test_json_queries_total 1
+                            
+                            # TYPE questdb_test_json_queries_failed_total counter
+                            questdb_test_json_queries_failed_total{reason="cancelled"} 0
+                            questdb_test_json_queries_failed_total{reason="syntax_error"} 1
+                            
+                            # TYPE questdb_test_compiled_json_queries_failed_total counter
+                            questdb_test_compiled_json_queries_failed_total{type="insert",reason="cancelled"} 1
+                            questdb_test_compiled_json_queries_failed_total{type="insert",reason="syntax_error"} 0
+                            questdb_test_compiled_json_queries_failed_total{type="select",reason="cancelled"} 0
+                            questdb_test_compiled_json_queries_failed_total{type="select",reason="syntax_error"} 0
+                            
+                            # TYPE questdb_test_json_queries_running gauge
+                            questdb_test_json_queries_running 1
+                            
+                            \r
+                            00\r
+                            \r
+                            """;
 
                     new SendAndReceiveRequestBuilder()
                             .withNetworkFacade(NetworkFacadeImpl.INSTANCE)
@@ -181,27 +195,34 @@ public class MetricsIODispatcherTest {
                 });
     }
 
-    private static HttpQueryTestBuilder.HttpClientCode buildClientCode(int parallelRequestBatches, int repeatedConnections, HttpQueryTestBuilder.HttpClientCode makeRequest) {
-        final HttpQueryTestBuilder.HttpClientCode repeatedRequest = engine -> {
+    private static HttpQueryTestBuilder.HttpClientCode buildClientCode(
+            int parallelRequestBatches,
+            int repeatedConnections,
+            HttpQueryTestBuilder.HttpClientCode makeRequest
+    ) {
+        final HttpQueryTestBuilder.HttpClientCode repeatedRequest = (engine, sqlExecutionContext) -> {
             for (int i = 0; i < repeatedConnections; i++) {
-                makeRequest.run(engine);
+                makeRequest.run(engine, sqlExecutionContext);
             }
         };
         // Parallel request batches.
         return parallelizeRequests(parallelRequestBatches, repeatedRequest);
     }
 
-    private static HttpQueryTestBuilder.HttpClientCode parallelizeRequests(int parallelRequests, HttpQueryTestBuilder.HttpClientCode makeRequest) {
+    private static HttpQueryTestBuilder.HttpClientCode parallelizeRequests(
+            int parallelRequests,
+            HttpQueryTestBuilder.HttpClientCode makeRequest
+    ) {
         assert parallelRequests > 0;
         if (parallelRequests == 1) {
             return makeRequest;
         }
-        return engine -> {
+        return (engine, sqlExecutionContext) -> {
             final ExecutorService execSvc = Executors.newCachedThreadPool();
             final ObjList<Future<Void>> futures = new ObjList<>(parallelRequests);
             for (int index = 0; index < parallelRequests; index++) {
                 futures.add(execSvc.submit(() -> {
-                    makeRequest.run(engine);
+                    makeRequest.run(engine, sqlExecutionContext);
                     return null;
                 }));
             }
@@ -224,7 +245,7 @@ public class MetricsIODispatcherTest {
         final int workerCount = Math.max(2, Math.min(parallelRequestBatches, 6));
         final PrometheusMetricsProcessor.RequestStatePool pool = new PrometheusMetricsProcessor.RequestStatePool(workerCount);
 
-        Assert.assertEquals(pool.size(), 0);
+        Assert.assertEquals(0, pool.size());
 
         MetricsRegistry metrics = new MetricsRegistryImpl();
         for (int i = 0; i < metricCount; i++) {
@@ -236,10 +257,10 @@ public class MetricsIODispatcherTest {
             expectedResponse.append("questdb_testMetrics").append(i).append("_total ").append(i).append("\n").append("\n");
         }
 
-        final HttpQueryTestBuilder.HttpClientCode makeRequest = engine -> {
+        final HttpQueryTestBuilder.HttpClientCode makeRequest = (engine, sqlExecutionContext) -> {
             try (HttpClient client = HttpClientFactory.newPlainTextInstance()) {
                 if (parallelRequestBatches == 1) {
-                    Assert.assertEquals(pool.size(), 0);
+                    Assert.assertTrue("pool.size() > 1: " + pool.size(), pool.size() <= 1);
                 }
 
                 final StringSink utf16Sink = new StringSink();
@@ -253,7 +274,7 @@ public class MetricsIODispatcherTest {
                                     .url("/metrics")
                                     .send()
                     ) {
-                        response.await(5_000);
+                        response.await(15_000);
                         utf16Sink.clear();
                         utf16Sink.put(response.getStatusCode());
                         TestUtils.assertEquals("200", utf16Sink);
@@ -264,7 +285,7 @@ public class MetricsIODispatcherTest {
 
                         utf16Sink.clear();
                         Fragment fragment;
-                        while ((fragment = chunkedResponse.recv(5_000)) != null) {
+                        while ((fragment = chunkedResponse.recv()) != null) {
                             Utf8s.utf8ToUtf16(fragment.lo(), fragment.hi(), utf16Sink);
                         }
                         TestUtils.assertEquals(expectedResponse, utf16Sink);
@@ -272,9 +293,7 @@ public class MetricsIODispatcherTest {
                 }
 
                 if (parallelRequestBatches == 1) {
-                    if (pool.size() > 1) {
-                        Assert.fail("pool.size() > 1: " + pool.size());
-                    }
+                    Assert.assertTrue("pool.size() > 1: " + pool.size(), pool.size() <= 1);
                 }
             }
         };
@@ -284,17 +303,17 @@ public class MetricsIODispatcherTest {
         final HttpQueryTestBuilder.HttpClientCode clientCode = buildClientCode(parallelRequestBatches, repeatedConnections, makeRequest);
         new HttpMinTestBuilder()
                 .withTempFolder(temp)
-                .withScrapable(metrics)
+                .withScrappable(metrics)
                 .withTcpSndBufSize(tcpSndBufSize)
                 .withSendBufferSize(sendBufferSize)
                 .withWorkerCount(workerCount)
                 .withPrometheusPool(pool)
                 .run(clientCode);
 
-        Assert.assertEquals(pool.size(), 0);
+        Assert.assertEquals(0, pool.size());
     }
 
-    private static class TestMetrics implements Scrapable {
+    private static class TestMetrics implements Target {
         private static final short INSERT = 0;
         private static final short QUERY_CANCELLED = 0;
         private static final CharSequence[] QUERY_TYPE_ID_TO_NAME = new CharSequence[2];

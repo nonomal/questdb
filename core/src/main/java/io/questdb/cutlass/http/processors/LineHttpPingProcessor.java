@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -25,18 +25,30 @@
 package io.questdb.cutlass.http.processors;
 
 import io.questdb.cairo.SecurityContext;
+import io.questdb.cutlass.http.ActiveConnectionTracker;
 import io.questdb.cutlass.http.HttpConnectionContext;
+import io.questdb.cutlass.http.HttpRequestHandler;
+import io.questdb.cutlass.http.HttpRequestHeader;
 import io.questdb.cutlass.http.HttpRequestProcessor;
 import io.questdb.network.PeerDisconnectedException;
 import io.questdb.network.PeerIsSlowToReadException;
-import io.questdb.network.QueryPausedException;
-import io.questdb.network.ServerDisconnectException;
 
-public class LineHttpPingProcessor implements HttpRequestProcessor {
+// Inherits the same connection limit gauges as the ILP HTTP processor
+// This processor handles compatibility with InfluxDB line drivers that ping the server.
+public class LineHttpPingProcessor implements HttpRequestProcessor, HttpRequestHandler {
     private final String header;
 
     public LineHttpPingProcessor(CharSequence version) {
         this.header = "X-Influxdb-Version: " + version;
+    }
+
+    public String getName() {
+        return ActiveConnectionTracker.PROCESSOR_ILP_HTTP;
+    }
+
+    @Override
+    public HttpRequestProcessor getProcessor(HttpRequestHeader requestHeader) {
+        return this;
     }
 
     @Override
@@ -47,7 +59,7 @@ public class LineHttpPingProcessor implements HttpRequestProcessor {
     @Override
     public void onRequestComplete(
             HttpConnectionContext context
-    ) throws PeerDisconnectedException, PeerIsSlowToReadException, ServerDisconnectException, QueryPausedException {
+    ) throws PeerDisconnectedException, PeerIsSlowToReadException {
         context.simpleResponse().sendStatusNoContent(204, header);
     }
 

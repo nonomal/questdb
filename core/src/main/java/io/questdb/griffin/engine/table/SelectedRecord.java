@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,21 +24,40 @@
 
 package io.questdb.griffin.engine.table;
 
+import io.questdb.cairo.arr.ArrayView;
 import io.questdb.cairo.sql.Record;
 import io.questdb.std.BinarySequence;
+import io.questdb.std.Decimal128;
+import io.questdb.std.Decimal256;
 import io.questdb.std.IntList;
+import io.questdb.std.Interval;
 import io.questdb.std.Long256;
 import io.questdb.std.str.CharSink;
-import io.questdb.std.str.Utf16Sink;
 import io.questdb.std.str.Utf8Sequence;
-import io.questdb.std.str.Utf8Sink;
 
-class SelectedRecord implements Record {
+public class SelectedRecord implements Record {
     private final IntList columnCrossIndex;
     private Record base;
 
     public SelectedRecord(IntList columnCrossIndex) {
         this.columnCrossIndex = columnCrossIndex;
+    }
+
+    @Override
+    public ArrayView getArray(int col, int columnType) {
+        return base.getArray(getColumnIndex(col), columnType);
+    }
+
+    @Override
+    public int getArrayDimLen(int col, int columnType, int dim) {
+        // Forward, so a page-frame base keeps its direct shape-header read. Record's default would
+        // fall back to getArray() and materialize an ArrayView for every row.
+        return base.getArrayDimLen(getColumnIndex(col), columnType, dim);
+    }
+
+    @Override
+    public double getArrayDouble1d2d(int col, int columnType, int idx0, int idx1) {
+        return base.getArrayDouble1d2d(getColumnIndex(col), columnType, idx0, idx1);
     }
 
     @Override
@@ -69,6 +88,36 @@ class SelectedRecord implements Record {
     @Override
     public long getDate(int col) {
         return base.getDate(getColumnIndex(col));
+    }
+
+    @Override
+    public void getDecimal128(int col, Decimal128 sink) {
+        base.getDecimal128(getColumnIndex(col), sink);
+    }
+
+    @Override
+    public short getDecimal16(int col) {
+        return base.getDecimal16(getColumnIndex(col));
+    }
+
+    @Override
+    public void getDecimal256(int col, Decimal256 sink) {
+        base.getDecimal256(getColumnIndex(col), sink);
+    }
+
+    @Override
+    public int getDecimal32(int col) {
+        return base.getDecimal32(getColumnIndex(col));
+    }
+
+    @Override
+    public long getDecimal64(int col) {
+        return base.getDecimal64(getColumnIndex(col));
+    }
+
+    @Override
+    public byte getDecimal8(int col) {
+        return base.getDecimal8(getColumnIndex(col));
     }
 
     @Override
@@ -109,6 +158,11 @@ class SelectedRecord implements Record {
     @Override
     public int getInt(int col) {
         return base.getInt(getColumnIndex(col));
+    }
+
+    @Override
+    public Interval getInterval(int col) {
+        return base.getInterval(getColumnIndex(col));
     }
 
     @Override
@@ -157,11 +211,6 @@ class SelectedRecord implements Record {
     }
 
     @Override
-    public void getStr(int col, Utf16Sink utf16Sink) {
-        base.getStr(getColumnIndex(col), utf16Sink);
-    }
-
-    @Override
     public CharSequence getStrA(int col) {
         return base.getStrA(getColumnIndex(col));
     }
@@ -197,11 +246,6 @@ class SelectedRecord implements Record {
     }
 
     @Override
-    public void getVarchar(int col, Utf8Sink utf8Sink) {
-        base.getVarchar(getColumnIndex(col), utf8Sink);
-    }
-
-    @Override
     public Utf8Sequence getVarcharA(int col) {
         return base.getVarcharA(getColumnIndex(col));
     }
@@ -216,15 +260,19 @@ class SelectedRecord implements Record {
         return base.getVarcharSize(getColumnIndex(col));
     }
 
-    private int getColumnIndex(int columnIndex) {
-        return columnCrossIndex.getQuick(columnIndex);
-    }
-
-    Record getBaseRecord() {
+    // Public rather than package-private because the live view refresh path rebuilds the
+    // planner's mapping over WAL segment rows from its own package - see
+    // io.questdb.cairo.lv.MappingRecordCursor - and needs the base record back to
+    // delegate recordAt().
+    public Record getBaseRecord() {
         return base;
     }
 
-    void of(Record record) {
+    public void of(Record record) {
         this.base = record;
+    }
+
+    private int getColumnIndex(int columnIndex) {
+        return columnCrossIndex.getQuick(columnIndex);
     }
 }

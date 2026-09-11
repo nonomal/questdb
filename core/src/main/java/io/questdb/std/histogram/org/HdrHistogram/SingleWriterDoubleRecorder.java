@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -22,12 +22,10 @@
  *
  ******************************************************************************/
 
-/**
- * Written by Gil Tene of Azul Systems, and released to the public domain,
- * as explained at http://creativecommons.org/publicdomain/zero/1.0/
- *
- * @author Gil Tene
- */
+// Written by Gil Tene of Azul Systems, and released to the public domain,
+// as explained at http://creativecommons.org/publicdomain/zero/1.0/
+//
+// @author Gil Tene
 
 package io.questdb.std.histogram.org.HdrHistogram;
 
@@ -65,7 +63,7 @@ import java.util.concurrent.atomic.AtomicLong;
  */
 
 public class SingleWriterDoubleRecorder implements DoubleValueRecorder {
-    private static AtomicLong instanceIdSequencer = new AtomicLong(1);
+    private static final AtomicLong instanceIdSequencer = new AtomicLong(1);
     private final long instanceId = instanceIdSequencer.getAndIncrement();
 
     private final WriterReaderPhaser recordingPhaser = new WriterReaderPhaser();
@@ -356,7 +354,7 @@ public class SingleWriterDoubleRecorder implements DoubleValueRecorder {
         }
     }
 
-    private class InternalDoubleHistogram extends DoubleHistogram {
+    private static class InternalDoubleHistogram extends DoubleHistogram {
         private final long containingInstanceId;
 
         private InternalDoubleHistogram(long id, int numberOfSignificantValueDigits) {
@@ -377,7 +375,7 @@ public class SingleWriterDoubleRecorder implements DoubleValueRecorder {
         }
     }
 
-    private class PackedInternalDoubleHistogram extends PackedDoubleHistogram {
+    private static class PackedInternalDoubleHistogram extends PackedDoubleHistogram {
         private final long containingInstanceId;
 
         private PackedInternalDoubleHistogram(long id, int numberOfSignificantValueDigits) {

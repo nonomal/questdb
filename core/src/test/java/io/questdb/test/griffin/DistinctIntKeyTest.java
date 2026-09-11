@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -61,7 +61,7 @@ public class DistinctIntKeyTest extends AbstractCairoTest {
         final SqlExecutionContext sqlExecutionContext = TestUtils.createSqlExecutionCtx(engine, workerCount);
 
         assertMemoryLeak(() -> {
-            ddl(
+            execute(
                     "create table tab as (select timestamp_sequence('2020-01-01', 10 * 60 * 1000000L) ts, x::int i from long_sequence(10000))" +
                             " timestamp(ts) PARTITION BY MONTH",
                     sqlExecutionContext
@@ -69,74 +69,68 @@ public class DistinctIntKeyTest extends AbstractCairoTest {
 
             try {
                 assertExceptionNoLeakCheck("select DISTINCT i from tab order by 1 LIMIT 3", sqlExecutionContext);
-            } catch (OutOfMemoryError e) {
-                // ignore
+            } catch (CairoException e) {
+                Assert.assertTrue(e.isOutOfMemory());
             }
         });
     }
 
     @Test
     public void testDistinctInt() throws Exception {
-        assertQuery(
-                "i\n" +
-                        "0\n" +
-                        "2\n" +
-                        "4\n" +
-                        "6\n",
-                "select DISTINCT i from tab WHERE ts in '2020-03' order by 1 LIMIT 4",
-                "create table tab as (select timestamp_sequence('2020-01-01', 10 * 60 * 1000000L) ts, (2 * (x % 10))::int i from long_sequence(10000))" +
-                        " timestamp(ts) PARTITION BY MONTH",
-                null,
-                true,
-                true
-        );
+        assertQuery("select DISTINCT i from tab WHERE ts in '2020-03' order by 1 LIMIT 4")
+                .ddl("create table tab as (select timestamp_sequence('2020-01-01', 10 * 60 * 1000000L) ts, (2 * (x % 10))::int i from long_sequence(10000))" +
+                        " timestamp(ts) PARTITION BY MONTH")
+                .expectSize()
+                .returns("""
+                        i
+                        0
+                        2
+                        4
+                        6
+                        """);
     }
 
     @Test
     public void testDistinctIntFilteredFramed() throws Exception {
-        assertQuery(
-                "i\n" +
-                        "12\n" +
-                        "14\n" +
-                        "16\n" +
-                        "18\n",
-                "select DISTINCT i from tab WHERE ts in '2020-03' order by 1 LIMIT -4",
-                "create table tab as (" +
+        assertQuery("select DISTINCT i from tab WHERE ts in '2020-03' order by 1 LIMIT -4")
+                .ddl("create table tab as (" +
                         "select timestamp_sequence('2020-01-01', 10 * 60 * 1000000L) ts, (2 * (x % 10))::int i from long_sequence(10000)" +
-                        ") timestamp(ts) PARTITION BY MONTH",
-                null,
-                true,
-                true
-        );
+                        ") timestamp(ts) PARTITION BY MONTH")
+                .expectSize()
+                .returns("""
+                        i
+                        12
+                        14
+                        16
+                        18
+                        """);
     }
 
     @Test
     public void testDistinctIntWithAnotherCol() throws Exception {
-        assertQuery(
-                "i\tmonth\n" +
-                        "1\t1\n" +
-                        "2\t1\n" +
-                        "3\t1\n" +
-                        "4\t1\n" +
-                        "5\t1\n" +
-                        "6\t1\n" +
-                        "7\t1\n" +
-                        "8\t1\n" +
-                        "9\t1\n" +
-                        "10\t1\n",
-                "select DISTINCT i, month(ts) from tab order by 1 LIMIT 10",
-                "create table tab as (select timestamp_sequence('2020-01-01', 10 * 60 * 1000000L) ts, x::int i from long_sequence(10000))" +
-                        " timestamp(ts) PARTITION BY MONTH",
-                null,
-                true,
-                true
-        );
+        assertQuery("select DISTINCT i, month(ts) from tab order by 1 LIMIT 10")
+                .ddl("create table tab as (select timestamp_sequence('2020-01-01', 10 * 60 * 1000000L) ts, x::int i from long_sequence(10000))" +
+                        " timestamp(ts) PARTITION BY MONTH")
+                .expectSize()
+                .returns("""
+                        i\tmonth
+                        1\t1
+                        2\t1
+                        3\t1
+                        4\t1
+                        5\t1
+                        6\t1
+                        7\t1
+                        8\t1
+                        9\t1
+                        10\t1
+                        """);
     }
 
     @Test
     public void testDistinctOnBrokenTable() throws Exception {
         assertMemoryLeak(() -> {
-            ddl(
+            execute(
                     "create table tab as (select timestamp_sequence('2020-01-01', 10 * 60 * 1000000L) ts, x::int i from long_sequence(10000))" +
                             " timestamp(ts) PARTITION BY MONTH"
             );
@@ -145,7 +139,7 @@ public class DistinctIntKeyTest extends AbstractCairoTest {
             final String partition = "2020-02";
 
             TableToken tableToken = engine.verifyTableName("tab");
-            try (Path path = new Path().of(engine.getConfiguration().getRoot()).concat(tableToken).concat(partition)) {
+            try (Path path = new Path().of(engine.getConfiguration().getDbRoot()).concat(tableToken).concat(partition)) {
                 Assert.assertTrue(Files.rmdir(path, true));
             }
 

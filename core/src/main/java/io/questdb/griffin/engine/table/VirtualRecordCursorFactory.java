@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -25,45 +25,85 @@
 package io.questdb.griffin.engine.table;
 
 import io.questdb.cairo.AbstractRecordCursorFactory;
+import io.questdb.cairo.CairoException;
 import io.questdb.cairo.TableToken;
 import io.questdb.cairo.sql.Function;
 import io.questdb.cairo.sql.RecordCursor;
 import io.questdb.cairo.sql.RecordCursorFactory;
 import io.questdb.cairo.sql.RecordMetadata;
+import io.questdb.cairo.sql.SymbolTable;
+import io.questdb.cairo.sql.SymbolTableSource;
 import io.questdb.griffin.PlanSink;
+import io.questdb.griffin.PriorityMetadata;
 import io.questdb.griffin.SqlException;
 import io.questdb.griffin.SqlExecutionContext;
+import io.questdb.griffin.engine.functions.columns.ColumnFunction;
+import io.questdb.griffin.engine.functions.memoization.MemoizerFunction;
 import io.questdb.std.Misc;
 import io.questdb.std.ObjList;
+import org.jetbrains.annotations.NotNull;
 
 public class VirtualRecordCursorFactory extends AbstractRecordCursorFactory {
-    private final RecordCursorFactory base;
-    private final VirtualFunctionDirectSymbolRecordCursor cursor;
-    private final ObjList<Function> functions;
+    private RecordCursorFactory base;
+    private VirtualFunctionRecordCursor cursor;
+    private ObjList<Function> functions;
+    private final VirtualRecordCursorFactorySymbolTableSource internalSymbolTableSource;
+    private final PriorityMetadata priorityMetadata;
     private final boolean supportsRandomAccess;
 
     public VirtualRecordCursorFactory(
-            RecordMetadata metadata,
-            ObjList<Function> functions,
-            RecordCursorFactory base
+            @NotNull RecordMetadata virtualMetadata,
+            @NotNull PriorityMetadata priorityMetadata,
+            @NotNull ObjList<Function> functions,
+            @NotNull RecordCursorFactory base,
+            int virtualColumnReservedSlots
     ) {
-        super(metadata);
+        super(virtualMetadata);
         this.base = base;
         this.functions = functions;
-        boolean supportsRandomAccess = base.recordCursorSupportsRandomAccess();
-        for (int i = 0, n = functions.size(); i < n; i++) {
-            if (!functions.getQuick(i).supportsRandomAccess()) {
-                supportsRandomAccess = false;
-                break;
+        try {
+            int functionCount = functions.size();
+            boolean supportsRandomAccess = base.recordCursorSupportsRandomAccess();
+            final ObjList<MemoizerFunction> memoizedFunctions = new ObjList<>();
+            int randomCount = 0;
+            for (int i = 0; i < functionCount; i++) {
+                Function function = functions.getQuick(i);
+                if (supportsRandomAccess && !function.supportsRandomAccess()) {
+                    supportsRandomAccess = false;
+                }
+
+                if (function.isRandom()) {
+                    randomCount++;
+                }
+
+                if (function instanceof MemoizerFunction) {
+                    memoizedFunctions.add((MemoizerFunction) function);
+                }
             }
+            this.supportsRandomAccess = supportsRandomAccess && randomCount == 0;
+            this.cursor = new VirtualFunctionRecordCursor(
+                    priorityMetadata,
+                    functions,
+                    memoizedFunctions,
+                    this.supportsRandomAccess,
+                    virtualColumnReservedSlots
+            );
+            this.internalSymbolTableSource = new VirtualRecordCursorFactorySymbolTableSource(cursor, virtualColumnReservedSlots);
+            this.priorityMetadata = priorityMetadata;
+        } catch (Throwable th) {
+            Misc.free(this, th);
+            throw th;
         }
-        this.supportsRandomAccess = supportsRandomAccess;
-        this.cursor = new VirtualFunctionDirectSymbolRecordCursor(functions, supportsRandomAccess);
     }
 
     @Override
-    public boolean followedLimitAdvice() {
-        return base.followedLimitAdvice();
+    public boolean canPeelForTopK() {
+        return true;
+    }
+
+    @Override
+    public void changePageFrameSizes(int minRows, int maxRows) {
+        base.changePageFrameSizes(minRows, maxRows);
     }
 
     @Override
@@ -72,21 +112,39 @@ public class VirtualRecordCursorFactory extends AbstractRecordCursorFactory {
     }
 
     @Override
+    public String getBaseColumnName(int idx) {
+        return priorityMetadata.getColumnName(idx);
+    }
+
+    @Override
     public RecordCursorFactory getBaseFactory() {
         return base;
+    }
+
+    public int getColumnComplexity(int columnIndex) {
+        return functions.getQuick(columnIndex).getComplexity();
     }
 
     @Override
     public RecordCursor getCursor(SqlExecutionContext executionContext) throws SqlException {
         RecordCursor cursor = base.getCursor(executionContext);
         try {
-            Function.init(functions, cursor, executionContext);
+            internalSymbolTableSource.of(cursor);
+            Function.init(functions, internalSymbolTableSource, executionContext, null);
             this.cursor.of(cursor);
             return this.cursor;
         } catch (Throwable th) {
             cursor.close();
             throw th;
         }
+    }
+
+    public ObjList<Function> getFunctions() {
+        return functions;
+    }
+
+    public PriorityMetadata getPriorityMetadata() {
+        return priorityMetadata;
     }
 
     @Override
@@ -100,8 +158,55 @@ public class VirtualRecordCursorFactory extends AbstractRecordCursorFactory {
     }
 
     @Override
+    public boolean isNonDeterministic() {
+        for (int i = 0, n = functions.size(); i < n; i++) {
+            if (functions.getQuick(i).isNonDeterministic()) {
+                return true;
+            }
+        }
+        return base.isNonDeterministic();
+    }
+
+    // Mirrors isNonDeterministic() on the weaker within-execution property: projections of
+    // now() or bind variables are non-deterministic across executions, yet re-initialize to
+    // the same execution-scoped snapshot on every open, so they keep this factory stable.
+    @Override
+    public boolean isStableWithinExecution() {
+        for (int i = 0, n = functions.size(); i < n; i++) {
+            if (!functions.getQuick(i).isStableWithinExecution()) {
+                return false;
+            }
+        }
+        return base.isStableWithinExecution();
+    }
+
+    @Override
+    public boolean recordCursorSupportsLongTopK(int columnIndex) {
+        final int baseColumnIndex = cursor.getLongTopKColumnIndex(columnIndex);
+        if (baseColumnIndex != -1) {
+            return base.recordCursorSupportsLongTopK(baseColumnIndex);
+        }
+        return false;
+    }
+
+    @Override
     public boolean recordCursorSupportsRandomAccess() {
         return supportsRandomAccess;
+    }
+
+    @Override
+    public RecordCursorFactory rewrapOverTopK(RecordCursorFactory topK, RecordMetadata orderedMetadata) {
+        RecordCursorFactory rewrappedBase = base.rewrapOverTopK(topK, base.getMetadata());
+        // Shares functions and priorityMetadata with the orphaned wrapper. Per the
+        // RecordCursorFactory.rewrapOverTopK contract, the caller must not close the orphan;
+        // its state has transferred here. Same precedent as the AsOf and LatestBy peels.
+        return new VirtualRecordCursorFactory(
+                orderedMetadata,
+                priorityMetadata,
+                functions,
+                rewrappedBase,
+                priorityMetadata.getVirtualColumnReservedSlots()
+        );
     }
 
     @Override
@@ -117,6 +222,22 @@ public class VirtualRecordCursorFactory extends AbstractRecordCursorFactory {
     }
 
     @Override
+    public int translateOrderByColumnToBase(int projectedIndex) {
+        if (projectedIndex < 0 || projectedIndex >= functions.size()) {
+            return -1;
+        }
+        ColumnFunction columnFn = ColumnFunction.unwrap(functions.getQuick(projectedIndex));
+        if (columnFn == null) {
+            return -1;
+        }
+        int baseIdx = priorityMetadata.getBaseColumnIndex(columnFn.getColumnIndex());
+        if (baseIdx < 0) {
+            return -1;
+        }
+        return base.translateOrderByColumnToBase(baseIdx);
+    }
+
+    @Override
     public boolean usesCompiledFilter() {
         return base.usesCompiledFilter();
     }
@@ -128,7 +249,45 @@ public class VirtualRecordCursorFactory extends AbstractRecordCursorFactory {
 
     @Override
     protected void _close() {
-        Misc.freeObjList(functions);
-        Misc.free(base);
+        final RecordCursorFactory base = this.base;
+        this.base = null;
+        this.cursor = null;
+        final ObjList<Function> functions = this.functions;
+        this.functions = null;
+
+        Throwable cleanupFailure = Misc.freeObjListBestEffort(null, functions);
+        cleanupFailure = Misc.freeBestEffort(cleanupFailure, base);
+        CairoException.rethrowCleanupFailure(cleanupFailure);
+    }
+
+    private static class VirtualRecordCursorFactorySymbolTableSource implements SymbolTableSource {
+        private final RecordCursor own;
+        private final int virtualColumnReservedSlots;
+        private RecordCursor base;
+
+        public VirtualRecordCursorFactorySymbolTableSource(RecordCursor own, int virtualColumnReservedSlots) {
+            this.own = own;
+            this.virtualColumnReservedSlots = virtualColumnReservedSlots;
+        }
+
+        @Override
+        public SymbolTable getSymbolTable(int columnIndex) {
+            if (columnIndex < virtualColumnReservedSlots) {
+                return own.getSymbolTable(columnIndex);
+            }
+            return base.getSymbolTable(columnIndex - virtualColumnReservedSlots);
+        }
+
+        @Override
+        public SymbolTable newSymbolTable(int columnIndex) {
+            if (columnIndex < virtualColumnReservedSlots) {
+                return own.newSymbolTable(columnIndex);
+            }
+            return base.newSymbolTable(columnIndex - virtualColumnReservedSlots);
+        }
+
+        public void of(RecordCursor base) {
+            this.base = base;
+        }
     }
 }

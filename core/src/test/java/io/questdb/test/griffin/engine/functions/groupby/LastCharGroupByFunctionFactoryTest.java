@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -37,7 +37,7 @@ public class LastCharGroupByFunctionFactoryTest extends AbstractCairoTest {
 
     @Test
     public void testAllNull() throws SqlException {
-        ddl("create table tab (f char)");
+        execute("create table tab (f char)");
 
         try (TableWriter w = getWriter("tab")) {
             for (int i = 10; i > 0; i--) {
@@ -59,14 +59,13 @@ public class LastCharGroupByFunctionFactoryTest extends AbstractCairoTest {
 
     @Test
     public void testLastChar() throws Exception {
-        assertQuery(
-                "a\n" +
-                        "3\n",
-                "select last(a) a from tab",
-                "create table tab as (select '1' a union select '2' a union select '3' a)",
-                null,
-                false,
-                true
-        );
+        assertQuery("select last(a) a from tab")
+                .ddl("create table tab as (select '1' a union select '2' a union select '3' a)")
+                .noRandomAccess()
+                .expectSize()
+                .returns("""
+                        a
+                        3
+                        """);
     }
 }

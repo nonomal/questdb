@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,39 +24,28 @@
 
 package io.questdb.griffin.engine.groupby;
 
+import io.questdb.cairo.map.MapValue;
+import io.questdb.cairo.sql.Record;
 import io.questdb.griffin.engine.functions.GroupByFunction;
+import io.questdb.log.Log;
+import io.questdb.log.LogFactory;
 import io.questdb.std.BytecodeAssembler;
 import io.questdb.std.ObjList;
+import io.questdb.std.ex.BytecodeException;
 import org.jetbrains.annotations.NotNull;
 
 public class GroupByFunctionsUpdaterFactory {
     private static final int FIELD_POOL_OFFSET = 3;
+    private static final Log LOG = LogFactory.getLog(GroupByFunctionsUpdaterFactory.class);
 
     private GroupByFunctionsUpdaterFactory() {
     }
 
     /**
-     * Creates a GroupByFunctionUpdater instance capturing the provided group by functions.
-     * The generated class will have fields GroupByFunction f0, GroupByFunction f1, GroupByFunction f2 ... GroupByFunction fn
-     * for each group by function from the provided list.
-     * <p>
-     * The generated class will have the following methods:
-     * <ul>
-     * <li>updateNew(MapValue value, Record record, long rowId) - calls f0, f1, f2 ... fn.computeFirst(value, record, rowId) for each group by function</li>
-     * <li>updateExisting(MapValue value, Record record, long rowId) - calls f0, f1, f2 ... fn.computeNext(value, record, rowId) for each group by function</li>
-     * <li>updateEmpty(MapValue value) - calls f0, f1, f2 ... fn.setEmpty(value) for each group by function</li>
-     * <li>merge(MapValue destValue, MapValue srcValue) - calls fn.merge(destValue, srcValue) for each group by function</li>
-     * <li>setFunctions(ObjList&lt;GroupByFunction&gt; groupByFunctions) - sets the group by functions to the fields. This method is called by the factory and should not be called by the caller.</li>
-     * </ul>
-     *
-     * @param asm              BytecodeAssembler instance
-     * @param groupByFunctions list of group by functions
-     * @return GroupByFunctionUpdater instance
+     * Always generates anonymous GroupByFunctionsUpdater implementation class. Kept public for benchmarking purposes,
+     * otherwise use {@link #getInstanceClass(BytecodeAssembler, int)}.
      */
-    public static GroupByFunctionsUpdater getInstance(
-            BytecodeAssembler asm,
-            @NotNull ObjList<GroupByFunction> groupByFunctions
-    ) {
+    public static Class<? extends GroupByFunctionsUpdater> generateInstanceClass(@NotNull BytecodeAssembler asm, int functionCount) {
         asm.init(GroupByFunctionsUpdater.class);
         asm.setupPool();
         final int thisClassIndex = asm.poolClass(asm.poolUtf8("io/questdb/griffin/engine/groupby/GroupByFunctionsUpdaterAsm"));
@@ -64,13 +53,11 @@ public class GroupByFunctionsUpdaterFactory {
         int interfaceClassIndex = asm.poolClass(GroupByFunctionsUpdater.class);
 
         final int superIndex = asm.poolMethod(superclassIndex, "<init>", "()V");
-
         final int typeIndex = asm.poolUtf8("Lio/questdb/griffin/engine/functions/GroupByFunction;");
-        final int functionSize = groupByFunctions.size();
 
         int firstFieldNameIndex = 0;
         int firstFieldIndex = 0;
-        for (int i = 0; i < functionSize; i++) {
+        for (int i = 0; i < functionCount; i++) {
             // if you change pool calls then you will likely need to change the FIELD_POOL_OFFSET constant
             int fieldNameIndex = asm.poolUtf8().putAscii("f").put(i).$();
             int nameAndType = asm.poolNameAndType(fieldNameIndex, typeIndex);
@@ -104,26 +91,81 @@ public class GroupByFunctionsUpdaterFactory {
         asm.defineClass(thisClassIndex, superclassIndex);
         asm.interfaceCount(1);
         asm.putShort(interfaceClassIndex);
-        asm.fieldCount(functionSize);
-        for (int i = 0; i < functionSize; i++) {
+        asm.fieldCount(functionCount);
+        for (int i = 0; i < functionCount; i++) {
             asm.defineField(firstFieldNameIndex + (i * FIELD_POOL_OFFSET), typeIndex);
         }
         asm.methodCount(6);
         asm.defineDefaultConstructor(superIndex);
 
-        generateUpdateNew(asm, functionSize, firstFieldIndex, computeFirstIndex, updateNewIndex, updateNewSigIndex);
-        generateUpdateExisting(asm, functionSize, firstFieldIndex, computeNextIndex, updateExistingIndex, updateExistingSigIndex);
-        generateUpdateEmpty(asm, functionSize, firstFieldIndex, setEmptyIndex, updateEmptyIndex, updateEmptySigIndex);
-        generateSetFunctions(asm, functionSize, firstFieldIndex, setFunctionsIndex, setFunctionsSigIndex, getIndex);
-        generateMerge(asm, functionSize, firstFieldIndex, mergeFunctionIndex, mergeIndex, mergeSigIndex);
+        generateUpdateNew(asm, functionCount, firstFieldIndex, computeFirstIndex, updateNewIndex, updateNewSigIndex);
+        generateUpdateExisting(asm, functionCount, firstFieldIndex, computeNextIndex, updateExistingIndex, updateExistingSigIndex);
+        generateUpdateEmpty(asm, functionCount, firstFieldIndex, setEmptyIndex, updateEmptyIndex, updateEmptySigIndex);
+        generateSetFunctions(asm, functionCount, firstFieldIndex, setFunctionsIndex, setFunctionsSigIndex, getIndex);
+        generateMerge(asm, functionCount, firstFieldIndex, mergeFunctionIndex, mergeIndex, mergeSigIndex);
 
         // class attribute count
         asm.putShort(0);
 
-        GroupByFunctionsUpdater updater = asm.newInstance();
+        return asm.loadClass();
+    }
 
-        updater.setFunctions(groupByFunctions);
-        return updater;
+    /**
+     * Creates an instance of a record sink class previously generated via the
+     * {@link #getInstanceClass(BytecodeAssembler, int)} method.
+     */
+    public static GroupByFunctionsUpdater getInstance(
+            @NotNull Class<? extends GroupByFunctionsUpdater> clazz,
+            @NotNull ObjList<GroupByFunction> groupByFunctions
+    ) {
+        try {
+            final GroupByFunctionsUpdater updater = clazz.getDeclaredConstructor().newInstance();
+            updater.setFunctions(groupByFunctions);
+            return updater;
+        } catch (Exception e) {
+            LOG.critical().$("could not create an instance of GroupByFunctionsUpdater, cause: ").$(e).$();
+            throw BytecodeException.INSTANCE;
+        }
+    }
+
+    /**
+     * Creates a GroupByFunctionUpdater instance capturing the provided group by functions.
+     * The generated class will have fields GroupByFunction f0, GroupByFunction f1, GroupByFunction f2 ... GroupByFunction fn
+     * for each group by function from the provided list.
+     * <p>
+     * The generated class will have the following methods:
+     * <ul>
+     * <li>updateNew(MapValue value, Record record, long rowId) - calls f0, f1, f2 ... fn.computeFirst(value, record, rowId) for each group by function</li>
+     * <li>updateExisting(MapValue value, Record record, long rowId) - calls f0, f1, f2 ... fn.computeNext(value, record, rowId) for each group by function</li>
+     * <li>updateEmpty(MapValue value) - calls f0, f1, f2 ... fn.setEmpty(value) for each group by function</li>
+     * <li>merge(MapValue destValue, MapValue srcValue) - calls fn.merge(destValue, srcValue) for each group by function</li>
+     * <li>setFunctions(ObjList&lt;GroupByFunction&gt; groupByFunctions) - sets the group by functions to the fields. This method is called by the factory and should not be called by the caller.</li>
+     * </ul>
+     *
+     * @param asm              BytecodeAssembler instance
+     * @param groupByFunctions list of group by functions
+     * @return GroupByFunctionUpdater instance
+     */
+    public static GroupByFunctionsUpdater getInstance(
+            @NotNull BytecodeAssembler asm,
+            @NotNull ObjList<GroupByFunction> groupByFunctions
+    ) {
+        final Class<? extends GroupByFunctionsUpdater> clazz = getInstanceClass(asm, groupByFunctions.size());
+        return getInstance(clazz, groupByFunctions);
+    }
+
+    /**
+     * Same as the {@link #getInstance(BytecodeAssembler, ObjList)} method, but returns the generated class instead
+     * of its instance. An instance can be later created via the {@link #getInstance(Class, ObjList)} method.
+     * <p>
+     * Used when creating per-worker updaters for parallel GROUP BY.
+     */
+    public static Class<? extends GroupByFunctionsUpdater> getInstanceClass(@NotNull BytecodeAssembler asm, int functionCount) {
+        // The threshold is chosen based on GroupByFunctionsUpdaterBenchmark.
+        if (functionCount > 32) {
+            return SimpleGroupByFunctionUpdater.class;
+        }
+        return generateInstanceClass(asm, functionCount);
     }
 
     private static void generateMerge(
@@ -151,7 +193,14 @@ public class GroupByFunctionsUpdaterFactory {
         asm.endMethod();
     }
 
-    private static void generateSetFunctions(BytecodeAssembler asm, int functionSize, int firstFieldIndex, int setFunctionsIndex, int setFunctionsSigIndex, int getIndex) {
+    private static void generateSetFunctions(
+            BytecodeAssembler asm,
+            int functionSize,
+            int firstFieldIndex,
+            int setFunctionsIndex,
+            int setFunctionsSigIndex,
+            int getIndex
+    ) {
         asm.startMethod(setFunctionsIndex, setFunctionsSigIndex, 3, 3);
         for (int i = 0; i < functionSize; i++) {
             asm.aload(0);
@@ -255,5 +304,45 @@ public class GroupByFunctionsUpdaterFactory {
         // attributes
         asm.putShort(0);
         asm.endMethod();
+    }
+
+    /**
+     * Used when the number of group by functions is large. Kept public for benchmarking purposes.
+     */
+    public static class SimpleGroupByFunctionUpdater implements GroupByFunctionsUpdater {
+        private ObjList<GroupByFunction> groupByFunctions;
+
+        @Override
+        public void merge(MapValue destValue, MapValue srcValue) {
+            for (int i = 0, n = groupByFunctions.size(); i < n; i++) {
+                groupByFunctions.getQuick(i).merge(destValue, srcValue);
+            }
+        }
+
+        @Override
+        public void setFunctions(ObjList<GroupByFunction> groupByFunctions) {
+            this.groupByFunctions = groupByFunctions;
+        }
+
+        @Override
+        public void updateEmpty(MapValue value) {
+            for (int i = 0, n = groupByFunctions.size(); i < n; i++) {
+                groupByFunctions.getQuick(i).setEmpty(value);
+            }
+        }
+
+        @Override
+        public void updateExisting(MapValue value, Record record, long rowId) {
+            for (int i = 0, n = groupByFunctions.size(); i < n; i++) {
+                groupByFunctions.getQuick(i).computeNext(value, record, rowId);
+            }
+        }
+
+        @Override
+        public void updateNew(MapValue value, Record record, long rowId) {
+            for (int i = 0, n = groupByFunctions.size(); i < n; i++) {
+                groupByFunctions.getQuick(i).computeFirst(value, record, rowId);
+            }
+        }
     }
 }

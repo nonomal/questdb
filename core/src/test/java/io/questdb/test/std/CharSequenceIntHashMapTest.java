@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -108,15 +108,15 @@ public class CharSequenceIntHashMapTest {
             CharSequence cs = rnd.nextChars(15);
             rnd.nextInt();
             if (rnd2.nextPositiveInt() % 16 != 0) {
-                map.increment(cs);
+                map.inc(cs);
                 int index = map.keyIndex(cs);
                 Assert.assertTrue(index < 0);
                 Assert.assertEquals(rnd3.nextInt() + 1, map.valueAt(index));
             } else {
-                map.increment(cs);
+                map.inc(cs);
                 int index = map.keyIndex(cs);
                 Assert.assertTrue(index < 0);
-                Assert.assertEquals(0, map.valueAt(index));
+                Assert.assertEquals(1, map.valueAt(index));
             }
         }
 
@@ -139,7 +139,7 @@ public class CharSequenceIntHashMapTest {
             } else {
                 int index = map2.keyIndex(cs);
                 Assert.assertTrue(index < 0);
-                Assert.assertEquals(0, map2.valueAt(index));
+                Assert.assertEquals(1, map2.valueAt(index));
             }
         }
 
@@ -189,6 +189,28 @@ public class CharSequenceIntHashMapTest {
                 Assert.assertEquals(value1, map.get(cs));
             }
         }
+    }
+
+    @Test
+    public void testIncAddsKeyToList() {
+        CharSequenceIntHashMap map = new CharSequenceIntHashMap();
+        map.inc("a");
+        map.inc("b");
+        map.inc("c");
+
+        // inc on new keys should add them to keys() list
+        ObjList<CharSequence> keys = map.keys();
+        Assert.assertEquals(3, keys.size());
+
+        // valueQuick should work for inc-inserted keys
+        for (int i = 0, n = keys.size(); i < n; i++) {
+            Assert.assertEquals(1, map.valueQuick(i));
+        }
+
+        // inc existing key should not add duplicate to list
+        map.inc("a");
+        Assert.assertEquals(3, keys.size());
+        Assert.assertEquals(2, map.get("a"));
     }
 
     @Test

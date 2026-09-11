@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -25,6 +25,12 @@
 package io.questdb;
 
 public interface MemoryConfiguration {
+
+    /**
+     * Returns the interval in milliseconds between periodic memory usage log entries.
+     */
+    long getMemoryUsageLogInterval();
+
     /**
      * Returns the value of the configuration property ram.usage.limit.bytes.
      */
@@ -46,4 +52,9 @@ public interface MemoryConfiguration {
      * the limit set on our cgroup (such as in a Docker container), if any.
      */
     long getTotalSystemMemory();
+
+    /**
+     * Returns whether periodic memory usage logging is enabled.
+     */
+    boolean isMemoryUsageLogEnabled();
 }

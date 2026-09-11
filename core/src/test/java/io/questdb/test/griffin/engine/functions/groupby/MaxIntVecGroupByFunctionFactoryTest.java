@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -34,38 +34,54 @@ public class MaxIntVecGroupByFunctionFactoryTest extends AbstractCairoTest {
     public void testAddColumn() throws Exception {
         // fix page frame size, because it affects AVG accuracy
         setProperty(PropertyKey.CAIRO_SQL_PAGE_FRAME_MAX_ROWS, 10_000);
-        assertQuery("avg\n" +
-                        "5261.376146789\n", "select round(avg(f),9) avg from tab", "create table tab as (select rnd_int(-55, 9009, 2) f from long_sequence(131))", null, "alter table tab add column b int", "avg\n" +
-                        "5261.376146789\n", false, true, false);
+        assertQuery("select round(avg(f),9) avg from tab")
+                .ddl("create table tab as (select rnd_int(-55, 9009, 2) f from long_sequence(131))")
+                .mutateWith("alter table tab add column b int")
+                .noRandomAccess()
+                .expectSize()
+                .returns("""
+                        avg
+                        5261.376146789
+                        """, """
+                        avg
+                        5261.376146789
+                        """);
 
-        assertQuery(
-                "avg\tmax\n" +
-                        "14.792007\t967\n",
-                "select round(avg(f),6) avg, max(b) max from tab",
-                "insert into tab select rnd_int(2, 10, 2), rnd_int(93, 967, 4) from long_sequence(78057)",
-                null,
-                false,
-                true
-        );
+        assertQuery("select round(avg(f),6) avg, max(b) max from tab")
+                .ddl("insert into tab select rnd_int(2, 10, 2), rnd_int(93, 967, 4) from long_sequence(78057)")
+                .noRandomAccess()
+                .expectSize()
+                .returns("""
+                        avg\tmax
+                        14.792007\t967
+                        """);
     }
 
     @Test
     public void testAllNullThenOne() throws Exception {
-        assertQuery("max\n" +
-                "null\n", "select max(f) from tab", "create table tab as (select cast(null as int) f from long_sequence(33))", null, "insert into tab select 4567866 from long_sequence(1)", "max\n" +
-                        "4567866\n", false, true, false);
+        assertQuery("select max(f) from tab")
+                .ddl("create table tab as (select cast(null as int) f from long_sequence(33))")
+                .mutateWith("insert into tab select 4567866 from long_sequence(1)")
+                .noRandomAccess()
+                .expectSize()
+                .returns("""
+                        max
+                        null
+                        """, """
+                        max
+                        4567866
+                        """);
     }
 
     @Test
     public void testSimple() throws Exception {
-        assertQuery(
-                "max\n" +
-                        "122456138\n",
-                "select max(f) from tab",
-                "create table tab as (select rnd_int(-78783, 123239980, 2) f from long_sequence(181))",
-                null,
-                false,
-                true
-        );
+        assertQuery("select max(f) from tab")
+                .ddl("create table tab as (select rnd_int(-78783, 123239980, 2) f from long_sequence(181))")
+                .noRandomAccess()
+                .expectSize()
+                .returns("""
+                        max
+                        122456138
+                        """);
     }
 }

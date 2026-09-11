@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -26,62 +26,147 @@ package io.questdb.cairo.sql.async;
 
 import io.questdb.cairo.CairoConfiguration;
 import io.questdb.cairo.CairoException;
-import io.questdb.cairo.sql.PageAddressCache;
+import io.questdb.cairo.ImplicitCastException;
+import io.questdb.cairo.sql.PageFrameAddressCache;
+import io.questdb.cairo.sql.PageFrameMemory;
+import io.questdb.cairo.sql.PageFrameMemoryPool;
+import io.questdb.cairo.sql.PartitionFormat;
+import io.questdb.cairo.sql.SqlExecutionCircuitBreaker;
 import io.questdb.cairo.sql.StatefulAtom;
 import io.questdb.std.DirectLongList;
 import io.questdb.std.FlyweightMessageContainer;
+import io.questdb.std.IntHashSet;
+import io.questdb.std.MemoryTracker;
 import io.questdb.std.Misc;
+import io.questdb.std.Mutable;
+import io.questdb.std.NumericException;
+import io.questdb.std.QuietCloseable;
 import io.questdb.std.str.StringSink;
+import org.jetbrains.annotations.NotNull;
 
-import java.io.Closeable;
-
-public class PageFrameReduceTask implements Closeable {
-
+public class PageFrameReduceTask implements QuietCloseable, Mutable {
     public static final byte TYPE_FILTER = 0;
-    public static final byte TYPE_GROUP_BY = 1;
-    public static final byte TYPE_GROUP_BY_NOT_KEYED = 2;
+    public static final byte TYPE_TOP_K = 1;
+    public static final byte TYPE_WINDOW_JOIN = 2;
     private static final String exceptionMessage = "unexpected filter error";
 
-    // Used to pass the list of column page frame addresses to a JIT-compiled filter.
-    private final DirectLongList columns;
+    private final DirectLongList auxAddresses;
+    private final DirectLongList dataAddresses;
     private final StringSink errorMsg = new StringSink();
-    private final DirectLongList filteredRows; // Used for TYPE_FILTER.
-    private final long pageFrameQueueCapacity;
-    private final DirectLongList varSizeAux;
+    private final DirectLongList filteredRows; // Used for TYPE_FILTER and TYPE_WINDOW_JOIN.
+    private final PageFrameMemoryPool frameMemoryPool;
+    private final long frameQueueCapacity;
+    private int errno = CairoException.NON_CRITICAL;
+    private byte errorKind = AsyncQueryErrorKind.KIND_NONE;
+    private int errorMessagePosition;
+    private long filteredRowCount;
     private int frameIndex = Integer.MAX_VALUE;
+    private PageFrameMemory frameMemory;
     private PageFrameSequence<?> frameSequence;
-    private long frameSequenceId;
-    private boolean isCancelled;
-    private byte type;
+    private long frameSequenceId = -1;
+    private int interruptionReason = SqlExecutionCircuitBreaker.STATE_OK;
+    // Valid for TYPE_FILTER only. When set, only filteredRowCount field is initialized by the filter,
+    // i.e. filteredRows can't be used.
+    private boolean isCountOnly;
+    private boolean isOutOfMemory;
+    private byte taskType;
 
     public PageFrameReduceTask(CairoConfiguration configuration, int memoryTag) {
         try {
+            this.frameQueueCapacity = configuration.getPageFrameReduceQueueCapacity();
             this.filteredRows = new DirectLongList(configuration.getPageFrameReduceRowIdListCapacity(), memoryTag);
-            this.columns = new DirectLongList(configuration.getPageFrameReduceColumnListCapacity(), memoryTag);
-            this.varSizeAux = new DirectLongList(configuration.getPageFrameReduceColumnListCapacity(), memoryTag);
-            this.pageFrameQueueCapacity = configuration.getPageFrameReduceQueueCapacity();
+            this.dataAddresses = new DirectLongList(configuration.getPageFrameReduceColumnListCapacity(), memoryTag);
+            this.auxAddresses = new DirectLongList(configuration.getPageFrameReduceColumnListCapacity(), memoryTag);
+            this.frameMemoryPool = new PageFrameMemoryPool(configuration, 0L);
         } catch (Throwable th) {
             close();
             throw th;
         }
     }
 
+    public static void populateJitAddresses(
+            @NotNull PageFrameMemory frameMemory,
+            @NotNull PageFrameAddressCache pageAddressCache,
+            @NotNull DirectLongList dataAddresses,
+            @NotNull DirectLongList auxAddresses
+    ) {
+        final int columnCount = pageAddressCache.getColumnCount();
+
+        dataAddresses.clear();
+        for (int columnIndex = 0; columnIndex < columnCount; columnIndex++) {
+            dataAddresses.add(frameMemory.getPageAddress(columnIndex));
+        }
+
+        auxAddresses.clear();
+        for (int columnIndex = 0; columnIndex < columnCount; columnIndex++) {
+            auxAddresses.add(
+                    pageAddressCache.isVarSizeColumn(columnIndex)
+                            ? frameMemory.getAuxPageAddress(columnIndex)
+                            : 0
+            );
+        }
+    }
+
+    /**
+     * Builds the typed exception to re-throw at the collector. The kind is the class
+     * of the throwable captured by the worker via {@link #setErrorMsg(Throwable)};
+     * {@link ImplicitCastException} and {@link NumericException} are preserved so
+     * callers (and the fuzzer oracle) can recognise legitimate user-facing errors.
+     * All other throwables fall back to a non-critical {@link CairoException}, which
+     * preserves the pre-existing behaviour for truly unexpected errors (e.g. NPE).
+     */
+    public RuntimeException buildError() {
+        return switch (errorKind) {
+            case AsyncQueryErrorKind.KIND_IMPLICIT_CAST ->
+                    ImplicitCastException.instance().position(errorMessagePosition).put(errorMsg);
+            case AsyncQueryErrorKind.KIND_NUMERIC ->
+                    NumericException.instance().position(errorMessagePosition).put(errorMsg);
+            // critical(errno) preserves the worker's errno and, with it, isCritical();
+            // errno == NON_CRITICAL reduces to the previous nonCritical() behaviour.
+            default -> CairoException.critical(errno)
+                    .position(errorMessagePosition)
+                    .put(errorMsg)
+                    .setInterruptionReason(interruptionReason)
+                    .setOutOfMemory(isOutOfMemory);
+        };
+    }
+
+    @Override
+    public void clear() {
+        filteredRowCount = 0;
+        isCountOnly = false;
+        filteredRows.resetCapacity();
+        dataAddresses.resetCapacity();
+        auxAddresses.resetCapacity();
+        frameMemoryPool.clear();
+    }
+
     @Override
     public void close() {
+        filteredRowCount = 0;
+        isCountOnly = false;
         Misc.free(filteredRows);
-        Misc.free(columns);
-        Misc.free(varSizeAux);
+        Misc.free(dataAddresses);
+        Misc.free(auxAddresses);
+        Misc.free(frameMemoryPool);
+    }
+
+    /**
+     * Returns list of pointers to aux vectors (var-size columns only).
+     */
+    public DirectLongList getAuxAddresses() {
+        return auxAddresses;
     }
 
     /**
      * Returns list of pointers to data vectors.
      */
-    public DirectLongList getData() {
-        return columns;
+    public DirectLongList getDataAddresses() {
+        return dataAddresses;
     }
 
-    public CharSequence getErrorMsg() {
-        return errorMsg;
+    public long getFilteredRowCount() {
+        return filteredRowCount;
     }
 
     public DirectLongList getFilteredRows() {
@@ -90,6 +175,10 @@ public class PageFrameReduceTask implements Closeable {
 
     public int getFrameIndex() {
         return frameIndex;
+    }
+
+    public PageFrameMemory getFrameMemory() {
+        return frameMemory;
     }
 
     public long getFrameRowCount() {
@@ -109,90 +198,132 @@ public class PageFrameReduceTask implements Closeable {
         return frameSequenceId;
     }
 
-    public PageAddressCache getPageAddressCache() {
-        return frameSequence.getPageAddressCache();
-    }
-
-    public byte getType() {
-        return type;
-    }
-
     /**
-     * Returns list of pointers to aux vectors (var-size columns only).
+     * Returns the per-query memory tracker captured by the owning frame sequence
+     * at workload start, or {@code null} between workloads / when no per-query
+     * limit is configured. Workers feed this to tracker-aware allocation paths.
      */
-    public DirectLongList getVarSizeAux() {
-        return varSizeAux;
+    public MemoryTracker getMemoryTracker() {
+        return frameSequence != null ? frameSequence.getMemoryTracker() : null;
+    }
+
+    public byte getTaskType() {
+        return taskType;
     }
 
     public boolean hasError() {
-        return errorMsg.length() > 0;
+        return !errorMsg.isEmpty();
     }
 
     public boolean isCancelled() {
-        return isCancelled;
+        return interruptionReason == SqlExecutionCircuitBreaker.STATE_CANCELLED;
     }
 
-    public void of(PageFrameSequence<?> frameSequence, int frameIndex) {
+    public boolean isCountOnly() {
+        return isCountOnly;
+    }
+
+    public boolean isOutOfMemory() {
+        return isOutOfMemory;
+    }
+
+    public boolean isParquetFrame() {
+        return frameSequence.getPageFrameAddressCache().getFrameFormat(frameIndex) == PartitionFormat.PARQUET;
+    }
+
+    public void of(PageFrameSequence<?> frameSequence, int frameIndex, boolean countOnly) {
         this.frameSequence = frameSequence;
+        final boolean sameQueryExecution = frameSequenceId == frameSequence.getId();
         this.frameSequenceId = frameSequence.getId();
-        this.type = frameSequence.getTaskType();
+        this.taskType = frameSequence.getTaskType();
         this.frameIndex = frameIndex;
+        this.isCountOnly = countOnly;
+        // Rebind the per-query tracker on every frame: clear() nulls it on the
+        // pool between frames, and the pool.of() below only re-runs on a fresh
+        // query. Top K uses its own frame memory pool, so this is a no-op there.
+        frameMemoryPool.setMemoryTracker(frameSequence.getMemoryTracker());
+        // Initialize the memory pool if the task wasn't previously initialized for the same query,
+        // or it belongs to top K. Top K uses its own frame memory pool.
+        if (!sameQueryExecution && taskType != TYPE_TOP_K) {
+            frameMemoryPool.of(frameSequence.getPageFrameAddressCache());
+        }
+        frameMemory = null;
+        filteredRows.clear();
+        filteredRowCount = 0;
         errorMsg.clear();
-        isCancelled = false;
-        if (type == TYPE_FILTER) {
-            filteredRows.clear();
-        }
+        errorMessagePosition = 0;
+        errno = CairoException.NON_CRITICAL;
+        errorKind = AsyncQueryErrorKind.KIND_NONE;
+        interruptionReason = SqlExecutionCircuitBreaker.STATE_OK;
+        isOutOfMemory = false;
     }
 
+    public PageFrameMemory populateFrameMemory() {
+        assert taskType != TYPE_TOP_K;
+        frameMemory = frameMemoryPool.navigateTo(frameIndex);
+        return frameMemory;
+    }
+
+    public PageFrameMemory populateFrameMemory(IntHashSet columnIndexes) {
+        assert taskType != TYPE_TOP_K;
+        frameMemory = frameMemoryPool.navigateTo(frameIndex, columnIndexes);
+        return frameMemory;
+    }
+
+    // Must be called after populateFrameMemory.
     public void populateJitData() {
-        PageAddressCache pageAddressCache = getPageAddressCache();
-        final long columnCount = pageAddressCache.getColumnCount();
-        if (columns.getCapacity() < columnCount) {
-            columns.setCapacity(columnCount);
-        }
-        columns.clear();
-        for (int columnIndex = 0; columnIndex < columnCount; columnIndex++) {
-            columns.add(pageAddressCache.getPageAddress(getFrameIndex(), columnIndex));
-        }
+        populateJitData(frameMemory);
+    }
 
-        if (varSizeAux.getCapacity() < columnCount) {
-            varSizeAux.setCapacity(columnCount);
-        }
-        varSizeAux.clear();
-        for (int columnIndex = 0; columnIndex < columnCount; columnIndex++) {
-            varSizeAux.add(
-                    pageAddressCache.isVarSizeColumn(columnIndex)
-                            ? pageAddressCache.getAuxPageAddress(getFrameIndex(), columnIndex)
-                            : 0
-            );
-        }
-        final long rowCount = getFrameRowCount();
-        if (filteredRows.getCapacity() < rowCount) {
-            filteredRows.setCapacity(rowCount);
+    // Useful when using external frame memory pool.
+    public void populateJitData(@NotNull PageFrameMemory frameMemory) {
+        assert frameMemory.getFrameIndex() == frameIndex;
+        populateJitAddresses(frameMemory, frameSequence.getPageFrameAddressCache(), dataAddresses, auxAddresses);
+        if (!isCountOnly) {
+            final long rowCount = getFrameRowCount();
+            if (filteredRows.getCapacity() < rowCount) {
+                filteredRows.setCapacity(rowCount);
+            }
         }
     }
 
-    public void resetCapacities() {
-        filteredRows.resetCapacity();
-        columns.resetCapacity();
-        varSizeAux.resetCapacity();
+    public boolean populateRemainingColumns(IntHashSet filterColumnIndexes, DirectLongList filteredRows, boolean fillWithNulls) {
+        assert frameMemory != null;
+        if (frameMemory.getFrameFormat() == PartitionFormat.PARQUET) {
+            return frameMemory.populateRemainingColumns(filterColumnIndexes, filteredRows, fillWithNulls);
+        }
+        return false;
+    }
+
+    public void releaseFrameMemory() {
+        frameMemoryPool.releaseParquetBuffers();
+        frameMemory = null;
     }
 
     public void setErrorMsg(Throwable th) {
-        if (th instanceof FlyweightMessageContainer) {
-            errorMsg.put(((FlyweightMessageContainer) th).getFlyweightMessage());
+        if (th instanceof FlyweightMessageContainer fmc) {
+            errorMsg.put(fmc.getFlyweightMessage());
+            errorMessagePosition = fmc.getPosition();
         } else {
             final String msg = th.getMessage();
             errorMsg.put(msg != null ? msg : exceptionMessage);
         }
 
-        if (th instanceof CairoException) {
-            isCancelled = ((CairoException) th).isCancellation();
+        if (th instanceof CairoException ce) {
+            errno = ce.getErrno();
+            interruptionReason = ce.getInterruptionReason();
+            isOutOfMemory = ce.isOutOfMemory();
         }
+
+        errorKind = AsyncQueryErrorKind.of(th);
     }
 
-    public void setType(byte type) {
-        this.type = type;
+    public void setFilteredRowCount(long filteredRowCount) {
+        this.filteredRowCount = filteredRowCount;
+    }
+
+    public void setTaskType(byte taskType) {
+        this.taskType = taskType;
     }
 
     void collected() {
@@ -205,17 +336,21 @@ public class PageFrameReduceTask implements Closeable {
         // we assume that frame indexes are published in ascending order
         // and when we see the last index, we would free up the remaining resources
         if (frameIndex + 1 == frameCount) {
-            frameSequence.reset();
+            frameSequence.markAsDone();
         }
 
         frameSequence = null;
+        frameMemory = null;
 
         // We have to reset capacity only on max all queue items
         // What we are avoiding here is resetting capacity on 1000 frames given our queue size
         // is 32 items. If our particular producer resizes queue items to 10x of the initial size
         // we let these sizes stick until produce starts to wind down.
-        if (forceCollect || frameIndex >= frameCount - pageFrameQueueCapacity) {
-            resetCapacities();
+        if (forceCollect || frameIndex >= frameCount - frameQueueCapacity) {
+            clear();
+        } else {
+            // Never keep parquet buffers around to avoid OOM even if there is an ongoing query.
+            releaseFrameMemory();
         }
     }
 }

@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -32,6 +32,8 @@ import io.questdb.griffin.SqlExecutionContext;
 import io.questdb.std.IntList;
 import io.questdb.std.ObjList;
 
+import static io.questdb.griffin.engine.functions.groupby.ApproxPercentileDoubleGroupByFunctionFactory.checkPercentile;
+
 public class ApproxPercentileDoubleGroupByDefaultFunctionFactory implements FunctionFactory {
     private static final int DEFAULT_PRECISION = 1;
 
@@ -56,9 +58,7 @@ public class ApproxPercentileDoubleGroupByDefaultFunctionFactory implements Func
         final Function exprFunc = args.getQuick(0);
         final Function percentileFunc = args.getQuick(1);
 
-        if (!percentileFunc.isConstant() && !percentileFunc.isRuntimeConstant()) {
-            throw SqlException.$(argPositions.getQuick(1), "percentile must be a constant");
-        }
+        checkPercentile(percentileFunc, argPositions.getQuick(1));
 
         return new ApproxPercentileDoubleGroupByFunction(exprFunc, percentileFunc, DEFAULT_PRECISION, position);
     }

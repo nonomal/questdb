@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -26,14 +26,23 @@ package io.questdb.cairo.sql;
 
 import io.questdb.cairo.TableToken;
 import io.questdb.cairo.sql.async.PageFrameSequence;
+import io.questdb.cairo.vm.api.MemoryCARW;
 import io.questdb.griffin.PlanSink;
 import io.questdb.griffin.Plannable;
 import io.questdb.griffin.SqlException;
 import io.questdb.griffin.SqlExecutionContext;
+import io.questdb.griffin.engine.table.ConcurrentTimeFrameCursor;
+import io.questdb.griffin.engine.table.PushdownFilterExtractor;
+import io.questdb.griffin.model.ExpressionNode;
+import io.questdb.jit.CompiledFilter;
 import io.questdb.mp.SCSequence;
+import io.questdb.std.IntList;
+import io.questdb.std.ObjList;
 import io.questdb.std.str.CharSink;
 import io.questdb.std.str.Sinkable;
 import org.jetbrains.annotations.NotNull;
+import org.jetbrains.annotations.Nullable;
+import org.jetbrains.annotations.TestOnly;
 
 import java.io.Closeable;
 
@@ -65,20 +74,45 @@ public interface RecordCursorFactory extends Closeable, Sinkable, Plannable {
     int SCAN_DIRECTION_FORWARD = 1;
     int SCAN_DIRECTION_OTHER = 0;
 
+    /**
+     * Returns true if this factory may be peeled by the parallel top-K gate, so the
+     * page-frame leaf below it can be wrapped by {@code AsyncTopKRecordCursorFactory}
+     * and this factory rebuilt over that top-K.
+     * <p>
+     * Implementations that return {@code true} must also override
+     * {@link #translateOrderByColumnToBase(int)} to map ORDER BY indices into the
+     * base metadata, and {@link #rewrapOverTopK(RecordCursorFactory, RecordMetadata)}
+     * to reconstruct the wrapper over the new top-K factory. The default returns
+     * {@code false}, which keeps non-projecting factories and projecting factories
+     * that cannot safely splice a top-K below themselves (e.g.
+     * {@code ExtraNullColumnCursorFactory}, whose null-column splice has no base
+     * counterpart) on the generic Sort light path.
+     *
+     * @return true if the factory participates in parallel top-K peeling
+     */
+    default boolean canPeelForTopK() {
+        return false;
+    }
+
+    /**
+     * Changes the page frame sizes for this factory.
+     *
+     * @param minRows minimum rows per page frame
+     * @param maxRows maximum rows per page frame
+     */
+    default void changePageFrameSizes(int minRows, int maxRows) {
+    }
+
     @Override
     default void close() {
     }
 
-    default SingleSymbolFilter convertToSampleByIndexDataFrameCursorFactory() {
+    default SingleSymbolFilter convertToSampleByIndexPageFrameCursorFactory() {
         return null;
     }
 
     default PageFrameSequence<?> execute(SqlExecutionContext executionContext, SCSequence collectSubSeq, int order) throws SqlException {
         return null;
-    }
-
-    default boolean followedLimitAdvice() {
-        return false;
     }
 
     /**
@@ -95,32 +129,66 @@ public interface RecordCursorFactory extends Closeable, Sinkable, Plannable {
      * that key read from symbol column map to symbol values unambiguously.
      * In that if you read key 1 at row 10, it might map to 'AAA' and if you read
      * key 1 at row 100 it might map to 'BBB'.
-     * Such factories cannot be used in multi-threaded execution and cannot be tested
+     * Such factories cannot be used in multithreaded execution and cannot be tested
      * via `testSymbolAPI()` call.
      *
      * @return true if the factory uses fragmented symbol tables and can't be used
-     * in multi-threaded execution
+     * in multithreaded execution
      */
     default boolean fragmentedSymbolTables() {
         return false;
     }
 
+    /**
+     * Returns the atom holding this factory's shared, per-worker execution state, if any.
+     * Parallel factories keep the atom on the factory, so it outlives the cursor and stays
+     * observable after the frame sequence has been awaited. Tests use it to assert that a
+     * reduce phase released everything it acquired.
+     *
+     * @return the atom, or null if the factory drives no parallel execution state
+     */
+    @TestOnly
+    default @Nullable StatefulAtom getAtom() {
+        return null;
+    }
+
+    /**
+     * Returns the base column name at the given index.
+     *
+     * @param idx the column index
+     * @return the column name
+     */
     default String getBaseColumnName(int idx) {
         return getBaseFactory().getMetadata().getColumnName(idx);
     }
 
     /**
-     * Method is necessary for cases where row cursor uses index from table reader while record cursor
-     * can reorder columns (e.g. DataFrameRecordCursorFactory)
+     * Returns the base factory, if any.
      *
-     * @param idx idx of column
-     * @return name of base column (no remapping)
+     * @return the base factory, or null if none
      */
-    default String getBaseColumnNameNoRemap(int idx) {
-        return getBaseColumnName(idx);
+    default RecordCursorFactory getBaseFactory() {
+        return null;
     }
 
-    default RecordCursorFactory getBaseFactory() {
+    // to be used in combination with compiled filter
+    @Nullable
+    default ObjList<Function> getBindVarFunctions() {
+        return null;
+    }
+
+    // to be used in combination with compiled filter
+    @Nullable
+    default MemoryCARW getBindVarMemory() {
+        return null;
+    }
+
+    default IntList getColumnCrossIndex() {
+        return null;
+    }
+
+    @Nullable
+    default CompiledFilter getCompiledFilter() {
         return null;
     }
 
@@ -137,6 +205,11 @@ public interface RecordCursorFactory extends Closeable, Sinkable, Plannable {
      */
     default RecordCursor getCursor(SqlExecutionContext executionContext) throws SqlException {
         throw new UnsupportedOperationException();
+    }
+
+    @Nullable
+    default Function getFilter() {
+        return null;
     }
 
     /**
@@ -158,9 +231,35 @@ public interface RecordCursorFactory extends Closeable, Sinkable, Plannable {
      * Note: tables with designated timestamp keep rows in timestamp order, so:
      * - forward scan produces rows in ascending ts order
      * - backward scan produces rows in descending ts order
+     *
+     * @return the scan direction
      */
     default int getScanDirection() {
         return SCAN_DIRECTION_FORWARD;
+    }
+
+    /**
+     * Returns an independent cursor for the given consumer ID. Idempotent —
+     * same sharedId always returns the same cursor instance.
+     *
+     * @param executionContext SQL execution context
+     * @param sharedId         unique consumer identifier (0-based)
+     * @return cursor for the given consumer
+     */
+    default RecordCursor getSharedCursor(SqlExecutionContext executionContext, int sharedId) throws SqlException {
+        throw new UnsupportedOperationException();
+    }
+
+    /**
+     * Returns the original filter expression that can be stolen by parent factories.
+     * When {@link #supportsFilterStealing()} returns true, this method should return
+     * the original expression of the stolen filter.
+     *
+     * @return the original filter expression that can be stolen, or null if
+     * filter stealing is not supported
+     */
+    default ExpressionNode getStealFilterExpr() {
+        return null;
     }
 
     /**
@@ -174,25 +273,230 @@ public interface RecordCursorFactory extends Closeable, Sinkable, Plannable {
         return null;
     }
 
-    default TimeFrameRecordCursor getTimeFrameCursor(SqlExecutionContext executionContext) throws SqlException {
+    /**
+     * Returns time frame cursor or null if time frames aren't supported by the factory.
+     *
+     * @param executionContext the SQL execution context
+     * @return the time frame cursor, or null if not supported
+     * @throws SqlException if an error occurs
+     */
+    default TimeFrameCursor getTimeFrameCursor(SqlExecutionContext executionContext) throws SqlException {
         return null;
     }
 
     /**
-     * Returns true if this factory handles limit M , N clause already and false otherwise .
-     * If true then separate limit cursor factory is not needed (and could actually cause problem
+     * Closes everything but base factory and filter.
+     */
+    default void halfClose() {
+    }
+
+    /**
+     * Returns true if this factory handles {@code limit(M, N)} clause.
+     * If true, then a separate limit cursor factory is not needed (and could actually cause problem
      * by re-applying limit logic).
+     *
+     * @return true if limit is implemented
      */
     default boolean implementsLimit() {
         return false;
     }
 
-    boolean recordCursorSupportsRandomAccess();
-
-    default void revertFromSampleByIndexDataFrameCursorFactory() {
+    /**
+     * Returns true unless this factory can PROVE its result is stable across two cursor opens.
+     * The contract is fail-safe: the default is {@code true} ("assume unstable") and a factory
+     * asserts determinism by overriding this to return {@code false} only when every value source
+     * it evaluates (projected/aggregate functions, retained filter, interval model, row cursor,
+     * child factories) is itself deterministic. A factory that does not override merely loses
+     * determinism-dependent optimizations; it can never cause wrong results.
+     * <p>
+     * Compile-time consumers (for example scalar-subquery timestamp bounds in
+     * {@code WhereClauseParser}) use this to avoid pruning optimizations that would re-open the
+     * cursor and observe a different value (for example {@code rnd_*} or {@code systimestamp()}).
+     * Returning {@code false} for a factory whose value is genuinely unstable across opens leads
+     * to silently dropped rows, which is why unknown shapes must report {@code true}.
+     *
+     * @return true if two cursor opens can yield different values or stability cannot be proven
+     */
+    default boolean isNonDeterministic() {
+        return true;
     }
 
+    /**
+     * Returns true if the factory stands for nothing more but a projection, so that
+     * the above factory (e.g. a parallel GROUP BY one) can steal the projection.
+     * <p>
+     * Projection consist of cross-indexes and metadata columns.
+     *
+     * @return true if the factory stands for nothing more but a projection
+     * @see #getColumnCrossIndex()
+     * @see #getBaseColumnName(int)
+     */
+    default boolean isProjection() {
+        return false;
+    }
+
+    /**
+     * Returns true if this factory is guaranteed to produce the same result for every cursor
+     * open within a single query execution (same {@code SqlExecutionContext}). This is a weaker
+     * property than {@code !isNonDeterministic()}: a factory projecting {@code now()} or a bind
+     * variable is non-deterministic across executions, yet stable within one, because those
+     * functions re-initialize to the same execution-scoped snapshot on every open.
+     * <p>
+     * Fail-safe like {@link #isNonDeterministic()}: the default claims stability only for
+     * provably deterministic factories, so unknown shapes never enable stability-dependent
+     * optimizations (for example scalar-subquery timestamp pruning in {@code WhereClauseParser}).
+     * Overriding factories must prove that every value source they evaluate is itself stable
+     * within the execution.
+     *
+     * @return true if every cursor open within one execution yields the same result
+     */
+    default boolean isStableWithinExecution() {
+        return !isNonDeterministic();
+    }
+
+    /**
+     * Returns true if this factory reads data from outside the database, i.e. from a source whose
+     * contents QuestDB neither owns nor tracks transactionally (currently {@code read_parquet()}).
+     * <p>
+     * <b>Polarity matters, and it is the opposite of {@link #isNonDeterministic()}.</b> This
+     * property is <i>fail-open</i>: the default is {@code false}, meaning "not external unless a
+     * factory says so". It exists to answer a question of <i>semantic legality</i> (may this query
+     * be persisted as a materialized view?), where a wrong {@code true} rejects SQL that users
+     * already run successfully and permanently invalidates deployed views.
+     * {@link #isNonDeterministic()} answers a question of <i>optimizer safety</i> (may we prune?),
+     * where a wrong {@code true} merely forgoes an optimization. Those two questions have opposite
+     * safe defaults, so they must never share a property: consulting the fail-safe determinism
+     * flag from a rejection gate makes every factory that simply never overrode it illegal by
+     * accident.
+     * <p>
+     * Delegates to the base factory so wrapping factories (projection, filter, sort, limit,
+     * group-by, set operations) report their underlying scan.
+     *
+     * @return true if this factory, or any factory beneath it, reads an external data source
+     */
+    default boolean usesExternalDataSource() {
+        final RecordCursorFactory base = getBaseFactory();
+        return base != null && base.usesExternalDataSource();
+    }
+
+    /**
+     * Returns true if this factory may read a Parquet-format partition storing a column whose
+     * type was later changed by {@code ALTER COLUMN TYPE} (decoded in its source type and
+     * converted lazily, so raw-address readers would misread it). Delegates to the base
+     * factory so wrapping factories report their underlying scan.
+     */
+    default boolean hasParquetConvertedColumns(SqlExecutionContext executionContext) {
+        final RecordCursorFactory base = getBaseFactory();
+        return base != null && base.hasParquetConvertedColumns(executionContext);
+    }
+
+    default boolean mayHaveParquetPartitions(SqlExecutionContext executionContext) {
+        return false;
+    }
+
+    /**
+     * Returns a new time frame cursor instance or null if time frames aren't supported by the factory.
+     * The returned instance can be used by a worker thread, i.e. the underlying interaction with
+     * table reader is synchronized between the time frame instances returned by this method.
+     * <p>
+     * Unlike with {@link #getTimeFrameCursor(SqlExecutionContext)}, the returned cursor has to be
+     * initialized before usage.
+     *
+     * @return a new concurrent time frame cursor, or null if not supported
+     */
+    default ConcurrentTimeFrameCursor newTimeFrameCursor() {
+        return null;
+    }
+
+    /**
+     * Returns true when factory's record cursor supports optimized top K (ORDER BY + LIMIT N) loop
+     * for the given LONG or TIMESTAMP column.
+     *
+     * @param columnIndex index of the column to check
+     * @return true if the factory supports the fast path for the column
+     */
+    default boolean recordCursorSupportsLongTopK(int columnIndex) {
+        return false;
+    }
+
+    /**
+     * Returns true if the record cursor supports random access.
+     *
+     * @return true if random access is supported
+     */
+    boolean recordCursorSupportsRandomAccess();
+
+    default void revertFromSampleByIndexPageFrameCursorFactory() {
+    }
+
+    /**
+     * Re-wraps a freshly-built top-K factory so this factory's output shape is preserved.
+     * Default is a pass-through — factories that do not project simply return the top-K.
+     * Projection wrappers override to re-create themselves over the new base.
+     * <p>
+     * Ownership: after this call the caller must not close the original wrapper; its
+     * state has either transferred to the returned factory or been dropped on the floor,
+     * matching the AsOf/LatestBy peel precedent.
+     *
+     * @param topK            newly-built top-K factory over the page-frame leaf
+     * @param orderedMetadata projected output metadata for the re-wrapped factory
+     * @return re-wrapped factory, or {@code topK} unchanged for non-projecting factories
+     */
+    default RecordCursorFactory rewrapOverTopK(RecordCursorFactory topK, RecordMetadata orderedMetadata) {
+        return topK;
+    }
+
+    default void setPushdownFilterCondition(ObjList<PushdownFilterExtractor.PushdownFilterCondition> pushdownFilterConditions) {
+    }
+
+    /**
+     * Returns true if the factory stands for nothing more but a filter, so that
+     * the above factory (e.g. a parallel GROUP BY one) can steal the filter.
+     *
+     * @return true if filter stealing is supported
+     */
+    default boolean supportsFilterStealing() {
+        return false;
+    }
+
+    /**
+     * Returns true if the factory supports page frame cursor.
+     *
+     * @return true if page frame cursor is supported
+     */
     default boolean supportsPageFrameCursor() {
+        return false;
+    }
+
+    /**
+     * Returns true when this factory's page-frame cursor ({@link #getPageFrameCursor})
+     * yields frames whose column page addresses are fully materialized — a raw
+     * page-frame consumer that reads {@code frame.getPageAddress(col)} directly (the
+     * parquet {@code /exp} / {@code COPY} DIRECT_PAGE_FRAME export) sees real data.
+     * <p>
+     * The covering-index single-key scan ({@code sym = 'x'}) instead produces
+     * METADATA-ONLY frames: the covered columns are decoded lazily on the async reduce
+     * workers (via {@code PageFrameMemoryPool#patchCoveredFrameMemory}) and the raw
+     * frame addresses are placeholders, so a direct reader would export all-null
+     * covered columns. Such factories return false, and the parquet exporter routes
+     * them through the row-wise cursor path, which drives the same covered decode the
+     * query path uses. Delegates to the base factory so a wrapper over a metadata-only
+     * scan reports the same.
+     *
+     * @return true if raw page-frame addresses are directly readable
+     */
+    default boolean producesMaterializedPageFrames() {
+        final RecordCursorFactory base = getBaseFactory();
+        return base == null || base.producesMaterializedPageFrames();
+    }
+
+    /**
+     * Returns true if this factory supports multiple independent cursors
+     * over the same materialized data. When true,
+     * {@link #getSharedCursor(SqlExecutionContext, int)} can be called with
+     * different consumer IDs to obtain independent cursors.
+     */
+    default boolean supportsSharedCursors() {
         return false;
     }
 
@@ -200,12 +504,19 @@ public interface RecordCursorFactory extends Closeable, Sinkable, Plannable {
      * Time frames are supported only for full table scan cursors, i.e. "x" queries.
      *
      * @return true if the factory supports time frames
-     * and {@link #getTimeFrameCursor(SqlExecutionContext)} can be safely called.
+     * and {@link #getTimeFrameCursor(SqlExecutionContext)}
+     * or {@link #newTimeFrameCursor()} can be safely called.
      */
     default boolean supportsTimeFrameCursor() {
         return false;
     }
 
+    /**
+     * Returns true if the factory supports UPDATE row ID for the given table.
+     *
+     * @param tableName the table token
+     * @return true if UPDATE row ID is supported
+     */
     default boolean supportsUpdateRowId(TableToken tableName) {
         return false;
     }
@@ -223,6 +534,22 @@ public interface RecordCursorFactory extends Closeable, Sinkable, Plannable {
     }
 
     /**
+     * Translates an ORDER BY column index expressed in this factory's output metadata
+     * to the corresponding column index in the base (page-frame) metadata.
+     * <p>
+     * Returns the input unchanged for factories that do not re-arrange or hide base
+     * columns. Returns a negative value if the projected column cannot be resolved
+     * to a base column (for example, a computed {@code VirtualRecord} column); the
+     * caller must fall back to the generic sort path in that case.
+     *
+     * @param projectedIndex column index in this factory's output metadata
+     * @return column index in the base metadata, or a negative value if unresolvable
+     */
+    default int translateOrderByColumnToBase(int projectedIndex) {
+        return projectedIndex;
+    }
+
+    /**
      * @return true if the factory uses a {@link io.questdb.jit.CompiledFilter}.
      */
     default boolean usesCompiledFilter() {
@@ -231,6 +558,8 @@ public interface RecordCursorFactory extends Closeable, Sinkable, Plannable {
 
     /**
      * Returns true if the factory uses index-based access.
+     *
+     * @return true if the factory uses index-based access
      */
     default boolean usesIndex() {
         return false;

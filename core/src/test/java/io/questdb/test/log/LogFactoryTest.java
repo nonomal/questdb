@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,30 +24,66 @@
 
 package io.questdb.test.log;
 
-import io.questdb.griffin.SqlCompilerImpl;
-import io.questdb.griffin.model.IntervalUtils;
-import io.questdb.log.*;
-import io.questdb.mp.*;
-import io.questdb.std.*;
-import io.questdb.std.datetime.microtime.MicrosecondClock;
-import io.questdb.std.datetime.microtime.TimestampFormatUtils;
-import io.questdb.std.datetime.microtime.Timestamps;
-import io.questdb.std.str.*;
+import io.questdb.cairo.MicrosTimestampDriver;
+import io.questdb.griffin.engine.QueryProgress;
+import io.questdb.log.GuaranteedLogger;
+import io.questdb.log.Log;
+import io.questdb.log.LogConsoleWriter;
+import io.questdb.log.LogError;
+import io.questdb.log.LogFactory;
+import io.questdb.log.LogFileWriter;
+import io.questdb.log.LogLevel;
+import io.questdb.log.LogRecord;
+import io.questdb.log.LogRecordUtf8Sink;
+import io.questdb.log.LogRollingFileWriter;
+import io.questdb.log.LogWriter;
+import io.questdb.log.LogWriterConfig;
+import io.questdb.log.Logger;
+import io.questdb.mp.QueueConsumer;
+import io.questdb.mp.RingQueue;
+import io.questdb.mp.SCSequence;
+import io.questdb.mp.SOCountDownLatch;
+import io.questdb.mp.SOUnboundedCountDownLatch;
+import io.questdb.mp.SPSequence;
+import io.questdb.std.Chars;
+import io.questdb.std.Files;
+import io.questdb.std.FilesFacadeImpl;
+import io.questdb.std.MemoryTag;
+import io.questdb.std.Misc;
+import io.questdb.std.Numbers;
+import io.questdb.std.NumericException;
+import io.questdb.std.Os;
+import io.questdb.std.Rnd;
+import io.questdb.std.Unsafe;
+import io.questdb.std.datetime.MicrosecondClock;
+import io.questdb.std.datetime.microtime.Micros;
+import io.questdb.std.datetime.microtime.MicrosFormatUtils;
+import io.questdb.std.str.GcUtf8String;
+import io.questdb.std.str.Path;
+import io.questdb.std.str.Sinkable;
+import io.questdb.std.str.StringSink;
+import io.questdb.std.str.Utf8Sink;
+import io.questdb.std.str.Utf8s;
 import io.questdb.test.std.TestFilesFacadeImpl;
 import io.questdb.test.tools.TestUtils;
 import org.jetbrains.annotations.NotNull;
+import org.jetbrains.annotations.Nullable;
 import org.junit.Assert;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
 
+import java.io.Closeable;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
+import java.io.PrintStream;
 import java.lang.reflect.Field;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Paths;
 import java.util.Properties;
+import java.util.Set;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
@@ -66,6 +102,115 @@ public class LogFactoryTest {
                 Assert.fail();
             } catch (LogError e) {
                 Assert.assertEquals("Class not found com.questdb.log.StdOutWriter2", e.getMessage());
+            }
+        }
+    }
+
+    @Test
+    public void testCloseRetriesAfterWorkerHaltTimeout() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final AtomicInteger closeCount = new AtomicInteger();
+            final AtomicBoolean isClosedWhileRunning = new AtomicBoolean();
+            final AtomicBoolean isReleaseRequested = new AtomicBoolean();
+            final AtomicBoolean isWriterRunning = new AtomicBoolean();
+            final SOCountDownLatch runEntered = new SOCountDownLatch(1);
+            final SOCountDownLatch runExited = new SOCountDownLatch(1);
+            final LogFactory factory = new LogFactory();
+
+            class BlockingLogWriter implements Closeable, LogWriter {
+                @Override
+                public void bindProperties(LogFactory factory) {
+                }
+
+                @Override
+                public void close() {
+                    closeCount.incrementAndGet();
+                    if (isWriterRunning.get()) {
+                        isClosedWhileRunning.set(true);
+                    }
+                }
+
+                @Override
+                public boolean run(@NotNull WorkerContext workerContext) {
+                    isWriterRunning.set(true);
+                    runEntered.countDown();
+                    try {
+                        while (!isReleaseRequested.get()) {
+                            Os.pause();
+                        }
+                    } finally {
+                        isWriterRunning.set(false);
+                        runExited.countDown();
+                    }
+                    return false;
+                }
+            }
+
+            try {
+                factory.setWorkerPoolHaltTimeoutForTesting(TimeUnit.MILLISECONDS.toNanos(10));
+                factory.add(new LogWriterConfig(LogLevel.ALL, (ring, seq, level) -> new BlockingLogWriter()));
+                factory.bind();
+                factory.startThread();
+                Assert.assertTrue("logging writer never started", runEntered.await(TimeUnit.SECONDS.toNanos(10)));
+
+                final IllegalStateException timeout = Assert.assertThrows(IllegalStateException.class, factory::close);
+                Assert.assertEquals("logging worker pool did not halt within timeout", timeout.getMessage());
+                Assert.assertEquals(0, closeCount.get());
+                Assert.assertFalse(isClosedWhileRunning.get());
+
+                final IllegalStateException restart = Assert.assertThrows(IllegalStateException.class, factory::startThread);
+                Assert.assertEquals("logging worker pool cannot restart after halt", restart.getMessage());
+
+                isReleaseRequested.set(true);
+                Assert.assertTrue("logging writer never exited", runExited.await(TimeUnit.SECONDS.toNanos(10)));
+                factory.setWorkerPoolHaltTimeoutForTesting(TimeUnit.SECONDS.toNanos(10));
+                factory.close();
+
+                Assert.assertEquals(1, closeCount.get());
+                Assert.assertFalse(isClosedWhileRunning.get());
+            } finally {
+                isReleaseRequested.set(true);
+                factory.setWorkerPoolHaltTimeoutForTesting(TimeUnit.SECONDS.toNanos(10));
+                factory.close();
+            }
+        });
+    }
+
+    @Test
+    public void testConsecutiveAbandonedRecordsDoNotBlockProductionQueue() throws Exception {
+        File javaExecutable = new File(new File(System.getProperty("java.home"), "bin"), "java");
+        if (!javaExecutable.exists()) {
+            javaExecutable = new File(javaExecutable.getPath() + ".exe");
+        }
+        final String classPath = Paths.get(
+                ProductionModeLogRecordMain.class.getProtectionDomain().getCodeSource().getLocation().toURI()
+        ) + File.pathSeparator + Paths.get(
+                LogFactory.class.getProtectionDomain().getCodeSource().getLocation().toURI()
+        );
+        final File outputFile = temp.newFile("production-mode-log-record-main.out");
+        final Process process = new ProcessBuilder(
+                javaExecutable.getAbsolutePath(),
+                "--enable-native-access=ALL-UNNAMED",
+                "--add-exports=java.base/jdk.internal.vm=ALL-UNNAMED",
+                "-cp",
+                classPath,
+                ProductionModeLogRecordMain.class.getName()
+        ).redirectErrorStream(true).redirectOutput(outputFile).start();
+        try {
+            process.getOutputStream().close();
+            if (!process.waitFor(15, TimeUnit.SECONDS)) {
+                process.destroyForcibly();
+                process.waitFor();
+                Assert.fail(
+                        "production-mode log regression process timed out:\n"
+                                + java.nio.file.Files.readString(outputFile.toPath(), StandardCharsets.UTF_8)
+                );
+            }
+            final String output = java.nio.file.Files.readString(outputFile.toPath(), StandardCharsets.UTF_8);
+            Assert.assertEquals(output, 0, process.exitValue());
+        } finally {
+            if (process.isAlive()) {
+                process.destroyForcibly().onExit().join();
             }
         }
     }
@@ -107,10 +252,38 @@ public class LogFactoryTest {
 
             System.err.println(x.getAbsolutePath());
 
-            Os.sleep(100);
+            factory.flushJobs();
             final String expected = orig + "\r\n";
-            final String actual = new String(java.nio.file.Files.readAllBytes(x.toPath()), StandardCharsets.UTF_8);
+            final String actual = java.nio.file.Files.readString(x.toPath());
             Assert.assertEquals(expected, actual);
+        }
+    }
+
+    @Test
+    public void testFileWriterExpandsPidToken() throws Exception {
+        final File dir = temp.newFolder();
+        final String template = new File(dir, "pid-token-%p.log").getAbsolutePath();
+
+        try (LogFactory factory = new LogFactory()) {
+            factory.add(new LogWriterConfig(LogLevel.ERROR, (ring, seq, level) -> {
+                LogFileWriter w = new LogFileWriter(ring, seq, level);
+                w.setLocation(template);
+                return w;
+            }));
+
+            factory.bind();
+            factory.startThread();
+
+            final Log logger = factory.create("x");
+            logger.xerror().$("pid token line").$();
+            factory.flushJobs();
+
+            // The writer expands %p to the JVM pid, so concurrent or respawned
+            // processes never collide on the same log file.
+            final File expanded = new File(dir, "pid-token-" + Os.getPid() + ".log");
+            Assert.assertTrue(expanded.exists());
+            Assert.assertFalse(new File(dir, "pid-token-%p.log").exists());
+            Assert.assertTrue(java.nio.file.Files.readString(expanded.toPath()).contains("pid token line"));
         }
     }
 
@@ -128,7 +301,7 @@ public class LogFactoryTest {
                 }
 
                 @Override
-                public boolean run(int workerId, @NotNull RunStatus runStatus) {
+                public boolean run(@NotNull WorkerContext workerContext) {
                     long cursor = seq.next();
                     if (cursor > -1) {
                         counter.incrementAndGet();
@@ -148,7 +321,7 @@ public class LogFactoryTest {
                 }
 
                 @Override
-                public boolean run(int workerId, @NotNull RunStatus runStatus) {
+                public boolean run(@NotNull WorkerContext workerContext) {
                     throw new UnsupportedOperationException();
                 }
             }));
@@ -207,13 +380,13 @@ public class LogFactoryTest {
             factory.bind();
             factory.startThread();
 
-            Assert.assertEquals(Logger.class, getLogger(SqlCompilerImpl.class).getClass());
+            Assert.assertEquals(Logger.class, getLogger().getClass());
 
-            LogFactory.enableGuaranteedLogging(SqlCompilerImpl.class);
-            Assert.assertEquals(GuaranteedLogger.class, getLogger(SqlCompilerImpl.class).getClass());
+            LogFactory.enableGuaranteedLogging(QueryProgress.class);
+            Assert.assertEquals(GuaranteedLogger.class, getLogger().getClass());
 
-            LogFactory.disableGuaranteedLogging(SqlCompilerImpl.class);
-            Assert.assertEquals(Logger.class, getLogger(SqlCompilerImpl.class).getClass());
+            LogFactory.disableGuaranteedLogging(QueryProgress.class);
+            Assert.assertEquals(Logger.class, getLogger().getClass());
         }
     }
 
@@ -244,7 +417,7 @@ public class LogFactoryTest {
                 logger.xerror().$("test ").$hex(i).$();
             }
 
-            Os.sleep(100);
+            factory.flushJobs();
 
             Assert.assertEquals(0, x.length());
             Assert.assertEquals(576, y.length());
@@ -253,32 +426,41 @@ public class LogFactoryTest {
 
     @Test
     public void testLogAutoDeleteByDirectorySize40k() throws Exception {
-        testAutoDelete("40k", null);
+        testAutoDelete("40k", null, "30k");
     }
 
     @Test
     public void testLogAutoDeleteByDirectorySize500k() throws Exception {
-        testAutoDelete("500k", null);
+        testAutoDelete("500k", null, "30k");
+    }
+
+    @Test
+    public void testLogAutoDeleteByDirectorySizeRandom() throws Exception {
+        Rnd rnd = TestUtils.generateRandom(null);
+        int fullSize = 2 + rnd.nextInt(498);
+        int rollSize = Math.max(1, (1 + rnd.nextInt(fullSize - 1)) / 2);
+        System.out.println("fullSize=" + fullSize + "k, rollSize=" + rollSize + "k");
+        testAutoDelete(fullSize + "k", null, rollSize + "k");
     }
 
     @Test
     public void testLogAutoDeleteByFileAge1Year() throws Exception {
-        testAutoDelete(null, "1y");
+        testAutoDelete(null, "1y", "30k");
     }
 
     @Test
     public void testLogAutoDeleteByFileAge25days() throws Exception {
-        testAutoDelete(null, "25d");
+        testAutoDelete(null, "25d", "30k");
     }
 
     @Test
     public void testLogAutoDeleteByFileAge3weeks() throws Exception {
-        testAutoDelete(null, "3w");
+        testAutoDelete(null, "3w", "30k");
     }
 
     @Test
     public void testLogAutoDeleteByFileAge6months() throws Exception {
-        testAutoDelete(null, "6m");
+        testAutoDelete(null, "6m", "30k");
     }
 
     @Test
@@ -293,7 +475,7 @@ public class LogFactoryTest {
                 }
 
                 @Override
-                public boolean run(int workerId, @NotNull RunStatus runStatus) {
+                public boolean run(@NotNull WorkerContext workerContext) {
                     return seq.consumeAll(ring, this::log);
                 }
 
@@ -336,6 +518,336 @@ public class LogFactoryTest {
     }
 
     @Test
+    public void testLogSequenceReleasePreservesRenderingFailureWhenEolFails() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final AtomicReference<SCSequence> consumerSequence = new AtomicReference<>();
+            try (LogFactory factory = new LogFactory()) {
+                factory.add(newSequenceCapturingWriterConfig(consumerSequence));
+                factory.bind();
+
+                final Log logger = factory.create("x");
+                final SCSequence sequence = consumerSequence.get();
+
+                final RuntimeException objectFailure = new RuntimeException("object rendering failure");
+                assertRenderingFailureWithFailingEol(
+                        logger.info(),
+                        sequence,
+                        0,
+                        objectFailure,
+                        record -> record.$(new Object() {
+                            @Override
+                            public String toString() {
+                                throw objectFailure;
+                            }
+                        })
+                );
+
+                final RuntimeException sinkableFailure = new RuntimeException("sinkable rendering failure");
+                assertRenderingFailureWithFailingEol(
+                        logger.info(),
+                        sequence,
+                        1,
+                        sinkableFailure,
+                        record -> record.$((Sinkable) sink -> {
+                            throw sinkableFailure;
+                        })
+                );
+
+                final RuntimeException throwableFailure = new RuntimeException("throwable rendering failure");
+                assertRenderingFailureWithFailingEol(
+                        logger.info(),
+                        sequence,
+                        2,
+                        throwableFailure,
+                        record -> record.$(new Throwable() {
+                            @Override
+                            public String getMessage() {
+                                throw throwableFailure;
+                            }
+                        })
+                );
+
+                logger.info().$("after failures").$();
+                final long cursor = sequence.next();
+                Assert.assertEquals(3, cursor);
+                sequence.done(cursor);
+            }
+        });
+    }
+
+    @Test
+    public void testLogSequenceIsReleasedWhenAbandonedErrorPrintingThrows() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final AtomicReference<SCSequence> consumerSequence = new AtomicReference<>();
+            try (LogFactory factory = new LogFactory()) {
+                factory.add(newSequenceCapturingWriterConfig(consumerSequence));
+                factory.bind();
+
+                final Log logger = factory.create("x");
+                final LogRecord record = logger.info();
+                record.$("abandoned");
+
+                final Class<?> recordClass = record.getClass();
+                final Field abandonedErrorField = recordClass.getDeclaredField("abandonedLogRecordError");
+                final long abandonedErrorOffset = Unsafe.objectFieldOffset(abandonedErrorField);
+                final Object originalError = Unsafe.getUnsafe().getObject(record, abandonedErrorOffset);
+                final RuntimeException printFailure = new RuntimeException("print failure");
+                final LogError throwingError = new LogError("throwing abandoned-record error", false) {
+                    @Override
+                    public void printStackTrace(PrintStream stream) {
+                        throw printFailure;
+                    }
+                };
+                Unsafe.putObject(record, abandonedErrorOffset, throwingError);
+                try {
+                    logger.info().$();
+                    Assert.fail("expected abandoned-record error printing to fail");
+                } catch (RuntimeException e) {
+                    Assert.assertSame(printFailure, e);
+                } finally {
+                    Unsafe.putObject(record, abandonedErrorOffset, originalError);
+                }
+
+                final Field isLogRecordInProgressField = recordClass.getDeclaredField("isLogRecordInProgress");
+                isLogRecordInProgressField.setAccessible(true);
+                Assert.assertFalse(isLogRecordInProgressField.getBoolean(record));
+
+                final SCSequence sequence = consumerSequence.get();
+                for (int expectedCursor = 0; expectedCursor < 2; expectedCursor++) {
+                    final long cursor = sequence.next();
+                    Assert.assertEquals(expectedCursor, cursor);
+                    sequence.done(cursor);
+                }
+
+                logger.info().$("after failure").$();
+                final long cursor = sequence.next();
+                Assert.assertEquals(2, cursor);
+                sequence.done(cursor);
+            }
+        });
+    }
+
+    @Test
+    public void testLogSequenceIsReleasedWhenAbandonedErrorRefreshThrows() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final AtomicReference<SCSequence> consumerSequence = new AtomicReference<>();
+            try (LogFactory factory = new LogFactory()) {
+                factory.add(newSequenceCapturingWriterConfig(consumerSequence));
+                factory.bind();
+
+                final Log logger = factory.create("x");
+                final LogRecord record = logger.info();
+                record.$();
+
+                final SCSequence sequence = consumerSequence.get();
+                long cursor = sequence.next();
+                Assert.assertEquals(0, cursor);
+                sequence.done(cursor);
+
+                final Class<?> recordClass = record.getClass();
+                final Field abandonedErrorField = recordClass.getDeclaredField("abandonedLogRecordError");
+                final long abandonedErrorOffset = Unsafe.objectFieldOffset(abandonedErrorField);
+                final Object originalError = Unsafe.getUnsafe().getObject(record, abandonedErrorOffset);
+                final RuntimeException stackTraceFailure = new RuntimeException("stack trace failure");
+                final AtomicBoolean isArmed = new AtomicBoolean();
+                final LogError throwingError = new LogError("throwing abandoned-record error", false) {
+                    @Override
+                    public synchronized Throwable fillInStackTrace() {
+                        if (isArmed.get()) {
+                            throw stackTraceFailure;
+                        }
+                        return this;
+                    }
+                };
+                isArmed.set(true);
+                Unsafe.putObject(record, abandonedErrorOffset, throwingError);
+                try {
+                    logger.info().$();
+                    Assert.fail("expected abandoned-record stack refresh to fail");
+                } catch (RuntimeException e) {
+                    Assert.assertSame(stackTraceFailure, e);
+                } finally {
+                    Unsafe.putObject(record, abandonedErrorOffset, originalError);
+                }
+
+                final Field isLogRecordInProgressField = recordClass.getDeclaredField("isLogRecordInProgress");
+                isLogRecordInProgressField.setAccessible(true);
+                Assert.assertFalse(isLogRecordInProgressField.getBoolean(record));
+
+                cursor = sequence.next();
+                Assert.assertEquals(1, cursor);
+                sequence.done(cursor);
+
+                logger.info().$("after failure").$();
+                cursor = sequence.next();
+                Assert.assertEquals(2, cursor);
+                sequence.done(cursor);
+            }
+        });
+    }
+
+    @Test
+    public void testLogSequenceIsReleasedWhenRecoveryEolThrows() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final AtomicReference<SCSequence> consumerSequence = new AtomicReference<>();
+            try (LogFactory factory = new LogFactory()) {
+                factory.add(newSequenceCapturingWriterConfig(consumerSequence));
+                factory.bind();
+
+                final Log logger = factory.create("x");
+                final LogRecord record = logger.info();
+                record.$(new Throwable("abandoned"));
+
+                final Class<?> recordClass = record.getClass();
+                final Field dejaVuField = recordClass.getDeclaredField("dejaVu");
+                dejaVuField.setAccessible(true);
+                final Set<?> dejaVu = (Set<?>) dejaVuField.get(record);
+                Assert.assertEquals(1, dejaVu.size());
+
+                final RuntimeException eolFailure = new RuntimeException("EOL failure");
+                final Field sinkField = recordClass.getDeclaredField("sink");
+                sinkField.setAccessible(true);
+                sinkField.set(record, new LogRecordUtf8Sink(0, 0) {
+                    @Override
+                    public Utf8Sink putEOL() {
+                        throw eolFailure;
+                    }
+                });
+
+                try {
+                    logger.info().$();
+                    Assert.fail("expected abandoned-record recovery to fail while appending EOL");
+                } catch (RuntimeException e) {
+                    Assert.assertSame(eolFailure, e);
+                }
+
+                Assert.assertTrue(dejaVu.isEmpty());
+                final Field isLogRecordInProgressField = recordClass.getDeclaredField("isLogRecordInProgress");
+                isLogRecordInProgressField.setAccessible(true);
+                Assert.assertFalse(isLogRecordInProgressField.getBoolean(record));
+
+                final SCSequence sequence = consumerSequence.get();
+                for (int expectedCursor = 0; expectedCursor < 2; expectedCursor++) {
+                    final long cursor = sequence.next();
+                    Assert.assertEquals(expectedCursor, cursor);
+                    sequence.done(cursor);
+                }
+
+                logger.info().$("after recovery").$();
+                final long cursor = sequence.next();
+                Assert.assertEquals(2, cursor);
+                sequence.done(cursor);
+            }
+        });
+    }
+
+    @Test
+    public void testLogSequenceIsReleasedWhenRecoveryMarkerThrows() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final AtomicReference<SCSequence> consumerSequence = new AtomicReference<>();
+            try (LogFactory factory = new LogFactory()) {
+                factory.add(newSequenceCapturingWriterConfig(consumerSequence));
+                factory.bind();
+
+                final Log logger = factory.create("x");
+                final LogRecord record = logger.info();
+                record.$(new Throwable("abandoned"));
+
+                final Class<?> recordClass = record.getClass();
+                final Field dejaVuField = recordClass.getDeclaredField("dejaVu");
+                dejaVuField.setAccessible(true);
+                final Set<?> dejaVu = (Set<?>) dejaVuField.get(record);
+                Assert.assertEquals(1, dejaVu.size());
+
+                final RuntimeException markerFailure = new RuntimeException("marker failure");
+                final RuntimeException eolFailure = new RuntimeException("EOL failure");
+                final Field sinkField = recordClass.getDeclaredField("sink");
+                sinkField.setAccessible(true);
+                sinkField.set(record, new LogRecordUtf8Sink(0, 0) {
+                    @Override
+                    public Utf8Sink putAscii(CharSequence cs) {
+                        throw markerFailure;
+                    }
+
+                    @Override
+                    public Utf8Sink putEOL() {
+                        throw eolFailure;
+                    }
+                });
+
+                try {
+                    logger.info().$();
+                    Assert.fail("expected abandoned-record marker to fail");
+                } catch (RuntimeException e) {
+                    Assert.assertSame(markerFailure, e);
+                    Assert.assertArrayEquals(new Throwable[]{eolFailure}, e.getSuppressed());
+                }
+
+                Assert.assertTrue(dejaVu.isEmpty());
+                final Field isLogRecordInProgressField = recordClass.getDeclaredField("isLogRecordInProgress");
+                isLogRecordInProgressField.setAccessible(true);
+                Assert.assertFalse(isLogRecordInProgressField.getBoolean(record));
+
+                final SCSequence sequence = consumerSequence.get();
+                for (int expectedCursor = 0; expectedCursor < 2; expectedCursor++) {
+                    final long cursor = sequence.next();
+                    Assert.assertEquals(expectedCursor, cursor);
+                    sequence.done(cursor);
+                }
+
+                logger.info().$("after recovery").$();
+                final long cursor = sequence.next();
+                Assert.assertEquals(2, cursor);
+                sequence.done(cursor);
+            }
+        });
+    }
+
+    @Test
+    public void testLogSequenceIsReleasedWhenThrowableRenderingThrows() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            final AtomicReference<SCSequence> consumerSequence = new AtomicReference<>();
+            final AtomicReference<RingQueue<LogRecordUtf8Sink>> logRing = new AtomicReference<>();
+            try (LogFactory factory = new LogFactory()) {
+                factory.add(newSequenceCapturingWriterConfig(consumerSequence, logRing));
+                factory.bind();
+
+                final Log logger = factory.create("x");
+                final RuntimeException messageFailure = new RuntimeException("message failure");
+                final Throwable throwable = new Throwable() {
+                    @Override
+                    public String getMessage() {
+                        throw messageFailure;
+                    }
+                };
+                final LogRecord record = logger.info();
+                int sizeAfterFailure = -1;
+                try {
+                    record.$(throwable);
+                    Assert.fail("expected Throwable.getMessage() to fail");
+                } catch (RuntimeException e) {
+                    Assert.assertSame(messageFailure, e);
+                    sizeAfterFailure = logRing.get().get(0).size();
+                } finally {
+                    record.I$();
+                }
+                record.$();
+                Assert.assertEquals(sizeAfterFailure, logRing.get().get(0).size());
+
+                final SCSequence sequence = consumerSequence.get();
+                long cursor = sequence.next();
+                Assert.assertEquals(0, cursor);
+                sequence.done(cursor);
+
+                logger.info().$("after failure").$();
+                cursor = sequence.next();
+                Assert.assertEquals(1, cursor);
+                sequence.done(cursor);
+            }
+        });
+    }
+
+    @Test
     public void testMultiplexing() throws Exception {
         final File x = temp.newFile();
         final File y = temp.newFile();
@@ -362,7 +874,7 @@ public class LogFactoryTest {
                 logger.xinfo().$("test ").$(' ').$(i).$();
             }
 
-            Os.sleep(100);
+            factory.flushJobs();
             Assert.assertTrue(x.length() > 0);
             TestUtils.assertEquals(x, y);
         }
@@ -485,8 +997,7 @@ public class LogFactoryTest {
             Log logger1 = factory.create("com.questdb.net.Y");
             logger1.xinfo().$("this is for network").$();
 
-            // let async writer catch up in a busy environment
-            Os.sleep(100);
+            factory.flushJobs();
 
             Assert.assertEquals("this is for network" + Misc.EOL, TestUtils.readStringFromFile(a));
             Assert.assertEquals("this is for std" + Misc.EOL, TestUtils.readStringFromFile(b));
@@ -510,32 +1021,32 @@ public class LogFactoryTest {
     }
 
     @Test
-    public void testRollingFileWriterByDay() throws Exception {
+    public void testRollingFileWriterByDay() {
         testRollOnDate("mylog-${date:yyyy-MM-dd}.log", 24 * 60000, "day", "mylog-2015-05");
     }
 
     @Test
-    public void testRollingFileWriterByHour() throws Exception {
+    public void testRollingFileWriterByHour() {
         testRollOnDate("mylog-${date:yyyy-MM-dd-hh}.log", 100000, "hour", "mylog-2015-05-03");
     }
 
     @Test
-    public void testRollingFileWriterByMinute() throws Exception {
+    public void testRollingFileWriterByMinute() {
         testRollOnDate("mylog-${date:yyyy-MM-dd-hh-mm}.log", 1000, "minute", "mylog-2015-05-03");
     }
 
     @Test
-    public void testRollingFileWriterByMonth() throws Exception {
+    public void testRollingFileWriterByMonth() {
         testRollOnDate("mylog-${date:yyyy-MM}.log", 30 * 24 * 60000, "month", "mylog-2015");
     }
 
     @Test
-    public void testRollingFileWriterBySize() throws Exception {
+    public void testRollingFileWriterBySize() {
         String base = temp.getRoot().getAbsolutePath() + Files.SEPARATOR;
         String logFile = base + "mylog-${date:yyyy-MM-dd}.log";
         String expectedLogFile = base + "mylog-2015-05-03.log";
 
-        final MicrosecondClock clock = new TestMicrosecondClock(TimestampFormatUtils.parseTimestamp("2015-05-03T10:35:00.000Z"), 1, IntervalUtils.parseFloorPartialTimestamp("2019-12-31"));
+        final MicrosecondClock clock = new TestMicrosecondClock(MicrosFormatUtils.parseTimestamp("2015-05-03T10:35:00.000Z"), 1, MicrosTimestampDriver.floor("2019-12-31"));
 
         try (Path path = new Path()) {
             // create rogue file that would be in a way of logger rolling existing files
@@ -613,17 +1124,17 @@ public class LogFactoryTest {
     }
 
     @Test
-    public void testRollingFileWriterByYear() throws Exception {
+    public void testRollingFileWriterByYear() {
         testRollOnDate("mylog-${date:yyyy-MM}.log", 12 * 30 * 24 * 60000L, "year", "mylog-201");
     }
 
     @Test
-    public void testRollingFileWriterDateParse() throws Exception {
+    public void testRollingFileWriterDateParse() {
         String base = temp.getRoot().getAbsolutePath() + Files.SEPARATOR;
         String logFile = base + "mylog-${date:yyyy-MM-dd}.log";
         String expectedLogFile = base + "mylog-2015-05-03.log";
         try (LogFactory factory = new LogFactory()) {
-            final MicrosecondClock clock = new TestMicrosecondClock(TimestampFormatUtils.parseTimestamp("2015-05-03T11:35:00.000Z"), 1, IntervalUtils.parseFloorPartialTimestamp("2015-05-04"));
+            final MicrosecondClock clock = new TestMicrosecondClock(MicrosFormatUtils.parseTimestamp("2015-05-03T11:35:00.000Z"), 1, MicrosTimestampDriver.floor("2015-05-04"));
 
             factory.add(new LogWriterConfig(LogLevel.INFO, (ring, seq, level) -> {
                 LogRollingFileWriter w = new LogRollingFileWriter(TestFilesFacadeImpl.INSTANCE, clock, ring, seq, level);
@@ -639,20 +1150,20 @@ public class LogFactoryTest {
                 logger.xinfo().$("test ").$(' ').$(i).$();
             }
 
-            Os.sleep(100);
+            factory.flushJobs();
         }
         Assert.assertTrue(new File(expectedLogFile).length() > 0);
     }
 
     @Test
-    public void testRollingFileWriterDateParsePushFilesMid() throws Exception {
+    public void testRollingFileWriterDateParsePushFilesMid() {
         String base = temp.getRoot().getAbsolutePath() + Files.SEPARATOR;
         String expectedLogFile = base + "mylog-2015-05-03.log";
         try (LogFactory factory = new LogFactory()) {
 
             String logFile = base + "mylog-${date:yyyy-MM-dd}.log";
 
-            final MicrosecondClock clock = new TestMicrosecondClock(TimestampFormatUtils.parseTimestamp("2015-05-03T10:35:00.000Z"), 1, IntervalUtils.parseFloorPartialTimestamp("2015-05-04"));
+            final MicrosecondClock clock = new TestMicrosecondClock(MicrosFormatUtils.parseTimestamp("2015-05-03T10:35:00.000Z"), 1, MicrosTimestampDriver.floor("2015-05-04"));
 
             try (Path path = new Path()) {
 
@@ -685,7 +1196,7 @@ public class LogFactoryTest {
                 logger.xinfo().$("test ").$(' ').$(i).$();
             }
 
-            Os.sleep(1000);
+            factory.flushJobs();
         }
         Assert.assertTrue(new File(expectedLogFile).length() > 0);
     }
@@ -929,6 +1440,106 @@ public class LogFactoryTest {
     }
 
     @Test
+    public void testSpaceInRollEvery() {
+        final String logFile = temp.getRoot().getAbsolutePath() + Files.SEPARATOR + "mylog-${date:yyyy-MM-dd}.log";
+
+        final MicrosecondClock clock = new TestMicrosecondClock(
+                MicrosFormatUtils.parseTimestamp("2015-05-03T10:35:00.000Z"),
+                1,
+                MicrosTimestampDriver.floor("2019-12-31")
+        );
+
+        final RingQueue<LogRecordUtf8Sink> queue = new RingQueue<>(
+                LogRecordUtf8Sink::new,
+                1024,
+                1024,
+                MemoryTag.NATIVE_DEFAULT
+        );
+
+        final SPSequence pubSeq = new SPSequence(queue.getCycle());
+        final SCSequence subSeq = new SCSequence();
+        pubSeq.then(subSeq).then(pubSeq);
+
+        try (final LogRollingFileWriter writer = new LogRollingFileWriter(
+                TestFilesFacadeImpl.INSTANCE,
+                clock,
+                queue,
+                subSeq,
+                LogLevel.INFO
+        )) {
+            writer.setLocation(logFile);
+            writer.setRollEvery("day  ");
+            writer.bindProperties(LogFactory.getInstance());
+
+            Assert.assertNotEquals(Long.MAX_VALUE, writer.getRollDeadlineFunction().getDeadline());
+            Assert.assertEquals(1430697600000000L, writer.getRollDeadlineFunction().getDeadline());
+        }
+
+        try (final LogRollingFileWriter writer = new LogRollingFileWriter(
+                TestFilesFacadeImpl.INSTANCE,
+                clock,
+                queue,
+                subSeq,
+                LogLevel.INFO
+        )) {
+            writer.setLocation(logFile);
+            writer.setRollEvery(" minute ");
+            writer.bindProperties(LogFactory.getInstance());
+
+            Assert.assertNotEquals(Long.MAX_VALUE, writer.getRollDeadlineFunction().getDeadline());
+            Assert.assertEquals(1430649360000000L, writer.getRollDeadlineFunction().getDeadline());
+        }
+    }
+
+    @Test
+    public void testThrowableCauseIsNotCircularAcrossRecords() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            // Regression test for the dejaVu clear in AsyncLogRecord.$(): the set used to
+            // retain every Throwable a carrier thread ever logged, so a cause shared with
+            // an earlier record printed as [CIRCULAR REFERENCE] instead of its stack trace.
+            try (LogFactory factory = new LogFactory()) {
+                final StringSink sink = new StringSink();
+                SOCountDownLatch latch = new SOCountDownLatch(1);
+
+                factory.add(new LogWriterConfig(LogLevel.ALL, (ring, seq, level) -> new LogWriter() {
+                    @Override
+                    public void bindProperties(LogFactory factory) {
+                    }
+
+                    @Override
+                    public boolean run(@NotNull WorkerContext workerContext) {
+                        return seq.consumeAll(ring, this::log);
+                    }
+
+                    private void log(LogRecordUtf8Sink record) {
+                        sink.put((Sinkable) record);
+                        latch.countDown();
+                    }
+                }));
+
+                factory.bind();
+                factory.startThread();
+                Log logger = factory.create("x");
+
+                Exception cause = new RuntimeException("shared cause");
+                logger.error().$("first").$(new RuntimeException("wrapper 1", cause)).$();
+                latch.await();
+                latch.setCount(1);
+                logger.error().$("second").$(new RuntimeException("wrapper 2", cause)).$();
+                latch.await();
+
+                String out = sink.toString();
+                Assert.assertFalse("shared cause degraded to a circular reference: " + out,
+                        out.contains("[CIRCULAR REFERENCE"));
+                int first = out.indexOf("Caused by: java.lang.RuntimeException: shared cause");
+                Assert.assertTrue("cause missing from the first record: " + out, first > -1);
+                Assert.assertTrue("cause missing from the second record: " + out,
+                        out.indexOf("Caused by: java.lang.RuntimeException: shared cause", first + 1) > first);
+            }
+        });
+    }
+
+    @Test
     public void testUninitializedFactory() {
         System.setProperty(LogFactory.CONFIG_SYSTEM_PROPERTY, Files.getResourcePath(getClass().getResource("/test-log.conf")));
 
@@ -994,9 +1605,63 @@ public class LogFactoryTest {
         r.$();
     }
 
-    private static Log getLogger(Class<?> clazz) {
+    private static void assertRenderingFailureWithFailingEol(
+            LogRecord record,
+            SCSequence sequence,
+            long expectedCursor,
+            RuntimeException renderingFailure,
+            LogOperation operation
+    ) throws Exception {
+        final Class<?> recordClass = record.getClass();
+        final Field sinkField = recordClass.getDeclaredField("sink");
+        sinkField.setAccessible(true);
+        final Object originalSink = sinkField.get(record);
+        final Field inProgressField = recordClass.getDeclaredField("isLogRecordInProgress");
+        inProgressField.setAccessible(true);
+        final RuntimeException eolFailure = new RuntimeException("EOL failure at cursor " + expectedCursor);
+        final AtomicInteger eolCallCount = new AtomicInteger();
+
         try {
-            final Field field = clazz.getDeclaredField("LOG");
+            sinkField.set(record, new LogRecordUtf8Sink(0, 0) {
+                @Override
+                public Utf8Sink putAscii(CharSequence cs) {
+                    return this;
+                }
+
+                @Override
+                public Utf8Sink putEOL() {
+                    eolCallCount.incrementAndGet();
+                    throw eolFailure;
+                }
+            });
+
+            try {
+                operation.run(record);
+                Assert.fail("expected log rendering to fail");
+            } catch (RuntimeException e) {
+                Assert.assertSame(renderingFailure, e);
+                Assert.assertArrayEquals(new Throwable[]{eolFailure}, e.getSuppressed());
+            }
+
+            Assert.assertFalse(inProgressField.getBoolean(record));
+            record.$();
+            record.I$();
+            Assert.assertEquals(1, eolCallCount.get());
+
+            final long cursor = sequence.next();
+            Assert.assertEquals(expectedCursor, cursor);
+            sequence.done(cursor);
+        } finally {
+            sinkField.set(record, originalSink);
+            if (inProgressField.getBoolean(record)) {
+                record.$();
+            }
+        }
+    }
+
+    private static Log getLogger() {
+        try {
+            final Field field = QueryProgress.class.getDeclaredField("LOG");
             field.setAccessible(true);
             return (Log) field.get(null);
         } catch (NoSuchFieldException | IllegalAccessException e) {
@@ -1004,23 +1669,50 @@ public class LogFactoryTest {
         }
     }
 
+    private static LogWriterConfig newSequenceCapturingWriterConfig(AtomicReference<SCSequence> consumerSequence) {
+        return newSequenceCapturingWriterConfig(consumerSequence, null);
+    }
+
+    private static LogWriterConfig newSequenceCapturingWriterConfig(
+            AtomicReference<SCSequence> consumerSequence,
+            @Nullable AtomicReference<RingQueue<LogRecordUtf8Sink>> consumerRing
+    ) {
+        return new LogWriterConfig(LogLevel.INFO, (ring, seq, level) -> {
+            consumerSequence.set(seq);
+            if (consumerRing != null) {
+                consumerRing.set(ring);
+            }
+            return new LogWriter() {
+                @Override
+                public void bindProperties(LogFactory factory) {
+                }
+
+                @Override
+                public boolean run(@NotNull WorkerContext workerContext) {
+                    return false;
+                }
+            };
+        });
+    }
+
     private void assertFileLength(String file) {
         long len = new File(file).length();
         Assert.assertTrue("oops: " + len, len > 0L && len < 1073741824L);
     }
 
-    private void testAutoDelete(String sizeLimit, String lifeDuration) throws NumericException {
+    private void testAutoDelete(String sizeLimit, String lifeDuration, String rollSize) throws Exception {
         final int extraFiles = 2;
         String fileTemplate = "mylog-${date:yyyy-MM-dd}.log";
         String extraFilePrefix = "mylog-test";
-        long speed = Timestamps.HOUR_MICROS;
+        long speed = Micros.HOUR_MICROS;
 
         final MicrosecondClock clock = new TestMicrosecondClock(
-                TimestampFormatUtils.parseTimestamp("2015-05-03T10:35:00.000Z"),
+                MicrosFormatUtils.parseTimestamp("2015-05-03T10:35:00.000Z"),
                 speed,
-                IntervalUtils.parseFloorPartialTimestamp("2019-12-31")
+                MicrosTimestampDriver.floor("2019-12-31")
         );
 
+        long nSizeLimit = sizeLimit != null ? Numbers.parseLongSize(sizeLimit) : 0;
         String base = temp.getRoot().getAbsolutePath() + Files.SEPARATOR;
         String logFile = base + fileTemplate;
         AtomicReference<LogRollingFileWriter> writerRef = new AtomicReference<>();
@@ -1030,7 +1722,7 @@ public class LogFactoryTest {
                 w.setLocation(logFile);
                 w.setSpinBeforeFlush("10");
                 w.setRollEvery("day");
-                w.setRollSize("30k");
+                w.setRollSize(rollSize);
                 if (sizeLimit != null) {
                     w.setSizeLimit(sizeLimit);
                 }
@@ -1047,17 +1739,16 @@ public class LogFactoryTest {
 
             if (sizeLimit != null) {
                 // Create files to be deleted based on size.
-                long nSizeLimit = Numbers.parseLongSize(sizeLimit);
                 try (Path path = new Path()) {
                     for (int i = 0; i < extraFiles; i++) {
                         path.of(base + extraFilePrefix).put(i).put(".log").$();
-                        int fd = Files.openRW(path.$());
+                        long fd = Files.openRW(path.$());
                         try {
                             Files.allocate(fd, nSizeLimit + 1);
                         } finally {
                             Files.close(fd);
                         }
-                        Files.setLastModified(path.$(), clock.getTicks() / 1000 - (i + 1) * 24 * Timestamps.HOUR_MICROS / 1000);
+                        Files.setLastModified(path.$(), clock.getTicks() / 1000 - (i + 1) * 24 * Micros.HOUR_MICROS / 1000);
                     }
                 }
             }
@@ -1068,27 +1759,33 @@ public class LogFactoryTest {
                     for (int i = 0; i < extraFiles; i++) {
                         path.of(base + extraFilePrefix).put(i).put(".log").$();
                         Files.touch(path.$());
-                        Files.setLastModified(path.$(), clock.getTicks() / 1000 - (i + 1) * Numbers.parseLongDuration(lifeDuration) / 1000);
+                        Files.setLastModified(path.$(), clock.getTicks() / 1000 - (i + 1) * Numbers.parseLongDurationMicros(lifeDuration) / 1000);
                     }
                 }
             }
 
             Log logger = factory.create("x");
-            for (int i = 0; i < 100000; i++) {
+            int lines = (int) Math.max(100000, (double) nSizeLimit / (5 + 1 + 3) * 2);
+            for (int i = 0; i < lines; i++) {
                 logger.xinfo().$("test ").$(' ').$(i).$();
             }
+            logger.infoW().$("!").$();
 
             // Wait until we roll log files at least once.
             TestUtils.assertEventually(() -> {
-                logger.xinfo().$("test foobar").$();
+                logger.infoW().$("!").$();
                 Assert.assertTrue(writerRef.get().getRolledCount() > 0);
             }, 10);
+
+            factory.close(true);
         }
 
         int fileCount = 0;
+        boolean endFound = false;
         try (Path path = new Path()) {
             StringSink fileNameSink = new StringSink();
             path.of(base).$();
+            int len = path.size();
             long pFind = Files.findFirst(path.$());
             try {
                 Assert.assertNotEquals(0, pFind);
@@ -1101,6 +1798,14 @@ public class LogFactoryTest {
                     // All extra files should be deleted.
                     Assert.assertFalse(Chars.contains(fileNameSink, extraFilePrefix));
                     fileCount++;
+
+                    path.trimTo(len).concat(fileNameSink);
+                    long fileSize = Files.length(path.$());
+
+                    long fd = Files.openRO(path.$());
+                    char b = (char) Files.readNonNegativeByte(fd, fileSize - 3);
+                    Files.close(fd);
+                    endFound |= b == '!';
                 } while (Files.findNext(pFind) > 0);
             } finally {
                 Files.findClose(pFind);
@@ -1108,6 +1813,7 @@ public class LogFactoryTest {
         }
 
         Assert.assertTrue(fileCount > 0);
+        Assert.assertTrue(endFound);
     }
 
     private void testCustomLogIsCreated(boolean isCreated) throws IOException {
@@ -1140,9 +1846,9 @@ public class LogFactoryTest {
             String mustContain
     ) throws NumericException {
         final MicrosecondClock clock = new TestMicrosecondClock(
-                TimestampFormatUtils.parseTimestamp("2015-05-03T10:35:00.000Z"),
+                MicrosFormatUtils.parseTimestamp("2015-05-03T10:35:00.000Z"),
                 speed,
-                IntervalUtils.parseFloorPartialTimestamp("2019-12-31")
+                MicrosTimestampDriver.floor("2019-12-31")
         );
 
         final long expectedFileCount = Files.getOpenFileCount();
@@ -1201,6 +1907,11 @@ public class LogFactoryTest {
         Assert.assertTrue(fileCount > 0);
         Assert.assertEquals(expectedFileCount, Files.getOpenFileCount());
         Assert.assertEquals(expectedMemUsage, Unsafe.getMemUsed());
+    }
+
+    @FunctionalInterface
+    private interface LogOperation {
+        void run(LogRecord record);
     }
 
     private static class TestMicrosecondClock implements MicrosecondClock {

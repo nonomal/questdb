@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -75,16 +75,29 @@ public class ObjListTest {
         Assert.assertEquals(list(), remove(list("a", "b", "c"), 4, 10));
     }
 
+    @Test
+    public void testRemoveFromToClearsRemovedBackingSlots() {
+        final ObjList<Object> list = new ObjList<>();
+        for (int i = 0; i < 32; i++) {
+            list.add(new Object());
+        }
+
+        list.remove(16, list.size() - 1);
+
+        Assert.assertEquals(16, list.size());
+        Assert.assertTrue("removed backing slots must be cleared", list.hasOnlyNullsBeyondSizeForTesting());
+    }
+
+    private static <T> ObjList<T> remove(ObjList<T> o, int from, int to) {
+        o.remove(from, to);
+        return o;
+    }
+
     private ObjList<String> list(String... values) {
         ObjList<String> result = new ObjList<>();
         for (String value : values) {
             result.add(value);
         }
         return result;
-    }
-
-    private static <T> ObjList<T> remove(ObjList<T> o, int from, int to) {
-        o.remove(from, to);
-        return o;
     }
 }

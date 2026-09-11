@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -62,10 +62,9 @@ public class RPadFunctionFactory implements FunctionFactory {
     }
 
     public static class RPadFunc extends StrFunction implements BinaryFunction {
-
         private final Function lenFunc;
         private final int maxLength;
-        private final StringSink sink = new StringSink();
+        private final StringSink sinkA = new StringSink();
         private final StringSink sinkB = new StringSink();
         private final Function strFunc;
 
@@ -92,7 +91,7 @@ public class RPadFunctionFactory implements FunctionFactory {
 
         @Override
         public CharSequence getStrA(final Record rec) {
-            return rPad(strFunc.getStrA(rec), lenFunc.getInt(rec), sink);
+            return rPad(strFunc.getStrA(rec), lenFunc.getInt(rec), sinkA);
         }
 
         @Override
@@ -109,6 +108,11 @@ public class RPadFunctionFactory implements FunctionFactory {
             } else {
                 return TableUtils.NULL_LEN;
             }
+        }
+
+        @Override
+        public boolean isThreadSafe() {
+            return false;
         }
 
         @Nullable

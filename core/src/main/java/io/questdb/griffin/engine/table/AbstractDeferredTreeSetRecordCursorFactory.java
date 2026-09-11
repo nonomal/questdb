@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -25,34 +25,70 @@
 package io.questdb.griffin.engine.table;
 
 import io.questdb.cairo.CairoConfiguration;
+import io.questdb.cairo.CairoException;
 import io.questdb.cairo.SymbolMapReader;
 import io.questdb.cairo.TableUtils;
-import io.questdb.cairo.sql.*;
+import io.questdb.cairo.sql.Function;
+import io.questdb.cairo.sql.PageFrameCursor;
+import io.questdb.cairo.sql.PartitionFrameCursorFactory;
+import io.questdb.cairo.sql.RecordCursor;
+import io.questdb.cairo.sql.RecordMetadata;
+import io.questdb.cairo.sql.StaticSymbolTable;
+import io.questdb.cairo.sql.SymbolTable;
 import io.questdb.griffin.SqlException;
 import io.questdb.griffin.SqlExecutionContext;
 import io.questdb.std.IntHashSet;
+import io.questdb.std.IntList;
+import io.questdb.std.Misc;
 import io.questdb.std.ObjList;
 import io.questdb.std.Transient;
 import org.jetbrains.annotations.NotNull;
 
+/**
+ * Abstract base class for deferred tree set record cursor factories.
+ * Used for symbol filtering where symbols may need deferred resolution.
+ */
 public abstract class AbstractDeferredTreeSetRecordCursorFactory extends AbstractTreeSetRecordCursorFactory {
+    /**
+     * The column index for symbol filtering.
+     */
     protected final int columnIndex;
-    protected final ObjList<Function> deferredSymbolFuncs;
+    /**
+     * Keys for deferred symbols.
+     */
     protected final IntHashSet deferredSymbolKeys;
-    // the following two instances are shared between factory and cursor
-    // factory will be resolving symbols for cursor and if successful
-    // symbol keys will be added to this hash set
+    /**
+     * Symbol keys that were resolved during construction.
+     */
     protected final IntHashSet symbolKeys;
+    /**
+     * Functions for deferred symbol resolution.
+     */
+    protected ObjList<Function> deferredSymbolFuncs;
 
+    /**
+     * Constructs a new deferred tree set record cursor factory.
+     *
+     * @param configuration               the Cairo configuration
+     * @param metadata                    the record metadata
+     * @param partitionFrameCursorFactory the partition frame cursor factory
+     * @param columnIndex                 the column index for symbol filtering
+     * @param keyValueFuncs               the key value functions
+     * @param symbolMapReader             the symbol map reader
+     * @param columnIndexes               the column indexes
+     * @param columnSizeShifts            the column size shifts
+     */
     public AbstractDeferredTreeSetRecordCursorFactory(
             @NotNull CairoConfiguration configuration,
             @NotNull RecordMetadata metadata,
-            @NotNull DataFrameCursorFactory dataFrameCursorFactory,
+            @NotNull PartitionFrameCursorFactory partitionFrameCursorFactory,
             int columnIndex,
             @Transient ObjList<Function> keyValueFuncs,
-            @Transient SymbolMapReader symbolMapReader
+            @Transient SymbolMapReader symbolMapReader,
+            @NotNull IntList columnIndexes,
+            @NotNull IntList columnSizeShifts
     ) {
-        super(metadata, dataFrameCursorFactory, configuration);
+        super(configuration, metadata, partitionFrameCursorFactory, columnIndexes, columnSizeShifts);
 
         // we need two data structures, int hash set for symbol keys we can resolve here
         // and CharSequence hash set for symbols we cannot resolve
@@ -92,22 +128,39 @@ public abstract class AbstractDeferredTreeSetRecordCursorFactory extends Abstrac
     }
 
     @Override
-    protected RecordCursor getCursorInstance(
-            DataFrameCursor dataFrameCursor,
+    protected void _close() {
+        final ObjList<Function> deferredSymbolFuncs = this.deferredSymbolFuncs;
+        this.deferredSymbolFuncs = null;
+        Throwable failure = null;
+        try {
+            super._close();
+        } catch (Throwable th) {
+            failure = th;
+        }
+        failure = Misc.freeObjListBestEffort(failure, deferredSymbolFuncs);
+        CairoException.rethrowCleanupFailure(failure);
+    }
+
+    @Override
+    protected RecordCursor initRecordCursor(
+            PageFrameCursor pageFrameCursor,
             SqlExecutionContext executionContext
     ) throws SqlException {
         if (deferredSymbolFuncs != null) {
             deferredSymbolKeys.clear();
-            StaticSymbolTable symbolTable = dataFrameCursor.getSymbolTable(cursor.getColumnIndexes().getQuick(columnIndex));
+            StaticSymbolTable symbolTable = pageFrameCursor.getSymbolTable(columnIndex);
             for (int i = 0, n = deferredSymbolFuncs.size(); i < n; i++) {
                 Function symbolFunc = deferredSymbolFuncs.get(i);
                 final CharSequence symbol = symbolFunc.getStrA(null);
                 int symbolKey = symbolTable.keyOf(symbol);
                 if (symbolKey != SymbolTable.VALUE_NOT_FOUND) {
-                    deferredSymbolKeys.add(TableUtils.toIndexKey(symbolKey));
+                    int indexKey = TableUtils.toIndexKey(symbolKey);
+                    if (!symbolKeys.contains(indexKey)) {
+                        deferredSymbolKeys.add(indexKey);
+                    }
                 }
             }
         }
-        return super.getCursorInstance(dataFrameCursor, executionContext);
+        return super.initRecordCursor(pageFrameCursor, executionContext);
     }
 }

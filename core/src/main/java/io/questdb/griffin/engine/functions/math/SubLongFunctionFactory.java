@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -30,28 +30,50 @@ import io.questdb.cairo.sql.Record;
 import io.questdb.griffin.FunctionFactory;
 import io.questdb.griffin.PlanSink;
 import io.questdb.griffin.SqlExecutionContext;
-import io.questdb.griffin.engine.functions.BinaryFunction;
 import io.questdb.griffin.engine.functions.LongFunction;
+import io.questdb.griffin.engine.functions.constants.LongConstant;
 import io.questdb.std.IntList;
+import io.questdb.std.Misc;
 import io.questdb.std.Numbers;
 import io.questdb.std.ObjList;
+import io.questdb.std.Transient;
 
 public class SubLongFunctionFactory implements FunctionFactory {
+
     @Override
     public String getSignature() {
         return "-(LL)";
     }
 
     @Override
-    public Function newInstance(int position, ObjList<Function> args, IntList argPositions, CairoConfiguration configuration1, SqlExecutionContext sqlExecutionContext) {
-        return new SubtractIntVVFunc(args.getQuick(0), args.getQuick(1));
+    public Function newInstance(
+            int position,
+            @Transient ObjList<Function> args,
+            @Transient IntList argPositions,
+            CairoConfiguration configuration,
+            SqlExecutionContext sqlExecutionContext
+    ) {
+        final Function left = args.getQuick(0);
+        final Function right = args.getQuick(1);
+        // null - x and x - null always evaluate to null. Fold at construction time so the
+        // non-null operand (potentially a column reference) is never evaluated with a null
+        // record via FunctionParser.functionToConstant().
+        if (left.isNullConstant()) {
+            Misc.free(right);
+            return LongConstant.NULL;
+        }
+        if (right.isNullConstant()) {
+            Misc.free(left);
+            return LongConstant.NULL;
+        }
+        return new SubLongFunc(left, right);
     }
 
-    private static class SubtractIntVVFunc extends LongFunction implements BinaryFunction {
-        final Function left;
-        final Function right;
+    private static class SubLongFunc extends LongFunction implements ArithmeticBinaryFunction {
+        private final Function left;
+        private final Function right;
 
-        public SubtractIntVVFunc(Function left, Function right) {
+        public SubLongFunc(Function left, Function right) {
             this.left = left;
             this.right = right;
         }
@@ -65,11 +87,9 @@ public class SubLongFunctionFactory implements FunctionFactory {
         public long getLong(Record rec) {
             long l = left.getLong(rec);
             long r = right.getLong(rec);
-
             if (l != Numbers.LONG_NULL && r != Numbers.LONG_NULL) {
                 return l - r;
             }
-
             return Numbers.LONG_NULL;
         }
 

@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -66,10 +66,10 @@ public final class LongLongHashSet implements Mutable, Sinkable {
     private final long noEntryKeyValue;
     private final SinkStrategy sinkStrategy;
     private int capacity;
+    private boolean hasNull = false;
     private int mask;
     private int size;
     private long[] values;
-    private boolean hasNull = false;
 
     /**
      * Creates a new set with a given capacity, load factor and no entry sentinel value.
@@ -129,6 +129,10 @@ public final class LongLongHashSet implements Mutable, Sinkable {
         }
     }
 
+    public void addNull() {
+        this.hasNull = true;
+    }
+
     /**
      * Clears the set.
      */
@@ -139,14 +143,6 @@ public final class LongLongHashSet implements Mutable, Sinkable {
         hasNull = false;
     }
 
-    public boolean hasNull() {
-        return hasNull;
-    }
-
-    public void addNull() {
-        this.hasNull = true;
-    }
-
     /**
      * Check if the set contains a tuple with the given keys.
      *
@@ -154,6 +150,10 @@ public final class LongLongHashSet implements Mutable, Sinkable {
      */
     public boolean contains(long key1, long key2) {
         return keyIndex(key1, key2) < 0;
+    }
+
+    public boolean hasNull() {
+        return hasNull;
     }
 
     /**

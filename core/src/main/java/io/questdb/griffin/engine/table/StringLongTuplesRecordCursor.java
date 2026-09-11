@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -25,12 +25,14 @@
 package io.questdb.griffin.engine.table;
 
 import io.questdb.cairo.CairoException;
+import io.questdb.cairo.sql.NoRandomAccessRecordCursor;
 import io.questdb.cairo.sql.Record;
-import io.questdb.cairo.sql.RecordCursor;
+import io.questdb.cairo.sql.SqlExecutionCircuitBreaker;
 import org.jetbrains.annotations.NotNull;
 
-final class StringLongTuplesRecordCursor implements RecordCursor {
+final class StringLongTuplesRecordCursor implements NoRandomAccessRecordCursor {
     private final TableWriterMetricsRecord record = new TableWriterMetricsRecord();
+    private SqlExecutionCircuitBreaker circuitBreaker;
     private String[] keys;
     private int pos;
     private long[] values;
@@ -45,12 +47,8 @@ final class StringLongTuplesRecordCursor implements RecordCursor {
     }
 
     @Override
-    public Record getRecordB() {
-        throw new UnsupportedOperationException("RecordB not supported");
-    }
-
-    @Override
     public boolean hasNext() {
+        circuitBreaker.statefulThrowExceptionIfTripped();
         if (keys.length > pos + 1) {
             pos++;
             return true;
@@ -58,16 +56,17 @@ final class StringLongTuplesRecordCursor implements RecordCursor {
         return false;
     }
 
-    public void of(String[] keys, long[] values) {
+    public void of(String[] keys, long[] values, SqlExecutionCircuitBreaker circuitBreaker) {
         assert keys.length == values.length;
         this.keys = keys;
         this.values = values;
+        this.circuitBreaker = circuitBreaker;
         toTop();
     }
 
     @Override
-    public void recordAt(Record record, long atRowId) {
-        throw new UnsupportedOperationException("random access not supported");
+    public long preComputedStateSize() {
+        return 0;
     }
 
     @Override
@@ -90,7 +89,8 @@ final class StringLongTuplesRecordCursor implements RecordCursor {
         }
 
         @Override
-        @NotNull public CharSequence getStrA(int col) {
+        @NotNull
+        public CharSequence getStrA(int col) {
             if (col != 0) {
                 throw CairoException.nonCritical().put("unsupported string column number [column=").put(col).put("]");
             }
@@ -104,9 +104,6 @@ final class StringLongTuplesRecordCursor implements RecordCursor {
 
         @Override
         public int getStrLen(int col) {
-            if (col != 0) {
-                throw CairoException.nonCritical().put("unsupported string column number [column=").put(col).put("]");
-            }
             return getStrA(col).length();
         }
     }

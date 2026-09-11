@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -36,13 +36,17 @@ public class HideTelemetryTablesTest extends AbstractCairoTest {
         node1.getConfigurationOverrides().setIsHidingTelemetryTable(true);
 
         assertMemoryLeak(() -> {
-            ddl("create table test(a int)");
-            ddl("create table " + TelemetryTask.TABLE_NAME + "(a int)");
-            ddl("create table " + TelemetryConfigLogger.TELEMETRY_CONFIG_TABLE_NAME + "(a int)");
-            assertSql(
-                    "id\ttable_name\tdesignatedTimestamp\tpartitionBy\tmaxUncommittedRows\to3MaxLag\n" +
-                            "1\ttest\t\tNONE\t1000\t300000000\n", "select id,table_name,designatedTimestamp,partitionBy,maxUncommittedRows,o3MaxLag from tables()"
-            );
+            execute("create table test(a int)");
+            execute("create table " + TelemetryTask.TABLE_NAME + "(a int)");
+            execute("create table " + TelemetryConfigLogger.TELEMETRY_CONFIG_TABLE_NAME + "(a int)");
+            assertQuery("select id,table_name,designatedTimestamp,partitionBy,maxUncommittedRows,o3MaxLag from tables()")
+                    .noLeakCheck()
+                    .expectSize()
+                    .noRandomAccess()
+                    .returns("""
+                            id\ttable_name\tdesignatedTimestamp\tpartitionBy\tmaxUncommittedRows\to3MaxLag
+                            1\ttest\t\tNONE\t1000\t300000000
+                            """);
         });
     }
 
@@ -51,15 +55,18 @@ public class HideTelemetryTablesTest extends AbstractCairoTest {
         node1.getConfigurationOverrides().setIsHidingTelemetryTable(false);
 
         assertMemoryLeak(() -> {
-            ddl("create table test(a int)");
-            ddl("create table " + TelemetryTask.TABLE_NAME + "(a int)");
-            ddl("create table " + TelemetryConfigLogger.TELEMETRY_CONFIG_TABLE_NAME + "(a int)");
-            assertSql(
-                    "id\ttable_name\tdesignatedTimestamp\tpartitionBy\tmaxUncommittedRows\to3MaxLag\n" +
-                            "2\ttelemetry\t\tNONE\t1000\t300000000\n" +
-                            "3\ttelemetry_config\t\tNONE\t1000\t300000000\n" +
-                            "1\ttest\t\tNONE\t1000\t300000000\n", "select id,table_name,designatedTimestamp,partitionBy,maxUncommittedRows,o3MaxLag from tables() order by 2"
-            );
+            execute("create table test(a int)");
+            execute("create table " + TelemetryTask.TABLE_NAME + "(a int)");
+            execute("create table " + TelemetryConfigLogger.TELEMETRY_CONFIG_TABLE_NAME + "(a int)");
+            assertQuery("select id,table_name,designatedTimestamp,partitionBy,maxUncommittedRows,o3MaxLag from tables() order by 2")
+                    .noLeakCheck()
+                    .expectSize()
+                    .returns("""
+                            id\ttable_name\tdesignatedTimestamp\tpartitionBy\tmaxUncommittedRows\to3MaxLag
+                            2\ttelemetry\t\tNONE\t1000\t300000000
+                            3\ttelemetry_config\t\tNONE\t1000\t300000000
+                            1\ttest\t\tNONE\t1000\t300000000
+                            """);
         });
     }
 }

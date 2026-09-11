@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,24 +24,30 @@
 
 package io.questdb.cairo;
 
+import io.questdb.cairo.arr.ArrayTypeDriver;
+import io.questdb.cairo.arr.NoopArrayWriteState;
 import io.questdb.cairo.sql.Record;
 import io.questdb.cairo.sql.RecordCursor;
 import io.questdb.cairo.sql.RecordMetadata;
 import io.questdb.log.Log;
+import io.questdb.log.LogError;
 import io.questdb.log.LogRecord;
+import io.questdb.std.BinarySequence;
 import io.questdb.std.Chars;
+import io.questdb.std.Decimals;
+import io.questdb.std.Interval;
+import io.questdb.std.Misc;
 import io.questdb.std.Numbers;
 import io.questdb.std.Uuid;
-import io.questdb.std.datetime.microtime.TimestampFormatUtils;
 import io.questdb.std.datetime.millitime.DateFormatUtils;
 import io.questdb.std.str.CharSink;
 import io.questdb.std.str.MutableCharSink;
+import io.questdb.std.str.Utf8Sequence;
 
 import static io.questdb.std.Numbers.IPv4_NULL;
 
 public class CursorPrinter {
     private static final char COLUMN_DELIMITER = '\t';
-    public static int FLOAT_SCALE = 4;
 
     public static void printColumn(Record r, RecordMetadata m, int columnIndex, CharSink<?> sink, boolean printTypes) {
         printColumn(r, m, columnIndex, sink, false, printTypes);
@@ -58,7 +64,7 @@ public class CursorPrinter {
                 DateFormatUtils.appendDateTime(sink, record.getDate(columnIndex));
                 break;
             case ColumnType.TIMESTAMP:
-                TimestampFormatUtils.appendDateTimeUSec(sink, record.getTimestamp(columnIndex));
+                ColumnType.getTimestampDriver(columnType).append(sink, record.getTimestamp(columnIndex));
                 break;
             case ColumnType.DOUBLE:
                 double v = record.getDouble(columnIndex);
@@ -71,7 +77,7 @@ public class CursorPrinter {
             case ColumnType.FLOAT:
                 float f = record.getFloat(columnIndex);
                 if (Numbers.isFinite(f)) {
-                    sink.put(f, FLOAT_SCALE);
+                    sink.put(f);
                 } else {
                     sink.put("null");
                 }
@@ -84,7 +90,8 @@ public class CursorPrinter {
                 break;
             case ColumnType.STRING:
                 if (!symbolAsString | metadata.getColumnType(columnIndex) != ColumnType.SYMBOL) {
-                    sink.put(record.getStrA(columnIndex));
+                    CharSequence val = record.getStrA(columnIndex);
+                    sink.put(val != null ? val : nullStringValue);
                     break;
                 } // Fall down to SYMBOL
             case ColumnType.SYMBOL:
@@ -123,7 +130,12 @@ public class CursorPrinter {
                 sink.put(record.getBool(columnIndex));
                 break;
             case ColumnType.BINARY:
-                Chars.toSink(record.getBin(columnIndex), sink);
+                BinarySequence bin = record.getBin(columnIndex);
+                if (bin != null) {
+                    Chars.toSink(bin, sink);
+                } else {
+                    sink.put(nullStringValue);
+                }
                 break;
             case ColumnType.LONG256:
                 record.getLong256(columnIndex, sink);
@@ -146,7 +158,46 @@ public class CursorPrinter {
                 break;
             }
             case ColumnType.VARCHAR:
-                sink.put(record.getVarcharA(columnIndex));
+                Utf8Sequence varchar = record.getVarcharA(columnIndex);
+                if (varchar != null) {
+                    sink.put(varchar);
+                } else {
+                    sink.put(nullStringValue);
+                }
+                break;
+            case ColumnType.INTERVAL:
+                Interval interval = record.getInterval(columnIndex);
+                if (!Interval.NULL.equals(interval)) {
+                    interval.toSink(sink, columnType);
+                }
+                break;
+            case ColumnType.ARRAY:
+                ArrayTypeDriver.arrayToJson(
+                        record.getArray(columnIndex, columnType),
+                        sink,
+                        NoopArrayWriteState.INSTANCE
+                );
+                break;
+            case ColumnType.ARRAY_STRING:
+                sink.put(record.getStrA(columnIndex));
+                break;
+            case ColumnType.DECIMAL8:
+                putDecimal8Value(sink, record, columnIndex, columnType);
+                break;
+            case ColumnType.DECIMAL16:
+                putDecimal16Value(sink, record, columnIndex, columnType);
+                break;
+            case ColumnType.DECIMAL32:
+                putDecimal32Value(sink, record, columnIndex, columnType);
+                break;
+            case ColumnType.DECIMAL64:
+                putDecimal64Value(sink, record, columnIndex, columnType);
+                break;
+            case ColumnType.DECIMAL128:
+                putDecimal128Value(sink, record, columnIndex, columnType);
+                break;
+            case ColumnType.DECIMAL256:
+                putDecimal256Value(sink, record, columnIndex, columnType);
                 break;
             default:
                 break;
@@ -175,14 +226,26 @@ public class CursorPrinter {
         if (printHeader) {
             LogRecord line = sink.xDebugW();
             printHeader(metadata, logRecSink.of(line));
-            line.$();
+            try {
+                line.$();
+            } catch (LogError e) {
+                // We're logging data we don't control, it could be invalid UTF-8.
+                // Let's not break the test when this happens.
+                sink.xDebugW().$("LogError: ").$(e.getMessage()).$();
+            }
         }
 
         final Record record = cursor.getRecord();
         while (cursor.hasNext()) {
             LogRecord line = sink.xDebugW();
             print(record, metadata, logRecSink.of(line), false);
-            line.$();
+            try {
+                line.$();
+            } catch (LogError e) {
+                // We're logging data we don't control, it could be invalid UTF-8.
+                // Let's not break the test when this happens.
+                sink.xDebugW().$("LogError: ").$(e.getMessage()).$();
+            }
         }
     }
 
@@ -222,6 +285,50 @@ public class CursorPrinter {
                 sink.put(COLUMN_DELIMITER);
             }
             printColumn(record, metadata, i, sink, printTypes);
+        }
+    }
+
+    private static void putDecimal128Value(CharSink<?> sink, Record rec, int col, int type) {
+        var decimal = Misc.getThreadLocalDecimal128();
+        rec.getDecimal128(col, decimal);
+        if (!decimal.isNull()) {
+            Decimals.append(decimal, ColumnType.getDecimalPrecision(type), ColumnType.getDecimalScale(type), sink);
+        }
+    }
+
+    private static void putDecimal16Value(CharSink<?> sink, Record rec, int col, int type) {
+        short l = rec.getDecimal16(col);
+        if (l != Decimals.DECIMAL16_NULL) {
+            Decimals.append(l, ColumnType.getDecimalPrecision(type), ColumnType.getDecimalScale(type), sink);
+        }
+    }
+
+    private static void putDecimal256Value(CharSink<?> sink, Record rec, int col, int type) {
+        var decimal = Misc.getThreadLocalDecimal256();
+        rec.getDecimal256(col, decimal);
+        if (!decimal.isNull()) {
+            Decimals.append(decimal, ColumnType.getDecimalPrecision(type), ColumnType.getDecimalScale(type), sink);
+        }
+    }
+
+    private static void putDecimal32Value(CharSink<?> sink, Record rec, int col, int type) {
+        int l = rec.getDecimal32(col);
+        if (l != Decimals.DECIMAL32_NULL) {
+            Decimals.append(l, ColumnType.getDecimalPrecision(type), ColumnType.getDecimalScale(type), sink);
+        }
+    }
+
+    private static void putDecimal64Value(CharSink<?> sink, Record rec, int col, int type) {
+        long l = rec.getDecimal64(col);
+        if (l != Decimals.DECIMAL64_NULL) {
+            Decimals.append(l, ColumnType.getDecimalPrecision(type), ColumnType.getDecimalScale(type), sink);
+        }
+    }
+
+    private static void putDecimal8Value(CharSink<?> sink, Record rec, int col, int type) {
+        byte l = rec.getDecimal8(col);
+        if (l != Decimals.DECIMAL8_NULL) {
+            Decimals.append(l, ColumnType.getDecimalPrecision(type), ColumnType.getDecimalScale(type), sink);
         }
     }
 

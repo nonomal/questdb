@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -42,7 +42,8 @@ import io.questdb.std.histogram.org.HdrHistogram.PackedDoubleHistogram;
 public class ApproxPercentileDoublePackedGroupByFunction extends DoubleFunction implements GroupByFunction, BinaryFunction {
     private final Function exprFunc;
     private final int funcPosition;
-    private final ObjList<PackedDoubleHistogram> histograms = new ObjList<>();
+    private ObjList<PackedDoubleHistogram> histograms = new ObjList<>();
+    private boolean isShared;
     private final Function percentileFunc;
     private final int precision;
     private int histogramIndex;
@@ -58,6 +59,7 @@ public class ApproxPercentileDoublePackedGroupByFunction extends DoubleFunction 
 
     @Override
     public void clear() {
+        if (isShared) return;
         histograms.clear();
         histogramIndex = 0;
     }
@@ -135,6 +137,13 @@ public class ApproxPercentileDoublePackedGroupByFunction extends DoubleFunction 
     }
 
     @Override
+    public void initSharedFrom(GroupByFunction primary) {
+        this.valueIndex = primary.getValueIndex();
+        this.histograms = ((ApproxPercentileDoublePackedGroupByFunction) primary).histograms;
+        this.isShared = true;
+    }
+
+    @Override
     public void initValueIndex(int valueIndex) {
         this.valueIndex = valueIndex;
     }
@@ -151,7 +160,7 @@ public class ApproxPercentileDoublePackedGroupByFunction extends DoubleFunction 
     }
 
     @Override
-    public boolean isReadThreadSafe() {
+    public boolean isThreadSafe() {
         return false;
     }
 

@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,16 +24,17 @@
 
 package io.questdb.griffin.engine.table;
 
-import io.questdb.cairo.BitmapIndexReader;
-import io.questdb.cairo.TableReader;
-import io.questdb.cairo.sql.DataFrame;
+import io.questdb.cairo.idx.IndexReader;
 import io.questdb.cairo.sql.Function;
+import io.questdb.cairo.sql.PageFrame;
+import io.questdb.cairo.sql.PageFrameCursor;
+import io.questdb.cairo.sql.PageFrameMemory;
 import io.questdb.cairo.sql.RowCursor;
 import io.questdb.cairo.sql.SymbolTable;
 import io.questdb.griffin.PlanSink;
-import io.questdb.std.IntList;
 
 public class SymbolIndexFilteredRowCursorFactory implements SymbolFunctionRowCursorFactory {
+    private final int columnIndex;
     private final SymbolIndexFilteredRowCursor cursor;
     private final Function symbolFunction;
 
@@ -41,25 +42,22 @@ public class SymbolIndexFilteredRowCursorFactory implements SymbolFunctionRowCur
             int columnIndex,
             int symbolKey,
             Function filter,
-            boolean cachedIndexReaderCursor,
             int indexDirection,
-            IntList columnIndexes,
             Function symbolFunction
     ) {
+        this.columnIndex = columnIndex;
         this.cursor = new SymbolIndexFilteredRowCursor(
                 columnIndex,
                 symbolKey,
                 filter,
-                cachedIndexReaderCursor,
-                indexDirection,
-                columnIndexes
+                indexDirection
         );
         this.symbolFunction = symbolFunction;
     }
 
     @Override
-    public RowCursor getCursor(DataFrame dataFrame) {
-        return cursor.of(dataFrame);
+    public RowCursor getCursor(PageFrame pageFrame, PageFrameMemory pageFrameMemory) {
+        return cursor.of(pageFrame, pageFrameMemory);
     }
 
     @Override
@@ -76,6 +74,16 @@ public class SymbolIndexFilteredRowCursorFactory implements SymbolFunctionRowCur
         return false;
     }
 
+    // Both selecting values must be stable: the symbol key AND the residual index filter. A null key
+    // function means a compile-time-resolved constant key (stable); a single unstable source
+    // (e.g. rnd_* in either) makes the selected rows vary across opens.
+    @Override
+    public boolean isStableWithinExecution() {
+        final Function filter = cursor.getFilter();
+        return (symbolFunction == null || symbolFunction.isStableWithinExecution())
+                && (filter == null || filter.isStableWithinExecution());
+    }
+
     @Override
     public boolean isUsingIndex() {
         return true;
@@ -87,14 +95,13 @@ public class SymbolIndexFilteredRowCursorFactory implements SymbolFunctionRowCur
     }
 
     @Override
-    public void prepareCursor(TableReader tableReader) {
-        this.cursor.prepare(tableReader);
+    public void prepareCursor(PageFrameCursor pageFrameCursor) {
+        cursor.prepare(pageFrameCursor);
     }
 
     @Override
     public void toPlan(PlanSink sink) {
-        sink.type("Index ").type(BitmapIndexReader.nameOf(cursor.getIndexDirection())).type(" scan").meta("on").putColumnName(cursor.getColumnIndex());
-        sink.attr("filter").putColumnName(cursor.getColumnIndex()).val('=').val(cursor.getSymbolKey()).val(" and ").val(cursor.getFilter());
+        sink.type("Index ").type(IndexReader.nameOf(cursor.getIndexDirection())).type(" scan").meta("on").putBaseColumnName(columnIndex);
+        sink.attr("filter").putBaseColumnName(columnIndex).val('=').val(cursor.getSymbolKey()).val(" and ").val(cursor.getFilter());
     }
 }
-

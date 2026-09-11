@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -25,6 +25,7 @@
 package io.questdb.griffin.engine.groupby;
 
 import io.questdb.cairo.AbstractRecordCursorFactory;
+import io.questdb.cairo.CairoException;
 import io.questdb.cairo.sql.Function;
 import io.questdb.cairo.sql.RecordCursor;
 import io.questdb.cairo.sql.RecordCursorFactory;
@@ -36,17 +37,29 @@ import io.questdb.std.ObjList;
 
 public abstract class AbstractSampleByRecordCursorFactory extends AbstractRecordCursorFactory {
 
-    protected final RecordCursorFactory base;
-    protected final ObjList<Function> recordFunctions;
+    protected RecordCursorFactory base;
+    protected Function offsetFunc;
+    protected ObjList<Function> recordFunctions;
+    protected Function sampleFromFunc;
+    protected Function sampleToFunc;
+    protected Function timezoneNameFunc;
 
     public AbstractSampleByRecordCursorFactory(
             RecordCursorFactory base,
             RecordMetadata metadata,
-            ObjList<Function> recordFunctions
+            ObjList<Function> recordFunctions,
+            Function timezoneNameFunc,
+            Function offsetFunc,
+            Function sampleFromFunc,
+            Function sampleToFunc
     ) {
         super(metadata);
         this.base = base;
         this.recordFunctions = recordFunctions;
+        this.timezoneNameFunc = timezoneNameFunc;
+        this.offsetFunc = offsetFunc;
+        this.sampleFromFunc = sampleFromFunc;
+        this.sampleToFunc = sampleToFunc;
     }
 
     @Override
@@ -71,8 +84,64 @@ public abstract class AbstractSampleByRecordCursorFactory extends AbstractRecord
 
     @Override
     protected void _close() {
-        Misc.freeObjList(recordFunctions);
-        Misc.free(base);
+        CairoException.rethrowCleanupFailure(closeSampleByOwnersBestEffort(null));
+    }
+
+    protected final Throwable closeDetachedSampleByOwnersBestEffort(
+            Throwable failure,
+            RecordCursorFactory base,
+            Function offsetFunc,
+            ObjList<Function> recordFunctions,
+            Function sampleFromFunc,
+            Function sampleToFunc,
+            Function timezoneNameFunc
+    ) {
+        failure = Misc.freeObjListBestEffort(failure, recordFunctions);
+        failure = Misc.freeBestEffort(failure, base);
+        // The factory is the lifetime owner of the temporal parameter functions (timezone,
+        // offset, FROM, TO); the cursors only borrow them across the executions of this cached
+        // factory. The generator accepts runtime-constant expressions here, which may own child
+        // functions, so they must be closed exactly once.
+        failure = Misc.freeBestEffort(failure, timezoneNameFunc);
+        if (offsetFunc != timezoneNameFunc) {
+            failure = Misc.freeBestEffort(failure, offsetFunc);
+        }
+        if (sampleFromFunc != timezoneNameFunc && sampleFromFunc != offsetFunc) {
+            failure = Misc.freeBestEffort(failure, sampleFromFunc);
+        }
+        if (sampleToFunc != timezoneNameFunc && sampleToFunc != offsetFunc && sampleToFunc != sampleFromFunc) {
+            failure = Misc.freeBestEffort(failure, sampleToFunc);
+        }
+        return failure;
+    }
+
+    protected final Throwable closeSampleByOwnersBestEffort(Throwable failure) {
+        final RecordCursorFactory base = this.base;
+        this.base = null;
+        final Function offsetFunc = this.offsetFunc;
+        this.offsetFunc = null;
+        final ObjList<Function> recordFunctions = this.recordFunctions;
+        this.recordFunctions = null;
+        final Function sampleFromFunc = this.sampleFromFunc;
+        this.sampleFromFunc = null;
+        final Function sampleToFunc = this.sampleToFunc;
+        this.sampleToFunc = null;
+        final Function timezoneNameFunc = this.timezoneNameFunc;
+        this.timezoneNameFunc = null;
+
+        return closeDetachedSampleByOwnersBestEffort(
+                failure,
+                base,
+                offsetFunc,
+                recordFunctions,
+                sampleFromFunc,
+                sampleToFunc,
+                timezoneNameFunc
+        );
+    }
+
+    protected AbstractNoRecordSampleByCursor detachRawCursor() {
+        return getRawCursor();
     }
 
     protected abstract AbstractNoRecordSampleByCursor getRawCursor();
@@ -83,13 +152,20 @@ public abstract class AbstractSampleByRecordCursorFactory extends AbstractRecord
     ) throws SqlException {
         try {
             // init all record functions for this cursor, in case functions require metadata and/or symbol tables
-            Function.init(recordFunctions, baseCursor, executionContext);
-            AbstractNoRecordSampleByCursor cursor = getRawCursor();
+            Function.init(recordFunctions, baseCursor, executionContext, null);
+        } catch (Throwable th) {
+            Misc.free(baseCursor);
+            throw th;
+        }
+
+        AbstractNoRecordSampleByCursor cursor = null;
+        try {
+            cursor = getRawCursor();
             cursor.of(baseCursor, executionContext);
             return cursor;
-        } catch (Throwable ex) {
-            Misc.free(baseCursor);
-            throw ex;
+        } catch (Throwable th) {
+            Misc.free(cursor);
+            throw th;
         }
     }
 }

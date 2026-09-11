@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,7 +24,10 @@
 
 package io.questdb.cairo;
 
+import io.questdb.cairo.idx.BitmapIndexUtils;
+import io.questdb.cairo.idx.BitmapIndexWriter;
 import io.questdb.cairo.vm.api.MemoryMA;
+import io.questdb.cairo.vm.api.MemoryR;
 import io.questdb.std.FilesFacade;
 import io.questdb.std.MemoryTag;
 import io.questdb.std.Misc;
@@ -67,9 +70,32 @@ public interface MapWriter extends SymbolCountProvider {
         }
     }
 
+    /**
+     * Column index in table writer metadata. This value is a pass-thru from table writer, and
+     * it used by table writer to look-back the column name when needed.
+     *
+     * @return column index or -1 if this is a NullWriter (noop writer)
+     */
+    int getColumnIndex();
+
     boolean getNullFlag();
 
     int getSymbolCapacity();
+
+    MemoryR getSymbolOffsetsMemory();
+
+    MemoryR getSymbolValuesMemory();
+
+    /**
+     * @return whether the value-to-key cache is allocated. Not the same question as
+     * {@link #isCached()}, which reports what the column asked for: a column configured CACHE
+     * keeps that flag after {@link SymbolMapWriter} has run the cache's key buffer out and
+     * dropped it, because the drop is an internal fallback rather than a change to the column.
+     * The two disagreeing is what tells a caller the column is missing a cache it is entitled
+     * to. An implementation that holds no cache of its own answers whatever {@link #isCached()}
+     * answers, so such a caller finds nothing to act on
+     */
+    boolean isCacheAllocated();
 
     boolean isCached();
 

@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -31,6 +31,7 @@ import java.util.Arrays;
  */
 public class BitSet implements Mutable {
     public static final int BITS_PER_WORD = 64;
+    private final int initialNBits;
     private long[] words;
 
     public BitSet() {
@@ -38,11 +39,12 @@ public class BitSet implements Mutable {
     }
 
     public BitSet(int nBits) {
+        this.initialNBits = nBits;
         this.words = new long[wordIndex(nBits - 1) + 1];
     }
 
-    public int capacity() {
-        return words.length * BITS_PER_WORD;
+    public long capacity() {
+        return (long) words.length * BITS_PER_WORD;
     }
 
     @Override
@@ -66,6 +68,10 @@ public class BitSet implements Mutable {
         return old;
     }
 
+    public void resetCapacity() {
+        this.words = new long[wordIndex(initialNBits - 1) + 1];
+    }
+
     /**
      * Sets the given bit to 1.
      */
@@ -73,6 +79,15 @@ public class BitSet implements Mutable {
         int wordIndex = wordIndex(bitIndex);
         checkCapacity(wordIndex + 1);
         words[wordIndex] |= 1L << bitIndex;
+    }
+
+    /**
+     * Sets the given bit to 0.
+     */
+    public void unset(int bitIndex) {
+        int wordIndex = wordIndex(bitIndex);
+        checkCapacity(wordIndex + 1);
+        words[wordIndex] &= ~(1L << bitIndex);
     }
 
     private static int wordIndex(int bitIndex) {

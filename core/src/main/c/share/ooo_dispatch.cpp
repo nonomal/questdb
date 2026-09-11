@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -61,6 +61,13 @@ inline void run_vec_bulk(T *dest,
                          const int64_t count,
                          const lambda_iteration l_iteration,
                          const lambda_vec_iteration l_vec_iteration) {
+
+    // TVec::size() returns the number of lanes (e.g. 8 for Vec8uq), which equals
+    // the number of T elements per store ONLY when sizeof(lane) == sizeof(T).
+    // Mismatched types (e.g. Vec8uq with long_128bit) silently produce a wrong
+    // increment, leaving holes in the output. Fail at compile time instead.
+    static_assert(TVec::size() == sizeof(TVec) / sizeof(T),
+                  "TVec::size() does not match sizeof(TVec)/sizeof(T) — use set_memory_vanilla_vec for mismatched types");
 
     constexpr int64_t alignment = TVec::store_nt_alignment();
     const auto unaligned = ((uint64_t) dest) % alignment;
@@ -135,6 +142,35 @@ inline void set_memory_vanilla(T *addr, const T value, const int64_t count) {
     };
 
     run_vec_bulk<T, TVec>(addr, count, l_iteration, l_bulk);
+}
+
+// 33-34
+// Cannot use run_vec_bulk here because TVec::size() returns the number of
+// uint64_t lanes (8 for Vec8uq), not the number of T elements per store.
+// For long_128bit (16 bytes) one Vec8uq store covers 4 elements, not 8.
+// For long_256bit (32 bytes) one Vec8uq store covers 2 elements, not 8.
+template<typename T, typename TVec>
+inline void set_memory_vanilla_vec(T *addr, const T value, const TVec vec, const int64_t count) {
+    constexpr int64_t store_bytes = (int64_t) sizeof(TVec);
+    constexpr int64_t elems_per_store = store_bytes / (int64_t) sizeof(T);
+    static_assert(elems_per_store * sizeof(T) == store_bytes, "T size must evenly divide vector store size");
+
+    constexpr int64_t alignment = TVec::store_nt_alignment();
+    const auto unaligned = ((uint64_t) addr) % alignment;
+
+    int64_t i = 0;
+    if (unaligned % sizeof(T) == 0) {
+        const int64_t head = unaligned > 0 ? (int64_t) (alignment - unaligned) / (int64_t) sizeof(T) : 0;
+        for (; i < head && i < count; i++) {
+            addr[i] = value;
+        }
+        for (; i + elems_per_store <= count; i += elems_per_store) {
+            vec.store_nt(addr + i);
+        }
+    }
+    for (; i < count; i++) {
+        addr[i] = value;
+    }
 }
 
 template<typename TVec, typename T>
@@ -289,18 +325,48 @@ void MULTI_VERSION_NAME (merge_copy_varchar_column)(
         const int64_t secondWord = src_fix[bit][rr * 2 + 1];
 
         auto originalData = secondWord & 0x000000000000ffffLL;
-        auto rellocatedSecondWord = originalData | (dst_var_offset << 16);
+        auto relocatedSecondWord = originalData | (dst_var_offset << 16);
         if ((firstWord & 1) == 0 && (firstWord & 4) == 0) {
             // not inlined and not null
             auto originalOffset = secondWord >> 16;
             auto len = (firstWord >> 4) & 0xffffff;
-            auto lenInDataMem = len;
-            auto data = src_var[bit] + originalOffset;
-            __MEMCPY(dst_var + dst_var_offset, data, lenInDataMem);
-            dst_var_offset += lenInDataMem;
+            __MEMCPY(dst_var + dst_var_offset, src_var[bit] + originalOffset, len);
+            dst_var_offset += len;
         }
         dst_fix[l * 2] = firstWord;
-        dst_fix[l * 2 + 1] = rellocatedSecondWord;
+        dst_fix[l * 2 + 1] = relocatedSecondWord;
+    }
+}
+
+// 32
+void MULTI_VERSION_NAME (merge_copy_array_column)(
+        index_t *merge_index,
+        int64_t merge_index_size,
+        int64_t *src_data_fix,
+        char *src_data_var,
+        int64_t *src_ooo_fix,
+        char *src_ooo_var,
+        int64_t *dst_fix,
+        char *dst_var,
+        int64_t dst_var_offset
+) {
+    int64_t *src_fix[] = {src_ooo_fix, src_data_fix};
+    char *src_var[] = {src_ooo_var, src_data_var};
+
+    for (int64_t l = 0; l < merge_index_size; l++) {
+        const uint64_t row = merge_index[l].i;
+        const uint32_t bit = (row >> 63);
+        const uint64_t rr = row & ~(1ull << 63);
+        const int64_t src_var_offset = src_fix[bit][rr * 2] & OFFSET_MAX;
+        auto size = static_cast<uint32_t>(src_fix[bit][rr * 2 + 1] & ARRAY_SIZE_MAX);
+
+        const auto relocated_var_offset = dst_var_offset & OFFSET_MAX;
+        if (size > 0) {
+            __MEMCPY(dst_var + dst_var_offset, src_var[bit] + src_var_offset, size);
+            dst_var_offset += size;
+        }
+        dst_fix[l * 2] = relocated_var_offset;
+        dst_fix[l * 2 + 1] = size;
     }
 }
 
@@ -413,14 +479,14 @@ void MULTI_VERSION_NAME (make_timestamp_index)(const int64_t *data, int64_t low,
     static_assert(sizeof(index_t) == 16);
 
     int64_t l = low;
-    Vec8q vec_i((l + 0) | (1ull << 63),
-                (l + 1) | (1ull << 63),
-                (l + 2) | (1ull << 63),
-                (l + 3) | (1ull << 63),
-                (l + 4) | (1ull << 63),
-                (l + 5) | (1ull << 63),
-                (l + 6) | (1ull << 63),
-                (l + 7) | (1ull << 63));
+    Vec8q vec_i((l + 0) | (1ll << 63),
+                (l + 1) | (1ll << 63),
+                (l + 2) | (1ll << 63),
+                (l + 3) | (1ll << 63),
+                (l + 4) | (1ll << 63),
+                (l + 5) | (1ll << 63),
+                (l + 6) | (1ll << 63),
+                (l + 7) | (1ll << 63));
     const Vec8q vec8(8);
     Vec8q vec_ts;
 
@@ -478,12 +544,12 @@ void MULTI_VERSION_NAME (set_memory_vanilla_short)(int16_t *data, const int16_t 
 }
 
 // 24
-void MULTI_VERSION_NAME (set_var_refs_64_bit)(int64_t *data, int64_t offset, int64_t count) {
+void MULTI_VERSION_NAME (set_binary_column_null_refs)(int64_t *data, int64_t offset, int64_t count) {
     set_var_refs<int64_t>(data, offset, count);
 }
 
 // 25
-void MULTI_VERSION_NAME (set_var_refs_32_bit)(int64_t *data, int64_t offset, int64_t count) {
+void MULTI_VERSION_NAME (set_string_column_null_refs)(int64_t *data, int64_t offset, int64_t count) {
     set_var_refs<int32_t>(data, offset, count);
 }
 
@@ -576,4 +642,60 @@ void MULTI_VERSION_NAME (set_varchar_null_refs)(int64_t *aux, int64_t offset, in
         aux[i] = 4;
         aux[i + 1] = o;
     }
+}
+
+// 31
+void MULTI_VERSION_NAME (set_array_null_refs)(int64_t *aux, int64_t offset, int64_t count) {
+    // varchar aux is 16 bytes
+    count *= 2;
+    // offset for subsequent varchars stays the same
+    Vec4q vec(offset, 0, offset, 0);
+
+    int64_t i = 0;
+    for (; i < count - 3; i += 4) {
+        vec.store(aux + i);
+    }
+
+    // tail
+    for (; i < count; i += 2) {
+        aux[i] = offset;
+        aux[i + 1] = 0;
+    }
+}
+
+// 32
+void MULTI_VERSION_NAME (shift_copy_array_aux)(int64_t shift, const int64_t *src, int64_t src_lo, int64_t src_hi, int64_t *dest) {
+    const int64_t count = 2 * (src_hi - src_lo + 1);
+
+    Vec4q vec;
+    // The offset is stored in the first 8 bytes of arrays's 16 bytes.
+    auto vec_shift = Vec4q(shift , 0, shift , 0);
+
+    auto src_loo = src + 2 * src_lo;
+    int64_t i = 0;
+    for (; i < count - 3; i += 4) {
+        vec.load(src_loo + i);
+        vec -= vec_shift;
+        vec.store(dest + i);
+    }
+
+    // tail
+    for (; i < count; i += 2) {
+        dest[i] = src[i + 2 * src_lo] - shift;
+        dest[i + 1] = src[i + 2 * src_lo + 1];
+    }
+}
+
+// 33
+void MULTI_VERSION_NAME (set_memory_vanilla_int128)(long_128bit *data, const long_128bit value, const int64_t count) {
+    Vec4uq vec4(value.long0, value.long1, value.long0, value.long1);
+    Vec8uq vec(vec4, vec4);
+    set_memory_vanilla_vec<long_128bit, Vec8uq>(data, value, vec, count);
+}
+
+// 34
+void MULTI_VERSION_NAME (set_memory_vanilla_int256)(long_256bit *data, const long_256bit value, const int64_t count) {
+    Vec4uq vec4(value.long0, value.long1, value.long2, value.long3);
+    Vec8uq vec(vec4, vec4);
+    set_memory_vanilla_vec<long_256bit, Vec8uq>(data, value, vec, count);
 }

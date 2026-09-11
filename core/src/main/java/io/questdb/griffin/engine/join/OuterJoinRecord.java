@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -35,20 +35,20 @@ public class OuterJoinRecord extends JoinRecord {
         this.nullRecord = nullRecord;
     }
 
+    public void of(Record master, Record slave) {
+        super.of(master, slave);
+        this.flappingSlave = slave;
+    }
+
     void hasSlave(boolean value) {
         if (value) {
-            if (flappingSlave != slave) {
-                slave = flappingSlave;
-            }
+            slave = flappingSlave;
         } else {
-            if (slave != nullRecord) {
-                slave = nullRecord;
-            }
+            slave = nullRecord;
         }
     }
 
-    void of(Record master, Record slave) {
-        super.of(master, slave);
-        this.flappingSlave = slave;
+    boolean hasSlave() {
+        return slave != nullRecord;
     }
 }

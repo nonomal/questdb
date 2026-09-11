@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,8 +24,8 @@
 
 package io.questdb;
 
-import io.questdb.cutlass.pgwire.PGWireConfiguration;
-import io.questdb.cutlass.pgwire.UsernamePasswordMatcher;
+import io.questdb.cutlass.auth.UsernamePasswordMatcher;
+import io.questdb.cutlass.pgwire.PGConfiguration;
 import io.questdb.std.Chars;
 import io.questdb.std.Misc;
 import io.questdb.std.QuietCloseable;
@@ -34,30 +34,35 @@ import io.questdb.std.str.DirectUtf8Sink;
 import io.questdb.std.str.Utf8s;
 import org.jetbrains.annotations.Nullable;
 
+import static io.questdb.cairo.SecurityContext.AUTH_TYPE_CREDENTIALS;
+import static io.questdb.cairo.SecurityContext.AUTH_TYPE_NONE;
+
 public class DynamicUsernamePasswordMatcher implements UsernamePasswordMatcher, QuietCloseable {
     private final DirectUtf8Sink defaultPassword;
     private final SimpleReadWriteLock lock;
+    private final PGConfiguration pgWireConfig;
     private final DirectUtf8Sink readOnlyPassword;
-    private final ServerConfiguration serverConfiguration;
-    private PGWireConfiguration pgwireConfiguration;
+    private final ServerConfiguration serverConfig;
+    private long serverConfigVersion;
 
     /**
      * Creates instance of dynamic username/password matcher. When serverConfiguration is provided,
      * it acts as "factory" for the PG wire configuration. The matcher will be checking if
      * pgWireConfiguration changed on the server configuration.
      *
-     * @param serverConfiguration server configuration that is triggering reload. It is nullable. When null,
-     *                            username and password are not reloaded.
-     * @param pgWireConfiguration the initial PG wire configuration instance.
+     * @param serverConfig server configuration that is triggering reload. It is nullable. When null,
+     *                     username and password are not reloaded.
+     * @param pgWireConfig the PG wire configuration instance.
      */
-    public DynamicUsernamePasswordMatcher(@Nullable ServerConfiguration serverConfiguration, PGWireConfiguration pgWireConfiguration) {
-        this.serverConfiguration = serverConfiguration;
-        this.pgwireConfiguration = pgWireConfiguration;
+    public DynamicUsernamePasswordMatcher(@Nullable ServerConfiguration serverConfig, PGConfiguration pgWireConfig) {
+        this.serverConfig = serverConfig;
+        this.serverConfigVersion = serverConfig != null ? serverConfig.getVersion() : 0;
+        this.pgWireConfig = pgWireConfig;
         this.defaultPassword = new DirectUtf8Sink(4);
-        this.defaultPassword.put(this.pgwireConfiguration.getDefaultPassword());
+        this.defaultPassword.put(pgWireConfig.getDefaultPassword());
         this.readOnlyPassword = new DirectUtf8Sink(4);
-        this.readOnlyPassword.put(this.pgwireConfiguration.getReadOnlyPassword());
-        lock = new SimpleReadWriteLock();
+        this.readOnlyPassword.put(pgWireConfig.getReadOnlyPassword());
+        this.lock = new SimpleReadWriteLock();
     }
 
     @Override
@@ -67,18 +72,19 @@ public class DynamicUsernamePasswordMatcher implements UsernamePasswordMatcher, 
     }
 
     @Override
-    public boolean verifyPassword(CharSequence username, long passwordPtr, int passwordLen) {
-        if (serverConfiguration != null && serverConfiguration.getPGWireConfiguration() != pgwireConfiguration) {
-
+    public byte verifyPassword(CharSequence username, long passwordPtr, int passwordLen) {
+        if (serverConfig != null && serverConfig.getVersion() != serverConfigVersion) {
             if (lock.writeLock().tryLock()) {
                 try {
-                    // Update the cached pgwire config
-                    pgwireConfiguration = serverConfiguration.getPGWireConfiguration();
-                    // Update the default and readonly user password sinks
-                    defaultPassword.clear();
-                    defaultPassword.put(pgwireConfiguration.getDefaultPassword());
-                    readOnlyPassword.clear();
-                    readOnlyPassword.put(pgwireConfiguration.getReadOnlyPassword());
+                    // Update the cached pgwire config, if no one did it in front of us
+                    if (serverConfig.getVersion() != serverConfigVersion) {
+                        // Update the default and readonly user password sinks
+                        defaultPassword.clear();
+                        defaultPassword.put(pgWireConfig.getDefaultPassword());
+                        readOnlyPassword.clear();
+                        readOnlyPassword.put(pgWireConfig.getReadOnlyPassword());
+                        serverConfigVersion = serverConfig.getVersion();
+                    }
                 } finally {
                     lock.writeLock().unlock();
                 }
@@ -88,17 +94,24 @@ public class DynamicUsernamePasswordMatcher implements UsernamePasswordMatcher, 
         lock.readLock().lock();
         try {
             if (username.length() == 0) {
-                return false;
+                return AUTH_TYPE_NONE;
             }
-            if (Chars.equals(username, pgwireConfiguration.getDefaultUsername())) {
-                return Utf8s.equals(defaultPassword, passwordPtr, passwordLen);
-            } else if (pgwireConfiguration.isReadOnlyUserEnabled() && Chars.equals(username, pgwireConfiguration.getReadOnlyUsername())) {
-                return Utf8s.equals(readOnlyPassword, passwordPtr, passwordLen);
+            if (Chars.equals(username, pgWireConfig.getDefaultUsername())) {
+                return verifyPassword(defaultPassword, passwordPtr, passwordLen);
+            } else if (pgWireConfig.isReadOnlyUserEnabled() && Chars.equals(username, pgWireConfig.getReadOnlyUsername())) {
+                return verifyPassword(readOnlyPassword, passwordPtr, passwordLen);
             } else {
-                return false;
+                return AUTH_TYPE_NONE;
             }
         } finally {
             lock.readLock().unlock();
         }
+    }
+
+    private byte verifyPassword(DirectUtf8Sink expectedPwd, long passwordPtr, int passwordLen) {
+        if (Utf8s.equals(expectedPwd, passwordPtr, passwordLen)) {
+            return AUTH_TYPE_CREDENTIALS;
+        }
+        return AUTH_TYPE_NONE;
     }
 }

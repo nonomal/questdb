@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -28,6 +28,11 @@
 #include "../share/sysutil.h"
 #include <sys/mman.h>
 #include <errno.h>
+
+// MADV_POPULATE_WRITE was added in Linux 5.14
+#ifndef MADV_POPULATE_WRITE
+#define MADV_POPULATE_WRITE 23
+#endif
 #include <limits.h>
 #include <string.h>
 #include <stdio.h>
@@ -93,10 +98,10 @@ JNIEXPORT jint JNICALL Java_io_questdb_std_Files_copy
     return len == 0 ? 0 : -1;
 }
 
-size_t copyData0(int srcFd, int dstFd, off_t srcOffset, off_t dstOffset, int64_t length) {
+size_t copyData0(int srcFd, long dstFd, off_t srcOffset, off_t dstOffset, int64_t length) {
     lseek64(dstFd, dstOffset, SEEK_SET);
 
-    size_t len = length > 0 ? length : SIZE_MAX;
+    size_t len = length > 0 ? (size_t)length : SIZE_MAX;
     off_t offset = srcOffset;
 
     while (len > 0) {
@@ -138,16 +143,23 @@ JNIEXPORT jint JNICALL Java_io_questdb_std_Files_getPosixFadvSequential(JNIEnv *
 
 JNIEXPORT jint JNICALL Java_io_questdb_std_Files_madvise0
         (JNIEnv *e, jclass cls, jlong address, jlong len, jint advise) {
-    void *memAddr = (void *) address;
-    return posix_madvise(memAddr, (off_t) len, advise);
+    return madvise((void *) address, (size_t) len, advise);
+}
+
+JNIEXPORT jint JNICALL Java_io_questdb_std_Files_getMadvPopulateWrite(JNIEnv *e, jclass cls) {
+    return MADV_POPULATE_WRITE;
 }
 
 JNIEXPORT jint JNICALL Java_io_questdb_std_Files_getPosixMadvRandom(JNIEnv *e, jclass cls) {
-    return POSIX_MADV_RANDOM;
+    return MADV_RANDOM;
 }
 
 JNIEXPORT jint JNICALL Java_io_questdb_std_Files_getPosixMadvSequential(JNIEnv *e, jclass cls) {
-    return POSIX_MADV_SEQUENTIAL;
+    return MADV_SEQUENTIAL;
+}
+
+JNIEXPORT jint JNICALL Java_io_questdb_std_Files_getPosixMadvDontneed(JNIEnv *e, jclass cls) {
+    return MADV_DONTNEED;
 }
 
 JNIEXPORT jlong JNICALL Java_io_questdb_std_Files_getFileSystemStatus

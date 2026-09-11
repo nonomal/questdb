@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -33,7 +33,6 @@ import io.questdb.griffin.engine.functions.constants.VarcharConstant;
 import io.questdb.std.*;
 import io.questdb.std.str.StringSink;
 import io.questdb.std.str.Utf8Sequence;
-import io.questdb.std.str.Utf8Sink;
 import io.questdb.std.str.Utf8StringSink;
 
 public class CastDoubleToVarcharFunctionFactory implements FunctionFactory {
@@ -54,28 +53,18 @@ public class CastDoubleToVarcharFunctionFactory implements FunctionFactory {
         Function doubleFunc = args.getQuick(0);
         if (doubleFunc.isConstant()) {
             final StringSink sink = Misc.getThreadLocalSink();
-            sink.put(doubleFunc.getDouble(null), configuration.getDoubleToStrCastScale());
+            sink.put(doubleFunc.getDouble(null));
             return new VarcharConstant(Chars.toString(sink));
         }
-        return new Func(args.getQuick(0), configuration.getDoubleToStrCastScale());
+        return new Func(args.getQuick(0));
     }
 
     public static class Func extends AbstractCastToVarcharFunction {
-        private final int scale;
         private final Utf8StringSink sinkA = new Utf8StringSink();
         private final Utf8StringSink sinkB = new Utf8StringSink();
 
-        public Func(Function arg, int scale) {
+        public Func(Function arg) {
             super(arg);
-            this.scale = scale;
-        }
-
-        @Override
-        public void getVarchar(Record rec, Utf8Sink utf8Sink) {
-            final double value = arg.getDouble(rec);
-            if (Numbers.isFinite(value)) {
-                utf8Sink.put(value, scale);
-            }
         }
 
         @Override
@@ -83,7 +72,7 @@ public class CastDoubleToVarcharFunctionFactory implements FunctionFactory {
             final double value = arg.getDouble(rec);
             if (Numbers.isFinite(value)) {
                 sinkA.clear();
-                sinkA.put(value, scale);
+                sinkA.put(value);
                 return sinkA;
             }
             return null;
@@ -94,7 +83,7 @@ public class CastDoubleToVarcharFunctionFactory implements FunctionFactory {
             final double value = arg.getDouble(rec);
             if (Numbers.isFinite(value)) {
                 sinkB.clear();
-                sinkB.put(value, scale);
+                sinkB.put(value);
                 return sinkB;
             }
             return null;

@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -26,8 +26,10 @@ package io.questdb.griffin;
 
 import io.questdb.cairo.CairoConfiguration;
 import io.questdb.cairo.CairoException;
+import io.questdb.cairo.ColumnType;
 import io.questdb.cairo.TableUtils;
 import io.questdb.cairo.TableWriter;
+import io.questdb.cairo.sql.PartitionFormat;
 import io.questdb.log.Log;
 import io.questdb.log.LogFactory;
 import io.questdb.std.FilesFacade;
@@ -62,9 +64,11 @@ public class DropIndexOperator {
         this.ff = configuration.getFilesFacade();
     }
 
-    public void executeDropIndex(CharSequence columnName, int columnIndex) {
+    public void executeDropIndex(String columnName, int columnIndex) {
+        int timestampType = tableWriter.getMetadata().getTimestampType();
         int partitionBy = tableWriter.getPartitionBy();
         int partitionCount = tableWriter.getPartitionCount();
+        byte indexType = tableWriter.getMetadata().getColumnIndexType(columnIndex);
         try {
             purgingOperator.clear();
             rollbackColumnVersions.clear();
@@ -72,32 +76,35 @@ public class DropIndexOperator {
                 long pTimestamp = tableWriter.getPartitionTimestamp(pIndex);
                 long pVersion = tableWriter.getPartitionNameTxn(pIndex);
                 long columnVersion = tableWriter.getColumnNameTxn(pTimestamp, columnIndex);
-                long columnTop = tableWriter.getColumnTop(pTimestamp, columnIndex, -1L);
+                long columnTop = tableWriter.getColumnTop(pTimestamp, columnIndex, -1);
+                byte partitionFormat = tableWriter.getPartitionFormat(pIndex);
 
-                if (columnTop != -1L) {
+                if (columnTop != -1) {
                     // bump up column version, metadata will be updated later
                     tableWriter.upsertColumnVersion(pTimestamp, columnIndex, columnTop);
-                    final long columnDropIndexVersion = tableWriter.getColumnNameTxn(pTimestamp, columnIndex);
 
-                    // create hard link to column data
-                    // src
-                    partitionDFile(path, rootLen, partitionBy, pTimestamp, pVersion, columnName, columnVersion);
-                    // hard link
-                    partitionDFile(other, rootLen, partitionBy, pTimestamp, pVersion, columnName, columnDropIndexVersion);
-                    if (-1 == ff.hardLink(path.$(), other.$())) {
-                        throw CairoException.critical(ff.errno())
-                                .put("cannot hardLink [src=").put(path)
-                                .put(", hardLink=").put(other)
-                                .put(']');
+                    if (partitionFormat == PartitionFormat.NATIVE) {
+                        final long columnDropIndexVersion = tableWriter.getColumnNameTxn(pTimestamp, columnIndex);
+                        // create hard link to column data
+                        // src
+                        partitionDFile(path, rootLen, timestampType, partitionBy, pTimestamp, pVersion, columnName, columnVersion);
+                        // hard link
+                        partitionDFile(other, rootLen, timestampType, partitionBy, pTimestamp, pVersion, columnName, columnDropIndexVersion);
+                        if (ff.hardLink(path.$(), other.$()) == -1) {
+                            throw CairoException.critical(ff.errno())
+                                    .put("cannot hardLink [src=").put(path)
+                                    .put(", hardLink=").put(other)
+                                    .put(']');
+                        }
+                        rollbackColumnVersions.add(columnIndex, columnDropIndexVersion, pTimestamp, pVersion);
                     }
 
                     // add to cleanup tasks, the index will be removed in due time
-                    purgingOperator.add(columnIndex, columnVersion, pTimestamp, pVersion);
-                    rollbackColumnVersions.add(columnIndex, columnDropIndexVersion, pTimestamp, pVersion);
+                    purgingOperator.add(columnIndex, columnName, ColumnType.SYMBOL, indexType, columnVersion, pTimestamp, pVersion);
                 }
             }
         } catch (Throwable th) {
-            LOG.error().$("Could not DROP INDEX: ").$(th.getMessage()).$();
+            LOG.error().$("Could not DROP INDEX: ").$safe(th.getMessage()).$();
             purgingOperator.clear();
 
             // cleanup successful links prior to the failed link operation
@@ -107,7 +114,7 @@ public class DropIndexOperator {
                     final long columnDropIndexVersion = rollbackColumnVersions.getQuick(i + 1);
                     final long pTimestamp = rollbackColumnVersions.getQuick(i + 2);
                     final long partitionNameTxn = rollbackColumnVersions.getQuick(i + 3);
-                    partitionDFile(other, rootLen, partitionBy, pTimestamp, partitionNameTxn, columnName, columnDropIndexVersion);
+                    partitionDFile(other, rootLen, timestampType, partitionBy, pTimestamp, partitionNameTxn, columnName, columnDropIndexVersion);
                     if (!ff.removeQuiet(other.$())) {
                         LOG.info().$("Please remove this file \"").$(other).$('"').I$();
                     }
@@ -123,14 +130,16 @@ public class DropIndexOperator {
     private static void partitionDFile(
             Path path,
             int rootLen,
+            int timestampType,
             int partitionBy,
             long partitionTimestamp,
             long partitionNameTxn,
             CharSequence columnName,
             long columnNameTxn
     ) {
-        TableUtils.setPathForPartition(
+        TableUtils.setPathForNativePartition(
                 path.trimTo(rootLen),
+                timestampType,
                 partitionBy,
                 partitionTimestamp,
                 partitionNameTxn

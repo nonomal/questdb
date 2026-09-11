@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,20 +24,42 @@
 
 package io.questdb.test.cairo.pool;
 
-import io.questdb.cairo.*;
+import io.questdb.cairo.CairoConfiguration;
+import io.questdb.cairo.CairoException;
+import io.questdb.cairo.ColumnType;
+import io.questdb.cairo.EntryUnavailableException;
+import io.questdb.cairo.IndexType;
+import io.questdb.cairo.PartitionBy;
+import io.questdb.cairo.TableReader;
+import io.questdb.cairo.TableToken;
+import io.questdb.cairo.TableUtils;
+import io.questdb.cairo.TableWriter;
+import io.questdb.cairo.TxnScoreboard;
 import io.questdb.cairo.pool.PoolListener;
 import io.questdb.cairo.pool.ReaderPool;
 import io.questdb.cairo.pool.ex.EntryLockedException;
 import io.questdb.cairo.pool.ex.PoolClosedException;
+import io.questdb.cairo.security.AllowAllSecurityContext;
 import io.questdb.mp.SOCountDownLatch;
-import io.questdb.std.*;
+import io.questdb.std.CharSequenceObjHashMap;
+import io.questdb.std.Chars;
+import io.questdb.std.FilesFacade;
+import io.questdb.std.IntList;
+import io.questdb.std.Misc;
+import io.questdb.std.ObjHashSet;
+import io.questdb.std.ObjList;
+import io.questdb.std.Os;
+import io.questdb.std.Rnd;
+import io.questdb.std.datetime.microtime.Micros;
 import io.questdb.std.str.LPSZ;
+import io.questdb.std.str.Path;
 import io.questdb.std.str.StringSink;
 import io.questdb.std.str.Utf8s;
 import io.questdb.test.AbstractCairoTest;
 import io.questdb.test.cairo.DefaultTestCairoConfiguration;
 import io.questdb.test.cairo.TableModel;
 import io.questdb.test.cairo.TestFilesFacade;
+import io.questdb.test.cairo.TestTableReaderRecordCursor;
 import io.questdb.test.tools.TestUtils;
 import org.jetbrains.annotations.NotNull;
 import org.junit.Assert;
@@ -45,15 +67,20 @@ import org.junit.Before;
 import org.junit.Test;
 
 import java.util.Map;
+import java.util.concurrent.BrokenBarrierException;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.*;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.CyclicBarrier;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.Assert.fail;
 
+@SuppressWarnings("CallToPrintStackTrace")
 public class ReaderPoolTest extends AbstractCairoTest {
-
     private TableToken uTableToken;
 
     @Before
@@ -65,7 +92,6 @@ public class ReaderPoolTest extends AbstractCairoTest {
 
     @Test
     public void testAllocate() throws Exception {
-
         assertWithPool(pool -> {
             // has to be less than the available entries in the pool, default is 160
             final int numOfThreads = 50;
@@ -85,6 +111,8 @@ public class ReaderPoolTest extends AbstractCairoTest {
                         }
                     } catch (Throwable th) {
                         errors.put(threadIndex, th);
+                    } finally {
+                        Path.clearThreadLocals();
                     }
                     end.countDown();
                 }).start();
@@ -104,7 +132,6 @@ public class ReaderPoolTest extends AbstractCairoTest {
 
     @Test
     public void testAllocateAndClear() throws Exception {
-
         assertWithPool(pool -> {
             int n = 2;
             final CyclicBarrier barrier = new CyclicBarrier(n);
@@ -129,6 +156,7 @@ public class ReaderPoolTest extends AbstractCairoTest {
                     e.printStackTrace();
                     errors.incrementAndGet();
                 } finally {
+                    Path.clearThreadLocals();
                     halt.countDown();
                 }
             }).start();
@@ -141,11 +169,11 @@ public class ReaderPoolTest extends AbstractCairoTest {
                         pool.releaseInactive();
                         Os.pause();
                     }
-
                 } catch (Exception e) {
                     e.printStackTrace();
                     errors.incrementAndGet();
                 } finally {
+                    Path.clearThreadLocals();
                     halt.countDown();
                 }
             }).start();
@@ -159,7 +187,6 @@ public class ReaderPoolTest extends AbstractCairoTest {
 
     @Test
     public void testBasicCharSequence() throws Exception {
-
         TableModel model = new TableModel(configuration, "x", PartitionBy.NONE).col("ts", ColumnType.DATE);
         AbstractCairoTest.create(model);
         sink.clear();
@@ -184,25 +211,6 @@ public class ReaderPoolTest extends AbstractCairoTest {
     }
 
     @Test
-    public void testClosePoolWhenReaderIsOut() throws Exception {
-        assertWithPool(pool -> {
-            TableModel model = new TableModel(configuration, "x", PartitionBy.NONE).col("ts", ColumnType.DATE);
-            AbstractCairoTest.create(model);
-
-            try (TableReader reader = pool.get(engine.verifyTableName("x"))) {
-                Assert.assertNotNull(reader);
-                try {
-                    pool.close();
-                    Assert.fail();
-                } catch (CairoException ex) {
-                    TestUtils.assertContains(ex.getFlyweightMessage(), reader.getTableToken().getDirName() + "' is left behind");
-                }
-                Assert.assertTrue(reader.isOpen());
-            }
-        });
-    }
-
-    @Test
     public void testCloseReaderWhenPoolClosed() throws Exception {
         assertWithPool(pool -> {
             TableReader reader = pool.get(uTableToken);
@@ -211,7 +219,8 @@ public class ReaderPoolTest extends AbstractCairoTest {
                 pool.close();
                 Assert.fail();
             } catch (CairoException ex) {
-                TestUtils.assertContains(ex.getFlyweightMessage(), reader.getTableToken().getDirName() + "' is left behind");
+                TestUtils.assertContains(ex.getFlyweightMessage(),
+                        "table is left behind on pool shutdown [table=" + reader.getTableToken().getDirName() + "]");
             }
             Assert.assertTrue(reader.isOpen());
             reader.close();
@@ -250,6 +259,478 @@ public class ReaderPoolTest extends AbstractCairoTest {
     }
 
     @Test
+    public void testConcurrentGetAndGetCopyOfFuzz() throws Exception {
+        final int readerThreadCount = 4;
+        final int readerIterations = 200;
+        final int writerIterations = 50;
+        final int writerBatchSize = 10;
+        final String tableName = "test";
+
+        final Rnd seedRnd = TestUtils.generateRandom(LOG);
+
+        assertWithPool((ReaderPool pool) -> {
+            TableModel model = new TableModel(configuration, tableName, PartitionBy.HOUR)
+                    .col("sym", ColumnType.SYMBOL)
+                    .timestamp("ts");
+            AbstractCairoTest.create(model);
+
+            final CyclicBarrier barrier = new CyclicBarrier(readerThreadCount + 1);
+            final CountDownLatch halt = new CountDownLatch(readerThreadCount + 1);
+            final AtomicInteger errors = new AtomicInteger();
+
+            final Rnd writerRnd = new Rnd(seedRnd.nextLong(), seedRnd.nextLong());
+            new Thread(() -> {
+                try {
+                    barrier.await();
+                    try (TableWriter writer = newOffPoolWriter(configuration, tableName)) {
+                        boolean columnsAdded = false;
+                        boolean columnTypeChanged = false;
+                        boolean columnRenamed = false;
+                        for (int i = 0; i < writerIterations; i++) {
+                            final int prob = writerRnd.nextInt(100);
+                            if (prob >= 95 && columnsAdded) {
+                                writer.removeColumn("sym2");
+                                writer.removeColumn("int2");
+                                writer.removeColumn(columnRenamed ? "bool3" : "bool2");
+                                columnsAdded = false;
+                                columnTypeChanged = false;
+                                columnRenamed = false;
+                            } else if (prob >= 90 && !columnsAdded) {
+                                writer.addColumn("sym2", ColumnType.SYMBOL, 256, true, IndexType.BITMAP, 256, false, AllowAllSecurityContext.INSTANCE);
+                                writer.addColumn("int2", ColumnType.INT, AllowAllSecurityContext.INSTANCE);
+                                writer.addColumn("bool2", ColumnType.BOOLEAN, AllowAllSecurityContext.INSTANCE);
+                                columnsAdded = true;
+                            } else if (prob >= 85 && columnsAdded && !columnTypeChanged) {
+                                writer.changeColumnType("sym2", ColumnType.STRING, 0, false, IndexType.NONE, 0, false, null);
+                                columnTypeChanged = true;
+                            } else if (prob >= 80 && columnsAdded && !columnRenamed) {
+                                writer.renameColumn("bool2", "bool3");
+                                columnRenamed = true;
+                            } else {
+                                for (int j = 0; j < writerBatchSize; j++) {
+                                    TableWriter.Row r = writer.newRow(Micros.SECOND_MICROS * i);
+                                    r.putSym(0, writerRnd.nextString(writerRnd.nextInt(32)));
+                                    r.append();
+                                }
+                                writer.commit();
+                            }
+                        }
+                    }
+                } catch (Exception e) {
+                    errors.incrementAndGet();
+                    e.printStackTrace(System.out);
+                } finally {
+                    Path.clearThreadLocals();
+                    halt.countDown();
+                }
+            }).start();
+
+            final TableToken tableToken = engine.verifyTableName(tableName);
+            for (int t = 0; t < readerThreadCount; t++) {
+                final Rnd readerRnd = new Rnd(seedRnd.nextLong(), seedRnd.nextLong());
+                new Thread(() -> {
+                    final StringSink sink = new StringSink();
+                    try (TestTableReaderRecordCursor cursor = new TestTableReaderRecordCursor()) {
+                        barrier.await();
+                        for (int i = 0; i < readerIterations; i++) {
+                            TableReader copiedReader = null;
+                            TableReader reader = null;
+                            try {
+                                if (readerRnd.nextBoolean()) {
+                                    reader = pool.get(tableToken);
+                                } else {
+                                    copiedReader = pool.get(tableToken);
+                                    Os.sleep(1); // wait a bit
+                                    reader = pool.getCopyOf(copiedReader, null);
+                                }
+
+                                // Just read the table contents.
+                                cursor.of(reader);
+                                println(reader.getMetadata(), cursor, sink);
+                            } finally {
+                                Misc.free(copiedReader);
+                                Misc.free(reader);
+                            }
+                        }
+                    } catch (Exception e) {
+                        errors.incrementAndGet();
+                        e.printStackTrace(System.out);
+                    } finally {
+                        Path.clearThreadLocals();
+                        halt.countDown();
+                    }
+                }).start();
+            }
+
+            halt.await();
+            Assert.assertEquals(0, halt.getCount());
+            Assert.assertEquals(0, errors.get());
+        });
+    }
+
+    // Covers the refreshAt()/getCopyOf() half of the same fix as
+    // testConcurrentGetRefreshFailureDoesNotHandOutDisposedReader. PR #7251 removed the failure-path
+    // close() from BOTH R.refresh() and R.refreshAt(); this exercises the refreshAt() branch.
+    //
+    // getCopyOf(src) requires src to be a pooled R holding its own slot, and get0()'s copyOf branch
+    // only calls tenant.refreshAt(supervisor, copyOfTenant) when the CAS-acquired slot already holds a
+    // returned tenant. So this uses a 2-slot pool: src holds slot 0 (kept checked out for the whole
+    // test) while a second reader R1 - opened at a newer txn and returned to the pool - holds slot 1.
+    // getCopyOf(src) lands on slot 1, sees R1.txn > src.txn, takes goActiveAtTxn()'s downgrade branch
+    // (init() -> openSymbolMaps()), and the injected fault makes the symbol-offset (.o) open throw. If
+    // refreshAt() were to close() on that failure it would returnToPool() the half-dead reader before
+    // get0() disposes it, letting a concurrent get() acquire a reader whose _txn mapping is already
+    // gone and dereference it - the "roTxMemBase is null" NPE. A correct pool keeps the slot owned by
+    // the disposing thread until it is fully gone, so the contender only ever sees
+    // EntryUnavailableException and never an NPE.
+    @Test
+    public void testConcurrentGetCopyOfRefreshFailureDoesNotHandOutDisposedReader() throws Exception {
+        final AtomicReference<TableReader> pooledReader = new AtomicReference<>();
+        final AtomicLong disposingThreadId = new AtomicLong(-1);
+        final AtomicBoolean isSymbolFaultEnabled = new AtomicBoolean();
+        final AtomicBoolean hasGateFired = new AtomicBoolean();
+        final AtomicReference<Throwable> refreshError = new AtomicReference<>();
+        final AtomicReference<Throwable> contenderError = new AtomicReference<>();
+        final CountDownLatch readerReleased = new CountDownLatch(1);
+        final CountDownLatch contenderDone = new CountDownLatch(1);
+
+        final TestFilesFacade ff = new TestFilesFacade() {
+            boolean isCalled = false;
+
+            @Override
+            public void munmap(long address, long size, int memoryTag) {
+                final TableReader r = pooledReader.get();
+                // The disposing thread frees _txn (nulling roTxMemBase) before it stops being open.
+                // The first munmap once isOpen() is false (the _cv unmap) is past that point: park
+                // here so the contender grabs a reader whose _txn mapping is already gone.
+                if (r != null
+                        && Thread.currentThread().threadId() == disposingThreadId.get()
+                        && !r.isOpen()
+                        && hasGateFired.compareAndSet(false, true)) {
+                    readerReleased.countDown();
+                    try {
+                        contenderDone.await(10, TimeUnit.SECONDS);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    }
+                }
+                super.munmap(address, size, memoryTag);
+            }
+
+            @Override
+            public long openRO(LPSZ name) {
+                // Fault only the open of the symbol-offset (.o) file on the disposing thread, reached
+                // via init() -> openSymbolMaps() inside goActiveAtTxn()'s downgrade. exists() is left
+                // to pass so only a real file's open fails.
+                if (isSymbolFaultEnabled.get()
+                        && Thread.currentThread().threadId() == disposingThreadId.get()
+                        && Utf8s.endsWithAscii(name, ".o")) {
+                    isCalled = true;
+                    return -1;
+                }
+                return super.openRO(name);
+            }
+
+            @Override
+            public boolean wasCalled() {
+                return isCalled;
+            }
+        };
+
+        final CairoConfiguration poolConfig = new DefaultTestCairoConfiguration(root) {
+            @Override
+            public @NotNull FilesFacade getFilesFacade() {
+                return ff;
+            }
+
+            @Override
+            public int getPoolSegmentSize() {
+                return 2;
+            }
+
+            @Override
+            public int getReaderPoolMaxSegments() {
+                return 1;
+            }
+
+            @Override
+            public long getSpinLockTimeout() {
+                return 250;
+            }
+        };
+
+        assertWithPool(pool -> {
+            final String tableName = "copyOfRefreshFailure";
+            TableModel model = new TableModel(configuration, tableName, PartitionBy.DAY)
+                    .col("sym", ColumnType.SYMBOL)
+                    .timestamp("ts");
+            AbstractCairoTest.create(model);
+            final TableToken tableToken = engine.verifyTableName(tableName);
+
+            // Keep the table's scoreboard memory alive across the disposal so the contender's
+            // acquireTxn() reads a live scoreboard and fails on the null _txn, not a freed scoreboard.
+            final TxnScoreboard scoreboardHold = engine.getTxnScoreboardPool().getTxnScoreboard(tableToken);
+            TableReader src = null;
+            try {
+                // T1: one row in the first partition.
+                try (TableWriter w = newOffPoolWriter(configuration, tableName)) {
+                    TableWriter.Row r = w.newRow(1);
+                    r.putSym(0, "foo");
+                    r.append();
+                    w.commit();
+                }
+
+                // src opens at T1 and takes slot 0; keep it checked out for the whole test so the
+                // contender is forced onto slot 1 and never onto slot 0.
+                src = pool.get(tableToken);
+
+                // T2: a second row in a NEW partition, so a copyOf onto a T2 reader must downgrade.
+                try (TableWriter w = newOffPoolWriter(configuration, tableName)) {
+                    TableWriter.Row r = w.newRow(Micros.DAY_MICROS + 1);
+                    r.putSym(0, "bar");
+                    r.append();
+                    w.commit();
+                }
+
+                // R1 opens at T2 and takes slot 1, then returns to the pool (stays open, R1.txn == T2).
+                final TableReader r1 = pool.get(tableToken);
+                pooledReader.set(r1);
+                r1.close();
+
+                final Thread contender = new Thread(() -> {
+                    try {
+                        if (!readerReleased.await(10, TimeUnit.SECONDS)) {
+                            return;
+                        }
+                        final long deadline = configuration.getMillisecondClock().getTicks() + 1000;
+                        while (configuration.getMillisecondClock().getTicks() < deadline) {
+                            try (TableReader r = pool.get(tableToken)) {
+                                Assert.assertTrue(r.isOpen());
+                                break;
+                            } catch (EntryUnavailableException retry) {
+                                Os.pause();
+                            }
+                        }
+                    } catch (Throwable th) {
+                        contenderError.set(th);
+                    } finally {
+                        Path.clearThreadLocals();
+                        contenderDone.countDown();
+                    }
+                });
+                contender.start();
+
+                final TableReader srcRef = src;
+                final Thread disposer = new Thread(() -> {
+                    disposingThreadId.set(Thread.currentThread().threadId());
+                    isSymbolFaultEnabled.set(true);
+                    // getCopyOf(src) lands on slot 1's R1 (R1.txn T2 > src.txn T1), downgrades via
+                    // init() -> openSymbolMaps(), and the faulted .o open throws out of refreshAt().
+                    try (TableReader ignore = pool.getCopyOf(srcRef, null)) {
+                        Assert.fail("getCopyOf refresh should have failed");
+                    } catch (Throwable th) {
+                        refreshError.set(th);
+                    } finally {
+                        isSymbolFaultEnabled.set(false);
+                        Path.clearThreadLocals();
+                        // Safety net so the contender never blocks if the disposal misses the gate.
+                        readerReleased.countDown();
+                    }
+                });
+                disposer.start();
+
+                disposer.join();
+                contender.join();
+
+                Assert.assertTrue("injected symbol fault never fired", ff.wasCalled());
+                Assert.assertTrue("reader disposal never reached the parked munmap", hasGateFired.get());
+                Assert.assertNotNull("the getCopyOf refresh should have failed", refreshError.get());
+
+                final Throwable contenderErr = contenderError.get();
+                if (contenderErr != null) {
+                    throw new AssertionError(
+                            "ReaderPool handed a being-disposed reader to a concurrent get()", contenderErr);
+                }
+
+                // The disposing thread must leave the slot cleanly reclaimable: once it is gone,
+                // a fresh get() returns a usable, open reader rather than a leaked or stuck slot.
+                try (TableReader reclaimed = pool.get(tableToken)) {
+                    Assert.assertTrue("pool slot was not cleanly reclaimed after disposal", reclaimed.isOpen());
+                }
+            } finally {
+                // src (slot 0) is held for the whole window; close it only after both threads join.
+                Misc.free(src);
+                Misc.free(scoreboardHold);
+            }
+        }, poolConfig);
+    }
+
+    // When goActive()/reload() throws while a pooled reader is being refreshed, ReaderPool.R.refresh()
+    // catches it and calls close(), which returnToPool()'s the reader: its slot is released while the
+    // reader is still assigned and still open. get0()'s own catch then disposes the same reader via
+    // goodbye()+close(). Between the release and the dispose a concurrent get() can acquire the
+    // half-dead reader and dereference its already-freed _txn mapping, producing the
+    // "roTxMemBase is null" NPE. This drives that exact interleaving deterministically.
+    //
+    // A single-slot pool forces both threads onto the same reader. The injected fault makes the
+    // refreshing thread's metadata reload throw; the FilesFacade then parks that thread inside its
+    // disposal - at the first munmap after the reader stops reporting open, i.e. after _txn was
+    // freed - and releases the second thread to contend for the just-released slot. A correct pool
+    // keeps the slot owned by the disposing thread until it is fully gone, so the second thread only
+    // ever sees EntryUnavailableException and never an NPE.
+    @Test
+    public void testConcurrentGetRefreshFailureDoesNotHandOutDisposedReader() throws Exception {
+        final AtomicReference<TableReader> pooledReader = new AtomicReference<>();
+        final AtomicLong disposingThreadId = new AtomicLong(-1);
+        final AtomicBoolean isMetaFaultEnabled = new AtomicBoolean();
+        final AtomicBoolean hasGateFired = new AtomicBoolean();
+        final AtomicReference<Throwable> refreshError = new AtomicReference<>();
+        final AtomicReference<Throwable> contenderError = new AtomicReference<>();
+        final CountDownLatch readerReleased = new CountDownLatch(1);
+        final CountDownLatch contenderDone = new CountDownLatch(1);
+
+        final TestFilesFacade ff = new TestFilesFacade() {
+            boolean isCalled = false;
+
+            @Override
+            public void munmap(long address, long size, int memoryTag) {
+                final TableReader r = pooledReader.get();
+                // The disposing thread frees _txn (nulling roTxMemBase) before it stops being open.
+                // The first munmap once isOpen() is false (the _cv unmap) is past that point: park
+                // here so the contender grabs a reader whose _txn mapping is already gone.
+                if (r != null
+                        && Thread.currentThread().threadId() == disposingThreadId.get()
+                        && !r.isOpen()
+                        && hasGateFired.compareAndSet(false, true)) {
+                    readerReleased.countDown();
+                    try {
+                        contenderDone.await(10, TimeUnit.SECONDS);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    }
+                }
+                super.munmap(address, size, memoryTag);
+            }
+
+            @Override
+            public long openRO(LPSZ name) {
+                if (isMetaFaultEnabled.get()
+                        && Thread.currentThread().threadId() == disposingThreadId.get()
+                        && Utf8s.endsWithAscii(name, TableUtils.META_FILE_NAME)) {
+                    isCalled = true;
+                    return -1;
+                }
+                return super.openRO(name);
+            }
+
+            @Override
+            public boolean wasCalled() {
+                return isCalled;
+            }
+        };
+
+        final CairoConfiguration poolConfig = new DefaultTestCairoConfiguration(root) {
+            @Override
+            public @NotNull FilesFacade getFilesFacade() {
+                return ff;
+            }
+
+            @Override
+            public int getPoolSegmentSize() {
+                return 1;
+            }
+
+            @Override
+            public int getReaderPoolMaxSegments() {
+                return 1;
+            }
+
+            @Override
+            public long getSpinLockTimeout() {
+                return 250;
+            }
+        };
+
+        assertWithPool(pool -> {
+            // Keep the table's scoreboard memory alive across the disposal so the contender's
+            // acquireTxn() reads a live scoreboard and fails on the null _txn, not a freed scoreboard.
+            final TxnScoreboard scoreboardHold = engine.getTxnScoreboardPool().getTxnScoreboard(uTableToken);
+            try {
+                // Prime the single slot: open a reader and return it; it stays open in the pool.
+                final TableReader primed = pool.get(uTableToken);
+                pooledReader.set(primed);
+                primed.close();
+
+                // Bump the metadata version so the refresh takes the slow metadata-reload path, where
+                // the injected _meta fault makes goActive() throw. Written via the unfaulted config.
+                try (TableWriter w = newOffPoolWriter(configuration, "u")) {
+                    w.addColumn("x", ColumnType.INT, AllowAllSecurityContext.INSTANCE);
+                }
+
+                final Thread contender = new Thread(() -> {
+                    try {
+                        if (!readerReleased.await(10, TimeUnit.SECONDS)) {
+                            return;
+                        }
+                        final long deadline = configuration.getMillisecondClock().getTicks() + 1000;
+                        while (configuration.getMillisecondClock().getTicks() < deadline) {
+                            try (TableReader r = pool.get(uTableToken)) {
+                                Assert.assertTrue(r.isOpen());
+                                break;
+                            } catch (EntryUnavailableException retry) {
+                                Os.pause();
+                            }
+                        }
+                    } catch (Throwable th) {
+                        contenderError.set(th);
+                    } finally {
+                        Path.clearThreadLocals();
+                        contenderDone.countDown();
+                    }
+                });
+                contender.start();
+
+                final Thread refresher = new Thread(() -> {
+                    disposingThreadId.set(Thread.currentThread().threadId());
+                    isMetaFaultEnabled.set(true);
+                    try (TableReader ignore = pool.get(uTableToken)) {
+                        Assert.fail("refresh-get should have failed");
+                    } catch (Throwable th) {
+                        refreshError.set(th);
+                    } finally {
+                        isMetaFaultEnabled.set(false);
+                        Path.clearThreadLocals();
+                        // Safety net so the contender never blocks if the disposal misses the gate.
+                        readerReleased.countDown();
+                    }
+                });
+                refresher.start();
+
+                refresher.join();
+                contender.join();
+
+                Assert.assertTrue("injected metadata fault never fired", ff.wasCalled());
+                Assert.assertTrue("reader disposal never reached the parked munmap", hasGateFired.get());
+                Assert.assertNotNull("the refresh-get should have failed", refreshError.get());
+
+                final Throwable contenderErr = contenderError.get();
+                if (contenderErr != null) {
+                    throw new AssertionError(
+                            "ReaderPool handed a being-disposed reader to a concurrent get()", contenderErr);
+                }
+
+                // The disposing thread must leave the slot cleanly reclaimable: once it is gone,
+                // a fresh get() returns a usable, open reader rather than a leaked or stuck slot.
+                try (TableReader reclaimed = pool.get(uTableToken)) {
+                    Assert.assertTrue("pool slot was not cleanly reclaimed after disposal", reclaimed.isOpen());
+                }
+            } finally {
+                Misc.free(scoreboardHold);
+            }
+        }, poolConfig);
+    }
+
+    @Test
     public void testConcurrentOpenAndClose() throws Exception {
         final int readerCount = 5;
         int threadCount = 2;
@@ -277,16 +758,15 @@ public class ReaderPoolTest extends AbstractCairoTest {
 
                         for (int i1 = 0; i1 < iterations; i1++) {
                             TableToken m = names[rnd.nextPositiveInt() % readerCount];
-
                             try (TableReader ignored = pool.get(m)) {
                                 Os.pause();
                             }
                         }
-
                     } catch (Exception e) {
                         e.printStackTrace();
                         errors.incrementAndGet();
                     } finally {
+                        Path.clearThreadLocals();
                         halt.countDown();
                     }
                 }).start();
@@ -313,17 +793,20 @@ public class ReaderPoolTest extends AbstractCairoTest {
             TableModel model = new TableModel(configuration, name, PartitionBy.NONE).col("ts", ColumnType.DATE);
             AbstractCairoTest.create(model);
 
-            try (TableWriter w = newOffPoolWriter(configuration, name, metrics)) {
+            try (TableWriter writer = newOffPoolWriter(configuration, name)) {
                 for (int k = 0; k < 10; k++) {
-                    TableWriter.Row r = w.newRow();
+                    TableWriter.Row r = writer.newRow();
                     r.putDate(0, dataRnd.nextLong());
                     r.append();
                 }
-                w.commit();
+                writer.commit();
             }
 
-            try (TableReader r = newOffPoolReader(configuration, name)) {
-                println(r.getMetadata(), r.getCursor());
+            try (
+                    TableReader reader = newOffPoolReader(configuration, name);
+                    TestTableReaderRecordCursor cursor = new TestTableReaderRecordCursor().of(reader)
+            ) {
+                println(reader.getMetadata(), cursor);
             }
             expectedRows[i] = sink.toString();
             expectedRowsMap.put(name, expectedRows[i]);
@@ -337,7 +820,6 @@ public class ReaderPoolTest extends AbstractCairoTest {
 
             for (int k = 0; k < threadCount; k++) {
                 new Thread(new Runnable() {
-
                     final ObjHashSet<TableReader> readers = new ObjHashSet<>();
                     final StringSink sink = new StringSink();
 
@@ -398,6 +880,7 @@ public class ReaderPoolTest extends AbstractCairoTest {
                             for (int i = 0; i < readers.size(); i++) {
                                 readers.get(i).close();
                             }
+                            Path.clearThreadLocals();
                             halt.countDown();
                         }
                     }
@@ -407,6 +890,276 @@ public class ReaderPoolTest extends AbstractCairoTest {
             halt.await();
             Assert.assertEquals(0, halt.getCount());
             Assert.assertEquals(0, errors.get());
+        });
+    }
+
+    @Test
+    public void testCopyOfCreatesNewReader() throws Exception {
+        assertWithPool(pool -> {
+            final String tableName = "test";
+            TableModel model = new TableModel(configuration, tableName, PartitionBy.DAY)
+                    .col("sym", ColumnType.SYMBOL)
+                    .timestamp("ts");
+            AbstractCairoTest.create(model);
+
+            try (TableWriter writer = newOffPoolWriter(configuration, tableName)) {
+                TableWriter.Row r = writer.newRow(1);
+                r.putSym(0, "foo");
+                r.append();
+                writer.commit();
+            }
+
+            final TableToken tableToken = engine.verifyTableName(tableName);
+            try (
+                    TableReader ogReader = pool.get(tableToken);
+                    TestTableReaderRecordCursor cursor = new TestTableReaderRecordCursor()
+            ) {
+                try (TableWriter writer = newOffPoolWriter(configuration, tableName)) {
+                    TableWriter.Row r = writer.newRow(Micros.DAY_MICROS + 1);
+                    r.putSym(0, "bar");
+                    r.append();
+                    writer.commit();
+                }
+
+                cursor.of(ogReader);
+                println(ogReader.getMetadata(), cursor);
+                final String expected = sink.toString();
+
+                TableReader copyReaderRef;
+                try (TableReader copyReader = pool.getCopyOf(ogReader, null)) {
+                    copyReaderRef = copyReader;
+                    cursor.of(copyReader);
+                    println(copyReader.getMetadata(), cursor);
+                    final String copyActual = sink.toString();
+
+                    Assert.assertEquals(expected, copyActual);
+                }
+
+                // This is the same instance as copyReader, but this time it's fully up-to-date.
+                try (TableReader newerTxnReader = pool.get(tableToken)) {
+                    Assert.assertSame(copyReaderRef, newerTxnReader);
+                    cursor.of(newerTxnReader);
+                    println(newerTxnReader.getMetadata(), cursor);
+                    final String newerTxnActual = sink.toString();
+
+                    Assert.assertNotEquals(expected, newerTxnActual);
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testCopyOfEmptyTable() throws Exception {
+        assertWithPool(pool -> {
+            final String tableName = "test";
+            TableModel model = new TableModel(configuration, tableName, PartitionBy.DAY)
+                    .col("sym", ColumnType.SYMBOL)
+                    .timestamp("ts");
+            AbstractCairoTest.create(model);
+
+            final TableToken tableToken = engine.verifyTableName(tableName);
+            try (
+                    TableReader ogReader = pool.get(tableToken);
+                    TestTableReaderRecordCursor cursor = new TestTableReaderRecordCursor()
+            ) {
+                cursor.of(ogReader);
+                println(ogReader.getMetadata(), cursor);
+                final String expected = sink.toString();
+
+                try (TableReader copyReader = pool.getCopyOf(ogReader, null)) {
+                    cursor.of(copyReader);
+                    println(copyReader.getMetadata(), cursor);
+                    final String copyActual = sink.toString();
+
+                    Assert.assertEquals(expected, copyActual);
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testCopyOfReloadsNewerTxnReader() throws Exception {
+        assertWithPool(pool -> {
+            final String tableName = "test";
+            TableModel model = new TableModel(configuration, tableName, PartitionBy.DAY)
+                    .col("sym", ColumnType.SYMBOL)
+                    .timestamp("ts");
+            AbstractCairoTest.create(model);
+
+            try (TableWriter writer = newOffPoolWriter(configuration, tableName)) {
+                TableWriter.Row r = writer.newRow(1);
+                r.putSym(0, "foo");
+                r.append();
+                writer.commit();
+            }
+
+            final TableToken tableToken = engine.verifyTableName(tableName);
+            try (
+                    TableReader ogReader = pool.get(tableToken);
+                    TestTableReaderRecordCursor cursor = new TestTableReaderRecordCursor()
+            ) {
+                cursor.of(ogReader);
+                println(ogReader.getMetadata(), cursor);
+                final String expected = sink.toString();
+
+                try (TableWriter writer = newOffPoolWriter(configuration, tableName)) {
+                    TableWriter.Row r = writer.newRow(Micros.DAY_MICROS + 1);
+                    r.putSym(0, "bar");
+                    r.append();
+                    writer.commit();
+                }
+
+                TableReader newerTxnReaderRef;
+                try (TableReader newerTxnReader = pool.get(tableToken)) {
+                    newerTxnReaderRef = newerTxnReader;
+                    cursor.of(newerTxnReader);
+                    println(newerTxnReader.getMetadata(), cursor);
+                    final String newerTxnActual = sink.toString();
+
+                    Assert.assertNotEquals(expected, newerTxnActual);
+                }
+
+                try (TableReader copyReader = pool.getCopyOf(ogReader, null)) {
+                    Assert.assertSame(newerTxnReaderRef, copyReader);
+                    cursor.of(copyReader);
+                    println(copyReader.getMetadata(), cursor);
+                    final String copyActual = sink.toString();
+
+                    Assert.assertEquals(expected, copyActual);
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testCopyOfReloadsOlderTxnReader() throws Exception {
+        assertWithPool(pool -> {
+            final String tableName = "test";
+            TableModel model = new TableModel(configuration, tableName, PartitionBy.DAY)
+                    .col("sym", ColumnType.SYMBOL)
+                    .timestamp("ts");
+            AbstractCairoTest.create(model);
+
+            try (TableWriter writer = newOffPoolWriter(configuration, tableName)) {
+                TableWriter.Row r = writer.newRow(1);
+                r.putSym(0, "foo");
+                r.append();
+                writer.commit();
+            }
+
+            final TableToken tableToken = engine.verifyTableName(tableName);
+            // Grab a couple of readers, so that we have a stale reader when we acquire the OG reader.
+            try (
+                    TableReader ignore1 = pool.get(tableToken);
+                    TableReader ignore2 = pool.get(tableToken)
+            ) {
+            }
+
+            try (TableWriter writer = newOffPoolWriter(configuration, tableName)) {
+                TableWriter.Row r = writer.newRow(Micros.DAY_MICROS + 1);
+                r.putSym(0, "bar");
+                r.append();
+                writer.commit();
+            }
+
+            try (
+                    TableReader ogReader = pool.get(tableToken);
+                    TestTableReaderRecordCursor cursor = new TestTableReaderRecordCursor()
+            ) {
+                try (TableWriter writer = newOffPoolWriter(configuration, tableName)) {
+                    TableWriter.Row r = writer.newRow(2 * Micros.DAY_MICROS + 1);
+                    r.putSym(0, "baz");
+                    r.append();
+                    writer.commit();
+                }
+
+                cursor.of(ogReader);
+                println(ogReader.getMetadata(), cursor);
+                final String expected = sink.toString();
+
+                try (TableReader copyReader = pool.getCopyOf(ogReader, null)) {
+                    cursor.of(copyReader);
+                    println(copyReader.getMetadata(), cursor);
+                    final String copyActual = sink.toString();
+
+                    Assert.assertEquals(expected, copyActual);
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testCopyOfReturnsSameTxnReader() throws Exception {
+        assertWithPool(pool -> {
+            final String tableName = "test";
+            TableModel model = new TableModel(configuration, tableName, PartitionBy.DAY)
+                    .col("sym", ColumnType.SYMBOL)
+                    .timestamp("ts");
+            AbstractCairoTest.create(model);
+
+            try (TableWriter writer = newOffPoolWriter(configuration, tableName)) {
+                TableWriter.Row r = writer.newRow(1);
+                r.putSym(0, "foo");
+                r.append();
+                writer.commit();
+            }
+
+            final TableToken tableToken = engine.verifyTableName(tableName);
+            try (
+                    TableReader ogReader = pool.get(tableToken);
+                    TestTableReaderRecordCursor cursor = new TestTableReaderRecordCursor()
+            ) {
+                cursor.of(ogReader);
+                println(ogReader.getMetadata(), cursor);
+                final String expected = sink.toString();
+
+                TableReader sameTxnReaderRef;
+                try (TableReader sameTxnReader = pool.get(tableToken)) {
+                    sameTxnReaderRef = sameTxnReader;
+                    cursor.of(sameTxnReader);
+                    println(sameTxnReader.getMetadata(), cursor);
+                    final String sameTxnActual = sink.toString();
+
+                    Assert.assertEquals(expected, sameTxnActual);
+                }
+
+                // We should get the same reader as before since getCopyOf() is no-op in this case.
+                try (TableReader copyReader = pool.getCopyOf(ogReader, null)) {
+                    Assert.assertSame(sameTxnReaderRef, copyReader);
+                    cursor.of(copyReader);
+                    println(copyReader.getMetadata(), cursor);
+                    final String copyActual = sink.toString();
+
+                    Assert.assertEquals(expected, copyActual);
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testDetachedRefCount() throws Exception {
+        TableModel model = new TableModel(configuration, "x", PartitionBy.NONE).col("ts", ColumnType.DATE);
+        AbstractCairoTest.create(model);
+        TableToken tableToken = engine.verifyTableName("x");
+        assertWithPool(pool -> {
+            ReaderPool.R reader = pool.get(tableToken);
+            Assert.assertEquals(0, reader.getDetachedRefCount());
+
+            pool.detach(reader);
+            Assert.assertEquals(0, reader.getDetachedRefCount());
+
+            for (int i = 0; i < 10; i++) {
+                reader.incrementDetachedRefCount();
+                Assert.assertEquals(i + 1, reader.getDetachedRefCount());
+            }
+            for (int i = 9; i > -1; i--) {
+                reader.close();
+                Assert.assertEquals(i, reader.getDetachedRefCount());
+            }
+
+            pool.attach(reader);
+            reader.close();
+            Assert.assertEquals(0, reader.getDetachedRefCount());
         });
     }
 
@@ -451,8 +1204,8 @@ public class ReaderPoolTest extends AbstractCairoTest {
                         barrier.await();
                         pool.close();
                     } catch (CairoException e) {
-                        // "is left behind" exception is a valid outcome, ignore it
-                        if (!Chars.contains(e.getFlyweightMessage(), xyzTableToken.getDirName() + "' is left behind")) {
+                        // "table is left behind" exception is a valid outcome, ignore it
+                        if (!Chars.contains(e.getFlyweightMessage(), "table is left behind on pool shutdown")) {
                             exceptionCount.incrementAndGet();
                             e.printStackTrace();
                         }
@@ -460,6 +1213,7 @@ public class ReaderPoolTest extends AbstractCairoTest {
                         exceptionCount.incrementAndGet();
                         e.printStackTrace();
                     } finally {
+                        Path.clearThreadLocals();
                         stopLatch.countDown();
                     }
                 }).start();
@@ -476,11 +1230,12 @@ public class ReaderPoolTest extends AbstractCairoTest {
                         exceptionCount.incrementAndGet();
                         e.printStackTrace();
                     } finally {
+                        Path.clearThreadLocals();
                         stopLatch.countDown();
                     }
                 }).start();
 
-                Assert.assertTrue(stopLatch.await(2, TimeUnit.SECONDS));
+                Assert.assertTrue(stopLatch.await(15, TimeUnit.SECONDS));
                 Assert.assertEquals(0, exceptionCount.get());
             });
         }
@@ -511,7 +1266,7 @@ public class ReaderPoolTest extends AbstractCairoTest {
             int count = N;
 
             @Override
-            public int openRO(LPSZ name) {
+            public long openRO(LPSZ name) {
                 count--;
                 if (Utf8s.endsWithAscii(name, TableUtils.META_FILE_NAME) && locked.get() == 1) {
                     return -1;
@@ -550,7 +1305,6 @@ public class ReaderPoolTest extends AbstractCairoTest {
                 Assert.assertTrue(reader.isOpen());
                 reader.close();
             }
-
         }, new DefaultTestCairoConfiguration(root) {
             @Override
             public @NotNull FilesFacade getFilesFacade() {
@@ -626,6 +1380,7 @@ public class ReaderPoolTest extends AbstractCairoTest {
                         ref.set(pool.get(nameX));
                     } catch (Throwable ignored) {
                     } finally {
+                        Path.clearThreadLocals();
                         // the end
                         halt.countDown();
                     }
@@ -698,7 +1453,7 @@ public class ReaderPoolTest extends AbstractCairoTest {
             CyclicBarrier barrier = new CyclicBarrier(2);
             CountDownLatch stopLatch = new CountDownLatch(2);
 
-            TableToken xTableToken = new TableToken("x", "x", 123, false, false, false);
+            TableToken xTableToken = new TableToken("x", "x", null, 123, false, false, false);
 
             final Runnable runnable = () -> {
                 try {
@@ -843,7 +1598,6 @@ public class ReaderPoolTest extends AbstractCairoTest {
     @Test
     public void testReaderDoubleClose() throws Exception {
         assertWithPool(pool -> {
-
             class Listener implements PoolListener {
                 private final IntList events = new IntList();
                 private final ObjList<TableToken> names = new ObjList<>();
@@ -893,7 +1647,7 @@ public class ReaderPoolTest extends AbstractCairoTest {
     @Test
     public void testUnlockByAnotherThread() throws Exception {
         assertWithPool(pool -> {
-            TableToken tableToken = new TableToken("Ургант", "Ургант", 123, false, false, false);
+            TableToken tableToken = new TableToken("Ургант", "Ургант", null, 123, false, false, false);
             Assert.assertTrue(pool.lock(tableToken));
             AtomicInteger errors = new AtomicInteger();
 
@@ -936,7 +1690,7 @@ public class ReaderPoolTest extends AbstractCairoTest {
                 }
             });
 
-            TableToken tableToken = new TableToken("xyz", "xyz", 123, false, false, false);
+            TableToken tableToken = new TableToken("xyz", "xyz", null, 123, false, false, false);
             pool.unlock(tableToken);
             Assert.assertEquals(1, counter.get());
         });
@@ -947,8 +1701,8 @@ public class ReaderPoolTest extends AbstractCairoTest {
     }
 
     private void assertWithPool(PoolAwareCode code, final CairoConfiguration configuration) throws Exception {
-        TestUtils.assertMemoryLeak(() -> {
-            try (ReaderPool pool = new ReaderPool(configuration, messageBus)) {
+        assertMemoryLeak(() -> {
+            try (ReaderPool pool = new ReaderPool(configuration, engine.getTxnScoreboardPool(), messageBus)) {
                 code.run(pool);
             }
         });

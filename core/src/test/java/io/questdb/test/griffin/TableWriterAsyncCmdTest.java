@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -41,7 +41,7 @@ import io.questdb.mp.SCSequence;
 import io.questdb.std.Files;
 import io.questdb.std.FilesFacade;
 import io.questdb.std.Misc;
-import io.questdb.std.datetime.microtime.Timestamps;
+import io.questdb.std.datetime.microtime.Micros;
 import io.questdb.std.str.LPSZ;
 import io.questdb.std.str.Path;
 import io.questdb.std.str.Utf8s;
@@ -54,6 +54,7 @@ import org.junit.Test;
 
 import static io.questdb.cairo.sql.OperationFuture.QUERY_NO_RESPONSE;
 import static io.questdb.griffin.engine.ops.AlterOperation.ADD_COLUMN;
+import static io.questdb.tasks.TableWriterTask.CMD_ALTER_TABLE;
 
 public class TableWriterAsyncCmdTest extends AbstractCairoTest {
 
@@ -64,13 +65,13 @@ public class TableWriterAsyncCmdTest extends AbstractCairoTest {
     @Test
     public void testAsyncAlterCommandInvalidSerialisation() throws Exception {
         assertMemoryLeak(() -> {
-            ddl("create table product (timestamp timestamp, name symbol nocache)", sqlExecutionContext);
+            execute("create table product (timestamp timestamp, name symbol nocache)", sqlExecutionContext);
             OperationFuture fut = null;
             try {
                 try (TableWriter writer = getWriter("product")) {
                     CompiledQueryImpl cc = new CompiledQueryImpl(engine).withContext(sqlExecutionContext);
                     AlterOperation creepyAlterOp = new AlterOperation();
-                    creepyAlterOp.of((short) 1000, writer.getTableToken(), writer.getMetadata().getTableId(), 1000);
+                    creepyAlterOp.of(CMD_ALTER_TABLE, (short) 1000, writer.getTableToken(), writer.getMetadata().getTableId(), 1000);
                     cc.ofAlter(creepyAlterOp);
                     fut = cc.execute(commandReplySequence);
                 }
@@ -87,7 +88,7 @@ public class TableWriterAsyncCmdTest extends AbstractCairoTest {
     @Test
     public void testAsyncAlterCommandsExceedEngineEventQueue() throws Exception {
         assertMemoryLeak(() -> {
-            ddl("create table product (timestamp timestamp)", sqlExecutionContext);
+            execute("create table product (timestamp timestamp)", sqlExecutionContext);
 
             // Block event queue with stale sequence
             SCSequence staleSequence = new SCSequence();
@@ -122,7 +123,7 @@ public class TableWriterAsyncCmdTest extends AbstractCairoTest {
                             qf.await();
                             Assert.fail();
                         } catch (SqlException exception) {
-                            TestUtils.assertContains(exception.getFlyweightMessage(), "Duplicate column [name=column5]");
+                            TestUtils.assertContains(exception.getFlyweightMessage(), "duplicate column [name=column5]");
                         }
                     }
                 }
@@ -133,7 +134,7 @@ public class TableWriterAsyncCmdTest extends AbstractCairoTest {
     @Test
     public void testAsyncAlterCommandsExceedsEngineCmdQueue() throws Exception {
         assertMemoryLeak(() -> {
-            ddl("create table product (timestamp timestamp)", sqlExecutionContext);
+            execute("create table product (timestamp timestamp)", sqlExecutionContext);
             SCSequence tempSequence = new SCSequence();
 
             try (SqlCompiler compiler = engine.getSqlCompiler()) {
@@ -155,7 +156,7 @@ public class TableWriterAsyncCmdTest extends AbstractCairoTest {
                 } // Unblock table
             }
 
-            ddl("ALTER TABLE product add column column5 int");
+            execute("ALTER TABLE product add column column5 int");
         });
     }
 
@@ -174,7 +175,7 @@ public class TableWriterAsyncCmdTest extends AbstractCairoTest {
         };
         assertMemoryLeak(ff, () -> {
 
-            ddl("create table product as (select x, x as to_remove from long_sequence(100))", sqlExecutionContext);
+            execute("create table product as (select x, x as to_remove from long_sequence(100))", sqlExecutionContext);
 
             try (SqlCompiler compiler = engine.getSqlCompiler()) {
                 OperationFuture fut;
@@ -192,7 +193,7 @@ public class TableWriterAsyncCmdTest extends AbstractCairoTest {
                     fut.close();
                 }
             }
-            ddl("ALTER TABLE product drop column to_remove", sqlExecutionContext);
+            execute("ALTER TABLE product drop column to_remove", sqlExecutionContext);
         });
     }
 
@@ -209,7 +210,7 @@ public class TableWriterAsyncCmdTest extends AbstractCairoTest {
         };
         assertMemoryLeak(ff, () -> {
 
-            ddl("create table product as (select x, timestamp_sequence('2020-01-01', 1000000000) ts from long_sequence(100))" +
+            execute("create table product as (select x, timestamp_sequence('2020-01-01', 1000000000) ts from long_sequence(100))" +
                     " timestamp(ts) partition by DAY", sqlExecutionContext);
 
             try (SqlCompiler compiler = engine.getSqlCompiler()) {
@@ -246,7 +247,7 @@ public class TableWriterAsyncCmdTest extends AbstractCairoTest {
 
         assertMemoryLeak(ff, () -> {
 
-            ddl("create table product as (select x, x as to_remove from long_sequence(100))", sqlExecutionContext);
+            execute("create table product as (select x, x as to_remove from long_sequence(100))", sqlExecutionContext);
 
             try (SqlCompiler compiler = engine.getSqlCompiler()) {
                 // Block table
@@ -256,7 +257,7 @@ public class TableWriterAsyncCmdTest extends AbstractCairoTest {
                         writer.tick(true);
 
                         try {
-                            fut.await(Timestamps.SECOND_MILLIS);
+                            fut.await(Micros.SECOND_MILLIS);
                             Assert.fail();
                         } catch (SqlException e) {
                             Assert.assertNotNull(e);
@@ -265,14 +266,14 @@ public class TableWriterAsyncCmdTest extends AbstractCairoTest {
                     }
                 } // Unblock table
             }
-            ddl("ALTER TABLE product drop column to_remove");
+            execute("ALTER TABLE product drop column to_remove");
         });
     }
 
     @Test
     public void testAsyncAlterDeserializationFails() throws Exception {
         assertMemoryLeak(() -> {
-            ddl("create table product as (select x, timestamp_sequence('2020-01-01', 1000000000) ts from long_sequence(100))" +
+            execute("create table product as (select x, timestamp_sequence('2020-01-01', 1000000000) ts from long_sequence(100))" +
                     " timestamp(ts) partition by DAY", sqlExecutionContext);
 
             OperationFuture fut;
@@ -284,7 +285,7 @@ public class TableWriterAsyncCmdTest extends AbstractCairoTest {
                 AlterOperation creepyAlterOp = new AlterOperation() {
                     @Override
                     public void serialize(TableWriterTask event) {
-                        event.of(TableWriterTask.CMD_ALTER_TABLE, tableId, writer.getTableToken());
+                        event.of(CMD_ALTER_TABLE, tableId, writer.getTableToken());
                         event.setInstance(1);
                         event.putShort(command);
                         event.putInt(-1);
@@ -292,7 +293,7 @@ public class TableWriterAsyncCmdTest extends AbstractCairoTest {
                         event.setInstance(this.getCorrelationId());
                     }
                 };
-                creepyAlterOp.of(command, writer.getTableToken(), tableId, 100);
+                creepyAlterOp.of(CMD_ALTER_TABLE, command, writer.getTableToken(), tableId, 100);
                 CompiledQueryImpl cc = new CompiledQueryImpl(engine).withContext(sqlExecutionContext);
                 cc.ofAlter(creepyAlterOp);
                 fut = cc.execute(commandReplySequence);
@@ -312,7 +313,7 @@ public class TableWriterAsyncCmdTest extends AbstractCairoTest {
     @Test
     public void testAsyncAlterDoesNotCommitUncommittedRowsOnWriterClose() throws Exception {
         assertMemoryLeak(() -> {
-            ddl("create table product (timestamp timestamp, name symbol nocache) timestamp(timestamp)", sqlExecutionContext);
+            execute("create table product (timestamp timestamp, name symbol nocache) timestamp(timestamp)", sqlExecutionContext);
             OperationFuture fut = null;
             try (SqlCompiler compiler = engine.getSqlCompiler()) {
                 try (TableWriter writer = getWriter("product")) {
@@ -344,7 +345,7 @@ public class TableWriterAsyncCmdTest extends AbstractCairoTest {
     @Test
     public void testAsyncAlterNonExistingTable() throws Exception {
         assertMemoryLeak(() -> {
-            ddl("create table product (timestamp timestamp, name symbol nocache)", sqlExecutionContext);
+            execute("create table product (timestamp timestamp, name symbol nocache)", sqlExecutionContext);
             OperationFuture fut = null;
             try {
                 try (TableWriter writer = getWriter("product")) {
@@ -355,7 +356,7 @@ public class TableWriterAsyncCmdTest extends AbstractCairoTest {
                     cc.ofAlter(creepyAlter.build());
                     fut = cc.execute(commandReplySequence);
                 }
-                drop("drop table product");
+                execute("drop table product");
 
                 // ALTER TABLE should be executed successfully on writer.close()
                 fut.await();
@@ -370,7 +371,7 @@ public class TableWriterAsyncCmdTest extends AbstractCairoTest {
     @Test
     public void testAsyncAlterSymbolCache() throws Exception {
         assertMemoryLeak(() -> {
-            ddl("create table product (timestamp timestamp, name symbol nocache)", sqlExecutionContext);
+            execute("create table product (timestamp timestamp, name symbol nocache)", sqlExecutionContext);
             OperationFuture fut = null;
             try (SqlCompiler compiler = engine.getSqlCompiler()) {
                 try (TableWriter writer = getWriter("product")) {
@@ -397,7 +398,7 @@ public class TableWriterAsyncCmdTest extends AbstractCairoTest {
     @Test
     public void testAsyncRenameMultipleColumns() throws Exception {
         assertMemoryLeak(() -> {
-            ddl("create table product (timestamp timestamp, name symbol nocache)", sqlExecutionContext);
+            execute("create table product (timestamp timestamp, name symbol nocache)", sqlExecutionContext);
             OperationFuture fut = null;
             try (SqlCompiler compiler = engine.getSqlCompiler()) {
 
@@ -424,7 +425,7 @@ public class TableWriterAsyncCmdTest extends AbstractCairoTest {
     public void testCommandQueueBufferOverflow() throws Exception {
         node1.setProperty(PropertyKey.CAIRO_WRITER_COMMAND_QUEUE_SLOT_SIZE, 4);
         assertMemoryLeak(() -> {
-            ddl("create table product (timestamp timestamp)", sqlExecutionContext);
+            execute("create table product (timestamp timestamp)", sqlExecutionContext);
 
             // Get the lock so command has to be serialized to writer command queue
             try (
@@ -445,7 +446,7 @@ public class TableWriterAsyncCmdTest extends AbstractCairoTest {
     @Test
     public void testCommandQueueReused() throws Exception {
         assertMemoryLeak(() -> {
-            ddl("create table product (timestamp timestamp)", sqlExecutionContext);
+            execute("create table product (timestamp timestamp)", sqlExecutionContext);
 
             // Block event queue with stale sequence
             try (
@@ -468,7 +469,7 @@ public class TableWriterAsyncCmdTest extends AbstractCairoTest {
     @Test
     public void testInvalidAlterDropPartitionStatementQueued() throws Exception {
         assertMemoryLeak(() -> {
-            ddl("create table product (timestamp timestamp, name symbol nocache)", sqlExecutionContext);
+            execute("create table product (timestamp timestamp, name symbol nocache)", sqlExecutionContext);
 
             try (TableWriter writer = getWriter("product")) {
                 AlterOperationBuilder creepyAlter = new AlterOperationBuilder();
@@ -492,7 +493,7 @@ public class TableWriterAsyncCmdTest extends AbstractCairoTest {
     @Test
     public void testInvalidAlterStatementQueued() throws Exception {
         assertMemoryLeak(() -> {
-            ddl("create table product (timestamp timestamp, name symbol nocache)", sqlExecutionContext);
+            execute("create table product (timestamp timestamp, name symbol nocache)", sqlExecutionContext);
 
             try (TableWriter writer = getWriter("product")) {
 

@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,14 +24,20 @@
 
 package io.questdb.griffin.engine.functions.catalogue;
 
-import io.questdb.cairo.*;
+import io.questdb.cairo.AbstractRecordCursorFactory;
+import io.questdb.cairo.CairoConfiguration;
+import io.questdb.cairo.ColumnType;
+import io.questdb.cairo.GenericRecordMetadata;
+import io.questdb.cairo.TableColumnMetadata;
+import io.questdb.cairo.TableUtils;
 import io.questdb.cairo.sql.Function;
+import io.questdb.cairo.sql.NoRandomAccessRecordCursor;
 import io.questdb.cairo.sql.Record;
 import io.questdb.cairo.sql.RecordCursor;
 import io.questdb.cairo.sql.RecordMetadata;
+import io.questdb.cairo.sql.SqlExecutionCircuitBreaker;
 import io.questdb.griffin.FunctionFactory;
 import io.questdb.griffin.PlanSink;
-import io.questdb.griffin.SqlException;
 import io.questdb.griffin.SqlExecutionContext;
 import io.questdb.griffin.engine.functions.CursorFunction;
 import io.questdb.std.IntList;
@@ -50,7 +56,7 @@ public class PgExtensionFunctionFactory implements FunctionFactory {
     }
 
     @Override
-    public Function newInstance(int position, ObjList<Function> args, IntList argPositions, CairoConfiguration configuration, SqlExecutionContext sqlExecutionContext) throws SqlException {
+    public Function newInstance(int position, ObjList<Function> args, IntList argPositions, CairoConfiguration configuration, SqlExecutionContext sqlExecutionContext) {
         return new CursorFunction(new PgExtensionCursorFactory(configuration));
     }
 
@@ -64,7 +70,7 @@ public class PgExtensionFunctionFactory implements FunctionFactory {
 
         @Override
         public RecordCursor getCursor(SqlExecutionContext executionContext) {
-            cursor.toTop();
+            cursor.of(executionContext.getCircuitBreaker());
             return cursor;
         }
 
@@ -78,15 +84,21 @@ public class PgExtensionFunctionFactory implements FunctionFactory {
             sink.type("pg_extension()");
         }
 
-        private static class PgExtensionRecordCursor implements RecordCursor {
+        private static class PgExtensionRecordCursor implements NoRandomAccessRecordCursor {
 
             private static final String[][] EXTENSIONS = {{"1", "questdb", "1", "1", "false", null, null, null}};
             private final PgExtensionRecord record = new PgExtensionRecord();
             private final CharSequence version;
+            private SqlExecutionCircuitBreaker circuitBreaker;
             private int index = -1;
 
             public PgExtensionRecordCursor(CharSequence version) {
                 this.version = version;
+            }
+
+            public void of(SqlExecutionCircuitBreaker circuitBreaker) {
+                this.circuitBreaker = circuitBreaker;
+                toTop();
             }
 
             @Override
@@ -100,23 +112,19 @@ public class PgExtensionFunctionFactory implements FunctionFactory {
             }
 
             @Override
-            public Record getRecordB() {
-                throw new UnsupportedOperationException();
-            }
-
-            @Override
             public boolean hasNext() {
+                circuitBreaker.statefulThrowExceptionIfTripped();
                 return ++index < EXTENSIONS.length;
-            }
-
-            @Override
-            public void recordAt(Record record, long atRowId) {
-                throw new UnsupportedOperationException();
             }
 
             @Override
             public long size() {
                 return EXTENSIONS.length;
+            }
+
+            @Override
+            public long preComputedStateSize() {
+                return 0;
             }
 
             @Override

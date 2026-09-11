@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,9 +24,25 @@
 
 package io.questdb.griffin;
 
-import io.questdb.cairo.*;
+import io.questdb.cairo.CairoConfiguration;
+import io.questdb.cairo.CairoException;
+import io.questdb.cairo.ColumnType;
+import io.questdb.cairo.ColumnTypeDriver;
+import io.questdb.cairo.IndexBuilder;
+import io.questdb.cairo.IndexType;
+import io.questdb.cairo.TableToken;
+import io.questdb.cairo.TableUtils;
+import io.questdb.cairo.TableWriter;
+import io.questdb.cairo.TimestampDriver;
+import io.questdb.cairo.UpdateOperator;
+import io.questdb.cairo.VarcharTypeDriver;
+import io.questdb.cairo.arr.ArrayTypeDriver;
 import io.questdb.cairo.sql.Record;
-import io.questdb.cairo.sql.*;
+import io.questdb.cairo.sql.RecordCursor;
+import io.questdb.cairo.sql.RecordCursorFactory;
+import io.questdb.cairo.sql.RecordMetadata;
+import io.questdb.cairo.sql.TableRecordMetadata;
+import io.questdb.cairo.sql.TableReferenceOutOfDateException;
 import io.questdb.cairo.vm.Vm;
 import io.questdb.cairo.vm.api.MemoryCM;
 import io.questdb.cairo.vm.api.MemoryCMARW;
@@ -34,7 +50,15 @@ import io.questdb.cairo.vm.api.MemoryCMR;
 import io.questdb.griffin.engine.ops.UpdateOperation;
 import io.questdb.log.Log;
 import io.questdb.log.LogFactory;
-import io.questdb.std.*;
+import io.questdb.std.Decimal128;
+import io.questdb.std.Decimal256;
+import io.questdb.std.FilesFacade;
+import io.questdb.std.IntList;
+import io.questdb.std.MemoryTag;
+import io.questdb.std.Misc;
+import io.questdb.std.ObjList;
+import io.questdb.std.QuietCloseable;
+import io.questdb.std.Rows;
 import io.questdb.std.str.Path;
 
 import static io.questdb.cairo.ColumnType.isVarSize;
@@ -46,7 +70,7 @@ public class UpdateOperatorImpl implements QuietCloseable, UpdateOperator {
     private final long dataAppendPageSize;
     private final ObjList<MemoryCMARW> dstColumns = new ObjList<>();
     private final FilesFacade ff;
-    private final long fileOpenOpts;
+    private final int fileOpenOpts;
     private final Path path;
     private final PurgingOperator purgingOperator;
     private final int rootLen;
@@ -90,8 +114,8 @@ public class UpdateOperatorImpl implements QuietCloseable, UpdateOperator {
             final RecordCursorFactory factory = op.getFactory();
 
             purgingOperator.clear();
-
             if (tableWriter.inTransaction()) {
+                assert !tableWriter.getTableToken().isWal();
                 LOG.info().$("committing current transaction before UPDATE execution [table=").$(tableToken).$(" instance=").$(op.getCorrelationId()).I$();
                 tableWriter.commit();
             }
@@ -154,38 +178,18 @@ public class UpdateOperatorImpl implements QuietCloseable, UpdateOperator {
                         final long currentRow = Rows.toLocalRowID(rowId);
 
                         if (rowPartitionIndex != partitionIndex) {
-                            if (tableWriter.isPartitionReadOnly(rowPartitionIndex)) {
-                                throw CairoException.critical(0)
-                                        .put("cannot update read-only partition [table=").put(tableToken.getTableName())
-                                        .put(", partitionTimestamp=").ts(tableWriter.getPartitionTimestamp(rowPartitionIndex))
-                                        .put(']');
-                            }
+                            checkPartitionCanUpdate(tableToken, rowPartitionIndex);
                             if (partitionIndex > -1) {
                                 LOG.info()
                                         .$("updating partition [partitionIndex=").$(partitionIndex)
                                         .$(", rowPartitionIndex=").$(rowPartitionIndex)
-                                        .$(", rowPartitionTs=").$ts(tableWriter.getPartitionTimestamp(rowPartitionIndex))
+                                        .$(", rowPartitionTs=").$ts(ColumnType.getTimestampDriver(tableWriter.getTimestampType()), tableWriter.getPartitionTimestamp(rowPartitionIndex))
                                         .$(", affectedColumnCount=").$(affectedColumnCount)
                                         .$(", prevRow=").$(prevRow)
                                         .$(", minRow=").$(minRow)
                                         .I$();
 
-                                copyColumns(
-                                        partitionIndex,
-                                        affectedColumnCount,
-                                        prevRow,
-                                        minRow
-                                );
-
-                                updateEffectiveColumnTops(
-                                        tableWriter,
-                                        partitionIndex,
-                                        updateColumnIndexes,
-                                        affectedColumnCount,
-                                        minRow
-                                );
-
-                                rebuildIndexes(tableWriter.getPartitionTimestamp(partitionIndex), tableMetadata, tableWriter);
+                                finishPartitionUpdate(partitionIndex, affectedColumnCount, prevRow, minRow, tableMetadata);
                             }
 
                             openColumns(srcColumns, rowPartitionIndex, false);
@@ -197,10 +201,12 @@ public class UpdateOperatorImpl implements QuietCloseable, UpdateOperator {
                         }
 
                         appendRowUpdate(
+                                sqlExecutionContext,
                                 rowPartitionIndex,
                                 affectedColumnCount,
                                 prevRow,
                                 currentRow,
+                                factory.getMetadata(),
                                 masterRecord,
                                 minRow
                         );
@@ -212,17 +218,7 @@ public class UpdateOperatorImpl implements QuietCloseable, UpdateOperator {
                     }
 
                     if (partitionIndex > -1) {
-                        copyColumns(partitionIndex, affectedColumnCount, prevRow, minRow);
-
-                        updateEffectiveColumnTops(
-                                tableWriter,
-                                partitionIndex,
-                                updateColumnIndexes,
-                                affectedColumnCount,
-                                minRow
-                        );
-
-                        rebuildIndexes(tableWriter.getPartitionTimestamp(partitionIndex), tableMetadata, tableWriter);
+                        finishPartitionUpdate(partitionIndex, affectedColumnCount, prevRow, minRow, tableMetadata);
                     }
                 } finally {
                     Misc.freeObjList(srcColumns);
@@ -241,9 +237,10 @@ public class UpdateOperatorImpl implements QuietCloseable, UpdateOperator {
                     purgingOperator.purge(
                             path.trimTo(rootLen),
                             tableWriter.getTableToken(),
+                            tableWriter.getMetadata().getTimestampType(),
                             tableWriter.getPartitionBy(),
-                            tableWriter.checkScoreboardHasReadersBeforeLastCommittedTxn(),
-                            tableWriter.getMetadata(),
+                            tableWriter.checkScoreboardHasReadersBeforeLastCommittedTxn()
+                                    || tableWriter.isCheckpointInProgress(),
                             tableWriter.getTruncateVersion(),
                             tableWriter.getTxn()
                     );
@@ -268,10 +265,11 @@ public class UpdateOperatorImpl implements QuietCloseable, UpdateOperator {
         } catch (TableReferenceOutOfDateException e) {
             throw e;
         } catch (SqlException e) {
-            throw CairoException.critical(0).put("could not apply update on SPI side [e=").put((CharSequence) e).put(']');
+            throw CairoException.nonCritical().put("could not apply update on SPI side [error=").put(e.getFlyweightMessage())
+                    .put(", position=").put(e.getPosition()).put(']');
         } catch (CairoException e) {
             if (e.isAuthorizationError() || e.isCancellation()) {
-                LOG.error().$(e.getFlyweightMessage()).$();
+                LOG.error().$safe(e.getFlyweightMessage()).$();
             } else {
                 LOG.error().$("could not update").$((Throwable) e).$();
             }
@@ -291,6 +289,28 @@ public class UpdateOperatorImpl implements QuietCloseable, UpdateOperator {
             return Math.min(firstUpdatedPartitionRowId, columnTop);
         }
         return firstUpdatedPartitionRowId;
+    }
+
+    private void checkPartitionCanUpdate(TableToken tableToken, int rowPartitionIndex) {
+        if (tableWriter.isPartitionReadOnly(rowPartitionIndex)) {
+            // The read-only flag is sequenced, so this fails deterministically on every instance.
+            // Although partition-manipulation errors are generally WAL-tolerable, UPDATE commands
+            // must remain unapplied: skipping one would lose DML already acknowledged at sequencing.
+            throw CairoException.partitionManipulationRecoverable()
+                    .put("cannot update read-only partition [table=").put(tableToken.getTableName())
+                    .put(", partitionTimestamp=").ts(
+                            tableWriter.getTimestampType(),
+                            tableWriter.getPartitionTimestamp(rowPartitionIndex))
+                    .put(']');
+        }
+        if (tableWriter.isPartitionParquet(rowPartitionIndex)) {
+            throw CairoException.nonCritical()
+                    .put("cannot update parquet-format partition [table=").put(tableToken.getTableName())
+                    .put(", partitionTimestamp=").ts(
+                            tableWriter.getTimestampType(),
+                            tableWriter.getPartitionTimestamp(rowPartitionIndex))
+                    .put("]; parquet partitions are read-only (e.g. converted by a TO PARQUET storage policy), restrict the UPDATE to native partitions");
+        }
     }
 
     private static void fillUpdatesGapWithNull(
@@ -337,10 +357,12 @@ public class UpdateOperatorImpl implements QuietCloseable, UpdateOperator {
     }
 
     private void appendRowUpdate(
+            SqlExecutionContext executionContext,
             int rowPartitionIndex,
             int affectedColumnCount,
             long prevRow,
             long currentRow,
+            RecordMetadata metadata,
             Record masterRecord,
             long firstUpdatedRowId
     ) {
@@ -353,11 +375,11 @@ public class UpdateOperatorImpl implements QuietCloseable, UpdateOperator {
             MemoryCMARW dstVarMem = dstColumns.get(2 * i + 1);
 
             final int columnIndex = updateColumnIndexes.get(i);
-            final long oldColumnTop = tableWriter.getColumnTop(partitionTimestamp, columnIndex, -1);
-            final long newColumnTop = calculatedEffectiveColumnTop(firstUpdatedRowId, oldColumnTop);
             final int toType = tableMetadata.getColumnType(columnIndex);
 
             if (currentRow > prevRow) {
+                final long oldColumnTop = tableWriter.getColumnTop(partitionTimestamp, columnIndex, -1);
+                final long newColumnTop = calculatedEffectiveColumnTop(firstUpdatedRowId, oldColumnTop);
                 copyColumn(
                         prevRow,
                         currentRow,
@@ -384,7 +406,8 @@ public class UpdateOperatorImpl implements QuietCloseable, UpdateOperator {
                     dstFixMem.putLong(masterRecord.getLong(i));
                     break;
                 case ColumnType.TIMESTAMP:
-                    dstFixMem.putLong(masterRecord.getTimestamp(i));
+                    TimestampDriver driver = ColumnType.getTimestampDriver(toType);
+                    dstFixMem.putLong(driver.from(masterRecord.getTimestamp(i), ColumnType.getTimestampType(metadata.getColumnType(i))));
                     break;
                 case ColumnType.DATE:
                     dstFixMem.putLong(masterRecord.getDate(i));
@@ -440,6 +463,38 @@ public class UpdateOperatorImpl implements QuietCloseable, UpdateOperator {
                     dstFixMem.putLong(masterRecord.getLong128Lo(i));
                     dstFixMem.putLong(masterRecord.getLong128Hi(i));
                     break;
+                case ColumnType.ARRAY:
+                    ArrayTypeDriver.appendValue(dstFixMem, dstVarMem, masterRecord.getArray(i, toType));
+                    break;
+                case ColumnType.DECIMAL8:
+                    dstFixMem.putByte(masterRecord.getDecimal8(i));
+                    break;
+                case ColumnType.DECIMAL16:
+                    dstFixMem.putShort(masterRecord.getDecimal16(i));
+                    break;
+                case ColumnType.DECIMAL32:
+                    dstFixMem.putInt(masterRecord.getDecimal32(i));
+                    break;
+                case ColumnType.DECIMAL64:
+                    dstFixMem.putLong(masterRecord.getDecimal64(i));
+                    break;
+                case ColumnType.DECIMAL128: {
+                    Decimal128 decimal128 = executionContext.getDecimal128();
+                    masterRecord.getDecimal128(i, decimal128);
+                    dstFixMem.putDecimal128(decimal128.getHigh(), decimal128.getLow());
+                    break;
+                }
+                case ColumnType.DECIMAL256: {
+                    Decimal256 decimal256 = executionContext.getDecimal256();
+                    masterRecord.getDecimal256(i, decimal256);
+                    dstFixMem.putDecimal256(
+                            decimal256.getHh(),
+                            decimal256.getHl(),
+                            decimal256.getLh(),
+                            decimal256.getLl()
+                    );
+                    break;
+                }
                 default:
                     throw CairoException.nonCritical()
                             .put("Column type ").put(ColumnType.nameOf(toType))
@@ -622,27 +677,55 @@ public class UpdateOperatorImpl implements QuietCloseable, UpdateOperator {
         }
     }
 
+    private void finishPartitionUpdate(
+            int partitionIndex,
+            int affectedColumnCount,
+            long prevRow,
+            long minRow,
+            TableRecordMetadata tableMetadata
+    ) {
+        copyColumns(partitionIndex, affectedColumnCount, prevRow, minRow);
+        updateEffectiveColumnTops(
+                tableWriter,
+                partitionIndex,
+                updateColumnIndexes,
+                affectedColumnCount,
+                minRow
+        );
+        rebuildIndexes(tableWriter.getPartitionTimestamp(partitionIndex), tableMetadata, tableWriter);
+        tableWriter.markPartitionDataChanged(partitionIndex);
+    }
+
     private void openColumns(ObjList<? extends MemoryCM> columns, int partitionIndex, boolean forWrite) {
         long partitionTimestamp = tableWriter.getPartitionTimestamp(partitionIndex);
         long partitionNameTxn = tableWriter.getPartitionNameTxn(partitionIndex);
+        long partitionSize = tableWriter.getPartitionSize(partitionIndex);
         RecordMetadata metadata = tableWriter.getMetadata();
         try {
             path.trimTo(rootLen);
-            TableUtils.setPathForPartition(path, tableWriter.getPartitionBy(), partitionTimestamp, partitionNameTxn);
+            TableUtils.setPathForNativePartition(
+                    path,
+                    tableWriter.getMetadata().getTimestampType(),
+                    tableWriter.getPartitionBy(),
+                    partitionTimestamp,
+                    partitionNameTxn
+            );
             int pathTrimToLen = path.size();
             for (int i = 0, n = updateColumnIndexes.size(); i < n; i++) {
                 int columnIndex = updateColumnIndexes.get(i);
-                CharSequence name = metadata.getColumnName(columnIndex);
+                String columnName = metadata.getColumnName(columnIndex);
                 int columnType = metadata.getColumnType(columnIndex);
+                byte indexType = ColumnType.isSymbol(columnType) ? metadata.getColumnIndexType(columnIndex) : IndexType.NONE;
 
                 final long columnTop = tableWriter.getColumnTop(partitionTimestamp, columnIndex, -1L);
+                long rowCount = columnTop > -1 ? partitionSize - columnTop : 0;
 
                 if (forWrite) {
                     long existingVersion = tableWriter.getColumnNameTxn(partitionTimestamp, columnIndex);
                     tableWriter.upsertColumnVersion(partitionTimestamp, columnIndex, columnTop);
-                    if (columnTop > -1) {
+                    if (rowCount > 0) {
                         // columnTop == -1 means column did not exist at the partition
-                        purgingOperator.add(columnIndex, existingVersion, partitionTimestamp, partitionNameTxn);
+                        purgingOperator.add(columnIndex, columnName, columnType, indexType, existingVersion, partitionTimestamp, partitionNameTxn);
                     }
                 }
 
@@ -655,10 +738,10 @@ public class UpdateOperatorImpl implements QuietCloseable, UpdateOperator {
                     colMemVar.close();
                     assert !colMemVar.isOpen();
 
-                    if (forWrite || columnTop != -1) {
+                    if (forWrite || rowCount > 0) {
                         colMemIndex.of(
                                 ff,
-                                iFile(path.trimTo(pathTrimToLen), name, columnNameTxn),
+                                iFile(path.trimTo(pathTrimToLen), columnName, columnNameTxn),
                                 dataAppendPageSize,
                                 -1,
                                 MemoryTag.MMAP_UPDATE,
@@ -666,7 +749,7 @@ public class UpdateOperatorImpl implements QuietCloseable, UpdateOperator {
                         );
                         colMemVar.of(
                                 ff,
-                                dFile(path.trimTo(pathTrimToLen), name, columnNameTxn),
+                                dFile(path.trimTo(pathTrimToLen), columnName, columnNameTxn),
                                 dataAppendPageSize,
                                 -1,
                                 MemoryTag.MMAP_UPDATE,
@@ -678,10 +761,10 @@ public class UpdateOperatorImpl implements QuietCloseable, UpdateOperator {
                     colMem.close();
                     assert !colMem.isOpen();
 
-                    if (forWrite || columnTop != -1) {
+                    if (forWrite || rowCount > 0) {
                         colMem.of(
                                 ff,
-                                dFile(path.trimTo(pathTrimToLen), name, columnNameTxn),
+                                dFile(path.trimTo(pathTrimToLen), columnName, columnNameTxn),
                                 dataAppendPageSize,
                                 -1,
                                 MemoryTag.MMAP_UPDATE,

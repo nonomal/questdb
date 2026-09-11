@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,13 +24,27 @@
 
 package io.questdb.test.cutlass.line.tcp;
 
+import io.questdb.cairo.ColumnType;
+import io.questdb.cairo.arr.ArrayTypeDriver;
+import io.questdb.cairo.arr.DirectArray;
+import io.questdb.cairo.arr.NoopArrayWriteState;
+import io.questdb.cairo.vm.api.MemoryA;
 import io.questdb.cutlass.line.LineException;
 import io.questdb.cutlass.line.tcp.LineTcpParser;
 import io.questdb.cutlass.line.tcp.LineTcpParser.ParseResult;
 import io.questdb.cutlass.line.tcp.LineTcpParser.ProtoEntity;
-import io.questdb.std.*;
+import io.questdb.std.Chars;
+import io.questdb.std.Files;
+import io.questdb.std.MemoryTag;
+import io.questdb.std.Numbers;
+import io.questdb.std.Os;
+import io.questdb.std.Unsafe;
+import io.questdb.std.Vect;
+import io.questdb.std.datetime.CommonUtils;
+import io.questdb.std.str.DirectUtf8Sink;
 import io.questdb.std.str.StringSink;
 import io.questdb.std.str.Utf8s;
+import io.questdb.test.cairo.ArrayTest;
 import io.questdb.test.cutlass.line.udp.LineUdpLexerTest;
 import io.questdb.test.tools.TestUtils;
 import org.junit.Assert;
@@ -46,6 +60,54 @@ public class LineTcpParser2Test extends LineUdpLexerTest {
     @BeforeClass
     public static void init() {
         Os.init();
+    }
+
+    @Test
+    public void testArrayBinaryFormat() {
+        final long allocSize = 2048;
+        long mem = Unsafe.malloc(allocSize, MemoryTag.NATIVE_DEFAULT);
+        try (
+                DirectUtf8Sink sink = new DirectUtf8Sink(1024);
+                DirectArray array = new DirectArray(configuration)
+        ) {
+            String array1 = "[1.0,2.0]";
+            array.setType(ColumnType.encodeArrayType(ColumnType.DOUBLE, 1));
+            array.setDimLen(0, 2);
+            array.applyShape();
+            array.putDouble(0, 1);
+            array.putDouble(1, 2);
+            Unsafe.putByte(mem, LineTcpParser.ENTITY_TYPE_ARRAY);
+            long array1Addr = mem + 1;
+            long array1Size = ArrayTest.arrayViewToBinaryFormat(array, array1Addr);
+            long array2Addr = array1Addr + array1Size;
+
+            String array2 = "[[1.1,2.1,3.1],[4.1,5.1,6.1]]";
+            array.clear();
+            array.setType(ColumnType.encodeArrayType(ColumnType.DOUBLE, 2));
+            array.setDimLen(0, 2);
+            array.setDimLen(1, 3);
+            array.applyShape();
+            MemoryA memA = array.startMemoryA();
+            memA.putDouble(1.1);
+            memA.putDouble(2.1);
+            memA.putDouble(3.1);
+            memA.putDouble(4.1);
+            memA.putDouble(5.1);
+            memA.putDouble(6.1);
+            Unsafe.putByte(array2Addr, LineTcpParser.ENTITY_TYPE_ARRAY);
+            sink.clear();
+            long array2Size = ArrayTest.arrayViewToBinaryFormat(array, array2Addr + 1);
+
+            assertThat(
+                    "measurement,tag=value field=" + array1 + ",field2=" + array2 + ",field3=10 100000\n",
+                    "measurement,tag=value field==,field2==,field3=10 100000\n",
+                    1,
+                    new long[]{mem, array2Addr},
+                    new long[]{array1Size + 1, array2Size + 1}
+            );
+        } finally {
+            Unsafe.free(mem, allocSize, MemoryTag.NATIVE_DEFAULT);
+        }
     }
 
     @Override
@@ -240,7 +302,7 @@ public class LineTcpParser2Test extends LineUdpLexerTest {
     @Test
     public void testNonAscii() {
         assertThat(
-                "weather1 terület=\"europeI\",temperature=80.0,humidity=24.0,hőmérséklet=18.0,notes=5072.0,ветер=63.0 1465839830102351000--non ascii--\n",
+                "weather1 terület=\"europeI\",temperature=80.0,humidity=24.0,hőmérséklet=18.0,notes=5072.0,ветер=63.0 1465839830102351000\n",
                 "weather1 terület=\"europeI\",temperature=80.0,humidity=24.0,hőmérséklet=18.0,notes=5072.0,ветер=63.0 1465839830102351000\n"
         );
     }
@@ -248,12 +310,16 @@ public class LineTcpParser2Test extends LineUdpLexerTest {
     @Override
     public void testSkipLine() {
         assertThat(
-                "measurement,tag=value,tag2=value field=10000i,field2=\"str\" 100000\n" +
-                        "measurement,tag=value3,tag2=value2 field=,field2=\"ok\"\n" +
-                        "measurement,tag=value4,tag2=value4 field=200i,field2=\"super\"\n",
-                "measurement,tag=value,tag2=value field=10000i,field2=\"str\" 100000\n" +
-                        "measurement,tag=value3,tag2=value2 field=,field2=\"ok\"\n" +
-                        "measurement,tag=value4,tag2=value4 field=200i,field2=\"super\"\n"
+                """
+                        measurement,tag=value,tag2=value field=10000i,field2="str" 100000
+                        measurement,tag=value3,tag2=value2 field=,field2="ok"
+                        measurement,tag=value4,tag2=value4 field=200i,field2="super"
+                        """,
+                """
+                        measurement,tag=value,tag2=value field=10000i,field2="str" 100000
+                        measurement,tag=value3,tag2=value2 field=,field2="ok"
+                        measurement,tag=value4,tag2=value4 field=200i,field2="super"
+                        """
         );
     }
 
@@ -268,17 +334,17 @@ public class LineTcpParser2Test extends LineUdpLexerTest {
     @Test
     public void testSupportsUtf8Chars() {
         assertThat(
-                "लаблअца,символ=значение1 поле=\"значение2\",поле2=\"значение3\" 123--non ascii--\n",
+                "लаблअца,символ=значение1 поле=\"значение2\",поле2=\"значение3\" 123\n",
                 "लаблअца,символ=значение1 поле=\"значение2\",поле2=\"значение3\" 123\n"
         );
 
         assertThat(
-                "लаблअца,символ=значение2 161--non ascii--\n",
+                "लаблअца,символ=значение2 161\n",
                 "लаблअца,символ=значение2  161\n"
         );
 
         assertThat(
-                "table,tag=ok field=\"значение2 non ascii quoted\" 161--non ascii--\n",
+                "table,tag=ok field=\"значение2 non ascii quoted\" 161\n",
                 "table,tag=ok field=\"значение2 non ascii quoted\" 161\n"
         );
     }
@@ -303,6 +369,7 @@ public class LineTcpParser2Test extends LineUdpLexerTest {
         );
     }
 
+    @Override
     @Test
     public void testTrailingSpace() {
         assertThat("measurement,a=10\n", "measurement,a=10 \n"); // Trailing space
@@ -444,8 +511,10 @@ public class LineTcpParser2Test extends LineUdpLexerTest {
 
         // Shorter version
         assertThat(
-                "md_msgs ts_nsec=1634886503004129476i,pcap_msg=1111111i,raw_msg=\"__\"____\"___,\"_______\"___,\"___\"________,\",Length=11i,MsgSeqNum=111111i,MsgType=11i,first_dir=T 1634886503004129476\n" +
-                        "md_msgs ts_nsec=1634886503004129476i,pkt_size=1111i,pcap_file=\"_______________________________________________________\",raw_msg=\"__\"___________,\"________\"________\",Length=11i,first_dir=T 1634886503004129476\n",
+                """
+                        md_msgs ts_nsec=1634886503004129476i,pcap_msg=1111111i,raw_msg="__"____"___,"_______"___,"___"________,",Length=11i,MsgSeqNum=111111i,MsgType=11i,first_dir=T 1634886503004129476
+                        md_msgs ts_nsec=1634886503004129476i,pkt_size=1111i,pcap_file="_______________________________________________________",raw_msg="__"___________,"________"________",Length=11i,first_dir=T 1634886503004129476
+                        """,
                 "md_msgs ts_nsec=1634886503004129476i,pcap_msg=1111111i,raw_msg=\"__\\\"____\\\"___,\\\"_______\\\"___,\\\"___\\\"________,\",Length=11i,MsgSeqNum=111111i,MsgType=11i,first_dir=T 1634886503004129476\r\n" +
                         "md_msgs ts_nsec=1634886503004129476i,pkt_size=1111i,pcap_file=\"_______________________________________________________\",raw_msg=\"__\\\"___________,\\\"________\\\"________\",Length=11i,first_dir=T 1634886503004129476\r"
         );
@@ -476,6 +545,9 @@ public class LineTcpParser2Test extends LineUdpLexerTest {
                 case LineTcpParser.ENTITY_TYPE_LONG256:
                     sink.put(entity.getValue()).put('i');
                     break;
+                case LineTcpParser.ENTITY_TYPE_ARRAY:
+                    ArrayTypeDriver.arrayToJson(entity.getArray(), sink, NoopArrayWriteState.INSTANCE);
+                    break;
                 default:
                     Utf8s.utf8ToUtf16(entity.getValue().lo(), entity.getValue().hi(), sink);
                     break;
@@ -485,23 +557,19 @@ public class LineTcpParser2Test extends LineUdpLexerTest {
         if (lineTcpParser.hasTimestamp()) {
             sink.put(' ');
             Numbers.append(sink, lineTcpParser.getTimestamp());
-            if (lineTcpParser.getTimestampUnit() != LineTcpParser.ENTITY_UNIT_NONE) {
+            if (lineTcpParser.getTimestampUnit() != CommonUtils.TIMESTAMP_UNIT_UNSET) {
                 switch (lineTcpParser.getTimestampUnit()) {
-                    case LineTcpParser.ENTITY_UNIT_NANO:
+                    case CommonUtils.TIMESTAMP_UNIT_NANOS:
                         sink.put("n");
                         break;
-                    case LineTcpParser.ENTITY_UNIT_MICRO:
+                    case CommonUtils.TIMESTAMP_UNIT_MICROS:
                         sink.put("t");
                         break;
-                    case LineTcpParser.ENTITY_UNIT_MILLI:
+                    case CommonUtils.TIMESTAMP_UNIT_MILLIS:
                         sink.put("m");
                         break;
                 }
             }
-        }
-
-        if (lineTcpParser.hasNonAsciiChars()) {
-            sink.put("--non ascii--");
         }
         sink.put('\n');
     }
@@ -568,18 +636,41 @@ public class LineTcpParser2Test extends LineUdpLexerTest {
     }
 
     protected void assertThat(CharSequence expected, String lineStr, int start) throws LineException {
+        assertThat(expected, lineStr, start, null, null);
+    }
+
+    protected void assertThat(CharSequence expected, String lineStr, int start, long[] binaryValuesPtr, long[] binaryValuesSize) throws LineException {
         byte[] line = lineStr.getBytes(Files.UTF_8);
-        final int len = line.length;
+        int len = line.length;
+        long binaryValueSizes = 0;
+        if (binaryValuesSize != null) {
+            for (long l : binaryValuesSize) {
+                binaryValueSizes += l;
+            }
+        }
+
         final boolean endWithEOL = line[len - 1] == '\n' || line[len - 1] == '\r';
-        int fullLen = endWithEOL ? line.length : line.length + 1;
+        int fullLen = (int) (endWithEOL ? line.length + binaryValueSizes : line.length + 1 + binaryValueSizes);
         long memFull = Unsafe.malloc(fullLen, MemoryTag.NATIVE_DEFAULT);
         long mem = Unsafe.malloc(fullLen, MemoryTag.NATIVE_DEFAULT);
-        for (int j = 0; j < len; j++) {
-            Unsafe.getUnsafe().putByte(memFull + j, line[j]);
+        int binaryValueIndex = 0;
+        long memStart = memFull;
+        byte lastByte = 0;
+        for (byte b : line) {
+            Unsafe.putByte(memStart, b);
+            memStart++;
+            if (b == '=' && lastByte == '=') {
+                Assert.assertNotNull(binaryValuesSize);
+                Vect.memcpy(memStart, binaryValuesPtr[binaryValueIndex], binaryValuesSize[binaryValueIndex]);
+                memStart += binaryValuesSize[binaryValueIndex];
+                binaryValueIndex++;
+            }
+            lastByte = b;
         }
         if (!endWithEOL) {
-            Unsafe.getUnsafe().putByte(memFull + len, (byte) '\n');
+            Unsafe.putByte(memStart, (byte) '\n');
         }
+        len = (int) (len + binaryValueSizes);
 
         try {
             for (int i = start; i < len; i++) {

@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,10 +24,12 @@
 
 package io.questdb.cairo.vm.api;
 
+import io.questdb.cairo.arr.ArrayView;
 import io.questdb.std.BinarySequence;
 import io.questdb.std.FilesFacade;
 import io.questdb.std.Long256;
 import io.questdb.std.Long256Acceptor;
+import io.questdb.std.Decimals;
 import io.questdb.std.str.LPSZ;
 import io.questdb.std.str.Utf8Sequence;
 import org.jetbrains.annotations.NotNull;
@@ -35,6 +37,11 @@ import org.jetbrains.annotations.NotNull;
 public class NullMemory implements MemoryMAR, MemoryCARW {
 
     public static final NullMemory INSTANCE = new NullMemory();
+
+    @Override
+    public long addressHi() {
+        throw new UnsupportedOperationException();
+    }
 
     @Override
     public long addressOf(long offset) {
@@ -60,7 +67,7 @@ public class NullMemory implements MemoryMAR, MemoryCARW {
     }
 
     @Override
-    public int detachFdClose() {
+    public long detachFdClose() {
         return -1;
     }
 
@@ -70,6 +77,11 @@ public class NullMemory implements MemoryMAR, MemoryCARW {
 
     @Override
     public long getAppendOffset() {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public ArrayView getArray(long offset) {
         throw new UnsupportedOperationException();
     }
 
@@ -84,7 +96,7 @@ public class NullMemory implements MemoryMAR, MemoryCARW {
     }
 
     @Override
-    public int getFd() {
+    public long getFd() {
         throw new UnsupportedOperationException();
     }
 
@@ -134,11 +146,11 @@ public class NullMemory implements MemoryMAR, MemoryCARW {
     }
 
     @Override
-    public void of(FilesFacade ff, LPSZ name, long extendSegmentSize, int memoryTag, long opts) {
+    public void of(FilesFacade ff, LPSZ name, long extendSegmentSize, int memoryTag, int opts) {
     }
 
     @Override
-    public void of(FilesFacade ff, LPSZ name, long extendSegmentSize, long size, int memoryTag, long opts, int madviseOpts) {
+    public void of(FilesFacade ff, LPSZ name, long extendSegmentSize, long size, int memoryTag, int opts, int madviseOpts) {
         throw new UnsupportedOperationException();
     }
 
@@ -154,6 +166,11 @@ public class NullMemory implements MemoryMAR, MemoryCARW {
 
     @Override
     public int pageIndex(long offset) {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public void putArray(ArrayView array) {
         throw new UnsupportedOperationException();
     }
 
@@ -197,6 +214,14 @@ public class NullMemory implements MemoryMAR, MemoryCARW {
 
     @Override
     public void putChar(long offset, char value) {
+    }
+
+    @Override
+    public void putDecimal128(long offset, long high, long low) {
+    }
+
+    @Override
+    public void putDecimal256(long offset, long hh, long hl, long lh, long ll) {
     }
 
     @Override
@@ -351,7 +376,7 @@ public class NullMemory implements MemoryMAR, MemoryCARW {
     }
 
     @Override
-    public void switchTo(FilesFacade ff, int fd, long extendSegmentSize, long offset, boolean truncate, byte truncateMode) {
+    public void switchTo(FilesFacade ff, long fd, long extendSegmentSize, long offset, boolean truncate, byte truncateMode) {
     }
 
     @Override

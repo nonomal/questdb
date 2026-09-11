@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -175,11 +175,11 @@ public class HyperLogLogDenseRepresentation {
     }
 
     private byte get(int idx) {
-        return Unsafe.getUnsafe().getByte(ptr + HEADER_SIZE + idx);
+        return Unsafe.getByte(ptr + HEADER_SIZE + idx);
     }
 
     private void set(int idx, byte val) {
-        Unsafe.getUnsafe().putByte(ptr + HEADER_SIZE + idx, val);
+        Unsafe.putByte(ptr + HEADER_SIZE + idx, val);
     }
 
     static long calculateSizeInBytes(int precision) {

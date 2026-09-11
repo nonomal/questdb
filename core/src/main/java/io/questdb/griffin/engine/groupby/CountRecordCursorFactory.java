@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -28,8 +28,12 @@ import io.questdb.cairo.AbstractRecordCursorFactory;
 import io.questdb.cairo.ColumnType;
 import io.questdb.cairo.GenericRecordMetadata;
 import io.questdb.cairo.TableColumnMetadata;
+import io.questdb.cairo.sql.NoRandomAccessRecordCursor;
 import io.questdb.cairo.sql.Record;
-import io.questdb.cairo.sql.*;
+import io.questdb.cairo.sql.RecordCursor;
+import io.questdb.cairo.sql.RecordCursorFactory;
+import io.questdb.cairo.sql.RecordMetadata;
+import io.questdb.cairo.sql.SqlExecutionCircuitBreaker;
 import io.questdb.griffin.PlanSink;
 import io.questdb.griffin.SqlException;
 import io.questdb.griffin.SqlExecutionContext;
@@ -57,7 +61,7 @@ public class CountRecordCursorFactory extends AbstractRecordCursorFactory {
             cursor.of(baseCursor, executionContext.getCircuitBreaker());
             return cursor;
         } catch (Throwable th) {
-            baseCursor.close();
+            cursor.close();
             throw th;
         }
     }
@@ -117,17 +121,26 @@ public class CountRecordCursorFactory extends AbstractRecordCursorFactory {
         @Override
         public boolean hasNext() {
             if (hasNext) {
-                long size = baseCursor.size();
-                if (size > -1) {
-                    count = size;
-                } else {
-                    baseCursor.calculateSize(circuitBreaker, counter);
-                    count = counter.get();
+                circuitBreaker.statefulThrowExceptionIfTripped();
+                // recalculate state only when new query is executed and not after toTop() is called.
+                if (this.count == -1) {
+                    long size = baseCursor.size();
+                    if (size > -1) {
+                        count = size;
+                    } else {
+                        baseCursor.calculateSize(circuitBreaker, counter);
+                        count = counter.get();
+                    }
                 }
                 hasNext = false;
                 return true;
             }
             return false;
+        }
+
+        @Override
+        public long preComputedStateSize() {
+            return count;
         }
 
         @Override
@@ -139,14 +152,14 @@ public class CountRecordCursorFactory extends AbstractRecordCursorFactory {
         public void toTop() {
             baseCursor.toTop();
             hasNext = true;
-            count = 0;
-            counter.clear();
         }
 
         private void of(RecordCursor baseCursor, SqlExecutionCircuitBreaker circuitBreaker) {
             this.baseCursor = baseCursor;
             this.circuitBreaker = circuitBreaker;
-            toTop();
+            this.count = -1;
+            this.hasNext = true;
+            this.counter.clear();
         }
 
         private class CountRecord implements Record {

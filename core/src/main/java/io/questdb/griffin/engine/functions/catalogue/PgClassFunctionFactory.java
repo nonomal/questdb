@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,15 +24,33 @@
 
 package io.questdb.griffin.engine.functions.catalogue;
 
-import io.questdb.cairo.*;
+import io.questdb.cairo.AbstractRecordCursorFactory;
+import io.questdb.cairo.CairoConfiguration;
+import io.questdb.cairo.CairoEngine;
+import io.questdb.cairo.CairoException;
+import io.questdb.cairo.ColumnType;
+import io.questdb.cairo.GenericRecordMetadata;
+import io.questdb.cairo.TableColumnMetadata;
+import io.questdb.cairo.TableToken;
+import io.questdb.cairo.TableUtils;
+import io.questdb.cairo.sql.DelegatingRecord;
+import io.questdb.cairo.sql.Function;
+import io.questdb.cairo.sql.NoRandomAccessRecordCursor;
 import io.questdb.cairo.sql.Record;
-import io.questdb.cairo.sql.*;
+import io.questdb.cairo.sql.RecordCursor;
+import io.questdb.cairo.sql.RecordMetadata;
+import io.questdb.cairo.sql.SqlExecutionCircuitBreaker;
 import io.questdb.cutlass.pgwire.PGOids;
 import io.questdb.griffin.FunctionFactory;
 import io.questdb.griffin.PlanSink;
 import io.questdb.griffin.SqlExecutionContext;
 import io.questdb.griffin.engine.functions.CursorFunction;
-import io.questdb.std.*;
+import io.questdb.std.IntList;
+import io.questdb.std.MemoryTag;
+import io.questdb.std.Misc;
+import io.questdb.std.ObjHashSet;
+import io.questdb.std.ObjList;
+import io.questdb.std.Unsafe;
 import io.questdb.std.str.Path;
 
 import static io.questdb.cutlass.pgwire.PGOids.PG_CATALOG_OID;
@@ -104,9 +122,7 @@ public class PgClassFunctionFactory implements FunctionFactory {
 
     @Override
     public Function newInstance(int position, ObjList<Function> args, IntList argPositions, CairoConfiguration configuration, SqlExecutionContext sqlExecutionContext) {
-        return new CursorFunction(
-                new PgClassCursorFactory(METADATA)
-        ) {
+        return new CursorFunction(new PgClassCursorFactory(METADATA)) {
             @Override
             public boolean isRuntimeConstant() {
                 return true;
@@ -116,7 +132,7 @@ public class PgClassFunctionFactory implements FunctionFactory {
 
     private static class PgClassCursorFactory extends AbstractRecordCursorFactory {
         private final PgClassRecordCursor cursor;
-        private final Path path;
+        private Path path;
         private long tempMem;
 
         public PgClassCursorFactory(RecordMetadata metadata) {
@@ -133,7 +149,7 @@ public class PgClassFunctionFactory implements FunctionFactory {
 
         @Override
         public RecordCursor getCursor(SqlExecutionContext executionContext) {
-            cursor.of(executionContext.getCairoEngine());
+            cursor.of(executionContext.getCairoEngine(), executionContext.getCircuitBreaker());
             cursor.toTop();
             return cursor;
         }
@@ -150,8 +166,21 @@ public class PgClassFunctionFactory implements FunctionFactory {
 
         @Override
         protected void _close() {
-            Misc.free(path);
-            tempMem = Unsafe.free(tempMem, Integer.BYTES, MemoryTag.NATIVE_FUNC_RSS);
+            final Path path = this.path;
+            this.path = null;
+            final long tempMem = this.tempMem;
+            this.tempMem = 0;
+            Throwable failure = Misc.freeBestEffort(null, path);
+            try {
+                Unsafe.free(tempMem, Integer.BYTES, MemoryTag.NATIVE_FUNC_RSS);
+            } catch (Throwable th) {
+                if (failure == null) {
+                    failure = th;
+                } else if (failure != th) {
+                    failure.addSuppressed(th);
+                }
+            }
+            CairoException.rethrowCleanupFailure(failure);
         }
     }
 
@@ -161,10 +190,12 @@ public class PgClassFunctionFactory implements FunctionFactory {
         private final DelegatingRecord record = new DelegatingRecord();
         private final PgClassRecordCursor.StaticReadingRecord staticReadingRecord = new PgClassRecordCursor.StaticReadingRecord();
         private final ObjHashSet<TableToken> tableBucket = new ObjHashSet<>();
+        private SqlExecutionCircuitBreaker circuitBreaker;
         private CairoEngine engine;
         private int fixedRelPos = -1;
         private int tableIndex = -1;
         private String tableName;
+        private TableToken tableToken;
 
         public PgClassRecordCursor() {
             this.record.of(staticReadingRecord);
@@ -203,6 +234,7 @@ public class PgClassFunctionFactory implements FunctionFactory {
 
         @Override
         public boolean hasNext() {
+            circuitBreaker.statefulThrowExceptionIfTripped();
             if (++fixedRelPos < fixedClassLen) {
                 return true;
             }
@@ -216,14 +248,20 @@ public class PgClassFunctionFactory implements FunctionFactory {
             if (tableIndex == tableBucket.size()) {
                 return false;
             }
-            TableToken token = tableBucket.get(tableIndex++);
-            tableName = token.getTableName();
-            intValues[INDEX_OID] = token.getTableId();
+            tableToken = tableBucket.get(tableIndex++);
+            tableName = tableToken.getTableName();
+            intValues[INDEX_OID] = tableToken.getTableId();
             return true;
         }
 
-        public void of(CairoEngine engine) {
+        public void of(CairoEngine engine, SqlExecutionCircuitBreaker circuitBreaker) {
             this.engine = engine;
+            this.circuitBreaker = circuitBreaker;
+        }
+
+        @Override
+        public long preComputedStateSize() {
+            return 0;
         }
 
         @Override
@@ -253,6 +291,11 @@ public class PgClassFunctionFactory implements FunctionFactory {
                         return 'p';
                     case 16:
                         // relkind
+                        if (tableToken.isLiveView() || tableToken.isView()) {
+                            return 'v';
+                        } else if (tableToken.isMatView()) {
+                            return 'm';
+                        }
                         return 'r';
                     default:
                         // relreplident
@@ -292,20 +335,12 @@ public class PgClassFunctionFactory implements FunctionFactory {
 
             @Override
             public CharSequence getStrB(int col) {
-                if (col == INDEX_RELNAME) {
-                    // relname
-                    return tableName;
-                }
-                return null;
+                return getStrA(col);
             }
 
             @Override
             public int getStrLen(int col) {
-                if (col == INDEX_RELNAME) {
-                    // relname
-                    return tableName.length();
-                }
-                return -1;
+                return TableUtils.lengthOf(getStrA(col));
             }
         }
 
@@ -367,11 +402,7 @@ public class PgClassFunctionFactory implements FunctionFactory {
 
             @Override
             public int getStrLen(int col) {
-                if (col == INDEX_RELNAME) {
-                    // relname
-                    return relNames[fixedRelPos].length();
-                }
-                return -1;
+                return TableUtils.lengthOf(getStrA(col));
             }
         }
     }

@@ -39,7 +39,6 @@ endif (APPLE)
 set(
         VCL_FILES
         src/main/c/share/vec_agg.cpp
-        src/main/c/share/vec_ts_agg.cpp
         src/main/c/share/ooo_dispatch.cpp
         src/main/c/share/geohash_dispatch.cpp
 )
@@ -51,7 +50,6 @@ set(
         src/main/c/share/vec_agg_vanilla.cpp
         src/main/c/share/vec_agg.cpp
         src/main/c/share/vec_int_key_agg.cpp
-        src/main/c/share/vec_ts_agg.cpp
         src/main/c/share/ooo_dispatch.cpp
         src/main/c/share/geohash_dispatch.cpp
 )
@@ -67,9 +65,9 @@ set(
         src/main/c/share/vec_agg_vanilla.h
         src/main/c/share/util.cpp
         src/main/c/share/ooo.cpp
-        src/main/c/share/txn_board.cpp
         src/main/c/share/bitmap_index_utils.h
         src/main/c/share/bitmap_index_utils.cpp
+        src/main/c/share/bp_bitpack.cpp
         src/main/c/share/geohash.cpp
         src/main/c/share/jit/compiler.h
         src/main/c/share/jit/compiler.cpp
@@ -80,10 +78,15 @@ set(
         src/main/c/share/byte_sink.h
         src/main/c/share/converters.cpp
         src/main/c/share/converters.h
+        src/main/c/share/json.cpp
+        src/main/c/share/fsst_jni.cpp
 )
 
 # JNI includes
 include_directories($ENV{JAVA_HOME}/include/)
+
+# Current directory includes and build directory includes
+include_directories(${CMAKE_CURRENT_BINARY_DIR} ${CMAKE_SOURCE_DIR})
 
 if (OS_DARWIN)
     include_directories($ENV{JAVA_HOME}/include/darwin/)
@@ -144,6 +147,7 @@ else ()
             SOURCE_FILES ${SOURCE_FILES}
             src/main/c/share/files.c
             src/main/c/share/os.c
+            src/main/c/share/ooo.h
     )
 endif ()
 
@@ -163,15 +167,11 @@ include(FetchContent)
 FetchContent_Declare(
         asmjit
         GIT_REPOSITORY https://github.com/questdb/asmjit.git
-        GIT_TAG 4ec760a3d1f69e32ba460ecd2513f29b8428700b # Fixed typos in documentation
+        GIT_TAG 0054ff4bede1acb92aa0192c7ce0fa5715a5f469 # fix(jit_allocator): bound BitVectorRangeIterator range_start to _end
 )
 
-FetchContent_GetProperties(asmjit)
-if (NOT asmjit_POPULATED)
-    FetchContent_Populate(asmjit)
-endif ()
-include("${asmjit_SOURCE_DIR}/CMakeLists.txt")
-include_directories(${asmjit_SOURCE_DIR}/src SYSTEM)
+FetchContent_MakeAvailable(asmjit)
+include_directories(${asmjit_SOURCE_DIR} SYSTEM)
 add_compile_definitions(ASMJIT_NO_STDCXX)
 
 # use this is for debug purposes
@@ -183,15 +183,10 @@ endif ()
 
 if (JIT_TEST)
     include_directories(${asmjit_SOURCE_DIR}/test SYSTEM)
+    include_directories(${asmjit_SOURCE_DIR}/asmjit-testing/commons SYSTEM)
     add_executable(jittests src/test/c/jittests/test_app.cpp)
     target_link_libraries(jittests questdb)
 endif ()
-
-#zlib
-
-set(ZLIB_SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/src/main/c/share/zlib-1.2.8)
-
-include(${ZLIB_SOURCE_DIR}/CMakeLists.txt)
 
 #liburing
 
@@ -199,8 +194,11 @@ if (OS_LINUX)
     MESSAGE("Downloading io_uring")
     ExternalProject_Add(
             liburing_git
-            GIT_REPOSITORY http://github.com/axboe/liburing.git
+            GIT_REPOSITORY https://github.com/axboe/liburing.git
             GIT_TAG liburing-2.2
+            # The tag pin allows a shallow clone (asmjit above pins a raw SHA, which
+            # CMake cannot clone shallowly); CI never needs liburing's history.
+            GIT_SHALLOW TRUE
             BUILD_IN_SOURCE 1
             BUILD_BYPRODUCTS "<SOURCE_DIR>/src/liburing.a"
             BUILD_COMMAND make "CC=${CMAKE_C_COMPILER}" "CXX=${CMAKE_CXX_COMPILER}" "AR=${CMAKE_AR}" "RANLIB=${CMAKE_RANLIB}"
@@ -216,8 +214,8 @@ if (OS_LINUX)
     target_link_libraries(liburing INTERFACE ${SOURCE_DIR}/src/liburing.a)
 endif ()
 
-# ZLIB_SRCS is defined in Zlib Cmake config
-add_library(questdb SHARED ${SOURCE_FILES} ${ZLIB_SRCS} ${ASMJIT_SRC})
+add_library(questdb SHARED ${SOURCE_FILES})
+target_link_libraries(questdb asmjit::asmjit)
 
 set(COMMON_OPTIONS "-Wno-gnu-anonymous-struct;-Wno-nested-anon-types;-Wno-unused-parameter;-fPIC;-fno-rtti;-fno-exceptions")
 
@@ -226,6 +224,13 @@ set(RELEASE_OPTIONS "-O3")
 
 list(APPEND DEBUG_OPTIONS "${ASMJIT_CFLAGS};${COMMON_OPTIONS}")
 list(APPEND RELEASE_OPTIONS "${ASMJIT_CFLAGS};${COMMON_OPTIONS}")
+
+#zlib
+
+set(SKIP_INSTALL_ALL OFF CACHE BOOL "Disable install" FORCE)
+set(ZLIB_BUILD_EXAMPLES OFF CACHE BOOL "Disable examples" FORCE)
+add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/src/main/c/share/zlib)
+target_link_libraries(questdb zlibstatic)
 
 if (OS_LINUX)
     target_link_libraries(questdb liburing)
@@ -329,14 +334,69 @@ else ()
     )
 endif (ARCH_AARCH64)
 
-if (OS_WINDOWS)
-    target_link_libraries(questdb wsock32 ws2_32 secur32 shlwapi psapi -s -static-libgcc)
-    target_compile_options(questdb PRIVATE -fno-threadsafe-statics)
-elseif (OS_DARWIN)
-    target_link_libraries(questdb -nostdlib++ -dead_strip -lc++)
+#cwida/fsst — bulk varchar codec, vendored as submodule.
+# Pinned at e638d4c (2026-04-07)
+set(FSST_DIR ${CMAKE_CURRENT_SOURCE_DIR}/src/main/c/share/fsst)
+add_library(questdb-fsst STATIC
+        ${FSST_DIR}/libfsst.cpp
+        ${FSST_DIR}/fsst_avx512.cpp
+)
+target_include_directories(questdb-fsst PUBLIC ${FSST_DIR})
+set_target_properties(questdb-fsst PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_compile_options(questdb-fsst PRIVATE
+        $<$<CONFIG:RELEASE>:-O3 -DNDEBUG>
+        $<$<CONFIG:DEBUG>:-g -O0>
+)
+
+if (ARCH_AARCH64)
+    set_source_files_properties(${FSST_DIR}/fsst_avx512.cpp PROPERTIES
+            COMPILE_OPTIONS "-O1")
+elseif (OS_WINDOWS)
+    set_source_files_properties(${FSST_DIR}/fsst_avx512.cpp PROPERTIES
+            COMPILE_OPTIONS "-mavx2;-mfma;-mavx512f;-mavx512vl;-mavx512bw;-mavx512dq;-O1;-include;intrin.h")
 else ()
-    target_compile_options(questdb PRIVATE -fno-threadsafe-statics -ffunction-sections -fdata-sections)
-    target_link_libraries(questdb rt -Wl,--gc-sections -Wl,--exclude-libs=ALL -static-libgcc)
+    set_source_files_properties(${FSST_DIR}/fsst_avx512.cpp PROPERTIES
+            COMPILE_OPTIONS "-mavx2;-mfma;-mavx512f;-mavx512vl;-mavx512bw;-mavx512dq;-O1")
 endif ()
 
+#simdjson
+set(SIMDJSON_ENABLE_THREADS OFF CACHE BOOL "Link with thread support" FORCE)
+include(${CMAKE_CURRENT_SOURCE_DIR}/src/main/c/share/simdjson-cmake/CMakeLists.txt)
+
+target_link_libraries(questdb questdb-fsst)
+target_include_directories(questdb PRIVATE ${FSST_DIR})
+
+if (OS_WINDOWS)
+    target_link_libraries(questdb wsock32 ws2_32 secur32 shlwapi psapi -s -static-libgcc -static-libstdc++ _simdjson)
+    target_compile_options(questdb PRIVATE -fno-threadsafe-statics)
+elseif (OS_DARWIN)
+    target_link_libraries(questdb -nostdlib++ -dead_strip -lc++ _simdjson)
+else ()
+    target_compile_options(questdb PRIVATE -fno-threadsafe-statics -ffunction-sections -fdata-sections)
+    target_link_libraries(questdb rt -Wl,--gc-sections -Wl,--exclude-libs=ALL -static-libgcc _simdjson)
+endif ()
+
+# create output directory in case it does not exist, e.g. after mvn clean
+add_custom_command(TARGET _simdjson PRE_LINK
+        COMMAND ${CMAKE_COMMAND} -E make_directory ${OUTPUT}
+)
+
+# Define the secondary output directory
+
+set(SECONDARY_OUTPUT ${CMAKE_CURRENT_SOURCE_DIR}/questdb/bin-local/)
+set(SECONDARY_OUTPUT2 ${CMAKE_CURRENT_SOURCE_DIR}/target/classes/io/questdb/bin-local/)
+
+add_custom_command(TARGET questdb POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory ${SECONDARY_OUTPUT}
+        COMMAND ${CMAKE_COMMAND} -E copy_directory ${OUTPUT} ${SECONDARY_OUTPUT}
+        COMMENT "Copying all build outputs from ${OUTPUT} to ${SECONDARY_OUTPUT}"
+)
+
+add_custom_command(TARGET questdb POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory ${SECONDARY_OUTPUT2}
+        COMMAND ${CMAKE_COMMAND} -E copy_directory ${OUTPUT} ${SECONDARY_OUTPUT2}
+        COMMENT "Copying all build outputs from ${OUTPUT} to ${SECONDARY_OUTPUT2}"
+)
+
+#jemalloc
 include(${CMAKE_CURRENT_SOURCE_DIR}/src/main/c/share/jemalloc-cmake/CMakeLists.txt)

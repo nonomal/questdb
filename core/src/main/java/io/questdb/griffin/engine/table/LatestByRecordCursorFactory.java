@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,15 +24,30 @@
 
 package io.questdb.griffin.engine.table;
 
-import io.questdb.cairo.*;
-import io.questdb.cairo.map.*;
+import io.questdb.cairo.AbstractRecordCursorFactory;
+import io.questdb.cairo.ArrayColumnTypes;
+import io.questdb.cairo.CairoConfiguration;
+import io.questdb.cairo.CairoException;
+import io.questdb.cairo.ColumnType;
+import io.questdb.cairo.ColumnTypes;
+import io.questdb.cairo.RecordSink;
+import io.questdb.cairo.map.Map;
+import io.questdb.cairo.map.MapFactory;
+import io.questdb.cairo.map.MapKey;
+import io.questdb.cairo.map.MapRecord;
+import io.questdb.cairo.map.MapValue;
+import io.questdb.cairo.sql.NoRandomAccessRecordCursor;
 import io.questdb.cairo.sql.Record;
-import io.questdb.cairo.sql.*;
+import io.questdb.cairo.sql.RecordCursor;
+import io.questdb.cairo.sql.RecordCursorFactory;
+import io.questdb.cairo.sql.SqlExecutionCircuitBreaker;
+import io.questdb.cairo.sql.SymbolTable;
 import io.questdb.griffin.PlanSink;
 import io.questdb.griffin.SqlException;
 import io.questdb.griffin.SqlExecutionContext;
 import io.questdb.std.DirectLongList;
 import io.questdb.std.MemoryTag;
+import io.questdb.std.MemoryTracker;
 import io.questdb.std.Misc;
 import org.jetbrains.annotations.NotNull;
 
@@ -44,11 +59,11 @@ public class LatestByRecordCursorFactory extends AbstractRecordCursorFactory {
     private static final int RECORD_INDEX_VALUE_IDX = 0;
     private static final int TIMESTAMP_VALUE_IDX = 1;
 
-    private final RecordCursorFactory base;
-    private final LatestByRecordCursor cursor;
     private final RecordSink recordSink;
-    private final DirectLongList rowIndexes;
     private final long rowIndexesInitialCapacity;
+    private RecordCursorFactory base;
+    private LatestByRecordCursor cursor;
+    private DirectLongList rowIndexes;
 
     public LatestByRecordCursorFactory(
             @NotNull CairoConfiguration configuration,
@@ -61,13 +76,24 @@ public class LatestByRecordCursorFactory extends AbstractRecordCursorFactory {
         assert !base.recordCursorSupportsRandomAccess();
         this.base = base;
         this.recordSink = recordSink;
-        ArrayColumnTypes mapValueTypes = new ArrayColumnTypes();
-        mapValueTypes.add(RECORD_INDEX_VALUE_IDX, ColumnType.LONG);
-        mapValueTypes.add(TIMESTAMP_VALUE_IDX, ColumnType.TIMESTAMP);
-        Map latestByMap = MapFactory.createOrderedMap(configuration, columnTypes, mapValueTypes);
-        this.cursor = new LatestByRecordCursor(latestByMap, timestampIndex);
-        this.rowIndexesInitialCapacity = configuration.getSqlLatestByRowCount();
-        this.rowIndexes = new DirectLongList(rowIndexesInitialCapacity, MemoryTag.NATIVE_LATEST_BY_LONG_LIST);
+        Map latestByMap = null;
+        try {
+            ArrayColumnTypes mapValueTypes = new ArrayColumnTypes();
+            mapValueTypes.add(RECORD_INDEX_VALUE_IDX, ColumnType.LONG);
+            mapValueTypes.add(TIMESTAMP_VALUE_IDX, base.getMetadata().getColumnType(timestampIndex));
+            // openOnInit=false: the cursor binds the per-query tracker and reopens the map in of(),
+            // so the first allocation is charged to the per-query counter.
+            latestByMap = MapFactory.createOrderedMap(configuration, columnTypes, mapValueTypes, false);
+            this.cursor = new LatestByRecordCursor(latestByMap, timestampIndex);
+            latestByMap = null; // cursor owns the map now
+            this.rowIndexesInitialCapacity = configuration.getSqlLatestByRowCount();
+            // keepClosed=true: rowIndexes is allocated lazily on the first reopen() under the bound tracker.
+            this.rowIndexes = new DirectLongList(rowIndexesInitialCapacity, MemoryTag.NATIVE_LATEST_BY_LONG_LIST, true);
+        } catch (Throwable th) {
+            Misc.free(latestByMap);
+            close();
+            throw th;
+        }
     }
 
     @Override
@@ -79,10 +105,10 @@ public class LatestByRecordCursorFactory extends AbstractRecordCursorFactory {
     public RecordCursor getCursor(SqlExecutionContext executionContext) throws SqlException {
         final RecordCursor baseCursor = base.getCursor(executionContext);
         try {
-            cursor.of(baseCursor, recordSink, rowIndexes, rowIndexesInitialCapacity, executionContext.getCircuitBreaker());
+            cursor.of(baseCursor, recordSink, rowIndexes, rowIndexesInitialCapacity, executionContext.getCircuitBreaker(), executionContext.getMemoryTracker());
             return cursor;
         } catch (Throwable th) {
-            baseCursor.close();
+            cursor.close();
             throw th;
         }
     }
@@ -110,9 +136,16 @@ public class LatestByRecordCursorFactory extends AbstractRecordCursorFactory {
 
     @Override
     protected void _close() {
-        Misc.free(rowIndexes);
-        Misc.free(cursor);
-        Misc.free(base);
+        final RecordCursorFactory base = this.base;
+        this.base = null;
+        final LatestByRecordCursor cursor = this.cursor;
+        this.cursor = null;
+        final DirectLongList rowIndexes = this.rowIndexes;
+        this.rowIndexes = null;
+        Throwable failure = Misc.freeBestEffort(null, rowIndexes);
+        failure = Misc.freeBestEffort(failure, cursor);
+        failure = Misc.freeBestEffort(failure, base);
+        CairoException.rethrowCleanupFailure(failure);
     }
 
     private static class LatestByRecordCursor implements NoRandomAccessRecordCursor {
@@ -141,14 +174,10 @@ public class LatestByRecordCursorFactory extends AbstractRecordCursorFactory {
         public void close() {
             if (isOpen) {
                 isOpen = false;
-                Misc.free(baseCursor);
-                if (rowIndexes != null) {
-                    rowIndexes.clear();
-                    if (rowIndexes.getCapacity() > rowIndexesCapacityThreshold) {
-                        // This call will shrink down the underlying array
-                        rowIndexes.setCapacity(rowIndexesCapacityThreshold);
-                    }
-                }
+                baseCursor = Misc.free(baseCursor);
+                // Free rowIndexes (and the map) here, under the per-query tracker bound in of(),
+                // so the next cursor reallocates from zero against its own tracker.
+                Misc.free(rowIndexes);
                 latestByMap.close();
             }
         }
@@ -196,22 +225,31 @@ public class LatestByRecordCursorFactory extends AbstractRecordCursorFactory {
                 RecordSink recordSink,
                 DirectLongList rowIndexes,
                 long rowIndexesCapacityThreshold,
-                SqlExecutionCircuitBreaker circuitBreaker
+                SqlExecutionCircuitBreaker circuitBreaker,
+                MemoryTracker memoryTracker
         ) {
-            if (!isOpen) {
-                isOpen = true;
-                latestByMap.reopen();
-            }
-
             this.baseCursor = baseCursor;
             baseRecord = baseCursor.getRecord();
+            isOpen = true;
+            // Bind the per-query tracker before (re)allocating either the map (dominant allocator,
+            // one entry per distinct key) or the rowIndexes list, so both are charged to the
+            // per-query counter and freed against it at close.
+            latestByMap.setMemoryTracker(memoryTracker);
+            latestByMap.reopen();
             this.recordSink = recordSink;
             this.rowIndexes = rowIndexes;
+            rowIndexes.setMemoryTracker(memoryTracker);
+            rowIndexes.reopen();
             this.circuitBreaker = circuitBreaker;
-            index = 0;
-            rowIndexesPos = 0;
             this.rowIndexesCapacityThreshold = rowIndexesCapacityThreshold;
+            rowIndexesPos = 0;
+            index = 0;
             isMapBuilt = false;
+        }
+
+        @Override
+        public long preComputedStateSize() {
+            return RecordCursor.fromBool(isMapBuilt) + baseCursor.preComputedStateSize();
         }
 
         @Override

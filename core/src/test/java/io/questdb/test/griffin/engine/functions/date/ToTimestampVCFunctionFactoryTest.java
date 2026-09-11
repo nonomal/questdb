@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,10 +24,10 @@
 
 package io.questdb.test.griffin.engine.functions.date;
 
+import io.questdb.cairo.ColumnType;
 import io.questdb.cairo.sql.Function;
 import io.questdb.griffin.FunctionFactory;
 import io.questdb.griffin.SqlException;
-import io.questdb.test.griffin.engine.AbstractFunctionFactoryTest;
 import io.questdb.griffin.engine.functions.columns.TimestampColumn;
 import io.questdb.griffin.engine.functions.constants.StrConstant;
 import io.questdb.griffin.engine.functions.constants.TimestampConstant;
@@ -35,10 +35,17 @@ import io.questdb.griffin.engine.functions.date.ToTimestampVCFunctionFactory;
 import io.questdb.std.IntList;
 import io.questdb.std.Numbers;
 import io.questdb.std.ObjList;
+import io.questdb.test.griffin.engine.AbstractFunctionFactoryTest;
 import org.junit.Assert;
 import org.junit.Test;
 
 public class ToTimestampVCFunctionFactoryTest extends AbstractFunctionFactoryTest {
+    @Test
+    public void testNanosField() throws SqlException {
+        // The "N+" specifier must accept nanoseconds, but the result type must still be `TIMESTAMP` (micros)
+        call(".123456789", ".N+").andAssertTimestamp(123456);
+    }
+
     @Test
     public void testNonCompliantDate() throws SqlException {
         call("2015 03/12 abc", "yyyy dd/MM").andAssertTimestamp(Numbers.LONG_NULL);
@@ -73,7 +80,7 @@ public class ToTimestampVCFunctionFactoryTest extends AbstractFunctionFactoryTes
     @Test
     public void test_whenInputStringIsNotConstant_functionDoesntCacheValue() throws SqlException {
         ObjList<Function> funcs = new ObjList<>();
-        funcs.add(new TimestampColumn(1));
+        funcs.add(TimestampColumn.newInstance(1, ColumnType.TIMESTAMP_MICRO));
         funcs.add(new StrConstant("yyyy dd/MM"));
 
         Function f = new ToTimestampVCFunctionFactory().newInstance(0, funcs, new IntList(), configuration, sqlExecutionContext);

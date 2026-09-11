@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -27,20 +27,31 @@ package io.questdb.std.str;
 import io.questdb.cairo.CairoException;
 import io.questdb.cairo.TableUtils;
 import io.questdb.griffin.engine.functions.str.TrimType;
-import io.questdb.std.ThreadLocal;
-import io.questdb.std.*;
+import io.questdb.std.Chars;
+import io.questdb.std.Numbers;
+import io.questdb.std.SwarUtils;
+import io.questdb.std.CarrierLocal;
+import io.questdb.std.Unsafe;
+import io.questdb.std.Utf8StringIntHashMap;
+import io.questdb.std.Utf8StringObjHashMap;
+import io.questdb.std.Vect;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
+import java.lang.ref.Reference;
+
 import static io.questdb.cairo.VarcharTypeDriver.VARCHAR_INLINED_PREFIX_BYTES;
 import static io.questdb.cairo.VarcharTypeDriver.VARCHAR_INLINED_PREFIX_MASK;
+import static io.questdb.std.Misc.getThreadLocalUtf8Sink;
 
 /**
  * UTF-8 specific variant of the {@link Chars} utility.
  */
 public final class Utf8s {
-
-    private final static io.questdb.std.ThreadLocal<StringSink> tlSink = new ThreadLocal<>(StringSink::new);
+    private static final long ASCII_MASK = 0x8080808080808080L;
+    private static final long DOT_WORD = SwarUtils.broadcast((byte) '.');
+    private static final char[] HEX_CHARS = "0123456789ABCDEF".toCharArray();
+    private static final CarrierLocal<StringSink> tlSink = new CarrierLocal<>(StringSink::new);
 
     private Utf8s() {
     }
@@ -54,6 +65,10 @@ public final class Utf8s {
      * sequences that contain characters outside the Basic Multilingual Plane (BMP).
      * <br>
      * This method assume that the sequences are valid UTF-8 sequences and does not perform any validation.
+     * <br>
+     * This method is optimized for VARCHAR column values which store a 6-byte prefix in the auxiliary vector.
+     * When comparing such values, it first compares the prefixes (from aux memory) and only accesses the
+     * data vector if the prefixes are equal and the strings are longer than 6 bytes.
      *
      * @param l left sequence
      * @param r right sequence
@@ -63,25 +78,44 @@ public final class Utf8s {
         if (l == r) {
             return 0;
         }
-
         if (l == null) {
             return -1;
         }
-
         if (r == null) {
             return 1;
         }
 
+        final long lPrefix = l.zeroPaddedSixPrefix();
+        final long rPrefix = r.zeroPaddedSixPrefix();
+        if (lPrefix != rPrefix) {
+            // Compare prefixes as big-endian for correct lexicographic order.
+            // Since the prefix is stored in little-endian, we reverse bytes first.
+            return Long.compareUnsigned(Long.reverseBytes(lPrefix), Long.reverseBytes(rPrefix));
+        }
+
+        // Prefixes are equal - compare remaining bytes from data vector.
         final int ll = l.size();
         final int rl = r.size();
         final int min = Math.min(ll, rl);
 
-        for (int i = 0; i < min; i++) {
+        // Compare 8 bytes at a time.
+        int i = VARCHAR_INLINED_PREFIX_BYTES;
+        for (; i <= min - Long.BYTES; i += Long.BYTES) {
+            final long lLong = l.longAt(i);
+            final long rLong = r.longAt(i);
+            if (lLong != rLong) {
+                return Long.compareUnsigned(Long.reverseBytes(lLong), Long.reverseBytes(rLong));
+            }
+        }
+
+        // Compare remaining bytes.
+        for (; i < min; i++) {
             final int k = Numbers.compareUnsigned(l.byteAt(i), r.byteAt(i));
             if (k != 0) {
                 return k;
             }
         }
+
         return Integer.compare(ll, rl);
     }
 
@@ -98,6 +132,11 @@ public final class Utf8s {
         return indexOfLowerCaseAscii(sequence, 0, sequence.size(), asciiTerm) != -1;
     }
 
+    /**
+     * Converts a direct UTF8 sequence to UTF16, returning an ASCII view when possible.
+     *
+     * @throws CairoException if the sequence contains malformed UTF8
+     */
     public static CharSequence directUtf8ToUtf16(
             @NotNull DirectUtf8Sequence utf8CharSeq,
             @NotNull MutableUtf16Sink tempSink
@@ -121,6 +160,81 @@ public final class Utf8s {
             sink.put((byte) (128 | c & 63));
         }
         return i;
+    }
+
+    /**
+     * Encodes the given UTF-16 string or its fragment to UTF-8 and appends it
+     * to this sink.
+     *
+     * @param sink     destination sink
+     * @param cs       UTF-16 source string
+     * @param maxBytes maximum number of bytes to write to sink; the limit is applied
+     *                 with character boundaries, so the actual number of written bytes
+     *                 may be lower than this value
+     * @return true if the string was written fully; false otherwise
+     */
+    public static boolean encodeUtf16WithLimit(@NotNull Utf8Sink sink, @NotNull CharSequence cs, int maxBytes) {
+        final int len = cs.length();
+        int bytes = 0;
+        int i = 0;
+        while (i < len) {
+            char c = cs.charAt(i++);
+            if (c < 128) {
+                if (bytes + 1 > maxBytes) {
+                    return false;
+                }
+                sink.putAscii(c);
+                bytes++;
+            } else if (c < 2048) {
+                if (bytes + 2 > maxBytes) {
+                    return false;
+                }
+                sink.put((byte) (192 | c >> 6));
+                sink.put((byte) (128 | c & 63));
+                bytes += 2;
+            } else if (Character.isSurrogate(c)) {
+                boolean valid = Character.isHighSurrogate(c);
+                int dword = c;
+                if (valid) {
+                    if (len - i < 1) {
+                        valid = false;
+                    } else {
+                        char c2 = cs.charAt(i++);
+                        if (Character.isLowSurrogate(c2)) {
+                            dword = Character.toCodePoint(c, c2);
+                        } else {
+                            valid = false;
+                        }
+                    }
+                }
+
+                if (!valid) {
+                    if (bytes + 1 > maxBytes) {
+                        return false;
+                    }
+                    sink.putAscii('?');
+                    bytes++;
+                } else {
+                    if (bytes + 4 > maxBytes) {
+                        return false;
+                    }
+                    sink.put((byte) (240 | dword >> 18));
+                    sink.put((byte) (128 | dword >> 12 & 63));
+                    sink.put((byte) (128 | dword >> 6 & 63));
+                    sink.put((byte) (128 | dword & 63));
+                    bytes += 4;
+                }
+            } else {
+                if (bytes + 3 > maxBytes) {
+                    return false;
+                }
+                sink.put((byte) (224 | c >> 12));
+                sink.put((byte) (128 | c >> 6 & 63));
+                sink.put((byte) (128 | c & 63));
+                bytes += 3;
+            }
+        }
+        return true;
     }
 
     public static boolean endsWith(@NotNull Utf8Sequence seq, @NotNull Utf8Sequence endsWith) {
@@ -185,7 +299,8 @@ public final class Utf8s {
             return false;
         }
         final int lSize = l.size();
-        return lSize == r.size() && l.zeroPaddedSixPrefix() == r.zeroPaddedSixPrefix()
+        return lSize == r.size()
+                && l.zeroPaddedSixPrefix() == r.zeroPaddedSixPrefix()
                 && dataEquals(l, r, VARCHAR_INLINED_PREFIX_BYTES, lSize);
     }
 
@@ -232,6 +347,19 @@ public final class Utf8s {
         }
         for (int index = 0; index < len; index++) {
             if (asciiSeq.charAt(index) != seq.byteAt(index)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    public static boolean equalsAscii(@NotNull CharSequence asciiSeq, long rLo, long rHi) {
+        int rLen = (int) (rHi - rLo);
+        if (rLen != asciiSeq.length()) {
+            return false;
+        }
+        for (int i = 0; i < rLen; i++) {
+            if (asciiSeq.charAt(i) != (char) Unsafe.getByte(rLo + i)) {
                 return false;
             }
         }
@@ -345,7 +473,7 @@ public final class Utf8s {
         long p = lo;
         int sequenceType = 0;
         while (p < hi) {
-            byte b = Unsafe.getUnsafe().getByte(p);
+            byte b = Unsafe.getByte(p);
             if (b < 0) {
                 int n = validateUtf8MultiByte(p, hi, b);
                 if (n == -1) {
@@ -391,6 +519,23 @@ public final class Utf8s {
             }
         }
         return ll > rl;
+    }
+
+    public static boolean hasDots(Utf8Sequence value) {
+        final int len = value.size();
+        int i = 0;
+        for (; i < len - 7; i += 8) {
+            final long word = value.longAt(i);
+            if (SwarUtils.markZeroBytes(word ^ DOT_WORD) != 0) {
+                return true;
+            }
+        }
+        for (; i < len; i++) {
+            if (value.byteAt(i) == '.') {
+                return true;
+            }
+        }
+        return false;
     }
 
     public static int hashCode(@NotNull Utf8Sequence value) {
@@ -685,17 +830,63 @@ public final class Utf8s {
         return -1;
     }
 
+    /**
+     * Returns whether the sequence is ASCII. A {@code true} hint is trusted;
+     * bytes are scanned only when the hint is conservatively {@code false}.
+     */
     public static boolean isAscii(Utf8Sequence utf8) {
-        boolean ascii = true;
-        if (utf8 != null) {
-            for (int k = 0, kl = utf8.size(); k < kl; k++) {
-                if (utf8.byteAt(k) < 0) {
-                    ascii = false;
-                    break;
+        return utf8 == null || utf8.isAscii() || isAsciiBytes0(utf8);
+    }
+
+    private static boolean isAsciiBytes0(@NotNull Utf8Sequence utf8) {
+        final int size = utf8.size();
+        if (utf8 instanceof DirectUtf8Sequence direct) {
+            final boolean ascii = isAscii(direct.ptr(), size);
+            Reference.reachabilityFence(direct);
+            return ascii;
+        }
+        if (size >= Long.BYTES) {
+            int i = 0;
+            for (int longLimit = size - Long.BYTES; i <= longLimit; i += Long.BYTES) {
+                if (!isAscii(utf8.longAt(i))) {
+                    return false;
                 }
             }
+            // Check a trailing partial word with one overlapping load instead
+            // of up to seven individual byteAt() calls.
+            return i >= size || isAscii(utf8.longAt(size - Long.BYTES));
         }
-        return ascii;
+        for (int i = 0; i < size; i++) {
+            if (utf8.byteAt(i) < 0) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // checks 8 consecutive bytes at once for non-ASCII chars
+    public static boolean isAscii(long w) {
+        return (w & ASCII_MASK) == 0;
+    }
+
+    public static boolean isAscii(long ptr, int size) {
+        long i = 0;
+        if (size >= Long.BYTES) {
+            for (long longLimit = size - Long.BYTES; i <= longLimit; i += Long.BYTES) {
+                if (!isAscii(Unsafe.getLong(ptr + i))) {
+                    return false;
+                }
+            }
+            // Check a trailing partial word with one overlapping load instead
+            // of up to seven individual byte loads.
+            return i >= size || isAscii(Unsafe.getLong(ptr + size - Long.BYTES));
+        }
+        for (; i < size; i++) {
+            if (Unsafe.getByte(ptr + i) < 0) {
+                return false;
+            }
+        }
+        return true;
     }
 
     public static int lastIndexOfAscii(@NotNull Utf8Sequence seq, char asciiTerm) {
@@ -718,6 +909,9 @@ public final class Utf8s {
             return TableUtils.NULL_LEN;
         }
         final int size = value.size();
+        if (value.isAscii()) {
+            return size;
+        }
 
         int continuationByteCount = 0;
         int i = 0;
@@ -798,6 +992,48 @@ public final class Utf8s {
         return h;
     }
 
+    public static void putSafe(long lo, long hi, @NotNull Utf8Sink sink) {
+        long p = lo;
+        while (p < hi) {
+            byte b = Unsafe.getByte(p);
+            if (b < 0) {
+                int n = putMultibyteSafe(p, hi, b, sink);
+                p += n;
+            } else {
+                char c = (char) b;
+                if (!Character.isISOControl(c)) {
+                    sink.put(c);
+                } else {
+                    putNonAsciiAsHex(sink, b);
+                }
+                ++p;
+            }
+        }
+    }
+
+    public static void putSafe(@NotNull Utf8Sequence source, @NotNull Utf8Sink sink) {
+        putSafe(source, 0, source.size(), sink);
+    }
+
+    public static void putSafe(@NotNull Utf8Sequence source, int lo, int hi, @NotNull Utf8Sink sink) {
+        int pos = lo;
+        while (pos < hi) {
+            byte b = source.byteAt(pos);
+            if (b < 0) {
+                int n = putMultibyteSafe(source, pos, hi, b, sink);
+                pos += n;
+            } else {
+                char c = (char) b;
+                if (!Character.isISOControl(c)) {
+                    sink.put(c);
+                } else {
+                    putNonAsciiAsHex(sink, b);
+                }
+                ++pos;
+            }
+        }
+    }
+
     /**
      * Does not delegate to {@link #startsWith(Utf8Sequence, long, Utf8Sequence, long)} in order
      * to prevent unneeded calculation of six-prefix when an earlier check fails.
@@ -810,7 +1046,10 @@ public final class Utf8s {
     }
 
     public static boolean startsWith(
-            @NotNull Utf8Sequence seq, long seqSixPrefix, @NotNull Utf8Sequence startsWith, long startsWithSixPrefix
+            @NotNull Utf8Sequence seq,
+            long seqSixPrefix,
+            @NotNull Utf8Sequence startsWith,
+            long startsWithSixPrefix
     ) {
         final int startsWithSize = startsWith.size();
         return startsWithSize == 0 || seq.size() >= startsWithSize &&
@@ -833,13 +1072,13 @@ public final class Utf8s {
 
     public static void strCpy(@NotNull Utf8Sequence src, int destLen, long destAddr) {
         for (int i = 0; i < destLen; i++) {
-            Unsafe.getUnsafe().putByte(destAddr + i, src.byteAt(i));
+            Unsafe.putByte(destAddr + i, src.byteAt(i));
         }
     }
 
     public static void strCpy(long srcLo, long srcHi, @NotNull Utf8Sink dest) {
         for (long i = srcLo; i < srcHi; i++) {
-            dest.putAny(Unsafe.getUnsafe().getByte(i));
+            dest.putAny(Unsafe.getByte(i));
         }
     }
 
@@ -865,7 +1104,7 @@ public final class Utf8s {
 
     public static void strCpyAscii(char @NotNull [] srcChars, int srcLo, int srcLen, long destAddr) {
         for (int i = 0; i < srcLen; i++) {
-            Unsafe.getUnsafe().putByte(destAddr + i, (byte) srcChars[i + srcLo]);
+            Unsafe.putByte(destAddr + i, (byte) srcChars[i + srcLo]);
         }
     }
 
@@ -880,20 +1119,90 @@ public final class Utf8s {
 
     public static void strCpyAscii(@NotNull CharSequence asciiSrc, int srcLo, int srcLen, long destAddr) {
         for (int i = 0; i < srcLen; i++) {
-            Unsafe.getUnsafe().putByte(destAddr + i, (byte) asciiSrc.charAt(srcLo + i));
+            Unsafe.putByte(destAddr + i, (byte) asciiSrc.charAt(srcLo + i));
         }
+    }
+
+    /**
+     * Encodes a CharSequence from UTF-16 to UTF-8, writing directly to native
+     * memory at {@code destAddr}. Writes at most {@code maxBytes} bytes without
+     * splitting multi-byte sequences. Invalid surrogates are replaced with '?'.
+     *
+     * @return the number of UTF-8 bytes written
+     */
+    public static int strCpyUtf8(@NotNull CharSequence src, long destAddr, int maxBytes) {
+        int pos = 0;
+        for (int i = 0, n = src.length(); i < n; i++) {
+            char c = src.charAt(i);
+            if (c < 0x80) {
+                if (pos + 1 > maxBytes) break;
+                Unsafe.putByte(destAddr + pos, (byte) c);
+                pos++;
+            } else if (c < 0x800) {
+                if (pos + 2 > maxBytes) break;
+                Unsafe.putByte(destAddr + pos, (byte) (192 | c >> 6));
+                Unsafe.putByte(destAddr + pos + 1, (byte) (128 | c & 63));
+                pos += 2;
+            } else if (Character.isSurrogate(c)) {
+                if (Character.isHighSurrogate(c) && i + 1 < n && Character.isLowSurrogate(src.charAt(i + 1))) {
+                    if (pos + 4 > maxBytes) break;
+                    int cp = Character.toCodePoint(c, src.charAt(i + 1));
+                    Unsafe.putByte(destAddr + pos, (byte) (240 | cp >> 18));
+                    Unsafe.putByte(destAddr + pos + 1, (byte) (128 | cp >> 12 & 63));
+                    Unsafe.putByte(destAddr + pos + 2, (byte) (128 | cp >> 6 & 63));
+                    Unsafe.putByte(destAddr + pos + 3, (byte) (128 | cp & 63));
+                    pos += 4;
+                    i++;
+                } else {
+                    if (pos + 1 > maxBytes) break;
+                    Unsafe.putByte(destAddr + pos, (byte) '?');
+                    pos++;
+                }
+            } else {
+                if (pos + 3 > maxBytes) break;
+                Unsafe.putByte(destAddr + pos, (byte) (224 | c >> 12));
+                Unsafe.putByte(destAddr + pos + 1, (byte) (128 | c >> 6 & 63));
+                Unsafe.putByte(destAddr + pos + 2, (byte) (128 | c & 63));
+                pos += 3;
+            }
+        }
+        return pos;
     }
 
     public static String stringFromUtf8Bytes(long lo, long hi) {
         if (hi == lo) {
             return "";
         }
-        Utf16Sink b = getThreadLocalSink();
-        utf8ToUtf16(lo, hi, b);
-        return b.toString();
+        Utf16Sink r = getThreadLocalSink();
+        if (!utf8ToUtf16(lo, hi, r)) {
+            Utf8StringSink sink = getThreadLocalUtf8Sink();
+            CairoException ex = CairoException.malformedUtf8().put("cannot convert invalid UTF-8 sequence to UTF-16 [seq=");
+            putSafe(lo, hi, sink);
+            ex.put(sink).put(']');
+            throw ex;
+        }
+        return r.toString();
     }
 
     public static String stringFromUtf8Bytes(@NotNull Utf8Sequence seq) {
+        if (seq.size() == 0) {
+            return "";
+        }
+        Utf16Sink b = getThreadLocalSink();
+        if (!utf8ToUtf16(seq, b)) {
+            if (seq instanceof DirectUtf8Sequence) {
+                Utf8StringSink sink = getThreadLocalUtf8Sink();
+                CairoException ex = CairoException.malformedUtf8().put("cannot convert invalid UTF-8 sequence to UTF-16 [seq=");
+                putSafe(seq.ptr(), seq.ptr() + seq.size(), sink);
+                ex.put(sink).put(']');
+                throw ex;
+            }
+            throw CairoException.malformedUtf8().put("cannot convert invalid UTF-8 sequence to UTF-16 [seq=").put(seq).put(']');
+        }
+        return b.toString();
+    }
+
+    public static String stringFromUtf8BytesSafe(@NotNull Utf8Sequence seq) {
         if (seq.size() == 0) {
             return "";
         }
@@ -937,7 +1246,7 @@ public final class Utf8s {
     }
 
     public static String toString(@NotNull Utf8Sequence us, int start, int end, byte unescapeAscii) {
-        final Utf8Sink sink = Misc.getThreadLocalUtf8Sink();
+        final Utf8Sink sink = getThreadLocalUtf8Sink();
         final int lastChar = end - 1;
         for (int i = start; i < end; i++) {
             byte b = us.byteAt(i);
@@ -974,6 +1283,72 @@ public final class Utf8s {
             }
         }
         sink.putAny(source, start, limit);
+    }
+
+    // returns number of bytes required to hold UTF-16 string after conversion to UTF-8
+    public static int utf8Bytes(CharSequence sequence) {
+        int count = 0;
+        int len = sequence.length();
+
+        for (int i = 0; i < len; i++) {
+            char ch = sequence.charAt(i);
+            if (ch < 0x80) {
+                count++;
+            } else if (ch < 0x800) {
+                count += 2;
+            } else if (Character.isSurrogate(ch)) {
+                if (Character.isHighSurrogate(ch)) {
+                    if (i + 1 < len && Character.isLowSurrogate(sequence.charAt(i + 1))) {
+                        // high + low surrogate
+                        count += 4;
+                        i++;
+                    } else {
+                        count += 1; // '?' (1 byte)
+                    }
+                } else {
+                    count += 1;  // '?' (1 byte)
+                }
+            } else {
+                count += 3;
+            }
+        }
+        return count;
+    }
+
+    /**
+     * Returns the number of UTF-8 bytes needed to encode the given sequence,
+     * stopping when the cumulative count would exceed {@code maxBytes}.
+     * Multi-byte characters are not split; surrogate handling matches
+     * {@link #strCpyUtf8(CharSequence, long, int)}.
+     */
+    public static int utf8Bytes(@NotNull CharSequence sequence, int maxBytes) {
+        int count = 0;
+        int len = sequence.length();
+
+        for (int i = 0; i < len; i++) {
+            char ch = sequence.charAt(i);
+            int charBytes;
+            if (ch < 0x80) {
+                charBytes = 1;
+            } else if (ch < 0x800) {
+                charBytes = 2;
+            } else if (Character.isSurrogate(ch)) {
+                if (Character.isHighSurrogate(ch) && i + 1 < len && Character.isLowSurrogate(sequence.charAt(i + 1))) {
+                    charBytes = 4;
+                    if (count + charBytes > maxBytes) break;
+                    count += charBytes;
+                    i++;
+                    continue;
+                } else {
+                    charBytes = 1; // '?' replacement
+                }
+            } else {
+                charBytes = 3;
+            }
+            if (count + charBytes > maxBytes) break;
+            count += charBytes;
+        }
+        return count;
     }
 
     /**
@@ -1054,7 +1429,7 @@ public final class Utf8s {
     public static boolean utf8ToUtf16(long lo, long hi, @NotNull Utf16Sink sink) {
         long p = lo;
         while (p < hi) {
-            byte b = Unsafe.getUnsafe().getByte(p);
+            byte b = Unsafe.getByte(p);
             if (b < 0) {
                 int n = utf8DecodeMultiByte(p, hi, b, sink);
                 if (n == -1) {
@@ -1068,6 +1443,14 @@ public final class Utf8s {
             }
         }
         return true;
+    }
+
+    private static boolean utf8ToUtf16(@NotNull DirectUtf8Sequence seq, @NotNull Utf16Sink sink) {
+        try {
+            return utf8ToUtf16(seq.lo(), seq.hi(), sink);
+        } finally {
+            Reference.reachabilityFence(seq);
+        }
     }
 
     /**
@@ -1107,6 +1490,53 @@ public final class Utf8s {
      */
     public static boolean utf8ToUtf16(@NotNull Utf8Sequence seq, @NotNull Utf16Sink sink) {
         return utf8ToUtf16(seq, 0, seq.size(), sink);
+    }
+
+    /**
+     * Same as {@link #utf8ToUtf16OrView(Utf8Sequence, MutableUtf16Sink)}, except that malformed
+     * UTF-8 raises an error instead of reading as null. Write paths call this one: a reader can
+     * only choose between null and garbage, but a writer would be discarding a value it was given.
+     *
+     * @param seq        source UTF-8 sequence; must be non-null
+     * @param decodeSink scratch UTF-16 sink used only on the non-ASCII path
+     * @return a CharSequence exposing {@code seq} as UTF-16 code points
+     * @throws CairoException if {@code seq} contains malformed UTF-8
+     */
+    public static @NotNull CharSequence utf8ToUtf16OrThrow(@NotNull Utf8Sequence seq, @NotNull MutableUtf16Sink decodeSink) {
+        final CharSequence utf16 = utf8ToUtf16OrView(seq, decodeSink);
+        if (utf16 == null) {
+            throw CairoException.malformedUtf8(seq);
+        }
+        return utf16;
+    }
+
+    /**
+     * Returns a CharSequence view of {@code seq} whose chars are real UTF-16 code
+     * points. If {@link #isAscii(Utf8Sequence)} reports true, the raw bytes are
+     * already valid code points one-to-one and the zero-allocation
+     * {@link Utf8Sequence#asAsciiCharSequence()} view is returned. Otherwise the
+     * sequence is decoded into {@code decodeSink}, which is cleared first.
+     * <p>
+     * Callers must not mutate {@code decodeSink} until they finish reading the
+     * returned CharSequence, since the returned reference may alias it.
+     * <p>
+     * Read-path conversion: malformed UTF-8 reads as null. Write paths call
+     * {@link #utf8ToUtf16OrThrow(Utf8Sequence, MutableUtf16Sink)} instead.
+     *
+     * @param seq        source UTF-8 sequence; must be non-null
+     * @param decodeSink scratch UTF-16 sink used only on the non-ASCII path
+     * @return a CharSequence exposing {@code seq} as UTF-16 code points, or null
+     * if {@code seq} contains malformed UTF-8
+     */
+    public static @Nullable CharSequence utf8ToUtf16OrView(@NotNull Utf8Sequence seq, @NotNull MutableUtf16Sink decodeSink) {
+        if (isAscii(seq)) {
+            return seq.asAsciiCharSequence();
+        }
+        decodeSink.clear();
+        final boolean valid = seq instanceof DirectUtf8Sequence direct
+                ? utf8ToUtf16(direct, decodeSink)
+                : utf8ToUtf16(seq, decodeSink);
+        return valid ? decodeSink : null;
     }
 
     /**
@@ -1167,7 +1597,7 @@ public final class Utf8s {
         int quoteCount = 0;
 
         while (p < hi) {
-            byte b = Unsafe.getUnsafe().getByte(p);
+            byte b = Unsafe.getByte(p);
             if (b < 0) {
                 int n = utf8DecodeMultiByte(p, hi, b, sink);
                 if (n == -1) {
@@ -1190,17 +1620,23 @@ public final class Utf8s {
         return true;
     }
 
+    /**
+     * Converts a direct UTF8 sequence to UTF16 or throws. The historical "unchecked"
+     * name means that failure is not returned as a boolean; the UTF8 bytes are validated.
+     *
+     * @throws CairoException if the sequence contains malformed UTF8
+     */
     public static void utf8ToUtf16Unchecked(@NotNull DirectUtf8Sequence utf8CharSeq, @NotNull MutableUtf16Sink tempSink) {
         tempSink.clear();
-        if (!utf8ToUtf16(utf8CharSeq.lo(), utf8CharSeq.hi(), tempSink)) {
-            throw CairoException.nonCritical().put("invalid UTF8 in value for ").put(utf8CharSeq);
+        if (!utf8ToUtf16(utf8CharSeq, tempSink)) {
+            throw CairoException.malformedUtf8(utf8CharSeq);
         }
     }
 
     public static boolean utf8ToUtf16Z(long lo, Utf16Sink sink) {
         long p = lo;
         while (true) {
-            byte b = Unsafe.getUnsafe().getByte(p);
+            byte b = Unsafe.getByte(p);
             if (b == 0) {
                 break;
             }
@@ -1228,7 +1664,7 @@ public final class Utf8s {
     public static void utf8ZCopy(long addr, Utf8Sink sink) {
         long p = addr;
         while (true) {
-            byte b = Unsafe.getUnsafe().getByte(p++);
+            byte b = Unsafe.getByte(p++);
             if (b == 0) {
                 break;
             }
@@ -1298,12 +1734,22 @@ public final class Utf8s {
                 return false;
             }
         }
-        for (; i < limit; i++) {
-            if (l.byteAt(i) != r.byteAt(i)) {
+
+        if (i <= limit - Integer.BYTES) {
+            if (l.intAt(i) != r.intAt(i)) {
                 return false;
             }
+            i += Integer.BYTES;
         }
-        return true;
+
+        if (i <= limit - Short.BYTES) {
+            if (l.shortAt(i) != r.shortAt(i)) {
+                return false;
+            }
+            i += Short.BYTES;
+        }
+
+        return i >= limit || l.byteAt(i) == r.byteAt(i);
     }
 
     private static int encodeUtf16Surrogate(@NotNull Utf8Sink sink, char c, @NotNull CharSequence in, int pos, int hi) {
@@ -1321,11 +1767,9 @@ public final class Utf8s {
                     return pos;
                 }
             }
-        } else if (Character.isLowSurrogate(c)) {
+        } else { // assume orphaned low surrogate -- the caller already checked it's a surrogate
             sink.putAscii('?');
             return pos;
-        } else {
-            dword = c;
         }
         sink.put((byte) (240 | dword >> 18));
         sink.put((byte) (128 | dword >> 12 & 63));
@@ -1335,7 +1779,11 @@ public final class Utf8s {
     }
 
     private static boolean equalPrefixBytes(
-            @NotNull Utf8Sequence l, long lSixPrefix, @NotNull Utf8Sequence r, long rSixPrefix, int prefixSize
+            @NotNull Utf8Sequence l,
+            long lSixPrefix,
+            @NotNull Utf8Sequence r,
+            long rSixPrefix,
+            int prefixSize
     ) {
         long prefixMask = (1L << 8 * Math.min(VARCHAR_INLINED_PREFIX_BYTES, prefixSize)) - 1;
         return ((lSixPrefix ^ rSixPrefix) & prefixMask) == 0
@@ -1343,7 +1791,10 @@ public final class Utf8s {
     }
 
     private static boolean equalSuffixBytes(
-            @NotNull Utf8Sequence seq, @NotNull Utf8Sequence suffix, int seqSize, int suffixSize
+            @NotNull Utf8Sequence seq,
+            @NotNull Utf8Sequence suffix,
+            int seqSize,
+            int suffixSize
     ) {
         int seqLo = seqSize - suffixSize;
         int i = 0;
@@ -1401,6 +1852,200 @@ public final class Utf8s {
 
     private static boolean isNotContinuation(int b) {
         return (b & 192) != 128;
+    }
+
+    private static void put2BytesSafe(byte b1, @NotNull Utf8Sink sink, byte b2) {
+        if (isNotContinuation(b2)) {
+            putNonAsciiAsHex(sink, b1);
+            putNonAsciiAsHex(sink, b2);
+            return;
+        }
+        sink.put(b1);
+        sink.put(b2);
+    }
+
+    private static int put3BytesSafe(byte b1, byte b2, byte b3, @NotNull Utf8Sink sink) {
+        if (!isMalformed3(b1, b2, b3)) {
+            char c = utf8ToChar(b1, b2, b3);
+            if (!Character.isSurrogate(c)) {
+                sink.put(b1);
+                sink.put(b2);
+                sink.put(b3);
+            }
+        } else {
+            putNonAsciiAsHex(sink, b1);
+            putNonAsciiAsHex(sink, b2);
+            putNonAsciiAsHex(sink, b3);
+        }
+        return 3;
+    }
+
+    private static void put4ByteSafe(byte b1, byte b2, byte b3, byte b4, @NotNull Utf8Sink sink) {
+        if (!isMalformed4(b2, b3, b4)) {
+            final int codePoint = getUtf8Codepoint(b1, b2, b3, b4);
+            if (Character.isSupplementaryCodePoint(codePoint)) {
+                sink.put(Character.highSurrogate(codePoint));
+                sink.put(Character.lowSurrogate(codePoint));
+                return;
+            }
+        }
+        putNonAsciiAsHex(sink, b1);
+        putNonAsciiAsHex(sink, b2);
+        putNonAsciiAsHex(sink, b3);
+        putNonAsciiAsHex(sink, b4);
+    }
+
+    private static int putInvalidBytes(long lo, long hi, byte b, @NotNull Utf8Sink sink) {
+        putNonAsciiAsHex(sink, b);
+        int i = 1;
+        for (; lo + i < hi; i++) {
+            byte val = Unsafe.getByte(lo + i);
+            if (val >= 0) {
+                i--;
+                break;
+            }
+            putNonAsciiAsHex(sink, val);
+        }
+        return i + 1;
+    }
+
+    private static int putInvalidBytes(@NotNull Utf8Sequence source, int lo, int hi, byte b, @NotNull Utf8Sink sink) {
+        putNonAsciiAsHex(sink, b);
+        int i = 1;
+        for (; lo + i < hi; i++) {
+            byte val = source.byteAt(lo + i);
+            if (val >= 0) {
+                i--;
+                break;
+            }
+            putNonAsciiAsHex(sink, val);
+        }
+        return i + 1;
+    }
+
+    private static int putMultibyteSafe(long lo, long hi, byte b, @NotNull Utf8Sink sink) {
+        if (b >> 5 == -2 && (b & 30) != 0) {
+            return putUpTo2BytesSafe(lo, hi, b, sink);
+        }
+        if (b >> 4 == -2) {
+            return putUpTo3BytesSafe(lo, hi, b, sink);
+        }
+        if (b >> 3 == -2) {
+            return putUpTo4BytesSafe(lo, hi, b, sink);
+        }
+        return putInvalidBytes(lo, hi, b, sink);
+    }
+
+    private static int putMultibyteSafe(@NotNull Utf8Sequence source, int lo, int hi, byte b, @NotNull Utf8Sink sink) {
+        if (b >> 5 == -2 && (b & 30) != 0) {
+            return putUpTo2BytesSafe(source, lo, hi, b, sink);
+        }
+        if (b >> 4 == -2) {
+            return putUpTo3BytesSafe(source, lo, hi, b, sink);
+        }
+        if (b >> 3 == -2) {
+            return putUpTo4BytesSafe(source, lo, hi, b, sink);
+        }
+        return putInvalidBytes(source, lo, hi, b, sink);
+    }
+
+    private static void putNonAsciiAsHex(@NotNull Utf8Sink sink, byte b) {
+        if (b >= ' ' && b < 127) {
+            sink.putAny(b);
+            return;
+        }
+        sink.putAny(((byte) '\\'));
+        sink.putAny(((byte) 'x'));
+        sink.put(HEX_CHARS[(b & 0xFF) >>> 4]);
+        sink.put(HEX_CHARS[b & 0x0F]);
+    }
+
+    private static int putUpTo2BytesSafe(long lo, long hi, byte b1, @NotNull Utf8Sink sink) {
+        if (hi - lo >= 2) {
+            byte b2 = Unsafe.getByte(lo + 1);
+            put2BytesSafe(b1, sink, b2);
+            return 2;
+        }
+        putNonAsciiAsHex(sink, b1);
+        return 1;
+    }
+
+    private static int putUpTo2BytesSafe(@NotNull Utf8Sequence source, int lo, int hi, byte b1, @NotNull Utf8Sink sink) {
+        if (hi - lo >= 2) {
+            byte b2 = source.byteAt(lo + 1);
+            put2BytesSafe(b1, sink, b2);
+            return 2;
+        }
+        putNonAsciiAsHex(sink, b1);
+        return 1;
+    }
+
+    private static int putUpTo3BytesSafe(long lo, long hi, byte b1, @NotNull Utf8Sink sink) {
+        if (hi - lo >= 3) {
+            byte b2 = Unsafe.getByte(lo + 1);
+            byte b3 = Unsafe.getByte(lo + 2);
+            return put3BytesSafe(b1, b2, b3, sink);
+        }
+        putNonAsciiAsHex(sink, b1);
+        if (hi - lo > 1) {
+            putNonAsciiAsHex(sink, Unsafe.getByte(lo + 1));
+            return 2;
+        }
+        return 1;
+    }
+
+    private static int putUpTo3BytesSafe(@NotNull Utf8Sequence source, int lo, int hi, byte b1, @NotNull Utf8Sink sink) {
+        if (hi - lo >= 3) {
+            byte b2 = source.byteAt(lo + 1);
+            byte b3 = source.byteAt(lo + 2);
+            return put3BytesSafe(b1, b2, b3, sink);
+        }
+        putNonAsciiAsHex(sink, b1);
+        if (hi - lo > 1) {
+            putNonAsciiAsHex(sink, source.byteAt(lo + 1));
+            return 2;
+        }
+        return 1;
+    }
+
+    private static int putUpTo4BytesSafe(long lo, long hi, byte b, @NotNull Utf8Sink sink) {
+        if (hi - lo >= 4) {
+            byte b2 = Unsafe.getByte(lo + 1);
+            byte b3 = Unsafe.getByte(lo + 2);
+            byte b4 = Unsafe.getByte(lo + 3);
+            put4ByteSafe(b, b2, b3, b4, sink);
+            return 4;
+        }
+        putNonAsciiAsHex(sink, b);
+        if (hi - lo > 1) {
+            putNonAsciiAsHex(sink, Unsafe.getByte(lo + 1));
+            if (hi - lo > 2) {
+                putNonAsciiAsHex(sink, Unsafe.getByte(lo + 2));
+                return 3;
+            }
+            return 2;
+        }
+        return 1;
+    }
+
+    private static int putUpTo4BytesSafe(@NotNull Utf8Sequence source, int lo, int hi, byte b, @NotNull Utf8Sink sink) {
+        if (hi - lo >= 4) {
+            byte b2 = source.byteAt(lo + 1);
+            byte b3 = source.byteAt(lo + 2);
+            byte b4 = source.byteAt(lo + 3);
+            put4ByteSafe(b, b2, b3, b4, sink);
+            return 4;
+        }
+        putNonAsciiAsHex(sink, b);
+        if (hi - lo > 1) {
+            putNonAsciiAsHex(sink, source.byteAt(lo + 1));
+            if (hi - lo > 2) {
+                putNonAsciiAsHex(sink, source.byteAt(lo + 2));
+                return 3;
+            }
+            return 2;
+        }
+        return 1;
     }
 
     private static int strCpyNonAscii(@NotNull Utf8Sequence seq, int charLo, int charHi, @NotNull Utf8Sink sink) {
@@ -1503,7 +2148,7 @@ public final class Utf8s {
         if (hi - lo < 2) {
             return -1;
         }
-        byte b2 = Unsafe.getUnsafe().getByte(lo + 1);
+        byte b2 = Unsafe.getByte(lo + 1);
         if (isNotContinuation(b2)) {
             return -1;
         }
@@ -1512,7 +2157,7 @@ public final class Utf8s {
     }
 
     private static int utf8Decode2BytesZ(long lo, int b1, @NotNull Utf16Sink sink) {
-        byte b2 = Unsafe.getUnsafe().getByte(lo + 1);
+        byte b2 = Unsafe.getByte(lo + 1);
         if (b2 == 0) {
             return -1;
         }
@@ -1539,8 +2184,8 @@ public final class Utf8s {
         if (hi - lo < 3) {
             return -1;
         }
-        byte b2 = Unsafe.getUnsafe().getByte(lo + 1);
-        byte b3 = Unsafe.getUnsafe().getByte(lo + 2);
+        byte b2 = Unsafe.getByte(lo + 1);
+        byte b3 = Unsafe.getByte(lo + 2);
         return utf8Decode3Byte0(b1, sink, b2, b3);
     }
 
@@ -1554,11 +2199,11 @@ public final class Utf8s {
     }
 
     private static int utf8Decode3BytesZ(long lo, byte b1, @NotNull Utf16Sink sink) {
-        byte b2 = Unsafe.getUnsafe().getByte(lo + 1);
+        byte b2 = Unsafe.getByte(lo + 1);
         if (b2 == 0) {
             return -1;
         }
-        byte b3 = Unsafe.getUnsafe().getByte(lo + 2);
+        byte b3 = Unsafe.getByte(lo + 2);
         if (b3 == 0) {
             return -1;
         }
@@ -1569,9 +2214,9 @@ public final class Utf8s {
         if (b >> 3 != -2 || hi - lo < 4) {
             return -1;
         }
-        byte b2 = Unsafe.getUnsafe().getByte(lo + 1);
-        byte b3 = Unsafe.getUnsafe().getByte(lo + 2);
-        byte b4 = Unsafe.getUnsafe().getByte(lo + 3);
+        byte b2 = Unsafe.getByte(lo + 1);
+        byte b3 = Unsafe.getByte(lo + 2);
+        byte b4 = Unsafe.getByte(lo + 3);
         return utf8Decode4Bytes0(b, sink, b2, b3, b4);
     }
 
@@ -1602,15 +2247,15 @@ public final class Utf8s {
         if (b >> 3 != -2) {
             return -1;
         }
-        byte b2 = Unsafe.getUnsafe().getByte(lo + 1);
+        byte b2 = Unsafe.getByte(lo + 1);
         if (b2 == 0) {
             return -1;
         }
-        byte b3 = Unsafe.getUnsafe().getByte(lo + 2);
+        byte b3 = Unsafe.getByte(lo + 2);
         if (b3 == 0) {
             return -1;
         }
-        byte b4 = Unsafe.getUnsafe().getByte(lo + 3);
+        byte b4 = Unsafe.getByte(lo + 3);
         if (b4 == 0) {
             return -1;
         }
@@ -1653,7 +2298,7 @@ public final class Utf8s {
         if (hi - lo < 2) {
             return -1;
         }
-        byte b2 = Unsafe.getUnsafe().getByte(lo + 1);
+        byte b2 = Unsafe.getByte(lo + 1);
         if (isNotContinuation(b2)) {
             return -1;
         }
@@ -1665,8 +2310,8 @@ public final class Utf8s {
             return -1;
         }
 
-        byte b2 = Unsafe.getUnsafe().getByte(lo + 1);
-        byte b3 = Unsafe.getUnsafe().getByte(lo + 2);
+        byte b2 = Unsafe.getByte(lo + 1);
+        byte b3 = Unsafe.getByte(lo + 2);
 
         if (isMalformed3(b1, b2, b3)) {
             return -1;
@@ -1701,9 +2346,9 @@ public final class Utf8s {
         if (b >> 3 != -2 || hi - lo < 4) {
             return -1;
         }
-        byte b2 = Unsafe.getUnsafe().getByte(lo + 1);
-        byte b3 = Unsafe.getUnsafe().getByte(lo + 2);
-        byte b4 = Unsafe.getUnsafe().getByte(lo + 3);
+        byte b2 = Unsafe.getByte(lo + 1);
+        byte b3 = Unsafe.getByte(lo + 2);
+        byte b4 = Unsafe.getByte(lo + 3);
 
         if (isMalformed4(b2, b3, b4)) {
             return -1;

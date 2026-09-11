@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -26,16 +26,33 @@ package io.questdb.cutlass.http.client;
 
 import io.questdb.HttpClientConfiguration;
 import io.questdb.cutlass.http.HttpHeaderParser;
+import io.questdb.cutlass.http.HttpKeywords;
 import io.questdb.log.Log;
 import io.questdb.log.LogFactory;
 import io.questdb.network.IOOperation;
 import io.questdb.network.NetworkFacade;
 import io.questdb.network.Socket;
 import io.questdb.network.SocketFactory;
-import io.questdb.std.*;
-import io.questdb.std.str.*;
+import io.questdb.network.TlsSessionInitFailedException;
+import io.questdb.std.BinarySequence;
+import io.questdb.std.Chars;
+import io.questdb.std.MemoryTag;
+import io.questdb.std.Misc;
+import io.questdb.std.Mutable;
+import io.questdb.std.Numbers;
+import io.questdb.std.ObjectPool;
+import io.questdb.std.QuietCloseable;
+import io.questdb.std.Unsafe;
+import io.questdb.std.Vect;
+import io.questdb.std.str.DirectUtf8String;
+import io.questdb.std.str.StringSink;
+import io.questdb.std.str.Utf8Sequence;
+import io.questdb.std.str.Utf8Sink;
+import io.questdb.std.str.Utf8StringSink;
+import io.questdb.std.str.Utf8s;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
+import org.jetbrains.annotations.TestOnly;
 
 import java.net.HttpURLConnection;
 
@@ -51,6 +68,7 @@ public abstract class HttpClient implements QuietCloseable {
     private final HttpClientCookieHandler cookieHandler;
     private final ObjectPool<DirectUtf8String> csPool = new ObjectPool<>(DirectUtf8String.FACTORY, 64);
     private final int defaultTimeout;
+    private final boolean fixBrokenConnection;
     private final int maxBufferSize;
     private final Request request = new Request();
     private final ResponseHeaders responseHeaders;
@@ -65,32 +83,62 @@ public abstract class HttpClient implements QuietCloseable {
 
     public HttpClient(HttpClientConfiguration configuration, SocketFactory socketFactory) {
         this.nf = configuration.getNetworkFacade();
-        this.socket = socketFactory.newInstance(nf, LOG);
-        this.defaultTimeout = configuration.getTimeout();
-        this.cookieHandler = configuration.getCookieHandlerFactory().getInstance();
-        this.bufferSize = configuration.getInitialRequestBufferSize();
-        this.maxBufferSize = configuration.getMaximumRequestBufferSize();
-        this.responseParserBufSize = configuration.getResponseBufferSize();
-        this.bufLo = Unsafe.malloc(bufferSize, MemoryTag.NATIVE_DEFAULT);
-        this.responseParserBufLo = Unsafe.malloc(responseParserBufSize, MemoryTag.NATIVE_DEFAULT);
-        this.responseHeaders = new ResponseHeaders(responseParserBufLo, responseParserBufSize, defaultTimeout, 4096, csPool);
+        // Locals mirror the resources the constructor takes. A throw past the first of them - the
+        // ResponseHeaders parser allocates natively, and so do both mallocs - leaves a half-built
+        // client that no caller can reach, so close() will never run and the catch has to free
+        // what was taken. The catch cannot read a blank final the failing statement never
+        // assigned, hence the locals. Sizes are read up front for the same reason.
+        //
+        // The parser goes last on purpose. It is the one resource the catch below cannot free -
+        // ResponseHeaders overrides close() to keep parser memory alive for the client - so nothing
+        // fallible may follow it. The constructor either already holds everything the parser needs
+        // or hands it in, so this ordering costs nothing.
+        final int requestBufSize = configuration.getInitialRequestBufferSize();
+        final int responseBufSize = configuration.getResponseBufferSize();
+        Socket socket = null;
+        long requestBuf = 0;
+        long responseBuf = 0;
+        try {
+            this.socket = socket = socketFactory.newInstance(nf, LOG);
+            this.defaultTimeout = configuration.getTimeout();
+            this.cookieHandler = configuration.getCookieHandlerFactory().getInstance();
+            this.bufferSize = requestBufSize;
+            this.maxBufferSize = configuration.getMaximumRequestBufferSize();
+            this.responseParserBufSize = responseBufSize;
+            this.fixBrokenConnection = configuration.fixBrokenConnection();
+            this.bufLo = requestBuf = Unsafe.malloc(requestBufSize, MemoryTag.NATIVE_DEFAULT);
+            this.responseParserBufLo = responseBuf = Unsafe.malloc(responseBufSize, MemoryTag.NATIVE_DEFAULT);
+            this.responseHeaders = new ResponseHeaders(
+                    defaultTimeout,
+                    4096,
+                    csPool,
+                    new ResponseImpl(responseBuf, responseBuf + responseBufSize, defaultTimeout),
+                    new ChunkedResponseImpl(responseBuf, responseBuf + responseBufSize, defaultTimeout)
+            );
+        } catch (Throwable th) {
+            if (responseBuf != 0) {
+                this.responseParserBufLo = Unsafe.free(responseBuf, responseBufSize, MemoryTag.NATIVE_DEFAULT);
+            }
+            if (requestBuf != 0) {
+                this.bufLo = Unsafe.free(requestBuf, requestBufSize, MemoryTag.NATIVE_DEFAULT);
+            }
+            Misc.free(socket, th);
+            throw th;
+        }
     }
 
     @Override
     public void close() {
-        disconnect();
-        if (bufLo != 0) {
-            Unsafe.free(bufLo, bufferSize, MemoryTag.NATIVE_DEFAULT);
-            bufLo = 0;
-            assert responseParserBufLo != 0;
-            Unsafe.free(responseParserBufLo, responseParserBufSize, MemoryTag.NATIVE_DEFAULT);
-            responseParserBufLo = 0;
-        }
-        responseHeaders.free();
+        closeBase();
     }
 
     public void disconnect() {
         Misc.free(socket);
+    }
+
+    @TestOnly
+    public ResponseHeaders getResponseHeaders() {
+        return responseHeaders;
     }
 
     public Request newRequest(CharSequence host, int port) {
@@ -115,6 +163,25 @@ public abstract class HttpClient implements QuietCloseable {
         }
     }
 
+    private void closeBase() {
+        // Free the native blocks in a finally: disconnect() runs an extension socket's close(), and a
+        // socket that throws there used to strand both buffers and the parser for good - close() is
+        // the only thing that ever frees them and no caller calls it twice. The socket failure still
+        // propagates, so the caller keeps seeing it.
+        try {
+            disconnect();
+        } finally {
+            if (bufLo != 0) {
+                Unsafe.free(bufLo, bufferSize, MemoryTag.NATIVE_DEFAULT);
+                bufLo = 0;
+                assert responseParserBufLo != 0;
+                Unsafe.free(responseParserBufLo, responseParserBufSize, MemoryTag.NATIVE_DEFAULT);
+                responseParserBufLo = 0;
+            }
+            responseHeaders.free();
+        }
+    }
+
     private int dieIfNegative(int byteCount) {
         if (byteCount < 0) {
             throw new HttpClientException("peer disconnect [errno=").errno(nf.errno()).put(']');
@@ -134,7 +201,12 @@ public abstract class HttpClient implements QuietCloseable {
 
     private void growBuffer(long requiredSize) {
         if (requiredSize > maxBufferSize) {
-            throw new HttpClientException("maximum buffer size exceeded [maxBufferSize=").put(maxBufferSize).put(", requiredSize=").put(requiredSize).put(']');
+            throw new HttpClientException("transaction is too large, either flush more frequently or " +
+                    "increase buffer size \"max_buf_size\" [maxBufferSize=")
+                    .putSize(maxBufferSize)
+                    .put(", transactionSize=")
+                    .putSize(requiredSize)
+                    .put(']');
         }
         long newBufferSize = Math.min(Numbers.ceilPow2((int) requiredSize), maxBufferSize);
         long newBufLo = Unsafe.realloc(bufLo, bufferSize, newBufferSize, MemoryTag.NATIVE_DEFAULT);
@@ -184,6 +256,26 @@ public abstract class HttpClient implements QuietCloseable {
         return n;
     }
 
+    /**
+     * Rolls the base class back from a platform subclass's failing constructor. The subclass catch
+     * cannot let this cleanup throw on top of the failure it is handling: the extension socket that
+     * {@link #disconnect()} closes can raise a runtime exception, which would replace the constructor
+     * failure the caller has to see and skip the poller the subclass releases next. Keep
+     * {@code primary} as the failure and carry the cleanup one as suppressed.
+     * <p>
+     * Releases the base class directly rather than through {@link #close()}, which dispatches into a
+     * subclass override running against fields its own constructor has not reached yet.
+     */
+    protected final void closeBaseQuietly(@NotNull Throwable primary) {
+        try {
+            closeBase();
+        } catch (Throwable th) {
+            if (th != primary) {
+                primary.addSuppressed(th);
+            }
+        }
+    }
+
     protected void dieWaiting(int n) {
         if (n == 1) {
             return;
@@ -200,6 +292,7 @@ public abstract class HttpClient implements QuietCloseable {
 
     protected abstract void setupIoWait();
 
+    @SuppressWarnings("unused")
     private static class BinarySequenceAdapter implements BinarySequence, Mutable {
         private final Utf8StringSink baseSink = new Utf8StringSink();
 
@@ -240,7 +333,7 @@ public abstract class HttpClient implements QuietCloseable {
         }
     }
 
-    public class Request implements Utf8Sink {
+    public class Request implements Utf8Sink, ArrayBufferAppender {
         private static final int STATE_CONTENT = 5;
         private static final int STATE_HEADER = 4;
         private static final int STATE_QUERY = 3;
@@ -249,33 +342,35 @@ public abstract class HttpClient implements QuietCloseable {
         private static final int STATE_URL_DONE = 2;
         private BinarySequenceAdapter binarySequenceAdapter;
         private int contentLengthHeaderReserved = 0;
+        private int[] ryuE10;
         private int state;
         private boolean urlEncode = false;
 
         public Request DELETE() {
             assert state == STATE_REQUEST;
             state = STATE_URL;
-            return put("DELETE ");
+            return putAscii("DELETE ");
         }
 
         public Request GET() {
             assert state == STATE_REQUEST;
             state = STATE_URL;
-            return put("GET ");
+            return putAscii("GET ");
         }
 
         public Request POST() {
             assert state == STATE_REQUEST;
             state = STATE_URL;
-            return put("POST ");
+            return putAscii("POST ");
         }
 
         public Request PUT() {
             assert state == STATE_REQUEST;
             state = STATE_URL;
-            return put("PUT ");
+            return putAscii("PUT ");
         }
 
+        @SuppressWarnings("unused")
         public Request authBasic(CharSequence username, CharSequence password) {
             beforeHeader();
             putAsciiInternal("Authorization: Basic ");
@@ -292,6 +387,7 @@ public abstract class HttpClient implements QuietCloseable {
             return this;
         }
 
+        @SuppressWarnings("unused")
         public Request authToken(CharSequence username, CharSequence token) {
             beforeHeader();
             putAsciiInternal("Authorization: Bearer ");
@@ -303,12 +399,22 @@ public abstract class HttpClient implements QuietCloseable {
             return this;
         }
 
+        @SuppressWarnings("unused")
         public int getContentLength() {
             if (contentStart > -1) {
                 return (int) (ptr - contentStart);
             } else {
                 return 0;
             }
+        }
+
+        @SuppressWarnings("unused")
+        public long getContentStart() {
+            return contentStart;
+        }
+
+        public long getPtr() {
+            return ptr;
         }
 
         public Request header(CharSequence name, CharSequence value) {
@@ -331,7 +437,7 @@ public abstract class HttpClient implements QuietCloseable {
         @Override
         public Request put(byte b) {
             checkCapacity(1);
-            Unsafe.getUnsafe().putByte(ptr, b);
+            Unsafe.putByte(ptr, b);
             ptr++;
             return this;
         }
@@ -371,6 +477,39 @@ public abstract class HttpClient implements QuietCloseable {
         }
 
         @Override
+        public void putBlockOfBytes(long from, long len) {
+            checkCapacity(len);
+            Vect.memcpy(ptr, from, len);
+            ptr += len;
+        }
+
+        @Override
+        public void putByte(byte value) {
+            put(value);
+        }
+
+        @Override
+        public void putDouble(double value) {
+            checkCapacity(Double.BYTES);
+            Unsafe.putDouble(ptr, value);
+            ptr += Double.BYTES;
+        }
+
+        @Override
+        public void putInt(int value) {
+            checkCapacity(Integer.BYTES);
+            Unsafe.putInt(ptr, value);
+            ptr += Integer.BYTES;
+        }
+
+        @Override
+        public void putLong(long value) {
+            checkCapacity(Long.BYTES);
+            Unsafe.putLong(ptr, value);
+            ptr += Long.BYTES;
+        }
+
+        @Override
         public Request putNonAscii(long lo, long hi) {
             final long size = hi - lo;
             checkCapacity(size);
@@ -402,22 +541,81 @@ public abstract class HttpClient implements QuietCloseable {
             return this;
         }
 
+        public Request query(CharSequence name, Utf8Sequence value) {
+            assert state == STATE_URL_DONE || state == STATE_QUERY;
+            if (state == STATE_URL_DONE) {
+                putAsciiInternal('?');
+            } else {
+                putAsciiInternal('&');
+            }
+            state = STATE_QUERY;
+            urlEncode = true;
+            try {
+                put(name).putAsciiInternal('=').put(value);
+            } finally {
+                urlEncode = false;
+            }
+            return this;
+        }
+
+        @Override
+        public int[] ryuScratch() {
+            if (ryuE10 == null) {
+                ryuE10 = new int[1];
+            }
+            return ryuE10;
+        }
+
         public ResponseHeaders send() {
             return send(defaultTimeout);
         }
 
-        public ResponseHeaders send(int timeout) {
+        /**
+         * Sends the HTTP request to the specified host and port with connection management.
+         * <p>
+         * This method intelligently manages the underlying socket connection:
+         * <ul>
+         *   <li>Reuses the existing connection if already connected to the same host:port</li>
+         *   <li>Establishes a new connection if not connected or connecting to a different host:port</li>
+         *   <li>Automatically reconnects if the existing connection is closed or broken (when configured)</li>
+         * </ul>
+         * <p>
+         * The request must be in a valid state (URL set, optional query parameters, headers, or content added)
+         * before calling this method. The HTTP version (1.1) and Host header are automatically appended.
+         * <p>
+         * Common use cases include:
+         * <ul>
+         *   <li>Failover scenarios - retry the same request on a different server</li>
+         *   <li>Multi-publishing - send the same data to multiple endpoints</li>
+         * </ul>
+         * Important: If the request buffer already contains an HTTP request header with a host
+         * then the host will not change! This means reverse proxies routing requests to different
+         * host based on the Host header will not work! Routing on TLS SNI will not be affected.
+         *
+         * @param host    the hostname or IP address to connect to
+         * @param port    the port number to connect on
+         * @param timeout the request timeout in milliseconds for socket operations
+         * @return the parsed response headers from the server
+         * @throws AssertionError if the request is not in a valid state
+         */
+        public ResponseHeaders send(CharSequence host, int port, int timeout) {
             assert state == STATE_URL_DONE || state == STATE_QUERY || state == STATE_HEADER || state == STATE_CONTENT;
             if (socket == null || socket.isClosed()) {
                 connect(host, port);
-            } else if (nf.testConnection(socket.getFd(), responseParserBufLo, 1)) {
+            } else if (fixBrokenConnection && nf.testConnection(socket.getFd(), 0, 0)) {
                 socket.close();
                 connect(host, port);
+            } else if (!Chars.equalsNc(host, HttpClient.this.host) || (port != HttpClient.this.port)) {
+                socket.close();
+                connect(host, port);
+                HttpClient.this.host = host;
+                HttpClient.this.port = port;
             }
 
             if (state == STATE_URL_DONE || state == STATE_QUERY) {
                 putAsciiInternal(" HTTP/1.1").putEOL();
                 putAsciiInternal("Host: ").put(host).putAscii(':').put(port).putEOL();
+                state = STATE_HEADER;
             }
 
             if (contentStart > -1) {
@@ -431,6 +629,10 @@ public abstract class HttpClient implements QuietCloseable {
             return responseHeaders;
         }
 
+        public ResponseHeaders send(int timeout) {
+            return send(host, port, timeout);
+        }
+
         public void sendPartialContent(int maxContentLen, int timeout) {
             if (state != STATE_CONTENT || contentStart == -1) {
                 throw new IllegalStateException("No content to send");
@@ -442,6 +644,7 @@ public abstract class HttpClient implements QuietCloseable {
             sendHeaderAndContent(maxContentLen, timeout);
         }
 
+        @SuppressWarnings("unused")
         public Request setCookie(CharSequence name, CharSequence value) {
             beforeHeader();
             put(HEADER_COOKIE).putAscii(": ").put(name);
@@ -450,6 +653,24 @@ public abstract class HttpClient implements QuietCloseable {
             }
             eol();
             return this;
+        }
+
+        @Override
+        public String toString() {
+            StringSink ss = new StringSink();
+            DirectUtf8String s = new DirectUtf8String();
+            s.of(bufLo, ptr);
+            ss.put(s);
+            return ss.toString();
+        }
+
+        @SuppressWarnings("unused")
+        public void trimContentToLen(int contentLen) {
+            ptr = contentStart + contentLen;
+        }
+
+        public void truncate() {
+            throw new UnsupportedOperationException();
         }
 
         public Request url(CharSequence url) {
@@ -500,9 +721,13 @@ public abstract class HttpClient implements QuietCloseable {
         }
 
         private void connect(CharSequence host, int port) {
-            int fd = nf.socketTcp(true);
+            long fd = nf.socketTcp(true);
             if (fd < 0) {
                 throw new HttpClientException("could not allocate a file descriptor").errno(nf.errno());
+            }
+            if (nf.setTcpNoDelay(fd, true) < 0) {
+                LOG.info().$("could not turn off Nagle's algorithm [fd=").$(fd)
+                        .$(", errno=").$(nf.errno()).I$();
             }
             socket.of(fd);
 
@@ -528,10 +753,15 @@ public abstract class HttpClient implements QuietCloseable {
             }
 
             if (socket.supportsTls()) {
-                if (socket.startTlsSession(host) < 0) {
+                try {
+                    socket.startTlsSession(host);
+                } catch (TlsSessionInitFailedException e) {
                     int errno = nf.errno();
                     disconnect();
-                    throw new HttpClientException("could not start TLS session [fd=").put(fd).put(", errno=").put(errno).put(']');
+                    throw new HttpClientException("could not start TLS session [fd=").put(fd)
+                            .put(", error=").put(e.getFlyweightMessage())
+                            .put(", errno=").put(errno)
+                            .put(']');
                 }
             }
             setupIoWait();
@@ -669,6 +899,15 @@ public abstract class HttpClient implements QuietCloseable {
                 case '}':
                     putAsciiInternal("%7D");
                     break;
+                case '\n':
+                    putAsciiInternal("%0A");
+                    break;
+                case '\r':
+                    putAsciiInternal("%0D");
+                    break;
+                case '\t':
+                    putAsciiInternal("%09");
+                    break;
                 default:
                     // there are symbols to escape, but those we do not tend to use at all
                     // https://www.w3schools.com/tags/ref_urlencode.ASP
@@ -704,15 +943,29 @@ public abstract class HttpClient implements QuietCloseable {
     }
 
     public class ResponseHeaders extends HttpHeaderParser {
-        private final ChunkedResponseImpl chunkedResponse;
+        private final AbstractChunkedResponse chunkedResponse;
         private final int defaultTimeout;
-        private final ResponseImpl response;
+        private final AbstractResponse response;
 
-        public ResponseHeaders(long respParserBufLo, int respParserBufSize, int defaultTimeout, int headerBufSize, ObjectPool<DirectUtf8String> pool) {
+        public ResponseHeaders(
+                int defaultTimeout,
+                int headerBufSize,
+                ObjectPool<DirectUtf8String> pool,
+                AbstractResponse response,
+                AbstractChunkedResponse chunkedResponse
+        ) {
+            // The client builds both response views and hands them in, so everything that can throw
+            // runs while Java evaluates the arguments, before super() takes the parser's header
+            // buffer, boundary augmenter and sink. Only field assignments follow that call, which is
+            // what keeps this constructor out of the leak: HttpClient never receives the object when
+            // a constructor here throws, so its own catch would have no reference to reach the
+            // parser through, and Java does not run a superclass close() when a subclass constructor
+            // fails. HttpHeaderParser rolls its own allocations back, so a throw inside super()
+            // leaves nothing behind either.
             super(headerBufSize, pool);
             this.defaultTimeout = defaultTimeout;
-            this.response = new ResponseImpl(respParserBufLo, respParserBufLo + respParserBufSize, defaultTimeout);
-            this.chunkedResponse = new ChunkedResponseImpl(respParserBufLo, respParserBufLo + respParserBufSize, defaultTimeout);
+            this.response = response;
+            this.chunkedResponse = chunkedResponse;
         }
 
         public void await() {
@@ -775,7 +1028,7 @@ public abstract class HttpClient implements QuietCloseable {
             if (isIncomplete()) {
                 throw new HttpClientException("http response headers not yet received");
             }
-            return Utf8s.equalsNcAscii("chunked", getHeader(HEADER_TRANSFER_ENCODING));
+            return HttpKeywords.isChunked(getHeader(HEADER_TRANSFER_ENCODING));
         }
 
         private void free() {

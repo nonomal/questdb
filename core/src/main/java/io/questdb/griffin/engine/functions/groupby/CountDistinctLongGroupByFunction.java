@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -40,13 +40,13 @@ public class CountDistinctLongGroupByFunction extends LongFunction implements Un
     private final Function arg;
     private final GroupByLongHashSet setA;
     private final GroupByLongHashSet setB;
+    private long cardinality;
     private int valueIndex;
 
     public CountDistinctLongGroupByFunction(Function arg, int setInitialCapacity, double setLoadFactor) {
         this.arg = arg;
-        // We use zero as the default value to speed up zeroing on rehash.
-        setA = new GroupByLongHashSet(setInitialCapacity, setLoadFactor, 0);
-        setB = new GroupByLongHashSet(setInitialCapacity, setLoadFactor, 0);
+        setA = new GroupByLongHashSet(setInitialCapacity, setLoadFactor, Numbers.LONG_NULL);
+        setB = new GroupByLongHashSet(setInitialCapacity, setLoadFactor, Numbers.LONG_NULL);
     }
 
     @Override
@@ -57,13 +57,11 @@ public class CountDistinctLongGroupByFunction extends LongFunction implements Un
 
     @Override
     public void computeFirst(MapValue mapValue, Record record, long rowId) {
-        long val = arg.getLong(record);
-        if (val != Numbers.LONG_NULL) {
+        final long value = arg.getLong(record);
+        if (value != Numbers.LONG_NULL) {
             mapValue.putLong(valueIndex, 1);
-            // Remap zero since it's used as the no entry key.
-            val = (val == 0) ? Numbers.LONG_NULL : val;
-            setA.of(0).add(val);
-            mapValue.putLong(valueIndex + 1, setA.ptr());
+            mapValue.putLong(valueIndex + 1, value);
+            cardinality++;
         } else {
             mapValue.putLong(valueIndex, 0);
             mapValue.putLong(valueIndex + 1, 0);
@@ -72,16 +70,31 @@ public class CountDistinctLongGroupByFunction extends LongFunction implements Un
 
     @Override
     public void computeNext(MapValue mapValue, Record record, long rowId) {
-        long val = arg.getLong(record);
-        if (val != Numbers.LONG_NULL) {
-            long ptr = mapValue.getLong(valueIndex + 1);
-            // Remap zero since it's used as the no entry key.
-            val = (val == 0) ? Numbers.LONG_NULL : val;
-            final long index = setA.of(ptr).keyIndex(val);
-            if (index >= 0) {
-                setA.addAt(index, val);
-                mapValue.addLong(valueIndex, 1);
-                mapValue.putLong(valueIndex + 1, setA.ptr());
+        final long value = arg.getLong(record);
+        if (value != Numbers.LONG_NULL) {
+            final long cnt = mapValue.getLong(valueIndex);
+            if (cnt == 0) {
+                mapValue.putLong(valueIndex, 1);
+                mapValue.putLong(valueIndex + 1, value);
+                cardinality++;
+            } else if (cnt == 1) { // inlined value
+                final long valueB = mapValue.getLong(valueIndex + 1);
+                if (value != valueB) {
+                    setA.of(0).add(value);
+                    setA.add(valueB);
+                    mapValue.putLong(valueIndex, 2);
+                    mapValue.putLong(valueIndex + 1, setA.ptr());
+                    cardinality++;
+                }
+            } else { // non-empty set
+                final long ptr = mapValue.getLong(valueIndex + 1);
+                final long index = setA.of(ptr).keyIndex(value);
+                if (index >= 0) {
+                    setA.addAt(index, value);
+                    mapValue.putLong(valueIndex, cnt + 1);
+                    mapValue.putLong(valueIndex + 1, setA.ptr());
+                    cardinality++;
+                }
             }
         }
     }
@@ -92,6 +105,11 @@ public class CountDistinctLongGroupByFunction extends LongFunction implements Un
     }
 
     @Override
+    public long getCardinalityStat() {
+        return cardinality;
+    }
+
+    @Override
     public long getLong(Record rec) {
         return rec.getLong(valueIndex);
     }
@@ -99,6 +117,11 @@ public class CountDistinctLongGroupByFunction extends LongFunction implements Un
     @Override
     public String getName() {
         return "count_distinct";
+    }
+
+    @Override
+    public int getSampleByFlags() {
+        return GroupByFunction.SAMPLE_BY_FILL_ALL;
     }
 
     @Override
@@ -114,8 +137,10 @@ public class CountDistinctLongGroupByFunction extends LongFunction implements Un
     @Override
     public void initValueTypes(ArrayColumnTypes columnTypes) {
         valueIndex = columnTypes.getColumnCount();
-        columnTypes.add(ColumnType.LONG); // count
-        columnTypes.add(ColumnType.LONG); // GroupByLongHashSet pointer
+        // count
+        columnTypes.add(ColumnType.LONG);
+        // inlined single value (count=1) or GroupByLongHashSet pointer (count>1)
+        columnTypes.add(ColumnType.LONG);
     }
 
     @Override
@@ -124,39 +149,71 @@ public class CountDistinctLongGroupByFunction extends LongFunction implements Un
     }
 
     @Override
-    public boolean isReadThreadSafe() {
+    public boolean isThreadSafe() {
         return false;
     }
 
     @Override
     public void merge(MapValue destValue, MapValue srcValue) {
-        long srcCount = srcValue.getLong(valueIndex);
+        final long srcCount = srcValue.getLong(valueIndex);
         if (srcCount == 0 || srcCount == Numbers.LONG_NULL) {
             return;
         }
-        long srcPtr = srcValue.getLong(valueIndex + 1);
 
-        long destCount = destValue.getLong(valueIndex);
+        final long destCount = destValue.getLong(valueIndex);
         if (destCount == 0 || destCount == Numbers.LONG_NULL) {
             destValue.putLong(valueIndex, srcCount);
-            destValue.putLong(valueIndex + 1, srcPtr);
+            destValue.putLong(valueIndex + 1, srcValue.getLong(valueIndex + 1));
             return;
         }
-        long destPtr = destValue.getLong(valueIndex + 1);
 
-        setA.of(destPtr);
-        setB.of(srcPtr);
+        if (srcCount == 1) { // inlined src value
+            final long srcVal = srcValue.getLong(valueIndex + 1);
+            if (destCount == 1) { // dest also holds inlined value
+                final long destVal = destValue.getLong(valueIndex + 1);
+                if (destVal != srcVal) {
+                    setA.of(0).add(srcVal);
+                    setA.add(destVal);
+                    destValue.putLong(valueIndex, 2);
+                    destValue.putLong(valueIndex + 1, setA.ptr());
+                }
+            } else { // dest holds a set
+                final long destPtr = destValue.getLong(valueIndex + 1);
+                setA.of(destPtr).add(srcVal);
+                destValue.putLong(valueIndex, setA.size());
+                destValue.putLong(valueIndex + 1, setA.ptr());
+            }
+            return;
+        }
 
-        if (setA.size() > (setB.size() >> 1)) {
-            setA.merge(setB);
+        // src holds a set
+        final long srcPtr = srcValue.getLong(valueIndex + 1);
+        if (destCount == 1) { // dest holds inlined value
+            final long destVal = destValue.getLong(valueIndex + 1);
+            setA.of(srcPtr).add(destVal);
             destValue.putLong(valueIndex, setA.size());
             destValue.putLong(valueIndex + 1, setA.ptr());
-        } else {
-            // Set A is significantly smaller than set B, so we merge it into set B.
-            setB.merge(setA);
-            destValue.putLong(valueIndex, setB.size());
-            destValue.putLong(valueIndex + 1, setB.ptr());
+        } else { // dest holds a set
+            final long destPtr = destValue.getLong(valueIndex + 1);
+            setA.of(destPtr);
+            setB.of(srcPtr);
+
+            if (setA.size() > (setB.size() >>> 1)) {
+                setA.merge(setB);
+                destValue.putLong(valueIndex, setA.size());
+                destValue.putLong(valueIndex + 1, setA.ptr());
+            } else {
+                // Set A is significantly smaller than set B, so we merge it into set B.
+                setB.merge(setA);
+                destValue.putLong(valueIndex, setB.size());
+                destValue.putLong(valueIndex + 1, setB.ptr());
+            }
         }
+    }
+
+    @Override
+    public void resetStats() {
+        this.cardinality = 0;
     }
 
     @Override
@@ -167,7 +224,7 @@ public class CountDistinctLongGroupByFunction extends LongFunction implements Un
 
     @Override
     public void setEmpty(MapValue mapValue) {
-        mapValue.putLong(valueIndex, 0L);
+        mapValue.putLong(valueIndex, 0);
         mapValue.putLong(valueIndex + 1, 0);
     }
 
@@ -186,10 +243,5 @@ public class CountDistinctLongGroupByFunction extends LongFunction implements Un
     @Override
     public boolean supportsParallelism() {
         return UnaryFunction.super.supportsParallelism();
-    }
-
-    @Override
-    public void toTop() {
-        UnaryFunction.super.toTop();
     }
 }

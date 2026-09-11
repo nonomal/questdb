@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,17 +24,16 @@
 
 package io.questdb.cutlass.line.tcp.auth;
 
-import io.questdb.cairo.CairoException;
 import io.questdb.cairo.SecurityContext;
 import io.questdb.cutlass.auth.AuthUtils;
-import io.questdb.cutlass.auth.Authenticator;
 import io.questdb.cutlass.auth.AuthenticatorException;
 import io.questdb.cutlass.auth.ChallengeResponseMatcher;
+import io.questdb.cutlass.auth.SocketAuthenticator;
 import io.questdb.log.Log;
 import io.questdb.log.LogFactory;
 import io.questdb.network.Socket;
 import io.questdb.std.MemoryTag;
-import io.questdb.std.ThreadLocal;
+import io.questdb.std.CarrierLocal;
 import io.questdb.std.Unsafe;
 import io.questdb.std.str.DirectUtf8String;
 import io.questdb.std.str.Utf8s;
@@ -42,11 +41,12 @@ import org.jetbrains.annotations.NotNull;
 
 import java.security.SecureRandom;
 
-public class EllipticCurveAuthenticator implements Authenticator {
-    private static final Log LOG = LogFactory.getLog(EllipticCurveAuthenticator.class);
-    private static final int MIN_BUF_SIZE = AuthUtils.CHALLENGE_LEN + 1;
+public class EllipticCurveAuthenticator implements SocketAuthenticator {
+    // this field is modified via reflection from tests, via LogFactory.enableGuaranteedLogging
+    @SuppressWarnings("FieldMayBeFinal")
+    private static Log LOG = LogFactory.getLog(EllipticCurveAuthenticator.class);
 
-    private static final ThreadLocal<SecureRandom> tlSrand = new ThreadLocal<>(SecureRandom::new);
+    private static final CarrierLocal<SecureRandom> tlSrand = new CarrierLocal<>(SecureRandom::new);
     private final ChallengeResponseMatcher challengeResponseMatcher;
     private final DirectUtf8String userNameFlyweight = new DirectUtf8String();
     protected long recvBufPseudoStart;
@@ -114,9 +114,6 @@ public class EllipticCurveAuthenticator implements Authenticator {
 
     @Override
     public void init(@NotNull Socket socket, long recvBuffer, long recvBufferLimit, long sendBuffer, long sendBufferLimit) {
-        if (recvBufferLimit - recvBuffer < MIN_BUF_SIZE) {
-            throw CairoException.critical(0).put("Minimum buffer length is ").put(MIN_BUF_SIZE);
-        }
         this.socket = socket;
         authState = AuthState.WAITING_FOR_KEY_ID;
         this.recvBufStart = recvBuffer;
@@ -144,7 +141,7 @@ public class EllipticCurveAuthenticator implements Authenticator {
         int n = 0;
         int lineEnd = -1;
         while (n < len) {
-            byte b = Unsafe.getUnsafe().getByte(recvBufStart + n);
+            byte b = Unsafe.getByte(recvBufStart + n);
             if (b == (byte) '\n') {
                 lineEnd = n;
                 break;
@@ -168,8 +165,14 @@ public class EllipticCurveAuthenticator implements Authenticator {
         int lineEnd = findLineEnd();
         if (lineEnd != -1) {
             userNameFlyweight.of(recvBufStart, recvBufStart + lineEnd);
+            if (Utf8s.validateUtf8(userNameFlyweight) < 0) {
+                // The client is not speaking our protocol, treat it as an authentication failure.
+                LOG.error().$('[').$(socket.getFd()).$("] authentication failed, key id is not valid UTF-8 [keyId=")
+                        .$safe(userNameFlyweight).I$();
+                throw AuthenticatorException.INSTANCE;
+            }
             principal = Utf8s.toString(userNameFlyweight);
-            LOG.info().$('[').$(socket.getFd()).$("] authentication read key id [keyId=").$(userNameFlyweight).I$();
+            LOG.info().$('[').$(socket.getFd()).$("] authentication read key id [keyId=").$safe(userNameFlyweight).I$();
             recvBufPos = recvBufStart;
             // Generate a challenge with printable ASCII characters 0x20 to 0x7e
             int n = 0;
@@ -177,11 +180,11 @@ public class EllipticCurveAuthenticator implements Authenticator {
             while (n < AuthUtils.CHALLENGE_LEN) {
                 assert recvBufStart + n < recvBufEnd;
                 int r = (int) (srand.nextDouble() * 0x5f) + 0x20;
-                Unsafe.getUnsafe().putByte(recvBufStart + n, (byte) r);
-                Unsafe.getUnsafe().putByte(challengePtr + n, (byte) r);
+                Unsafe.putByte(recvBufStart + n, (byte) r);
+                Unsafe.putByte(challengePtr + n, (byte) r);
                 n++;
             }
-            Unsafe.getUnsafe().putByte(recvBufStart + n, (byte) '\n');
+            Unsafe.putByte(recvBufStart + n, (byte) '\n');
             authState = AuthState.SENDING_CHALLENGE;
         }
     }
@@ -233,11 +236,11 @@ public class EllipticCurveAuthenticator implements Authenticator {
     }
 
     private enum AuthState {
-        WAITING_FOR_KEY_ID(Authenticator.NEEDS_READ),
-        SENDING_CHALLENGE(Authenticator.NEEDS_WRITE),
-        WAITING_FOR_RESPONSE(Authenticator.NEEDS_READ),
-        COMPLETE(Authenticator.OK),
-        FAILED(Authenticator.NEEDS_DISCONNECT);
+        WAITING_FOR_KEY_ID(SocketAuthenticator.NEEDS_READ),
+        SENDING_CHALLENGE(SocketAuthenticator.NEEDS_WRITE),
+        WAITING_FOR_RESPONSE(SocketAuthenticator.NEEDS_READ),
+        COMPLETE(SocketAuthenticator.OK),
+        FAILED(SocketAuthenticator.NEEDS_DISCONNECT);
 
         private final int ioContextResult;
 

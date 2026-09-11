@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,39 +24,64 @@
 
 package io.questdb.griffin.engine.functions.window;
 
-import io.questdb.cairo.*;
+import io.questdb.cairo.ArrayColumnTypes;
+import io.questdb.cairo.CairoConfiguration;
+import io.questdb.cairo.ColumnType;
+import io.questdb.cairo.ColumnTypes;
+import io.questdb.cairo.GenericRecordMetadata;
+import io.questdb.cairo.IndexType;
+import io.questdb.cairo.ListColumnFilter;
+import io.questdb.cairo.RecordSink;
+import io.questdb.cairo.RecordSinkFactory;
+import io.questdb.cairo.Reopenable;
+import io.questdb.cairo.SingleRecordSink;
+import io.questdb.cairo.TableColumnMetadata;
+import io.questdb.cairo.lv.LiveViewCheckpointDependency;
+import io.questdb.cairo.lv.LiveViewCheckpointFunctionIdentity;
+import io.questdb.cairo.lv.LiveViewSnapshotKeyCodec;
+import io.questdb.cairo.lv.LiveViewStatePageReader;
+import io.questdb.cairo.lv.LiveViewStatePageWriter;
 import io.questdb.cairo.map.Map;
 import io.questdb.cairo.map.MapFactory;
 import io.questdb.cairo.map.MapKey;
 import io.questdb.cairo.map.MapValue;
+import io.questdb.cairo.map.RecordValueSink;
+import io.questdb.cairo.map.RecordValueSinkFactory;
+import io.questdb.cairo.sql.Function;
 import io.questdb.cairo.sql.Record;
-import io.questdb.cairo.sql.*;
-import io.questdb.griffin.FunctionFactory;
+import io.questdb.cairo.sql.RecordMetadata;
+import io.questdb.cairo.sql.SymbolTableSource;
+import io.questdb.cairo.sql.VirtualRecord;
+import io.questdb.cairo.sql.WindowSPI;
 import io.questdb.griffin.PlanSink;
+import io.questdb.griffin.SqlCodeGenerator;
 import io.questdb.griffin.SqlException;
 import io.questdb.griffin.SqlExecutionContext;
+import io.questdb.griffin.SqlUtil;
 import io.questdb.griffin.engine.RecordComparator;
 import io.questdb.griffin.engine.functions.LongFunction;
-import io.questdb.griffin.engine.orderby.RecordComparatorCompiler;
+import io.questdb.griffin.engine.orderby.SortKeyEncoder;
 import io.questdb.griffin.engine.window.WindowContext;
 import io.questdb.griffin.engine.window.WindowFunction;
+import io.questdb.griffin.model.ExpressionNode;
+import io.questdb.std.DirectIntList;
 import io.questdb.std.IntList;
+import io.questdb.std.MemoryTag;
+import io.questdb.std.MemoryTracker;
 import io.questdb.std.Misc;
 import io.questdb.std.ObjList;
 import io.questdb.std.Unsafe;
+import org.jetbrains.annotations.Nullable;
 
-public class RankFunctionFactory implements FunctionFactory {
+public class RankFunctionFactory extends AbstractWindowFunctionFactory {
 
-    private static final String SIGNATURE = "rank()";
+    public static final String NAME = "rank";
+    private static final ArrayColumnTypes RANK_COLUMN_TYPES;
+    private static final String SIGNATURE = NAME + "()";
 
     @Override
     public String getSignature() {
         return SIGNATURE;
-    }
-
-    @Override
-    public boolean isWindow() {
-        return true;
     }
 
     @Override
@@ -72,255 +97,73 @@ public class RankFunctionFactory implements FunctionFactory {
             throw SqlException.emptyWindowContext(position);
         }
 
-        if (windowContext.getPartitionByRecord() != null) {
-            ArrayColumnTypes arrayColumnTypes = new ArrayColumnTypes();
-            arrayColumnTypes.add(ColumnType.LONG); // max index
-            arrayColumnTypes.add(ColumnType.LONG); // current index
-            arrayColumnTypes.add(ColumnType.LONG); // offset
-            Map map = MapFactory.createOrderedMap(configuration, windowContext.getPartitionByKeyTypes(), arrayColumnTypes);
-            return new RankFunction(map, windowContext.getPartitionByRecord(), windowContext.getPartitionBySink());
+        if (windowContext.getNullsDescPos() > 0) {
+            throw SqlException.$(windowContext.getNullsDescPos(), "RESPECT/IGNORE NULLS is not supported for current window function");
         }
+
         if (windowContext.isOrdered()) {
-            return new OrderRankFunction();
-        }
-        return new SequenceRankFunction();
-    }
-
-    private static class OrderRankFunction extends LongFunction implements ScalarFunction, WindowFunction, Reopenable {
-
-        private int columnIndex;
-        private long currentIndex = 0;
-        private long maxIndex = 0;
-        private long offset = 0;
-        private RecordComparator recordComparator;
-
-        private long value;
-
-        public OrderRankFunction() {
-        }
-
-        @Override
-        public void close() {
-        }
-
-        @Override
-        public void computeNext(Record record) {
-            assert recordComparator == null;
-            value = ++maxIndex;
-        }
-
-        @Override
-        public long getLong(Record rec) {
-            assert recordComparator == null;
-            return value;
-        }
-
-        @Override
-        public int getPassCount() {
-            return recordComparator == null ? WindowFunction.ZERO_PASS : WindowFunction.ONE_PASS;
-        }
-
-        @Override
-        public void initRecordComparator(RecordComparatorCompiler recordComparatorCompiler, ArrayColumnTypes chainTypes, IntList order) {
-            this.recordComparator = recordComparatorCompiler.compile(chainTypes, order);
-        }
-
-        @Override
-        public void pass1(Record record, long recordOffset, WindowSPI spi) {
-            if (recordComparator == null) {
-                // order dismiss
-                Unsafe.getUnsafe().putLong(spi.getAddress(recordOffset, columnIndex), maxIndex + 1);
+            // Rank() over (partition by xxx order by xxx)
+            if (windowContext.getPartitionByRecord() != null) {
+                return new RankOverPartitionFunction(
+                        windowContext.getPartitionByKeyTypes(),
+                        windowContext.getPartitionByRecord(),
+                        windowContext.getPartitionBySink(),
+                        configuration,
+                        false,
+                        windowContext.isLiveView(),
+                        NAME);
             } else {
-                if (currentIndex == 0) {
-                    currentIndex = 1;
-                    offset = recordOffset;
-                } else {
-                    // compare with prev record
-                    recordComparator.setLeft(record);
-                    if (recordComparator.compare(spi.getRecordAt(offset)) != 0) {
-                        currentIndex = maxIndex + 1;
-                        offset = recordOffset;
-                    }
-                }
-                Unsafe.getUnsafe().putLong(spi.getAddress(recordOffset, columnIndex), currentIndex);
+                // Rank() over (order by xxx)
+                return new RankFunction(configuration, false, NAME);
             }
-            maxIndex++;
-        }
-
-        @Override
-        public void reopen() {
-            reset();
-        }
-
-        @Override
-        public void reset() {
-            maxIndex = 0;
-            currentIndex = 0;
-            offset = 0;
-        }
-
-        @Override
-        public void setColumnIndex(int columnIndex) {
-            this.columnIndex = columnIndex;
-        }
-
-        @Override
-        public void toPlan(PlanSink sink) {
-            sink.val(SIGNATURE);
-        }
-
-        @Override
-        public void toTop() {
-            reset();
+        } else {
+            // Rank() over ([partition by xxx | ]), without ORDER BY, all rows are peers.
+            return new RankNoOrderFunction(windowContext.getPartitionByRecord(), NAME);
         }
     }
 
-    private static class RankFunction extends LongFunction implements ScalarFunction, WindowFunction, Reopenable {
+    protected static class RankFunction extends LongFunction implements Function, WindowFunction, Reopenable {
 
-        private final static int VAL_CURRENT_INDEX = 1;
-        private final static int VAL_MAX_INDEX = 0;
-        private final static int VAL_OFFSET = 2;
-        private final Map map;
-        private final VirtualRecord partitionByRecord;
-        private final RecordSink partitionBySink;
+        private final CairoConfiguration configuration;
+        private final boolean isDense;
+        private final String name;
         private int columnIndex;
-        private RecordComparator recordComparator;
-
-        private long value;
-
-        public RankFunction(Map map, VirtualRecord partitionByRecord, RecordSink partitionBySink) {
-            this.partitionByRecord = partitionByRecord;
-            this.partitionBySink = partitionBySink;
-            this.map = map;
-        }
-
-        @Override
-        public void close() {
-            Misc.free(map);
-            Misc.freeObjList(partitionByRecord.getFunctions());
-        }
-
-        @Override
-        public void computeNext(Record record) {
-            partitionByRecord.of(record);
-
-            MapKey mapKey = map.withKey();
-            mapKey.put(partitionByRecord, partitionBySink);
-            MapValue mapValue = mapKey.createValue();
-            long maxIndex = 0;
-            if (mapValue.isNew()) {
-                mapValue.putLong(VAL_MAX_INDEX, 0);
-                mapValue.putLong(VAL_CURRENT_INDEX, 0);
-                mapValue.putLong(VAL_OFFSET, 0);
-            } else {
-                maxIndex = mapValue.getLong(VAL_MAX_INDEX);
-            }
-
-            assert recordComparator == null;
-            value = maxIndex + 1;
-            mapValue.putLong(VAL_MAX_INDEX, value);
-        }
-
-        @Override
-        public long getLong(Record rec) {
-            assert recordComparator == null;
-            return value;
-        }
-
-        @Override
-        public int getPassCount() {
-            return recordComparator == null ? WindowFunction.ZERO_PASS : WindowFunction.ONE_PASS;
-        }
-
-        @Override
-        public void initRecordComparator(RecordComparatorCompiler recordComparatorCompiler, ArrayColumnTypes chainTypes, IntList order) {
-            this.recordComparator = recordComparatorCompiler.compile(chainTypes, order);
-        }
-
-        @Override
-        public void pass1(Record record, long recordOffset, WindowSPI spi) {
-            partitionByRecord.of(record);
-
-            MapKey mapKey = map.withKey();
-            mapKey.put(partitionByRecord, partitionBySink);
-            MapValue mapValue = mapKey.createValue();
-            long maxIndex = 0;
-            if (mapValue.isNew()) {
-                mapValue.putLong(VAL_MAX_INDEX, 0);
-                mapValue.putLong(VAL_CURRENT_INDEX, 0);
-                mapValue.putLong(VAL_OFFSET, 0);
-            } else {
-                maxIndex = mapValue.getLong(VAL_MAX_INDEX);
-            }
-
-            if (recordComparator == null) {
-                // no order or order dismiss
-                Unsafe.getUnsafe().putLong(spi.getAddress(recordOffset, columnIndex), maxIndex + 1);
-            } else {
-                long currentIndex = mapValue.getLong(VAL_CURRENT_INDEX);
-                long offset = mapValue.getLong(VAL_OFFSET);
-                if (currentIndex == 0) {
-                    mapValue.putLong(VAL_CURRENT_INDEX, 1);
-                    mapValue.putLong(VAL_OFFSET, recordOffset);
-                } else {
-                    // compare with prev record
-                    recordComparator.setLeft(record);
-                    if (recordComparator.compare(spi.getRecordAt(offset)) != 0) {
-                        mapValue.putLong(VAL_CURRENT_INDEX, maxIndex + 1);
-                        mapValue.putLong(VAL_OFFSET, recordOffset);
-                    }
-                }
-                Unsafe.getUnsafe().putLong(spi.getAddress(recordOffset, columnIndex), mapValue.getLong(VAL_CURRENT_INDEX));
-            }
-            mapValue.putLong(VAL_MAX_INDEX, maxIndex + 1);
-        }
-
-        @Override
-        public void reopen() {
-            map.reopen();
-        }
-
-        @Override
-        public void reset() {
-            map.close();
-        }
-
-        @Override
-        public void setColumnIndex(int columnIndex) {
-            this.columnIndex = columnIndex;
-        }
-
-        @Override
-        public void toPlan(PlanSink sink) {
-            sink.val(SIGNATURE);
-            sink.val(" over (");
-            sink.val("partition by ");
-            sink.val(partitionByRecord.getFunctions());
-            sink.val(')');
-        }
-
-        @Override
-        public void toTop() {
-            map.clear();
-        }
-    }
-
-    private static class SequenceRankFunction extends LongFunction implements ScalarFunction, WindowFunction, Reopenable {
-
-        private int columnIndex;
-
+        private long count = 1;
+        private long lastRecordOffset;
         private long rank;
+        private ObjList<DirectIntList> rankMaps;
+        private RecordComparator recordComparator;
+        private RecordSink recordSink;
+        private SingleRecordSink singleRecordSinkA;
+        private SingleRecordSink singleRecordSinkB;
 
-        public SequenceRankFunction() {
+        public RankFunction(CairoConfiguration configuration, boolean isDense, String name) {
+            this.configuration = configuration;
+            this.isDense = isDense;
+            this.name = name;
         }
 
         @Override
         public void close() {
+            super.close();
+            Misc.free(singleRecordSinkA);
+            Misc.free(singleRecordSinkB);
+            Misc.freeObjList(rankMaps);
         }
 
         @Override
         public void computeNext(Record record) {
-            this.rank = 1;
+            SingleRecordSink singleRecordSink = count % 2 == 0 ? singleRecordSinkA : singleRecordSinkB;
+            singleRecordSink.clear();
+            recordSink.copy(record, singleRecordSink);
+            if (count == 1) {
+                rank = 1;
+            } else {
+                if (!singleRecordSinkA.memeq(singleRecordSinkB)) {
+                    rank = isDense ? rank + 1 : count;
+                }
+            }
+            count++;
         }
 
         @Override
@@ -329,13 +172,175 @@ public class RankFunctionFactory implements FunctionFactory {
         }
 
         @Override
-        public void initRecordComparator(RecordComparatorCompiler recordComparatorCompiler, ArrayColumnTypes chainTypes, IntList order) {
+        public String getName() {
+            return name;
+        }
+
+        @Override
+        public int getPassCount() {
+            return WindowFunction.ZERO_PASS;
+        }
+
+        @Override
+        public void init(SymbolTableSource symbolTableSource, SqlExecutionContext executionContext) throws SqlException {
+            super.init(symbolTableSource, executionContext);
+            SortKeyEncoder.buildRankMaps(symbolTableSource, rankMaps, recordComparator);
+        }
+
+        @Override
+        public void initRecordComparator(SqlCodeGenerator sqlGenerator,
+                                         RecordMetadata metadata,
+                                         ArrayColumnTypes chainTypes,
+                                         IntList orderIndices,
+                                         ObjList<ExpressionNode> orderBy,
+                                         IntList orderByDirection) throws SqlException {
+            if (chainTypes.getColumnCount() == 0) {
+                ListColumnFilter listColumnFilter = sqlGenerator.getIndexColumnFilter();
+                listColumnFilter.clear();
+                for (int i = 0, size = orderBy.size(); i < size; i++) {
+                    ExpressionNode tok = orderBy.getQuick(i);
+                    // Defensive, not currently exercised: this streaming fast path (empty chainTypes)
+                    // is reached today only when the window ORDER BY is a dismissable designated-timestamp
+                    // order, whose token arrives as a clean column name, so no protected alias reaches the
+                    // strip below - no query drives it and it is not covered by a test. It is kept for
+                    // parity with toOrderIndices (the else branch) and every other window factory, which
+                    // all unquote a compiler-protected alias (dotted or operator token) through SqlUtil:
+                    // were one ever to reach here, a bare metadata lookup would miss it and add(0) would
+                    // corrupt the sort key.
+                    int index = SqlUtil.getColumnIndexQuiet(metadata, tok.token);
+                    if (index < 0) {
+                        throw SqlException.invalidColumn(tok.position, tok.token);
+                    }
+                    listColumnFilter.add(index + 1);
+                }
+
+                for (int i = 0, size = metadata.getColumnCount(); i < size; i++) {
+                    chainTypes.add(metadata.getColumnType(i));
+                }
+                recordSink = RecordSinkFactory.getInstance(configuration, sqlGenerator.getAsm(), chainTypes, listColumnFilter);
+                final long sinkBudget = (long) configuration.getSqlWindowStorePageSize() * configuration.getSqlWindowStoreMaxPages() / 2;
+                // DENSE_RANK() reuses this class, so the budget message has to name whichever of
+                // the two the user actually ran. Reporting RANK() for a dense_rank() query defeats
+                // the point of carrying an owner name at all.
+                final String owner = isDense
+                        ? SingleRecordSink.OWNER_DENSE_RANK_WINDOW_FUNCTION
+                        : SingleRecordSink.OWNER_RANK_WINDOW_FUNCTION;
+                singleRecordSinkA = new SingleRecordSink(sinkBudget, MemoryTag.NATIVE_RECORD_CHAIN, owner,
+                        SingleRecordSink.CONFIG_KEYS_WINDOW_STORE);
+                singleRecordSinkB = new SingleRecordSink(sinkBudget, MemoryTag.NATIVE_RECORD_CHAIN, owner,
+                        SingleRecordSink.CONFIG_KEYS_WINDOW_STORE);
+            } else {
+                if (orderIndices == null) {
+                    orderIndices = sqlGenerator.toOrderIndices(metadata, orderBy, orderByDirection);
+                }
+                this.recordComparator = sqlGenerator.getRecordComparatorCompiler().newInstance(metadata, orderIndices);
+                this.rankMaps = SortKeyEncoder.createRankMaps(metadata, orderIndices);
+            }
         }
 
         @Override
         public void pass1(Record record, long recordOffset, WindowSPI spi) {
-            computeNext(record);
-            Unsafe.getUnsafe().putLong(spi.getAddress(recordOffset, columnIndex), rank);
+            if (count == 1) {
+                rank = 1;
+            } else {
+                recordComparator.setLeft(record);
+                if (recordComparator.compare(spi.getRecordAt(lastRecordOffset)) != 0) {
+                    rank = isDense ? rank + 1 : count;
+                }
+            }
+            lastRecordOffset = recordOffset;
+            count++;
+            Unsafe.putLong(spi.getAddress(recordOffset, columnIndex), rank);
+        }
+
+        @Override
+        public void reopen() {
+            count = 1;
+            if (singleRecordSinkA != null) {
+                singleRecordSinkA.reopen();
+            }
+            if (singleRecordSinkB != null) {
+                singleRecordSinkB.reopen();
+            }
+        }
+
+        @Override
+        public void reset() {
+            count = 1;
+            Misc.freeObjListAndKeepObjects(rankMaps);
+        }
+
+        @Override
+        public void setColumnIndex(int columnIndex) {
+            this.columnIndex = columnIndex;
+        }
+
+        @Override
+        public void toPlan(PlanSink sink) {
+            sink.val(getName());
+            sink.val("() over ()");
+        }
+
+        @Override
+        public void toTop() {
+            count = 1;
+            super.toTop();
+        }
+    }
+
+    protected static class RankNoOrderFunction extends LongFunction implements Function, WindowFunction, Reopenable {
+
+        private static final long RANK_CONST = 1;
+        private final String name;
+        private final VirtualRecord partitionByRecord;
+        private int columnIndex;
+
+        public RankNoOrderFunction(VirtualRecord partitionByRecord, String name) {
+            this.partitionByRecord = partitionByRecord;
+            this.name = name;
+        }
+
+        @Override
+        public void close() {
+            super.close();
+            if (partitionByRecord != null) {
+                Misc.freeObjList(partitionByRecord.getFunctions());
+            }
+        }
+
+        @Override
+        public long getLong(Record rec) {
+            return RANK_CONST;
+        }
+
+        @Override
+        public String getName() {
+            return name;
+        }
+
+        @Override
+        public int getPassCount() {
+            return WindowFunction.ZERO_PASS;
+        }
+
+        @Override
+        public void init(SymbolTableSource symbolTableSource, SqlExecutionContext executionContext) throws SqlException {
+            super.init(symbolTableSource, executionContext);
+            if (partitionByRecord != null) {
+                Function.init(partitionByRecord.getFunctions(), symbolTableSource, executionContext, null);
+            }
+        }
+
+        @Override
+        public void initPartitionBy(SymbolTableSource symbolTableSource, SqlExecutionContext executionContext) throws SqlException {
+            if (partitionByRecord != null) {
+                Function.init(partitionByRecord.getFunctions(), symbolTableSource, executionContext, null);
+            }
+        }
+
+        @Override
+        public void pass1(Record record, long recordOffset, WindowSPI spi) {
+            Unsafe.putLong(spi.getAddress(recordOffset, columnIndex), RANK_CONST);
         }
 
         @Override
@@ -353,7 +358,538 @@ public class RankFunctionFactory implements FunctionFactory {
 
         @Override
         public void toPlan(PlanSink sink) {
-            sink.val(SIGNATURE);
+            sink.val(getName());
+            PercentRankFunctionFactory.PercentRankNoOrderFunction.toSink0(sink, partitionByRecord);
         }
+    }
+
+    protected static class RankOverPartitionFunction extends LongFunction implements Function, WindowFunction, Reopenable {
+
+        private final CairoConfiguration configuration;
+        private final boolean isDense;
+        private final ColumnTypes keyColumnTypes;
+        // True when this function is being compiled as part of a live view's
+        // SELECT. Drives opt-in allocation of the tombstone value-layout slot
+        // used by anchor-driven compaction, plus the chain-type capture the
+        // snapshot codec needs.
+        private final boolean liveView;
+        private final String name;
+        private final VirtualRecord partitionByRecord;
+        private final RecordSink partitionBySink;
+        private LiveViewCheckpointDependency checkpointDependency;
+        private LiveViewCheckpointFunctionIdentity checkpointFunctionIdentity;
+        // Subset of mapValueTypes covering the chain-prefix slots [0, chainTypeIndex).
+        // Populated when this function compiles for a live view so the snapshot
+        // codec can read the chain bytes back from MapValue at restore time;
+        // null for non-live-view compiles where snapshot is never called.
+        private ArrayColumnTypes chainColumnTypes;
+        private int chainTypeIndex;
+        private int columnIndex;
+        // Reusable second map for the live-view frontier sweep; ping-pongs with map.
+        private Map compactionScratch;
+        private Map map;
+        private ArrayColumnTypes mapValueTypes;
+        // The per-query MemoryTracker bound by setMemoryTracker; retained so
+        // retainPartitions can charge the lazily-created compaction scratch too.
+        private MemoryTracker memoryTracker;
+        private long rank;
+        private ObjList<DirectIntList> rankMaps;
+        private RecordComparator recordComparator;
+        private RecordValueSink recordValueSink;
+        // For the streaming (WindowRecordCursorFactory) path the MapValue stores only the ORDER BY
+        // columns, compacted. This maps each compacted rank-map slot back to its base column index so
+        // init() can populate the rank maps from the right symbol tables. Null on the cached path.
+        private int[] streamingSymbolTableIndices;
+        // Live-view-only: count of partitions whose tombstone byte is set. Tracked
+        // on the refresh-worker thread (single writer), read by 2b.1d's compaction
+        // path. Not volatile.
+        private long tombstoneCount;
+        // Value-layout index of the per-partition tombstone byte (live view only).
+        // Lives at chainTypeIndex + 2 (one slot past the count slot); -1 for
+        // non-live-view compiles where the slot is omitted.
+        private int tombstoneValueIndex = -1;
+
+        public RankOverPartitionFunction(ColumnTypes keyColumnTypes,
+                                         VirtualRecord partitionByRecord,
+                                         RecordSink partitionBySink,
+                                         CairoConfiguration configuration,
+                                         boolean isDense,
+                                         boolean liveView,
+                                         String name) {
+            this.partitionByRecord = partitionByRecord;
+            this.partitionBySink = partitionBySink;
+            // Snapshot the key types: the streaming path builds the map lazily in
+            // initRecordComparator(), by which point the generator has rebuilt its shared key-types
+            // buffer for a later window column's PARTITION BY. The live-view frontier sweep also
+            // needs a stable copy to allocate a scratch Map with the same key shape after
+            // compilation moves on.
+            this.keyColumnTypes = copyKeyTypes(keyColumnTypes);
+            this.configuration = configuration;
+            this.isDense = isDense;
+            this.liveView = liveView;
+            this.name = name;
+        }
+
+        @Override
+        public void close() {
+            super.close();
+            Misc.free(map);
+            Misc.free(compactionScratch);
+            Misc.freeObjList(partitionByRecord.getFunctions());
+            Misc.freeObjList(rankMaps);
+        }
+
+        @Override
+        public LiveViewCheckpointDependency checkpointDependency() {
+            return checkpointDependency;
+        }
+
+        @Override
+        public LiveViewCheckpointFunctionIdentity checkpointFunctionIdentity() {
+            return checkpointFunctionIdentity;
+        }
+
+        @Override
+        public void retainPartitions(Map survivingKeys, RecordSink survivingKeySink) {
+            // RankOverPartitionFunction implements WindowFunction directly (no
+            // BasePartitionedWindowFunction), so it overrides retainPartitions itself.
+            // The reusable scratch ping-pongs with map; only the first sweep allocates.
+            if (compactionScratch == null) {
+                compactionScratch = MapFactory.createUnorderedMap(configuration, keyColumnTypes, mapValueTypes);
+                // createUnorderedMap returns an OPEN map allocated under no tracker.
+                // Free that untracked backing, bind the tracker, then reopen so the
+                // scratch's malloc and free stay symmetric on the per-query counter
+                // once the ping-pong swap below promotes it to the live map.
+                if (memoryTracker != null) {
+                    compactionScratch.close();
+                    compactionScratch.setMemoryTracker(memoryTracker);
+                    compactionScratch.reopen();
+                }
+            } else {
+                compactionScratch.clear();
+            }
+            PartitionStateEvictor.rebuildKeepingMembers(map, compactionScratch, survivingKeys, survivingKeySink);
+            Map old = map;
+            map = compactionScratch;
+            compactionScratch = old;
+            tombstoneCount = 0;
+        }
+
+        @Override
+        public void computeNext(Record record) {
+            partitionByRecord.of(record);
+            MapKey key = map.withKey();
+            key.put(partitionByRecord, partitionBySink);
+            MapValue mapValue = key.createValue();
+            // Live mode keeps a tombstone byte alongside the rank slots; write it
+            // explicitly on the isNew branch so the two-pass snapshot walk sees the
+            // same byte both times. Maps do not guarantee zeroed value bytes on
+            // createValue.
+            if (mapValue.isNew() && tombstoneValueIndex >= 0) {
+                mapValue.putByte(tombstoneValueIndex, (byte) 0);
+            }
+            long count;
+            boolean isNew = mapValue.isNew();
+            // count == 0 acts as the implicit "uninitialized" signal - the natural
+            // state after createValue() returns a fresh entry, and the state
+            // resetPartition restores when the live-view ANCHOR fires.
+            boolean fresh = isNew || mapValue.getLong(chainTypeIndex + 1) == 0;
+            if (fresh) {
+                rank = 1;
+                count = 1;
+            } else {
+                rank = mapValue.getLong(chainTypeIndex);
+                count = mapValue.getLong(chainTypeIndex + 1);
+                // The MapValue holds the previous row's ORDER BY columns (compacted). setLeft caches
+                // them by value, so we can overwrite the slots with the current row and then compare
+                // the cached previous row against it - the comparator never touches the live record,
+                // which lets the MapValue store only the ORDER BY columns instead of the whole row.
+                recordComparator.setLeft(mapValue);
+            }
+            recordValueSink.copy(record, mapValue);
+            if (!fresh && recordComparator.compare(mapValue) != 0) {
+                rank = isDense ? rank + 1 : count;
+            }
+            mapValue.putLong(chainTypeIndex, rank);
+            mapValue.putLong(chainTypeIndex + 1, count + 1);
+        }
+
+        @Override
+        public long getLong(Record rec) {
+            return rank;
+        }
+
+        @Override
+        public String getName() {
+            return name;
+        }
+
+        @Override
+        public int getPassCount() {
+            return WindowFunction.ZERO_PASS;
+        }
+
+        @Override
+        public Map getPartitionMap() {
+            return map;
+        }
+
+        @Override
+        public ColumnTypes getCheckpointKeyColumnTypes() {
+            return keyColumnTypes;
+        }
+
+        @Override
+        public int getCheckpointKeyStartIndex() {
+            return mapValueTypes != null
+                    ? mapValueTypes.getColumnCount()
+                    : chainTypeIndex + 2;
+        }
+
+        @Override
+        public long getTombstoneCount() {
+            return tombstoneCount;
+        }
+
+        @Override
+        public int getTombstoneValueIndex() {
+            return tombstoneValueIndex;
+        }
+
+        @Override
+        public void markPartitionAlive(Record record) {
+            if (tombstoneValueIndex < 0 || tombstoneCount == 0) {
+                return;
+            }
+            partitionByRecord.of(record);
+            MapKey key = map.withKey();
+            key.put(partitionByRecord, partitionBySink);
+            MapValue value = key.findValue();
+            if (value != null && value.getByte(tombstoneValueIndex) == 1) {
+                value.putByte(tombstoneValueIndex, (byte) 0);
+                tombstoneCount--;
+            }
+        }
+
+        @Override
+        public void resetPartition(Record record) {
+            partitionByRecord.of(record);
+            MapKey key = map.withKey();
+            key.put(partitionByRecord, partitionBySink);
+            // Rank uses createValue intentionally: a partition may not exist yet
+            // when the anchor-driven reset fires (the anchor map fires
+            // resetPartition before the function map's first computeNext on a
+            // fresh partition). Other migrated functions only call findValue
+            // because their per-partition state is established by the row loop;
+            // rank's "uninitialized" signal is count=0, which must be written
+            // explicitly here.
+            MapValue mapValue = key.createValue();
+            // Set count to 0 — the implicit "uninitialized" signal for computeNext.
+            // Rank itself doesn't need an explicit clear; the next computeNext writes
+            // both slots before they're read.
+            mapValue.putLong(chainTypeIndex + 1, 0);
+            if (mapValue.isNew()) {
+                // Fresh entry: pin the tombstone byte to 0 since Maps don't guarantee
+                // zeroed value bytes on createValue.
+                if (tombstoneValueIndex >= 0) {
+                    mapValue.putByte(tombstoneValueIndex, (byte) 0);
+                }
+            } else if (tombstoneValueIndex >= 0 && mapValue.getByte(tombstoneValueIndex) != 1) {
+                mapValue.putByte(tombstoneValueIndex, (byte) 1);
+                tombstoneCount++;
+            }
+        }
+
+        @Override
+        public void init(SymbolTableSource symbolTableSource, SqlExecutionContext executionContext) throws SqlException {
+            super.init(symbolTableSource, executionContext);
+            Function.init(partitionByRecord.getFunctions(), symbolTableSource, executionContext, null);
+            buildRankMaps(symbolTableSource);
+        }
+
+        @Override
+        public void initPartitionBy(SymbolTableSource symbolTableSource, SqlExecutionContext executionContext) throws SqlException {
+            Function.init(partitionByRecord.getFunctions(), symbolTableSource, executionContext, null);
+            // Rebuild the rank maps here too. A live view's incremental refresh calls
+            // initPartitionBy instead of init() from the second cycle onward, and a rank map
+            // encodes symbol keys against the symbol table of the cycle that built it. Reusing a
+            // cycle-1 encoding to compare cycle-2 keys mis-orders every row whose ORDER BY symbol
+            // was added in between - silently, since the comparison still succeeds.
+            buildRankMaps(symbolTableSource);
+        }
+
+        @Override
+        public void initRecordComparator(SqlCodeGenerator sqlGenerator,
+                                         RecordMetadata metadata,
+                                         ArrayColumnTypes chainTypes,
+                                         IntList orderIndices,
+                                         ObjList<ExpressionNode> orderBy,
+                                         IntList orderByDirection) throws SqlException {
+            if (orderIndices == null) {
+                orderIndices = sqlGenerator.toOrderIndices(metadata, orderBy, orderByDirection);
+            }
+
+            if (chainTypes.getColumnCount() == 0) { // for WindowRecordCursorFactory
+                // Only the ORDER BY columns decide whether two consecutive rows are peers, so the
+                // MapValue holds just those (compacted) plus the running rank and count. Copying the
+                // whole projected row would force pass-through columns the MapValue cannot store
+                // (STRING, VARCHAR, BINARY, arrays, ...) through RecordValueSinkFactory
+                // and crash compilation. The value sink reads the ORDER BY columns from the live
+                // record at their base indices and writes them into MapValue slots 0..k-1; the
+                // comparator and rank maps are built over a matching compacted metadata so they read
+                // those same slots back.
+                final int orderByCount = orderIndices.size();
+
+                ListColumnFilter listColumnFilter = sqlGenerator.getIndexColumnFilter();
+                listColumnFilter.clear();
+                final GenericRecordMetadata orderByMetadata = new GenericRecordMetadata();
+                final IntList compactOrderIndices = new IntList(orderByCount);
+                streamingSymbolTableIndices = new int[orderByCount];
+                for (int i = 0; i < orderByCount; i++) {
+                    final int encoded = orderIndices.getQuick(i);
+                    final int orderByColumn = Math.abs(encoded) - 1;
+                    listColumnFilter.add(orderByColumn + 1);
+                    final TableColumnMetadata src = metadata.getColumnMetadata(orderByColumn);
+                    final int orderByColumnType = src.getColumnType();
+                    // The compacted MapValue holds the previous row's ORDER BY values, and computeNext
+                    // caches them through setLeft, overwrites the slots with the current row, then
+                    // compares. That is sound only when each value is cached by value: a var-size
+                    // column (STRING, VARCHAR, BINARY, array, INTERVAL) or a non-static symbol would be
+                    // cached as a flyweight aliasing the record and get corrupted by the overwrite,
+                    // silently producing wrong ranks. LONG256 is fixed-size but still excluded: its
+                    // comparator reads the right-hand operand via getLong256B, which FlyweightPackedMapValue
+                    // does not implement (it throws), so a LONG256 ORDER BY would crash here rather than
+                    // return a wrong rank. Only the designated timestamp and static indexed SYMBOLs reach
+                    // the streaming path today. RecordValueSinkFactory used to reject LONG256 outright,
+                    // which failed such a query at compile time; now that it accepts LONG256, reject here
+                    // instead, so a future routing change that admits another type surfaces as a clean
+                    // compile-time error rather than a mid-query crash or a wrong rank.
+                    if (!(ColumnType.isFixedSize(orderByColumnType) && ColumnType.tagOf(orderByColumnType) != ColumnType.LONG256)
+                            && !(ColumnType.isSymbol(orderByColumnType) && src.isSymbolTableStatic())) {
+                        throw SqlException.$(orderBy != null ? orderBy.getQuick(i).position : 0, "unsupported column type in streaming ")
+                                .put(name).put("() ORDER BY: ").put(ColumnType.nameOf(orderByColumnType));
+                    }
+                    // Synthetic unique names keep duplicate ORDER BY columns from clashing; only the
+                    // type and the static-symbol flag matter to the comparator and the rank maps.
+                    orderByMetadata.add(new TableColumnMetadata(
+                            "k" + i,
+                            orderByColumnType,
+                            IndexType.NONE,
+                            0,
+                            src.isSymbolTableStatic(),
+                            null
+                    ));
+                    compactOrderIndices.add(encoded < 0 ? -(i + 1) : (i + 1));
+                    streamingSymbolTableIndices[i] = orderByColumn;
+                    chainTypes.add(orderByColumnType);
+                }
+
+                chainTypeIndex = orderByCount;
+                recordValueSink = RecordValueSinkFactory.getInstance(sqlGenerator.getAsm(), metadata, listColumnFilter);
+                this.recordComparator = sqlGenerator.getRecordComparatorCompiler().newInstance(orderByMetadata, compactOrderIndices);
+                this.rankMaps = SortKeyEncoder.createRankMaps(orderByMetadata, compactOrderIndices);
+                if (liveView) {
+                    // Capture the chain-prefix types (the compacted ORDER BY columns) before the
+                    // rank/count/tombstone slots get appended below. Snapshot/restore
+                    // reads those chain bytes back via this typed slice so the live-view checkpoint can
+                    // rehydrate the recordComparator's stored "last key image".
+                    chainColumnTypes = new ArrayColumnTypes();
+                    for (int i = 0, size = chainTypes.getColumnCount(); i < size; i++) {
+                        chainColumnTypes.add(chainTypes.getColumnType(i));
+                    }
+                }
+                chainTypes.add(ColumnType.LONG); // rank
+                chainTypes.add(ColumnType.LONG); // count
+                if (liveView) {
+                    chainTypes.add(ColumnType.BYTE); // tombstone (anchor compaction)
+                    tombstoneValueIndex = chainTypeIndex + 2;
+                    // Caller reuses the chainTypes buffer across window functions in the
+                    // same query; take our own copy so {@link #retainPartitions}
+                    // can allocate a scratch Map with the exact same value layout.
+                    mapValueTypes = new ArrayColumnTypes();
+                    mapValueTypes.addAll(chainTypes);
+                }
+                // Lazy: reopen() allocates the backing after setMemoryTracker() binds
+                // the per-query tracker, keeping malloc/free on the per-query counter.
+                this.map = MapFactory.createUnorderedMap(
+                        configuration,
+                        keyColumnTypes,
+                        chainTypes,
+                        false,
+                        false
+                );
+            } else { // for CachedWindowRecordCursorFactory
+                map = MapFactory.createUnorderedMap(
+                        configuration,
+                        keyColumnTypes,
+                        RANK_COLUMN_TYPES,
+                        false,
+                        false
+                );
+                this.recordComparator = sqlGenerator.getRecordComparatorCompiler().newInstance(metadata, orderIndices);
+                this.rankMaps = SortKeyEncoder.createRankMaps(metadata, orderIndices);
+            }
+        }
+
+        @Override
+        public void onCheckpointRestoreBegin() {
+            map.clear();
+            tombstoneCount = 0;
+        }
+
+        @Override
+        public void pass1(Record record, long recordOffset, WindowSPI spi) {
+            partitionByRecord.of(record);
+            MapKey key = map.withKey();
+            key.put(partitionByRecord, partitionBySink);
+            MapValue mapValue = key.createValue();
+            long count;
+            if (mapValue.isNew()) {
+                rank = 1;
+                count = 1;
+            } else {
+                long lastOffset = mapValue.getLong(0);
+                rank = mapValue.getLong(1);
+                count = mapValue.getLong(2);
+                recordComparator.setLeft(record);
+                if (recordComparator.compare(spi.getRecordAt(lastOffset)) != 0) {
+                    rank = isDense ? rank + 1 : count;
+                }
+            }
+
+            mapValue.putLong(0, recordOffset);
+            mapValue.putLong(1, rank);
+            mapValue.putLong(2, count + 1);
+            Unsafe.putLong(spi.getAddress(recordOffset, columnIndex), rank);
+        }
+
+        @Override
+        public void reopen() {
+            if (map != null) {
+                map.reopen();
+            }
+            rank = 0;
+            tombstoneCount = 0;
+        }
+
+        @Override
+        public void reset() {
+            Misc.free(map);
+            compactionScratch = Misc.free(compactionScratch);
+            Misc.freeObjListAndKeepObjects(rankMaps);
+            rank = 0;
+        }
+
+        @Override
+        public long restoreCheckpointState(LiveViewStatePageReader source, long offset, MapValue value) {
+            offset = LiveViewSnapshotKeyCodec.readValueSlots(value, 0, source, offset, chainColumnTypes);
+            value.putLong(chainTypeIndex, source.getLong(offset));
+            offset += Long.BYTES;
+            value.putLong(chainTypeIndex + 1, source.getLong(offset));
+            offset += Long.BYTES;
+            if (tombstoneValueIndex >= 0) {
+                value.putByte(tombstoneValueIndex, (byte) 0);
+            }
+            return offset;
+        }
+
+        @Override
+        public void setColumnIndex(int columnIndex) {
+            this.columnIndex = columnIndex;
+        }
+
+        @Override
+        public void setCheckpointCompilerMetadata(
+                LiveViewCheckpointFunctionIdentity identity,
+                LiveViewCheckpointDependency dependency
+        ) {
+            if (checkpointFunctionIdentity != null || checkpointDependency != null) {
+                throw new IllegalStateException("live view checkpoint compiler metadata already set");
+            }
+            checkpointFunctionIdentity = identity;
+            checkpointDependency = dependency;
+        }
+
+        @Override
+        public void setMemoryTracker(@Nullable MemoryTracker tracker) {
+            // Retain the tracker so retainPartitions can charge the compaction scratch
+            // to it. The live map (which may itself be a scratch promoted by a prior
+            // swap) is tracked here directly.
+            this.memoryTracker = tracker;
+            if (map != null) {
+                map.setMemoryTracker(tracker);
+            }
+        }
+
+        @Override
+        public int checkpointStateFormatVersion() {
+            return 1;
+        }
+
+        @Override
+        public void freezeCheckpointState(LiveViewStatePageWriter sink, MapValue value) {
+            LiveViewSnapshotKeyCodec.writeKey(sink, value, chainColumnTypes, 0);
+            sink.putLong(value.getLong(chainTypeIndex));
+            sink.putLong(value.getLong(chainTypeIndex + 1));
+        }
+
+        @Override
+        public boolean supportsCheckpointState() {
+            // The chain-prefix restores through MapValue slot setters, which have no
+            // STRING variant - the chain types must be fixed-width, not merely
+            // codec-supported (the codec admits STRING for partition keys only).
+            return liveView
+                    && chainColumnTypes != null
+                    && LiveViewSnapshotKeyCodec.isAllTypesSupported(keyColumnTypes)
+                    && LiveViewSnapshotKeyCodec.isAllTypesFixedWidth(chainColumnTypes);
+        }
+
+        @Override
+        public void toPlan(PlanSink sink) {
+            sink.val(getName());
+            sink.val("()");
+            sink.val(" over (");
+            sink.val("partition by ");
+            sink.val(partitionByRecord.getFunctions());
+            sink.val(')');
+        }
+
+        @Override
+        public void toTop() {
+            super.toTop();
+            Misc.clear(map);
+            rank = 0;
+            tombstoneCount = 0;
+        }
+
+        /**
+         * (Re)builds the ORDER BY rank maps against {@code symbolTableSource}'s current symbol
+         * tables. Both {@link #init} and {@link #initPartitionBy} call this: the encodings are
+         * only valid for the symbol tables they were built from.
+         */
+        private void buildRankMaps(SymbolTableSource symbolTableSource) {
+            if (streamingSymbolTableIndices != null) {
+                // Streaming path: rank maps are indexed by compacted ORDER BY position, but the symbol
+                // tables live at the base column indices, so build each one through the mapping.
+                if (rankMaps != null) {
+                    for (int i = 0, n = rankMaps.size(); i < n; i++) {
+                        DirectIntList rankMap = rankMaps.getQuick(i);
+                        if (rankMap != null) {
+                            SortKeyEncoder.buildRankMap(symbolTableSource.getSymbolTable(streamingSymbolTableIndices[i]), rankMap);
+                        }
+                    }
+                    recordComparator.setRankMaps(rankMaps);
+                }
+            } else {
+                SortKeyEncoder.buildRankMaps(symbolTableSource, rankMaps, recordComparator);
+            }
+        }
+    }
+
+    static {
+        RANK_COLUMN_TYPES = new ArrayColumnTypes();
+        RANK_COLUMN_TYPES.add(ColumnType.LONG); // offset
+        RANK_COLUMN_TYPES.add(ColumnType.LONG); // rank
+        RANK_COLUMN_TYPES.add(ColumnType.LONG); // count
     }
 }

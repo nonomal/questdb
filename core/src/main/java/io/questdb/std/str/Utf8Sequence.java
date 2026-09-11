@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -25,12 +25,13 @@
 package io.questdb.std.str;
 
 import io.questdb.std.Unsafe;
+import io.questdb.std.bytes.ByteSequence;
 import org.jetbrains.annotations.NotNull;
 
 /**
  * A sequence of UTF-8 bytes.
  */
-public interface Utf8Sequence {
+public interface Utf8Sequence extends ByteSequence {
 
     /**
      * Returns a CharSequence view of the sequence.
@@ -49,6 +50,15 @@ public interface Utf8Sequence {
      * @return byte at index
      */
     byte byteAt(int index);
+
+    default int intAt(int offset) {
+        int result = 0;
+        result |= byteAt(offset) & 0xff;
+        result |= (byteAt(offset + 1) & 0xff) << 8;
+        result |= (byteAt(offset + 2) & 0xff) << (8 * 2);
+        result |= (byteAt(offset + 3) & 0xff) << (8 * 3);
+        return result;
+    }
 
     /**
      * Returns `true` if it's guaranteed that the contents of this UTF-8 sequence are
@@ -79,9 +89,14 @@ public interface Utf8Sequence {
      */
     default long longAt(int offset) {
         long result = 0;
-        for (int i = offset; i < offset + Long.BYTES; i++) {
-            result |= (byteAt(i) & 0xffL) << (8 * (i - offset));
-        }
+        result |= byteAt(offset) & 0xffL;
+        result |= (byteAt(offset + 1) & 0xffL) << 8;
+        result |= (byteAt(offset + 2) & 0xffL) << (8 * 2);
+        result |= (byteAt(offset + 3) & 0xffL) << (8 * 3);
+        result |= (byteAt(offset + 4) & 0xffL) << (8 * 4);
+        result |= (byteAt(offset + 5) & 0xffL) << (8 * 5);
+        result |= (byteAt(offset + 6) & 0xffL) << (8 * 6);
+        result |= (byteAt(offset + 7) & 0xffL) << (8 * 7);
         return result;
     }
 
@@ -93,6 +108,13 @@ public interface Utf8Sequence {
         return -1;
     }
 
+    default short shortAt(int offset) {
+        int result = 0;
+        result |= byteAt(offset) & 0xff;
+        result |= (byteAt(offset + 1) & 0xff) << 8;
+        return (short) result;
+    }
+
     /**
      * Number of bytes in the string.
      * <p>
@@ -101,13 +123,23 @@ public interface Utf8Sequence {
      */
     int size();
 
+    /**
+     * Number of bytes contiguously addressable bytes at the end of the sequence.
+     * This is useful if we need to access the data zero-copy via simd instructions.
+     * <p>
+     * The returned value, is the number of addressable bytes past `hi()`.
+     */
+    default long tailPadding() {
+        return 0;
+    }
+
     default void writeTo(long addr, int lo, int hi) {
         int i = lo;
         for (int n = hi - 7; i < n; i += 8, addr += 8) {
-            Unsafe.getUnsafe().putLong(addr, longAt(i));
+            Unsafe.putLong(addr, longAt(i));
         }
         for (; i < hi; i++, addr++) {
-            Unsafe.getUnsafe().putByte(addr, byteAt(i));
+            Unsafe.putByte(addr, byteAt(i));
         }
     }
 

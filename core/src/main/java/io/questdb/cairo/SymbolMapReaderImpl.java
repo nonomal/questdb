@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,17 +24,27 @@
 
 package io.questdb.cairo;
 
+import io.questdb.cairo.idx.ConcurrentBitmapIndexFwdReader;
 import io.questdb.cairo.sql.RowCursor;
 import io.questdb.cairo.sql.StaticSymbolTable;
 import io.questdb.cairo.sql.SymbolTable;
 import io.questdb.cairo.vm.Vm;
 import io.questdb.cairo.vm.api.MemoryCMR;
+import io.questdb.cairo.vm.api.MemoryR;
 import io.questdb.log.Log;
 import io.questdb.log.LogFactory;
-import io.questdb.std.*;
+import io.questdb.std.Chars;
+import io.questdb.std.FilesFacade;
+import io.questdb.std.Hash;
+import io.questdb.std.MemoryTag;
+import io.questdb.std.Misc;
+import io.questdb.std.Numbers;
+import io.questdb.std.ObjList;
+import io.questdb.std.Transient;
 import io.questdb.std.str.DirectString;
 import io.questdb.std.str.Path;
 import io.questdb.std.str.StringSink;
+import io.questdb.std.str.Utf8Sequence;
 import org.jetbrains.annotations.TestOnly;
 
 import java.io.Closeable;
@@ -58,20 +68,27 @@ public class SymbolMapReaderImpl implements Closeable, SymbolMapReader {
     private boolean nullValue;
     private int symbolCapacity;
     private int symbolCount;
+    private long symbolTableGeneration;
 
     public SymbolMapReaderImpl() {
     }
 
-    public SymbolMapReaderImpl(CairoConfiguration configuration, Path path, CharSequence name, long columnNameTxn, int symbolCount) {
-        of(configuration, path, name, columnNameTxn, symbolCount);
+    public SymbolMapReaderImpl(
+            CairoConfiguration configuration,
+            @Transient Utf8Sequence pathToTableDir,
+            @Transient CharSequence columnName,
+            long columnNameTxn,
+            int symbolCount
+    ) {
+        of(configuration, pathToTableDir, columnName, columnNameTxn, symbolCount);
     }
 
     @Override
     public void close() {
         Misc.free(indexReader);
         Misc.free(charMem);
-        this.cache.clear();
-        int fd = this.offsetMem.getFd();
+        cache.clear();
+        long fd = offsetMem.getFd();
         Misc.free(offsetMem);
         Misc.free(path);
         LOG.debug().$("closed [fd=").$(fd).$(']').$();
@@ -98,6 +115,21 @@ public class SymbolMapReaderImpl implements Closeable, SymbolMapReader {
     }
 
     @Override
+    public long getSymbolTableGeneration() {
+        return symbolTableGeneration;
+    }
+
+    @Override
+    public MemoryR getSymbolOffsetsColumn() {
+        return offsetMem;
+    }
+
+    @Override
+    public MemoryR getSymbolValuesColumn() {
+        return charMem;
+    }
+
+    @Override
     public boolean isCached() {
         return cached;
     }
@@ -111,11 +143,12 @@ public class SymbolMapReaderImpl implements Closeable, SymbolMapReader {
     public int keyOf(CharSequence value) {
         if (value != null) {
             int hash = Hash.boundedHash(value, maxHash);
-            final RowCursor cursor = indexReader.getCursor(true, hash, 0, maxOffset - Long.BYTES);
-            while (cursor.hasNext()) {
-                final long offsetOffset = cursor.next();
-                if (Chars.equals(value, charMem.getStrA(offsetMem.getLong(offsetOffset)))) {
-                    return SymbolMapWriter.offsetToKey(offsetOffset);
+            try (RowCursor cursor = indexReader.getCursor(hash, 0, maxOffset - Long.BYTES)) {
+                while (cursor.hasNext()) {
+                    final long offsetOffset = cursor.next();
+                    if (Chars.equals(value, charMem.getStrA(offsetMem.getLong(offsetOffset)))) {
+                        return SymbolMapWriter.offsetToKey(offsetOffset);
+                    }
                 }
             }
             return SymbolTable.VALUE_NOT_FOUND;
@@ -131,10 +164,16 @@ public class SymbolMapReaderImpl implements Closeable, SymbolMapReader {
         return new SymbolTableView();
     }
 
-    public void of(CairoConfiguration configuration, Path path, CharSequence columnName, long columnNameTxn, int symbolCount) {
-        FilesFacade ff = configuration.getFilesFacade();
+    public void of(
+            CairoConfiguration configuration,
+            @Transient Utf8Sequence pathToTableDir,
+            @Transient CharSequence columnName,
+            long columnNameTxn,
+            int symbolCount
+    ) {
+        final FilesFacade ff = configuration.getFilesFacade();
         this.configuration = configuration;
-        this.path.of(path);
+        this.path.of(pathToTableDir);
         this.columnNameSink.clear();
         this.columnNameSink.put(columnName);
         this.columnNameTxn = columnNameTxn;
@@ -146,7 +185,7 @@ public class SymbolMapReaderImpl implements Closeable, SymbolMapReader {
             // and we use "offset" file to store "header"
             if (!ff.exists(offsetFileName(path.trimTo(plen), columnName, columnNameTxn))) {
                 LOG.error().$(path).$(" is not found").$();
-                throw CairoException.critical(0).put("SymbolMap does not exist: ").put(path);
+                throw CairoException.fileNotFound().put("SymbolMap does not exist: ").put(path);
             }
 
             // is there enough length in "offset" file for "header"?
@@ -160,30 +199,49 @@ public class SymbolMapReaderImpl implements Closeable, SymbolMapReader {
             // we left off. Where we left off is stored externally to symbol map
             final long offsetMemSize = SymbolMapWriter.keyToOffset(symbolCount) + Long.BYTES;
             LOG.debug().$("offsetMem.of [columnName=").$(path).$(",offsetMemSize=").$(offsetMemSize).I$();
-            this.offsetMem.of(ff, path.$(), offsetMemSize, offsetMemSize, MemoryTag.MMAP_INDEX_READER);
+            offsetMem.of(ff, path.$(), offsetMemSize, offsetMemSize, MemoryTag.MMAP_INDEX_READER);
             this.symbolCapacity = offsetMem.getInt(SymbolMapWriter.HEADER_CAPACITY);
-            assert this.symbolCapacity > 0;
+            assert symbolCapacity > 0;
             this.cached = offsetMem.getBool(SymbolMapWriter.HEADER_CACHE_ENABLED);
             this.nullValue = offsetMem.getBool(SymbolMapWriter.HEADER_NULL_FLAG);
 
             // index reader is used to identify attempts to store duplicate symbol value
-            this.indexReader.of(configuration, path.trimTo(plen), columnName, columnNameTxn, 0);
+            // partition txn does not matter, because symbol is at the root of the table dir (not at partition level)
+            // Symbol-table de-dup index is BITMAP — metadata + cover params unused.
+            indexReader.of(configuration, path.trimTo(plen), columnName, columnNameTxn, -1, 0, null, null, 0);
 
+            long charSize = offsetMem.getLong(maxOffset);
+            // char file size can be zero only if symbolCount is zero
+            assert charSize > 0 || symbolCount == 0;
             // this is the place where symbol values are stored
-            this.charMem.wholeFile(ff, charFileName(path.trimTo(plen), columnName, columnNameTxn), MemoryTag.MMAP_INDEX_READER);
-
-            // move append pointer for symbol values in the correct place
-            this.charMem.extend(this.offsetMem.getLong(maxOffset));
+            charMem.of(
+                    ff,
+                    charFileName(path.trimTo(plen), columnName, columnNameTxn),
+                    ff.getMapPageSize(),
+                    charSize,
+                    MemoryTag.MMAP_INDEX_READER,
+                    CairoConfiguration.O_NONE,
+                    -1
+            );
 
             // we use index hash maximum equals to half of symbol capacity, which
             // theoretically should require 2 value cells in index per hash
             // we use 4 cells to compensate for occasionally unlucky hash distribution
             this.maxHash = Math.max(Numbers.ceilPow2(symbolCapacity / 2) - 1, 1);
-            if (cached) {
-                this.cache.setPos(symbolCapacity);
-            }
-            this.cache.clear();
-            LOG.debug().$("open [columnName=").$(path.trimTo(plen).concat(columnName).$()).$(", fd=").$(this.offsetMem.getFd()).$(", capacity=").$(symbolCapacity).$(']').$();
+            // The cache grows on demand in fetchAndCache, which is why it is not
+            // pre-sized here. Pre-sizing allocated and zero-filled an Object[] of
+            // the column's DECLARED capacity on every open - 16 MB for a column
+            // declared CAPACITY 2097152, retained for the reader's life, whether or
+            // not a single value was ever resolved through it. It bought nothing
+            // even then: the clear() below immediately reset the position to zero,
+            // so only the backing array survived, and extendAndSet grows that
+            // geometrically anyway.
+            cache.clear();
+            symbolTableGeneration = symbolTableGeneration == Long.MAX_VALUE ? 0 : symbolTableGeneration + 1;
+            LOG.debug().$("open [columnName=").$(path.trimTo(plen).concat(columnName).$())
+                    .$(", fd=").$(offsetMem.getFd())
+                    .$(", capacity=").$(symbolCapacity)
+                    .I$();
         } catch (Throwable e) {
             close();
             throw e;
@@ -200,14 +258,22 @@ public class SymbolMapReaderImpl implements Closeable, SymbolMapReader {
             // offset mem contains offsets of symbolCount + 1
             // we need to make sure we have access to the last element
             // which will indicate size of the char column
-            this.offsetMem.extend(maxOffset + Long.BYTES);
-            this.charMem.extend(this.offsetMem.getLong(maxOffset));
+            offsetMem.extend(maxOffset + Long.BYTES);
+
+            long charSize = offsetMem.getLong(maxOffset);
+            // char file size can be zero only if symbolCount is zero
+            assert charSize > 0 || symbolCount == 0;
+            charMem.extend(charSize);
         } else if (symbolCount < this.symbolCount) {
-            cache.remove(symbolCount + 1, this.symbolCount);
+            cache.remove(symbolCount, this.symbolCount - 1);
             this.symbolCount = symbolCount;
+            this.maxOffset = SymbolMapWriter.keyToOffset(symbolCount);
         }
+        // Refresh contains null flag.
+        this.nullValue = offsetMem.getBool(SymbolMapWriter.HEADER_NULL_FLAG);
         // Refresh index reader to avoid memory remapping on keyOf() calls.
-        this.indexReader.of(configuration, path, columnNameSink, columnNameTxn, 0);
+        // partition txn does not matter, because symbol is at the root of the table dir (not at partition level)
+        indexReader.of(configuration, path, columnNameSink, columnNameTxn, -1, 0, null, null, 0);
     }
 
     @Override
@@ -228,6 +294,25 @@ public class SymbolMapReaderImpl implements Closeable, SymbolMapReader {
                 return cachedValue(key);
             }
             return uncachedValue(key);
+        }
+        return null;
+    }
+
+    /**
+     * Binds the caller's {@code view} to the value stored for {@code key}, reading the
+     * mapped char file directly. Two differences from {@link #valueOf(int)} make this the
+     * accessor a bulk consumer wants: the caller owns the view, so two live values can be
+     * held at once without the A/B pair this class keeps for itself, and the read always
+     * goes to the mapping rather than the heap cache - a cached column would otherwise
+     * retain a {@code String} per resolved key, which is precisely the footprint a reader
+     * that resolves millions of keys must not build.
+     * <p>
+     * The view stays valid until this reader is rebound by {@link #of} or closed, or until
+     * the caller rebinds it.
+     */
+    public CharSequence valueOf(int key, DirectString view) {
+        if (key > -1 && key < symbolCount) {
+            return charMem.getStr(offsetMem.getLong(SymbolMapWriter.keyToOffset(key)), view);
         }
         return null;
     }
@@ -270,9 +355,16 @@ public class SymbolMapReaderImpl implements Closeable, SymbolMapReader {
         }
 
         @Override
+        public long getSymbolTableGeneration() {
+            return symbolTableGeneration;
+        }
+
+        @Override
         public int keyOf(CharSequence value) {
             if (value != null) {
                 int hash = Hash.boundedHash(value, maxHash);
+                // Here we need absolute row indexes within the partition while the cursor gives us relative ones.
+                // But since the minimum row index (minValue) is 0, they match.
                 rowCursor = indexReader.initCursor(rowCursor, hash, 0, maxOffset - Long.BYTES);
                 while (rowCursor.hasNext()) {
                     final long offsetOffset = rowCursor.next();

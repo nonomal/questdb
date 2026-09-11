@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -94,11 +94,20 @@ public class ReplaceVarcharFunctionFactoryTest extends AbstractFunctionFactoryTe
     @Test
     public void testReplaceWithSymbols() throws Exception {
         assertMemoryLeak(() -> {
-            ddl("create table tab as (select 'sym'::symbol sym from long_sequence(1))");
+            execute("create table tab as (select 'sym'::symbol sym from long_sequence(1))");
 
-            assertSql("replace\nSym\n", "select replace(sym, 's', 'S') from tab");
-            assertSql("replace\nS\n", "select replace(sym, sym, 'S') from tab");
-            assertSql("replace\nsym\n", "select replace(sym, sym, sym) from tab");
+            assertQuery("select replace(sym, 's', 'S') from tab")
+                    .noLeakCheck()
+                    .expectSize()
+                    .returns("replace\nSym\n");
+            assertQuery("select replace(sym, sym, 'S') from tab")
+                    .noLeakCheck()
+                    .expectSize()
+                    .returns("replace\nS\n");
+            assertQuery("select replace(sym, sym, sym) from tab")
+                    .noLeakCheck()
+                    .expectSize()
+                    .returns("replace\nsym\n");
         });
     }
 

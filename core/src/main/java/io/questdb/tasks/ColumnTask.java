@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -37,7 +37,7 @@ public class ColumnTask {
     private long long3;
     private long long4;
     private TableWriter.ColumnTaskHandler taskHandler;
-    private int timestampColumnIndex;
+    private long timestampColumnIndex;
 
     public int getColumnIndex() {
         return columnIndex;
@@ -75,7 +75,7 @@ public class ColumnTask {
         return taskHandler;
     }
 
-    public int getTimestampColumnIndex() {
+    public long getTimestampColumnIndex() {
         return timestampColumnIndex;
     }
 
@@ -83,7 +83,7 @@ public class ColumnTask {
             CountDownLatchSPI countDownLatchSPI,
             int columnIndex,
             int columnType,
-            int timestampIndex,
+            long timestampIndex,
             long long0,
             long long1,
             long long2,

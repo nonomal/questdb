@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -26,6 +26,7 @@ package io.questdb.griffin.engine.functions.catalogue;
 
 import io.questdb.cairo.CairoConfiguration;
 import io.questdb.cairo.sql.Function;
+import io.questdb.cairo.sql.FunctionExtension;
 import io.questdb.cairo.sql.Record;
 import io.questdb.griffin.FunctionFactory;
 import io.questdb.griffin.PlanSink;
@@ -33,7 +34,6 @@ import io.questdb.griffin.SqlExecutionContext;
 import io.questdb.griffin.engine.functions.StrArrayFunction;
 import io.questdb.std.IntList;
 import io.questdb.std.ObjList;
-import io.questdb.std.str.Utf16Sink;
 
 public class CurrentSchemasFunctionFactory implements FunctionFactory {
 
@@ -47,11 +47,20 @@ public class CurrentSchemasFunctionFactory implements FunctionFactory {
         return new CurrentSchemaFunction();
     }
 
-    private static class CurrentSchemaFunction extends StrArrayFunction {
+    private static class CurrentSchemaFunction extends StrArrayFunction implements FunctionExtension {
+        @Override
+        public FunctionExtension extendedOps() {
+            return this;
+        }
 
         @Override
         public int getArrayLength() {
             return 1;
+        }
+
+        @Override
+        public Record getRecord(Record rec) {
+            throw new UnsupportedOperationException();
         }
 
         @Override
@@ -60,18 +69,8 @@ public class CurrentSchemasFunctionFactory implements FunctionFactory {
         }
 
         @Override
-        public void getStr(Record rec, Utf16Sink utf16Sink) {
-            utf16Sink.put(getStrA(rec));
-        }
-
-        @Override
         public CharSequence getStrA(Record rec, int arrayIndex) {
-            return "public";
-        }
-
-        @Override
-        public void getStr(Record rec, Utf16Sink sink, int arrayIndex) {
-            sink.put(getStrA(rec, arrayIndex));
+            return Constants.PUBLIC_SCHEMA;
         }
 
         @Override
@@ -100,7 +99,7 @@ public class CurrentSchemasFunctionFactory implements FunctionFactory {
         }
 
         @Override
-        public boolean isReadThreadSafe() {
+        public boolean isThreadSafe() {
             return true;
         }
 

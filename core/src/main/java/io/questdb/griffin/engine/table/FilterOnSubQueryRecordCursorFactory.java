@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,9 +24,21 @@
 
 package io.questdb.griffin.engine.table;
 
-import io.questdb.cairo.BitmapIndexReader;
+import io.questdb.cairo.CairoConfiguration;
+import io.questdb.cairo.CairoException;
+import io.questdb.cairo.idx.IndexReader;
+import io.questdb.cairo.sql.Function;
+import io.questdb.cairo.sql.PageFrameCursor;
+import io.questdb.cairo.sql.ParquetDecodeHint;
+import io.questdb.cairo.sql.PartitionFrameCursorFactory;
 import io.questdb.cairo.sql.Record;
-import io.questdb.cairo.sql.*;
+import io.questdb.cairo.sql.RecordCursor;
+import io.questdb.cairo.sql.RecordCursorFactory;
+import io.questdb.cairo.sql.RecordMetadata;
+import io.questdb.cairo.sql.RowCursorFactory;
+import io.questdb.cairo.sql.SqlExecutionCircuitBreaker;
+import io.questdb.cairo.sql.StaticSymbolTable;
+import io.questdb.cairo.sql.SymbolTable;
 import io.questdb.griffin.PlanSink;
 import io.questdb.griffin.SqlException;
 import io.questdb.griffin.SqlExecutionContext;
@@ -38,43 +50,46 @@ import io.questdb.std.str.StringSink;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
-public class FilterOnSubQueryRecordCursorFactory extends AbstractDataFrameRecordCursorFactory {
-
+public class FilterOnSubQueryRecordCursorFactory extends AbstractPageFrameRecordCursorFactory {
     private final int columnIndex;
-    private final IntList columnIndexes;
-    private final DataFrameRecordCursorWrapper cursor;
     private final ObjList<RowCursorFactory> cursorFactories;
     private final int[] cursorFactoriesIdx;
     private final IntObjHashMap<RowCursorFactory> factoriesA = new IntObjHashMap<>(64, 0.5, -5);
     private final IntObjHashMap<RowCursorFactory> factoriesB = new IntObjHashMap<>(64, 0.5, -5);
-    private final Function filter;
     private final Record.CharSequenceFunction func;
-    private final RecordCursorFactory recordCursorFactory;
+    private PageFrameRecordCursorWrapper cursor;
+    private Function filter;
+    private RecordCursorFactory recordCursorFactory;
+    private HeapRowCursorFactory rowCursorFactory;
 
     public FilterOnSubQueryRecordCursorFactory(
+            @NotNull CairoConfiguration configuration,
             @NotNull RecordMetadata metadata,
-            @NotNull DataFrameCursorFactory dataFrameCursorFactory,
+            @NotNull PartitionFrameCursorFactory partitionFrameCursorFactory,
             @NotNull RecordCursorFactory recordCursorFactory,
             int columnIndex,
             @Nullable Function filter,
             @NotNull Record.CharSequenceFunction func,
-            @NotNull IntList columnIndexes
+            @NotNull IntList columnIndexes,
+            @NotNull IntList columnSizeShifts
     ) {
-        super(metadata, dataFrameCursorFactory);
+        super(metadata, partitionFrameCursorFactory, columnIndexes, columnSizeShifts);
+
         this.recordCursorFactory = recordCursorFactory;
         this.filter = filter;
         this.func = func;
         cursorFactories = new ObjList<>();
         cursorFactoriesIdx = new int[]{0};
-        final DataFrameRecordCursorImpl dataFrameRecordCursor = new DataFrameRecordCursorImpl(
-                new HeapRowCursorFactory(cursorFactories, cursorFactoriesIdx),
+        rowCursorFactory = new HeapRowCursorFactory(cursorFactories, cursorFactoriesIdx);
+        final PageFrameRecordCursorImpl pageFrameRecordCursor = new PageFrameRecordCursorImpl(
+                configuration,
+                metadata,
+                rowCursorFactory,
                 false,
-                filter,
-                columnIndexes
+                filter
         );
-        cursor = new DataFrameRecordCursorWrapper(dataFrameRecordCursor);
+        cursor = new PageFrameRecordCursorWrapper(pageFrameRecordCursor);
         this.columnIndex = columnIndex;
-        this.columnIndexes = columnIndexes;
     }
 
     @Override
@@ -92,35 +107,50 @@ public class FilterOnSubQueryRecordCursorFactory extends AbstractDataFrameRecord
         sink.type("FilterOnSubQuery");
         sink.optAttr("filter", filter);
         sink.child(recordCursorFactory);
-        sink.child(dataFrameCursorFactory);
+        sink.child(partitionFrameCursorFactory);
     }
 
     @Override
     protected void _close() {
-        super._close();
-        Misc.free(filter);
-        recordCursorFactory.close();
+        final PageFrameRecordCursorWrapper cursor = this.cursor;
+        this.cursor = null;
+        final Function filter = this.filter;
+        this.filter = null;
+        final RecordCursorFactory recordCursorFactory = this.recordCursorFactory;
+        this.recordCursorFactory = null;
+        final HeapRowCursorFactory rowCursorFactory = this.rowCursorFactory;
+        this.rowCursorFactory = null;
+        Throwable failure = null;
+        try {
+            super._close();
+        } catch (Throwable th) {
+            failure = th;
+        }
+        failure = Misc.freeBestEffort(failure, filter);
+        failure = Misc.freeBestEffort(failure, rowCursorFactory);
+        failure = Misc.freeBestEffort(failure, cursor);
+        failure = Misc.freeBestEffort(failure, recordCursorFactory);
         factoriesA.clear();
         factoriesB.clear();
+        CairoException.rethrowCleanupFailure(failure);
     }
 
     @Override
-    protected RecordCursor getCursorInstance(
-            DataFrameCursor dataFrameCursor,
+    protected RecordCursor initRecordCursor(
+            PageFrameCursor frameCursor,
             SqlExecutionContext executionContext
     ) throws SqlException {
-        cursor.of(dataFrameCursor, executionContext);
+        cursor.of(frameCursor, executionContext);
         return cursor;
     }
 
-    private class DataFrameRecordCursorWrapper implements RecordCursor {
-
-        private final DataFrameRecordCursor delegate;
+    private class PageFrameRecordCursorWrapper implements RecordCursor {
+        private final PageFrameRecordCursor delegate;
         private RecordCursor baseCursor;
         private IntObjHashMap<RowCursorFactory> factories;
         private IntObjHashMap<RowCursorFactory> targetFactories;
 
-        private DataFrameRecordCursorWrapper(DataFrameRecordCursor delegate) {
+        private PageFrameRecordCursorWrapper(PageFrameRecordCursor delegate) {
             this.delegate = delegate;
             this.factories = factoriesA;
         }
@@ -175,7 +205,7 @@ public class FilterOnSubQueryRecordCursorFactory extends AbstractDataFrameRecord
             return delegate.newSymbolTable(columnIndex);
         }
 
-        public void of(DataFrameCursor cursor, SqlExecutionContext executionContext) throws SqlException {
+        public void of(PageFrameCursor cursor, SqlExecutionContext executionContext) throws SqlException {
             if (baseCursor != null) {
                 baseCursor = Misc.free(baseCursor);
             }
@@ -194,8 +224,18 @@ public class FilterOnSubQueryRecordCursorFactory extends AbstractDataFrameRecord
         }
 
         @Override
+        public long preComputedStateSize() {
+            return baseCursor == null ? 1 : 0;
+        }
+
+        @Override
         public void recordAt(Record record, long atRowId) {
             delegate.recordAt(record, atRowId);
+        }
+
+        @Override
+        public void setParquetDecodeHint(ParquetDecodeHint hint) {
+            delegate.setParquetDecodeHint(hint);
         }
 
         @Override
@@ -204,13 +244,13 @@ public class FilterOnSubQueryRecordCursorFactory extends AbstractDataFrameRecord
         }
 
         @Override
-        public void skipRows(Counter rowCount) {
+        public void skipRows(Counter rowCount, long maxRowsAfterSkip) {
             if (baseCursor != null) {
                 buildFactories();
                 baseCursor = Misc.free(baseCursor);
             }
 
-            delegate.skipRows(rowCount);
+            delegate.skipRows(rowCount, maxRowsAfterSkip);
         }
 
         @Override
@@ -219,7 +259,7 @@ public class FilterOnSubQueryRecordCursorFactory extends AbstractDataFrameRecord
         }
 
         private void buildFactories() {
-            final StaticSymbolTable symbolTable = delegate.getDataFrameCursor().getSymbolTable(columnIndex);
+            final StaticSymbolTable symbolTable = delegate.getPageFrameCursor().getSymbolTable(columnIndex);
             final Record record = baseCursor.getRecord();
             StringSink sink = Misc.getThreadLocalSink();
             while (baseCursor.hasNext()) {
@@ -240,8 +280,7 @@ public class FilterOnSubQueryRecordCursorFactory extends AbstractDataFrameRecord
                                 rowCursorFactory = new SymbolIndexRowCursorFactory(
                                         columnIndex,
                                         symbolKey,
-                                        false,
-                                        BitmapIndexReader.DIR_FORWARD,
+                                        IndexReader.DIR_FORWARD,
                                         null
                                 );
                             } else {
@@ -249,9 +288,7 @@ public class FilterOnSubQueryRecordCursorFactory extends AbstractDataFrameRecord
                                         columnIndex,
                                         symbolKey,
                                         filter,
-                                        false,
-                                        BitmapIndexReader.DIR_FORWARD,
-                                        columnIndexes,
+                                        IndexReader.DIR_FORWARD,
                                         null
                                 );
                             }

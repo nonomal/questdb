@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,7 +24,15 @@
 
 package io.questdb.test.cairo;
 
-import io.questdb.cairo.*;
+import io.questdb.cairo.CairoConfiguration;
+import io.questdb.cairo.CairoException;
+import io.questdb.cairo.ColumnType;
+import io.questdb.cairo.PartitionBy;
+import io.questdb.cairo.TableReaderMetadata;
+import io.questdb.cairo.TableToken;
+import io.questdb.cairo.TableUtils;
+import io.questdb.cairo.TableWriter;
+import io.questdb.cairo.security.AllowAllSecurityContext;
 import io.questdb.cairo.vm.Vm;
 import io.questdb.cairo.vm.api.MemoryCMARW;
 import io.questdb.cairo.vm.api.MemoryMA;
@@ -51,7 +59,7 @@ public class TableReaderMetadataCorruptionTest extends AbstractCairoTest {
                 types,
                 names.length + 10,
                 5,
-                "Index flag is only supported for SYMBOL at [6]" //failed validation on garbage flags value
+                "index flag is only supported for SYMBOL column type" //failed validation on garbage flags value
         );
     }
 
@@ -65,7 +73,7 @@ public class TableReaderMetadataCorruptionTest extends AbstractCairoTest {
                 types,
                 names.length + 1000,
                 5,
-                "File is too small, column types are missing 4096",
+                "file is too small, column types are missing",
                 4096,
                 4096
         );
@@ -143,7 +151,7 @@ public class TableReaderMetadataCorruptionTest extends AbstractCairoTest {
                 types,
                 names.length + 10,
                 5,
-                "File is too small, column types are missing",
+                "file is too small, column types are missing",
                 4906,
                 128
         );
@@ -159,7 +167,7 @@ public class TableReaderMetadataCorruptionTest extends AbstractCairoTest {
                 types,
                 names.length,
                 23,
-                "Timestamp"
+                "timestamp index is outside of range"
         );
     }
 
@@ -173,7 +181,7 @@ public class TableReaderMetadataCorruptionTest extends AbstractCairoTest {
                 types,
                 names.length,
                 -2,
-                "Timestamp"
+                "timestamp index is outside of range"
         );
     }
 
@@ -203,7 +211,7 @@ public class TableReaderMetadataCorruptionTest extends AbstractCairoTest {
                 types,
                 names.length,
                 5,
-                "Invalid column type"
+                "invalid column type"
         );
     }
 
@@ -222,19 +230,79 @@ public class TableReaderMetadataCorruptionTest extends AbstractCairoTest {
     }
 
     @Test
+    public void testReplacingColumnIndexBeyondColumnCount() throws Exception {
+        // this index would send the chain walk past the end of the _meta file
+        assertReplacingIndexIgnored(100_000, 2);
+    }
+
+    @Test
+    public void testReplacingColumnIndexForwardReference() throws Exception {
+        // a replacing column always comes after the column it replaces, never before
+        assertReplacingIndexIgnored(9, 2);
+    }
+
+    @Test
+    public void testReplacingColumnIndexIsClearedOnNextDdl() throws Exception {
+        // any ALTER rewrites the column block, which drops the junk
+        assertMemoryLeak(() -> {
+            try (Path path = new Path()) {
+                TableToken tableToken = createAllTableWithReplacingIndex(path, 100_000, 2);
+
+                try (TableWriter writer = TestUtils.newOffPoolWriter(configuration, tableToken, engine)) {
+                    writer.addColumn("z", ColumnType.INT, AllowAllSecurityContext.INSTANCE);
+                }
+
+                Assert.assertEquals(0, readMetaInt(path, replacingIndexOffset(2)));
+            }
+        });
+    }
+
+    @Test
+    public void testReplacingColumnIndexOfDeletedColumnIsHonoured() throws Exception {
+        // what a real ALTER COLUMN TYPE leaves: "double" (3) replaces "short" (1), which is deleted
+        assertMemoryLeak(() -> {
+            try (Path path = new Path()) {
+                TableToken tableToken = createAllTableWithReplacingIndex(path, 1, 3);
+                // a deleted column has a negative type
+                pokeMetaInt(path, TableUtils.META_OFFSET_COLUMN_TYPES + TableUtils.META_COLUMN_DATA_SIZE, -ColumnType.SHORT);
+
+                try (TableReaderMetadata metadata = new TableReaderMetadata(configuration, tableToken)) {
+                    metadata.loadMetadata();
+                    // the replacement takes over the position of the column it replaced
+                    Assert.assertEquals(-1, metadata.getColumnIndexQuiet("short"));
+                    Assert.assertEquals("double", metadata.getColumnName(1));
+                    Assert.assertEquals(3, metadata.getWriterIndex(1));
+                    Assert.assertEquals(1, metadata.getOriginalWriterIndex(1));
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testReplacingColumnIndexPointsAtLiveColumn() throws Exception {
+        // in range and below column 3, but column 1 is live, so it is not a replacement
+        assertReplacingIndexIgnored(1, 3);
+    }
+
+    @Test
+    public void testReplacingColumnIndexSelfReference() throws Exception {
+        assertReplacingIndexIgnored(3, 3);
+    }
+
+    @Test
     public void testTransitionIndexWhenColumnCountIsBeyondFileSize() throws Exception {
         // this test asserts that validator compares column count to file size, where
         // file is prepared to be smaller than count. On Windows this setup does not work
         // because appender cannot truncate file to size smaller than default page size
         // when reader is open.
         if (Os.type != Os.WINDOWS) {
-            assertTransitionIndexValidation(99);
+            assertTransitionIndexValidation(99, "index flag is only supported for SYMBOL column type");
         }
     }
 
     @Test
     public void testTransitionIndexWhenColumnCountOverflows() throws Exception {
-        assertTransitionIndexValidation(Integer.MAX_VALUE - 1);
+        assertTransitionIndexValidation(Integer.MAX_VALUE - 1, "file is too small, column types are missing");
     }
 
     private void assertMetaConstructorFailure(String[] names, int[] types, int columnCount, int timestampIndex, String contains) throws Exception {
@@ -252,7 +320,7 @@ public class TableReaderMetadataCorruptionTest extends AbstractCairoTest {
                     throw CairoException.critical(TestFilesFacadeImpl.INSTANCE.errno()).put("Cannot create dir: ").put(path);
                 }
 
-                try (MemoryMA mem = Vm.getMAInstance(CommitMode.NOSYNC)) {
+                try (MemoryMA mem = Vm.getPMARInstance(null)) {
                     mem.of(
                             TestFilesFacadeImpl.INSTANCE,
                             path.trimTo(rootLen).concat(TableUtils.META_FILE_NAME).$(),
@@ -281,14 +349,14 @@ public class TableReaderMetadataCorruptionTest extends AbstractCairoTest {
                 if (trimSize > -1) {
                     FilesFacade ff = TestFilesFacadeImpl.INSTANCE;
                     path.trimTo(rootLen).concat(TableUtils.META_FILE_NAME).$();
-                    int fd = ff.openRW(path.$(), configuration.getWriterFileOpenOpts());
+                    long fd = ff.openRW(path.$(), configuration.getWriterFileOpenOpts());
                     assert fd > -1;
                     ff.truncate(fd, trimSize);
                     ff.close(fd);
                 }
 
                 try (TableReaderMetadata metadata = new TableReaderMetadata(configuration)) {
-                    metadata.load(path.$());
+                    metadata.loadMetadata(path.$());
                     Assert.fail();
                 } catch (CairoException e) {
                     TestUtils.assertContains(e.getFlyweightMessage(), contains);
@@ -297,11 +365,32 @@ public class TableReaderMetadataCorruptionTest extends AbstractCairoTest {
         });
     }
 
-    private void assertTransitionIndexValidation(int columnCount) throws Exception {
+    private void assertReplacingIndexIgnored(int replacingIndex, int columnIndex) throws Exception {
+        assertMemoryLeak(() -> {
+            try (Path path = new Path()) {
+                TableToken tableToken = createAllTableWithReplacingIndex(path, replacingIndex, columnIndex);
+
+                // both metadata paths read it as "no replacement" and leave the columns alone
+                try (TableReaderMetadata metadata = new TableReaderMetadata(configuration, tableToken)) {
+                    metadata.loadMetadata();
+                    Assert.assertEquals(columnIndex, metadata.getWriterIndex(columnIndex));
+                    for (int i = 0, n = metadata.getColumnCount(); i < n; i++) {
+                        Assert.assertEquals(metadata.getWriterIndex(i), metadata.getOriginalWriterIndex(i));
+                    }
+                }
+
+                try (TableWriter writer = TestUtils.newOffPoolWriter(configuration, tableToken, engine)) {
+                    Assert.assertEquals(columnIndex, writer.getMetadata().getWriterIndex(columnIndex));
+                }
+            }
+        });
+    }
+
+    private void assertTransitionIndexValidation(int columnCount, String contains) throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             try (Path path = new Path()) {
 
-                CreateTableTestUtils.createAllTable(engine, PartitionBy.NONE);
+                CreateTableTestUtils.createAllTable(engine, PartitionBy.NONE, ColumnType.TIMESTAMP_MICRO);
 
                 String tableName = "all";
                 TableToken tableToken = engine.verifyTableName(tableName);
@@ -310,7 +399,7 @@ public class TableReaderMetadataCorruptionTest extends AbstractCairoTest {
                 long len = TestFilesFacadeImpl.INSTANCE.length(path.$());
 
                 try (TableReaderMetadata metadata = new TableReaderMetadata(configuration, tableToken)) {
-                    metadata.load();
+                    metadata.loadMetadata();
                     try (MemoryCMARW mem = Vm.getCMARWInstance()) {
                         mem.smallFile(TestFilesFacadeImpl.INSTANCE, path.$(), MemoryTag.MMAP_DEFAULT);
                         mem.jumpTo(0);
@@ -322,11 +411,38 @@ public class TableReaderMetadataCorruptionTest extends AbstractCairoTest {
                         metadata.prepareTransition(0);
                         Assert.fail();
                     } catch (CairoException e) {
-                        TestUtils.assertContains(e.getFlyweightMessage(), "Invalid metadata at ");
+                        TestUtils.assertContains(e.getFlyweightMessage(), contains);
                     }
                 }
             }
         });
 
+    }
+
+    private TableToken createAllTableWithReplacingIndex(Path path, int replacingIndex, int columnIndex) {
+        CreateTableTestUtils.createAllTable(engine, PartitionBy.NONE, ColumnType.TIMESTAMP_MICRO);
+        TableToken tableToken = engine.verifyTableName("all");
+        path.of(root).concat(tableToken).concat(TableUtils.META_FILE_NAME).$();
+        // the on-disk encoding is 1-based, with 0 meaning "no replacement"
+        pokeMetaInt(path, replacingIndexOffset(columnIndex), replacingIndex + 1);
+        return tableToken;
+    }
+
+    private void pokeMetaInt(Path path, long offset, int value) {
+        try (MemoryCMARW mem = Vm.getCMARWInstance()) {
+            mem.smallFile(TestFilesFacadeImpl.INSTANCE, path.$(), MemoryTag.MMAP_DEFAULT);
+            mem.putInt(offset, value);
+        }
+    }
+
+    private int readMetaInt(Path path, long offset) {
+        try (MemoryCMARW mem = Vm.getCMARWInstance()) {
+            mem.smallFile(TestFilesFacadeImpl.INSTANCE, path.$(), MemoryTag.MMAP_DEFAULT);
+            return mem.getInt(offset);
+        }
+    }
+
+    private long replacingIndexOffset(int columnIndex) {
+        return TableUtils.META_OFFSET_COLUMN_TYPES + columnIndex * TableUtils.META_COLUMN_DATA_SIZE + 24;
     }
 }

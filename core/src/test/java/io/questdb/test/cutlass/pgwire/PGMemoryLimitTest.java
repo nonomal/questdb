@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -77,8 +77,8 @@ public class PGMemoryLimitTest extends BasePGTest {
                                 " FROM down " +
                                 " WHERE up.ts = down.ts and x < 4"
                 );
+                drainWalQueue();
             }
-
             final String expected = "ts[TIMESTAMP],x[BIGINT]\n" +
                     "1970-01-01 00:00:00.0,100\n" +
                     "1970-01-01 00:00:01.0,200\n" +
@@ -97,7 +97,7 @@ public class PGMemoryLimitTest extends BasePGTest {
         // the reason "simple" is excluded is dues to PG driver sending
         // update x = '20', where x is long and '20' is, well, string. We don't support such conversion at
         // the update level yet
-        assertWithPgServer(CONN_AWARE_ALL ^ CONN_AWARE_SIMPLE_BINARY ^ CONN_AWARE_SIMPLE_TEXT, (connection, binary, mode, port) -> {
+        assertWithPgServer(CONN_AWARE_EXTENDED, (connection, binary, mode, port) -> {
             try (Statement stat = connection.createStatement()) {
                 stat.execute(
                         "create table up as" +
@@ -118,8 +118,8 @@ public class PGMemoryLimitTest extends BasePGTest {
             Unsafe.setRssMemLimit(8_900_000);
             try (
                     PreparedStatement ps = connection.prepareStatement("UPDATE up SET x = ?" +
-                    " FROM down " +
-                    " WHERE up.ts = down.ts and x < 4")
+                            " FROM down " +
+                            " WHERE up.ts = down.ts and x < 4")
             ) {
                 // Set RSS limit, so that the UPDATE will fail with OOM.
                 try {

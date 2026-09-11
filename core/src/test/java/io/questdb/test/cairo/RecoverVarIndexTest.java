@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,12 +24,19 @@
 
 package io.questdb.test.cairo;
 
-import io.questdb.cairo.*;
+import io.questdb.cairo.CairoException;
+import io.questdb.cairo.ColumnType;
+import io.questdb.cairo.PartitionBy;
+import io.questdb.cairo.RebuildColumnBase;
+import io.questdb.cairo.RecoverVarIndex;
+import io.questdb.cairo.TableToken;
+import io.questdb.cairo.TableUtils;
+import io.questdb.cairo.TableWriter;
 import io.questdb.cairo.sql.RecordCursor;
 import io.questdb.cairo.sql.RecordCursorFactory;
 import io.questdb.griffin.SqlException;
 import io.questdb.std.Files;
-import io.questdb.std.datetime.microtime.Timestamps;
+import io.questdb.std.datetime.microtime.Micros;
 import io.questdb.std.str.LPSZ;
 import io.questdb.std.str.Path;
 import io.questdb.std.str.Utf8String;
@@ -67,7 +74,7 @@ public class RecoverVarIndexTest extends AbstractCairoTest {
                 createTableSql,
                 (tablePath) -> {
                 },
-                RecoverVarIndex::rebuildAll
+                RebuildColumnBase::rebuildAll
         );
     }
 
@@ -110,13 +117,15 @@ public class RecoverVarIndexTest extends AbstractCairoTest {
                     "alter table xxx add column str1 string;" +
                     "alter table xxx add column str2 string";
 
-            checkRecoverVarIndex(createAlterInsertSql,
+            checkRecoverVarIndex(
+                    createAlterInsertSql,
                     tablePath -> {
                     },
-                    RecoverVarIndex::rebuildAll);
+                    RebuildColumnBase::rebuildAll
+            );
 
             engine.releaseAllWriters();
-            insert("insert into xxx values(500100000000L, 50001, 'D', 'I2')");
+            execute("insert into xxx values(500100000000L, 50001, 'D', 'I2')");
             int sym1D = countByFullScanWhereValueD();
             Assert.assertEquals(1, sym1D);
         });
@@ -158,7 +167,7 @@ public class RecoverVarIndexTest extends AbstractCairoTest {
                         removeFileAtPartition("str1.i", PartitionBy.DAY, tablePath, 0, -1L);
                         removeFileAtPartition("str2.i", PartitionBy.DAY, tablePath, 0, -1L);
                     },
-                    RecoverVarIndex::rebuildAll
+                    RebuildColumnBase::rebuildAll
             );
         });
     }
@@ -181,7 +190,7 @@ public class RecoverVarIndexTest extends AbstractCairoTest {
                         removeFileAtPartition("str1.i", PartitionBy.NONE, tablePath, 0, -1L);
                         removeFileAtPartition("str2.i", PartitionBy.NONE, tablePath, 0, -1L);
                     },
-                    RecoverVarIndex::rebuildAll
+                    RebuildColumnBase::rebuildAll
             );
         });
     }
@@ -244,7 +253,7 @@ public class RecoverVarIndexTest extends AbstractCairoTest {
                     "from long_sequence(5000)";
 
             checkRecoverVarIndex(createAlterInsertSql,
-                    tablePath -> removeFileAtPartition("str2.i.1", PartitionBy.DAY, tablePath, Timestamps.DAY_MICROS * 11, 1L),
+                    tablePath -> removeFileAtPartition("str2.i.1", PartitionBy.DAY, tablePath, Micros.DAY_MICROS * 11, 1L),
                     rebuildIndex -> rebuildIndex.reindexColumn("str2"));
         });
     }
@@ -274,7 +283,7 @@ public class RecoverVarIndexTest extends AbstractCairoTest {
                         });
                 Assert.fail();
             } catch (CairoException ex) {
-                TestUtils.assertContains(ex.getFlyweightMessage(), "Cannot lock table");
+                TestUtils.assertContains(ex.getFlyweightMessage(), "cannot lock table");
             }
         });
     }
@@ -294,8 +303,8 @@ public class RecoverVarIndexTest extends AbstractCairoTest {
             AtomicInteger count = new AtomicInteger();
             ff = new TestFilesFacadeImpl() {
                 @Override
-                public int openRW(LPSZ name, long opts) {
-                    if (Utf8s.containsAscii(name, "str2.i") && count.incrementAndGet() == 14) {
+                public long openRW(LPSZ name, int opts) {
+                    if (Utf8s.containsAscii(name, "str2.i") && count.incrementAndGet() == 2) {
                         return -1;
                     }
                     return super.openRW(name, opts);
@@ -339,15 +348,15 @@ public class RecoverVarIndexTest extends AbstractCairoTest {
     private void checkRecoverVarIndex(String createTableSql, Action<String> changeTable, Action<RecoverVarIndex> rebuildIndexAction) throws Exception {
         assertMemoryLeak(ff, () -> {
             for (String sql : createTableSql.split(";")) {
-                ddl(sql);
+                execute(sql);
             }
-            ddl("create table copytbl as (select * from xxx)", sqlExecutionContext);
+            execute("create table copytbl as (select * from xxx)", sqlExecutionContext);
 
             engine.releaseAllReaders();
             engine.releaseAllWriters();
 
             TableToken xxx = engine.verifyTableName("xxx");
-            String tablePath = configuration.getRoot() + Files.SEPARATOR + xxx.getDirName();
+            String tablePath = configuration.getDbRoot() + Files.SEPARATOR + xxx.getDirName();
             changeTable.run(tablePath);
 
             rebuildVarColumn.clear();
@@ -374,10 +383,10 @@ public class RecoverVarIndexTest extends AbstractCairoTest {
         try (Path path = new Path()) {
             path.concat(tablePath);
             path.put(Files.SEPARATOR);
-            TableUtils.setPathForPartition(path, partitionBy, partitionTs, partitionNameTxn);
+            TableUtils.setPathForNativePartition(path, ColumnType.TIMESTAMP, partitionBy, partitionTs, partitionNameTxn);
             path.concat(fileName);
             LOG.info().$("removing ").$(path).$();
-            Assert.assertTrue(Files.remove(path.$()));
+            Assert.assertTrue(TestUtils.remove(path.$()));
         }
     }
 

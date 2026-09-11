@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,14 +24,21 @@
 
 package io.questdb.cairo;
 
+import io.questdb.cairo.lv.LiveViewCheckpointLayout;
 import io.questdb.cairo.sql.TableReferenceOutOfDateException;
 import io.questdb.cairo.wal.WalUtils;
 import io.questdb.log.Log;
 import io.questdb.log.LogFactory;
 import io.questdb.mp.AbstractQueueConsumerJob;
-import io.questdb.std.*;
+import io.questdb.mp.Job;
+import io.questdb.std.DirectLongList;
+import io.questdb.std.FilesFacade;
+import io.questdb.std.MemoryTag;
+import io.questdb.std.Misc;
+import io.questdb.std.Numbers;
+import io.questdb.std.NumericException;
+import io.questdb.std.Vect;
 import io.questdb.std.datetime.DateFormat;
-import io.questdb.std.datetime.millitime.DateFormatUtils;
 import io.questdb.std.str.Path;
 import io.questdb.std.str.Utf8StringSink;
 import io.questdb.std.str.Utf8s;
@@ -41,55 +48,61 @@ import java.io.Closeable;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import static io.questdb.cairo.TableUtils.TXN_FILE_NAME;
+import static io.questdb.std.datetime.DateLocaleFactory.EN_LOCALE;
 
 public class O3PartitionPurgeJob extends AbstractQueueConsumerJob<O3PartitionPurgeTask> implements Closeable {
 
     private final static Log LOG = LogFactory.getLog(O3PartitionPurgeJob.class);
     private final CairoConfiguration configuration;
     private final CairoEngine engine;
-    private final Utf8StringSink[] fileNameSinks;
+    private final Utf8StringSink fileNameSink;
     private final AtomicBoolean halted = new AtomicBoolean(false);
-    private final ObjList<DirectLongList> partitionList;
-    private final DatabaseSnapshotAgent snapshotAgent;
-    private final ObjList<TxReader> txnReaders;
-    private final ObjList<TxnScoreboard> txnScoreboards;
+    private final DirectLongList partitionList;
+    private final TxReader txnReader;
 
-    public O3PartitionPurgeJob(CairoEngine engine, DatabaseSnapshotAgent snapshotAgent, int workerCount) {
+    public O3PartitionPurgeJob(CairoEngine engine) {
         super(engine.getMessageBus().getO3PurgeDiscoveryQueue(), engine.getMessageBus().getO3PurgeDiscoverySubSeq());
         try {
             this.engine = engine;
-            this.snapshotAgent = snapshotAgent;
             this.configuration = engine.getMessageBus().getConfiguration();
-            this.fileNameSinks = new Utf8StringSink[workerCount];
-            this.partitionList = new ObjList<>(workerCount);
-            this.txnScoreboards = new ObjList<>(workerCount);
-            this.txnReaders = new ObjList<>(workerCount);
-
-            for (int i = 0; i < workerCount; i++) {
-                fileNameSinks[i] = new Utf8StringSink();
-                partitionList.add(new DirectLongList(configuration.getPartitionPurgeListCapacity() * 2L, MemoryTag.NATIVE_O3));
-                txnScoreboards.add(new TxnScoreboard(configuration.getFilesFacade(), configuration.getTxnScoreboardEntryCount()));
-                txnReaders.add(new TxReader(configuration.getFilesFacade()));
-            }
+            this.fileNameSink = new Utf8StringSink();
+            this.partitionList = new DirectLongList(
+                    configuration.getPartitionPurgeListCapacity() * 2L,
+                    MemoryTag.NATIVE_O3
+            );
+            this.txnReader = new TxReader(configuration.getFilesFacade());
         } catch (Throwable th) {
             close();
             throw th;
         }
     }
 
+    public O3PartitionPurgeJob(CairoEngine engine, int workerCount) {
+        this(engine);
+    }
+
+    @Override
+    public Job cloneInstance() {
+        return new O3PartitionPurgeJob(engine);
+    }
+
     @Override
     public void close() {
         if (halted.compareAndSet(false, true)) {
-            Misc.freeObjList(partitionList);
-            Misc.freeObjList(txnReaders);
-            Misc.freeObjList(txnScoreboards);
+            Misc.free(partitionList);
+            Misc.free(txnReader);
         }
+    }
+
+    @Override
+    public void closeInstance() {
+        close();
     }
 
     private static void parsePartitionDateVersion(
             Utf8StringSink fileNameSink,
             DirectLongList partitionList,
-            CharSequence tableName,
+            TableToken tableToken,
             DateFormat partitionByFormat
     ) {
         int index = Utf8s.lastIndexOfAscii(fileNameSink, '.');
@@ -101,10 +114,10 @@ public class O3PartitionPurgeJob extends AbstractQueueConsumerJob<O3PartitionPur
         try {
             if (index < len) {
                 long partitionVersion = Numbers.parseLong(fileNameSink, index + 1, len);
-                // When reader locks transaction 100 it opens partition version .99 or lower.
+                // When reader locks transaction 100 it opens a partition version .99 or lower.
                 // Also, when there is no transaction version in the name, it is counted as -1.
                 // By adding +1 here we kill 2 birds in with one stone, partition versions are aligned with
-                // txn scoreboard reader locks and no need to add -1 which allows us to use 128bit
+                // txn scoreboard reader locks and no need to add -1 that allows us to use 128bit
                 // sort to sort 2 x 64bit unsigned integers
                 partitionList.add(partitionVersion + 1);
             } else {
@@ -115,17 +128,21 @@ public class O3PartitionPurgeJob extends AbstractQueueConsumerJob<O3PartitionPur
             }
 
             try {
-                long partitionTs = partitionByFormat.parse(fileNameSink.asAsciiCharSequence(), 0, index, DateFormatUtils.EN_LOCALE);
+                long partitionTs = partitionByFormat.parse(fileNameSink.asAsciiCharSequence(), 0, index, EN_LOCALE);
                 partitionList.add(partitionTs);
             } catch (NumericException e) {
+                // A live view's table directory holds _checkpoints alongside its
+                // partitions, so without it here every discovery pass logs one
+                // "unknown directory" line per live view.
                 if (!Utf8s.startsWithAscii(fileNameSink, WalUtils.WAL_NAME_BASE) && !Utf8s.equalsAscii(WalUtils.SEQ_DIR, fileNameSink)
-                        && !Utf8s.equalsAscii("seq", fileNameSink)) {
-                    LOG.info().$("unknown directory [table=").utf8(tableName).$(", dir=").$(fileNameSink).I$();
+                        && !Utf8s.equalsAscii("seq", fileNameSink)
+                        && !Utf8s.equalsAscii(LiveViewCheckpointLayout.CHECKPOINT_DIR_NAME, fileNameSink)) {
+                    LOG.info().$("unknown directory [table=").$(tableToken).$(", dir=").$(fileNameSink).I$();
                 }
                 partitionList.setPos(partitionList.size() - 1); // remove partition version record
             }
         } catch (NumericException e) {
-            LOG.error().$("unknown directory [table=").utf8(tableName).$(", dir=").$(fileNameSink).I$();
+            LOG.error().$("unknown directory [table=").$(tableToken).$(", dir=").$(fileNameSink).I$();
         }
     }
 
@@ -135,21 +152,21 @@ public class O3PartitionPurgeJob extends AbstractQueueConsumerJob<O3PartitionPur
             DirectLongList partitionList,
             CharSequence root,
             TableToken tableToken,
-            TxnScoreboard txnScoreboard,
             TxReader txReader,
+            int timestampType,
             int partitionBy
     ) {
-        LOG.info().$("processing [table=").utf8(tableToken.getDirName()).I$();
+        LOG.info().$("processing [table=").$(tableToken).I$();
         Path path = Path.getThreadLocal(root).concat(tableToken);
         int plimit = path.size();
         partitionList.clear();
-        DateFormat partitionByFormat = PartitionBy.getPartitionDirFormatMethod(partitionBy);
+        DateFormat partitionByFormat = PartitionBy.getPartitionDirFormatMethod(timestampType, partitionBy);
         long p = ff.findFirst(path.$());
         if (p > 0) {
             try {
                 do {
                     if (ff.isDirOrSoftLinkDirNoDots(path, plimit, ff.findName(p), ff.findType(p), fileNameSink)) {
-                        parsePartitionDateVersion(fileNameSink, partitionList, tableToken.getDirName(), partitionByFormat);
+                        parsePartitionDateVersion(fileNameSink, partitionList, tableToken, partitionByFormat);
                         path.trimTo(plimit).$();
                     }
                 } while (ff.findNext(p) > 0);
@@ -169,9 +186,10 @@ public class O3PartitionPurgeJob extends AbstractQueueConsumerJob<O3PartitionPur
         path.of(root).concat(tableToken);
 
         int tableRootLen = path.size();
+        TxnScoreboard txnScoreboard = null;
         try {
-            txnScoreboard.ofRO(path);
-            txReader.ofRO(path.trimTo(tableRootLen).concat(TXN_FILE_NAME).$(), partitionBy);
+            txnScoreboard = engine.getTxnScoreboard(tableToken);
+            txReader.ofRO(path.trimTo(tableRootLen).concat(TXN_FILE_NAME).$(), timestampType, partitionBy);
             TableUtils.safeReadTxn(txReader, configuration.getMillisecondClock(), configuration.getSpinLockTimeout());
 
             for (int i = 0; i < n; i += 2) {
@@ -187,6 +205,7 @@ public class O3PartitionPurgeJob extends AbstractQueueConsumerJob<O3PartitionPur
                                 txReader,
                                 txnScoreboard,
                                 partitionTimestamp,
+                                timestampType,
                                 partitionBy,
                                 partitionList,
                                 lo,
@@ -207,6 +226,7 @@ public class O3PartitionPurgeJob extends AbstractQueueConsumerJob<O3PartitionPur
                         txReader,
                         txnScoreboard,
                         partitionTimestamp,
+                        timestampType,
                         partitionBy,
                         partitionList,
                         lo,
@@ -214,21 +234,21 @@ public class O3PartitionPurgeJob extends AbstractQueueConsumerJob<O3PartitionPur
                 );
             }
         } catch (TableReferenceOutOfDateException e) {
-            // table is dropped and recreated since we started processing it.
+            // the table is dropped and recreated since we started processing it.
             // abort the table processing
-            LOG.info().$("table reference out of date, aborting [table=").$(tableToken.getDirName()).I$();
+            LOG.info().$("table reference out of date, aborting [table=").$(tableToken).I$();
         } catch (CairoException ex) {
-            // It is possible that table is dropped while this async job was in the queue.
+            // It is possible that the table is dropped while this async job was in the queue.
             // so it can be not too bad. Log error and continue work on the queue
             LOG.error()
-                    .$("could not purge partition open [table=`").utf8(tableToken.getDirName())
-                    .$("`, ex=").$(ex.getFlyweightMessage())
+                    .$("could not purge partition open [table=").$(tableToken)
+                    .$(", msg=").$safe(ex.getFlyweightMessage())
                     .$(", errno=").$(ex.getErrno())
                     .I$();
-            LOG.error().$(ex.getFlyweightMessage()).$();
+            LOG.error().$safe(ex.getFlyweightMessage()).$();
         } finally {
             txReader.clear();
-            txnScoreboard.clear();
+            Misc.free(txnScoreboard);
         }
         LOG.info().$("processed [table=").$(tableToken).I$();
     }
@@ -241,6 +261,7 @@ public class O3PartitionPurgeJob extends AbstractQueueConsumerJob<O3PartitionPur
             TxReader txReader,
             TxnScoreboard txnScoreboard,
             long partitionTimestamp,
+            int timestampType,
             int partitionBy,
             DirectLongList partitionList,
             int lo,
@@ -248,26 +269,32 @@ public class O3PartitionPurgeJob extends AbstractQueueConsumerJob<O3PartitionPur
     ) {
         // Partition is dropped or not fully committed.
         // It is only possible to delete when there are no readers
+        boolean checkpointInProgress = engine.getCheckpointStatus().isInProgress();
         long lastTxn = txReader.getTxn();
         for (int i = hi - 2, n = lo - 1; i > n; i -= 2) {
             long nameTxn = partitionList.get(i);
 
-            // If last committed transaction number is 4, TableWriter can write partition with ending .4 and .3
-            // If the version on disk is .2 (nameTxn == 3) can remove it if the lastTxn > 3, e.g. when nameTxn < lastTxn
-            boolean rangeUnlocked = nameTxn < lastTxn && txnScoreboard.isRangeAvailable(nameTxn, lastTxn);
+            // If the last committed transaction number is 4, TableWriter can write partition with ending .4 and .3
+            // If the version on disk is .2 (nameTxn == 3) can remove it if the lastTxn > 3, e.g., when nameTxn < lastTxn
+            // When a backup checkpoint is in progress, skip deletion — the checkpoint may reference
+            // these partitions via snapshotted metadata even if the scoreboard is not pinned yet.
+            boolean rangeUnlocked = !checkpointInProgress
+                    && nameTxn < lastTxn && txnScoreboard.isRangeAvailable(nameTxn, lastTxn);
 
             path.trimTo(tableRootLen);
-            TableUtils.setPathForPartition(path, partitionBy, partitionTimestamp, nameTxn - 1);
+            TableUtils.setPathForNativePartition(path, timestampType, partitionBy, partitionTimestamp, nameTxn - 1);
             path.$();
 
             if (rangeUnlocked) {
                 // nameTxn can be deleted
-                // -1 here is to compensate +1 added when partition version parsed from folder name
+                // -1 here being to compensate +1 added when a partition version parsed from folder name
                 // See comments of why +1 added there in parsePartitionDateVersion()
-                purgePartition(tableToken, ff, path, "purging dropped partition directory [path=");
+                purgePartition(tableToken, ff, path, tableRootLen - tableToken.getDirNameUtf8().size() - 1, "purging dropped partition directory [path=");
                 lastTxn = nameTxn;
             } else {
-                LOG.info().$("cannot purge partition directory, locked for reading [path=").$(path).I$();
+                LOG.debug().$("cannot purge partition directory, locked for reading [path=")
+                        .$substr(tableRootLen - tableToken.getDirNameUtf8().size() - 1, path)
+                        .I$();
                 break;
             }
         }
@@ -281,6 +308,7 @@ public class O3PartitionPurgeJob extends AbstractQueueConsumerJob<O3PartitionPur
             TxReader txReader,
             TxnScoreboard txnScoreboard,
             long partitionTimestamp,
+            int timestampType,
             int partitionBy,
             DirectLongList partitionList,
             int lo,
@@ -296,6 +324,7 @@ public class O3PartitionPurgeJob extends AbstractQueueConsumerJob<O3PartitionPur
                     txReader,
                     txnScoreboard,
                     partitionTimestamp,
+                    timestampType,
                     partitionBy,
                     partitionList,
                     lo,
@@ -310,6 +339,7 @@ public class O3PartitionPurgeJob extends AbstractQueueConsumerJob<O3PartitionPur
                     txReader,
                     txnScoreboard,
                     partitionTimestamp,
+                    timestampType,
                     partitionBy,
                     partitionList,
                     lo,
@@ -326,6 +356,7 @@ public class O3PartitionPurgeJob extends AbstractQueueConsumerJob<O3PartitionPur
             TxReader txReader,
             TxnScoreboard txnScoreboard,
             long partitionTimestamp,
+            int timestampType,
             int partitionBy,
             DirectLongList partitionList,
             int lo,
@@ -334,6 +365,9 @@ public class O3PartitionPurgeJob extends AbstractQueueConsumerJob<O3PartitionPur
         long lastCommittedPartitionName = txReader.getPartitionNameTxnByPartitionTimestamp(partitionTimestamp);
         if (lastCommittedPartitionName > -1) {
             assert hi <= partitionList.size();
+            // When a backup checkpoint is in progress, skip deletion — the checkpoint may reference
+            // these partitions via snapshotted metadata even if the scoreboard is not pinned yet.
+            boolean checkpointInProgress = engine.getCheckpointStatus().isInProgress();
             // lo points to the beginning element in partitionList, hi next after last
             // each partition folder represented by a pair in the partitionList (partition version, partition timestamp)
             // Skip first pair, start from second and check if it can be deleted.
@@ -341,65 +375,102 @@ public class O3PartitionPurgeJob extends AbstractQueueConsumerJob<O3PartitionPur
                 long nextNameVersion = Math.min(lastCommittedPartitionName + 1, partitionList.get(i));
                 long previousNameVersion = partitionList.get(i - 2);
 
-                boolean rangeUnlocked = previousNameVersion < nextNameVersion
+                boolean rangeUnlocked = !checkpointInProgress
+                        && previousNameVersion < nextNameVersion
                         && txnScoreboard.isRangeAvailable(previousNameVersion, nextNameVersion);
 
+                // Sometimes TableWriter can create a partition folder before committing the transaction
+                // and then clean it before committing because it was not necessary to do a copy on write.
+                // We read partition directories before reading the txn file, so it is possible to see such partitions
+                // that don't exist when the txn file was committed.
+                // Check that the partition version we think we rely on indeed still exists.
+                if (rangeUnlocked) {
+                    path.trimTo(tableRootLen);
+                    TableUtils.setPathForNativePartition(
+                            path,
+                            timestampType,
+                            partitionBy,
+                            partitionTimestamp,
+                            nextNameVersion - 1
+                    );
+                    if (!ff.exists(path.$())) {
+                        // We see some phantom partitions, the best way is to abort processing this partition
+                        LOG.info().$("partition dir removed after scanning the directories, aborting processing the partition [partition=")
+                                .$substr(tableRootLen - tableToken.getDirNameUtf8().size() - 1, path)
+                                .I$();
+                        return;
+                    }
+                }
+
                 path.trimTo(tableRootLen);
-                TableUtils.setPathForPartition(path, partitionBy, partitionTimestamp, previousNameVersion - 1);
+                TableUtils.setPathForNativePartition(
+                        path,
+                        timestampType,
+                        partitionBy,
+                        partitionTimestamp,
+                        previousNameVersion - 1
+                );
                 path.$();
 
                 if (rangeUnlocked) {
                     // previousNameVersion can be deleted
-                    // -1 here is to compensate +1 added when partition version parsed from folder name
+                    // -1 here is to compensate +1 added when a partition version parsed from folder name
                     // See comments of why +1 added there in parsePartitionDateVersion()
-                    LOG.info().$("purging overwritten partition directory [path=").$(path).I$();
-                    purgePartition(tableToken, ff, path, "purging overwritten partition directory [path=");
+                    engine.getPartitionOverwriteControl().notifyPartitionMutates(
+                            tableToken,
+                            timestampType,
+                            partitionTimestamp,
+                            previousNameVersion - 1,
+                            0
+                    );
+                    purgePartition(
+                            tableToken,
+                            ff,
+                            path,
+                            tableRootLen - tableToken.getDirNameUtf8().size() - 1,
+                            "purging overwritten partition directory [path="
+                    );
                 } else {
-                    LOG.info().$("cannot purge overwritten partition directory, locked for reading [path=").$(path).I$();
+                    LOG.info().$("cannot purge overwritten partition directory, locked for reading path=")
+                            .$substr(tableRootLen - tableToken.getDirNameUtf8().size() - 1, path).I$();
                 }
             }
         }
     }
 
-    private void purgePartition(TableToken tableToken, FilesFacade ff, Path path, String message) {
+    private void purgePartition(TableToken tableToken, FilesFacade ff, Path path, int pathFrom, String message) {
         if (engine.lockTableCreate(tableToken)) {
             try {
                 TableToken lastToken = engine.getUpdatedTableToken(tableToken);
                 if (lastToken == tableToken) {
-                    LOG.info().$(message).$(path).I$();
+                    LOG.info().$(message).$substr(pathFrom, path).I$();
                     ff.unlinkOrRemove(path, LOG);
                 } else {
-                    // table is dropped and recreated since we started processing it.
+                    // the table is dropped and recreated since we started processing it.
                     // abort the table processing
                     throw new TableReferenceOutOfDateException();
                 }
             } finally {
-                engine.unLockTableCreate(tableToken);
+                engine.unlockTableCreate(tableToken);
             }
         } else {
-            // table is dropped and recreated since we started processing it.
+            // the table is dropped and recreated since we started processing it.
             // abort the table processing
             throw new TableReferenceOutOfDateException();
         }
     }
 
     @Override
-    protected boolean canRun() {
-        // No deletion must happen while a snapshot is in-flight.
-        return !snapshotAgent.isInProgress();
-    }
-
-    @Override
-    protected boolean doRun(int workerId, long cursor, RunStatus runStatus) {
+    protected boolean doRun(long cursor, WorkerContext workerContext) {
         final O3PartitionPurgeTask task = queue.get(cursor);
         discoverPartitions(
                 configuration.getFilesFacade(),
-                fileNameSinks[workerId],
-                partitionList.get(workerId),
-                configuration.getRoot(),
+                fileNameSink,
+                partitionList,
+                configuration.getDbRoot(),
                 task.getTableToken(),
-                txnScoreboards.get(workerId),
-                txnReaders.get(workerId),
+                txnReader,
+                task.getTimestampType(),
                 task.getPartitionBy()
         );
         subSeq.done(cursor);

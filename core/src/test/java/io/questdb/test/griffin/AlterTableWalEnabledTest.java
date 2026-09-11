@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -25,7 +25,6 @@
 package io.questdb.test.griffin;
 
 import io.questdb.PropertyKey;
-import io.questdb.cairo.SqlWalMode;
 import io.questdb.cairo.TableReader;
 import io.questdb.griffin.SqlException;
 import io.questdb.test.AbstractCairoTest;
@@ -120,7 +119,7 @@ public class AlterTableWalEnabledTest extends AbstractCairoTest {
     @Test
     public void testWalEnabledNameInCreateAsSelect() throws Exception {
         assertMemoryLeak(() -> {
-            compile("create table wm as (" +
+            execute("create table wm as (" +
                     "select x, cast(x as timestamp) as ts " +
                     "from long_sequence(2) " +
                     ") timestamp(ts) partition by DAY WAL");
@@ -132,7 +131,7 @@ public class AlterTableWalEnabledTest extends AbstractCairoTest {
     @Test
     public void testWalEnabledNameInCreateAsSelect2() throws Exception {
         assertMemoryLeak(() -> {
-            compile("create table wm as (" +
+            execute("create table wm as (" +
                     "select x, cast(x as timestamp) as ts " +
                     "from long_sequence(2) " +
                     ") timestamp(ts) partition by DAY Bypass WaL");
@@ -185,25 +184,29 @@ public class AlterTableWalEnabledTest extends AbstractCairoTest {
         }
     }
 
-    private void checkWalEnabledBeforeAfterAlter(String alterSuffix) throws SqlException {
+    private void checkWalEnabledBeforeAfterAlter(String alterSuffix) throws Exception {
         createTableWrite("my_table_wal", "WAL", "DAY");
         assertWalEnabled("my_table_wal", true);
-        ddl("alter table my_table_wal " + alterSuffix, sqlExecutionContext);
+        execute("alter table my_table_wal " + alterSuffix, sqlExecutionContext);
         assertWalEnabled("my_table_wal", true);
 
         createTableWrite("my_table_dir", "BYPASS WAL", "DAY");
         assertWalEnabled("my_table_dir", false);
-        ddl("alter table my_table_dir " + alterSuffix, sqlExecutionContext);
+        execute("alter table my_table_dir " + alterSuffix, sqlExecutionContext);
         assertWalEnabled("my_table_dir", false);
 
-        assertSql("table_name\twalEnabled\n" +
-                "my_table_dir\tfalse\n" +
-                "my_table_wal\ttrue\n", "select table_name, walEnabled from tables() order by table_name"
-        );
+        assertQuery("select table_name, walEnabled from tables() order by table_name")
+                .noLeakCheck()
+                .expectSize()
+                .returns("""
+                        table_name\twalEnabled
+                        my_table_dir\tfalse
+                        my_table_wal\ttrue
+                        """);
     }
 
-    private void createTableWrite(String tableName, String walMode, String partitionBY) throws SqlException {
-        compile(
+    private void createTableWrite(String tableName, String walMode, String partitionBY) throws Exception {
+        execute(
                 "create table " + tableName +
                         " (ts TIMESTAMP, x long, s symbol) timestamp(ts)" +
                         " PARTITION BY " + partitionBY +

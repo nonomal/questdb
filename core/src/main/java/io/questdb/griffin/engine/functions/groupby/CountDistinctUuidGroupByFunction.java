@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -37,17 +37,17 @@ import io.questdb.griffin.engine.groupby.GroupByLong128HashSet;
 import io.questdb.std.Numbers;
 import io.questdb.std.Uuid;
 
-public final class CountDistinctUuidGroupByFunction extends LongFunction implements UnaryFunction, GroupByFunction {
+public class CountDistinctUuidGroupByFunction extends LongFunction implements UnaryFunction, GroupByFunction {
     private final Function arg;
     private final GroupByLong128HashSet setA;
     private final GroupByLong128HashSet setB;
+    private long cardinality;
     private int valueIndex;
 
     public CountDistinctUuidGroupByFunction(Function arg, int setInitialCapacity, double setLoadFactor) {
         this.arg = arg;
-        // We use zero as the default value to speed up zeroing on rehash.
-        setA = new GroupByLong128HashSet(setInitialCapacity, setLoadFactor, 0);
-        setB = new GroupByLong128HashSet(setInitialCapacity, setLoadFactor, 0);
+        setA = new GroupByLong128HashSet(setInitialCapacity, setLoadFactor, Numbers.LONG_NULL);
+        setB = new GroupByLong128HashSet(setInitialCapacity, setLoadFactor, Numbers.LONG_NULL);
     }
 
     @Override
@@ -58,17 +58,13 @@ public final class CountDistinctUuidGroupByFunction extends LongFunction impleme
 
     @Override
     public void computeFirst(MapValue mapValue, Record record, long rowId) {
-        long lo = arg.getLong128Lo(record);
-        long hi = arg.getLong128Hi(record);
+        final long lo = arg.getLong128Lo(record);
+        final long hi = arg.getLong128Hi(record);
         if (!Uuid.isNull(lo, hi)) {
-            mapValue.putLong(valueIndex, 1L);
-            // Remap zero since it's used as the no entry key.
-            if (lo == 0 && hi == 0) {
-                lo = Numbers.LONG_NULL;
-                hi = Numbers.LONG_NULL;
-            }
+            mapValue.putLong(valueIndex, 1);
             setA.of(0).add(lo, hi);
             mapValue.putLong(valueIndex + 1, setA.ptr());
+            cardinality++;
         } else {
             mapValue.putLong(valueIndex, 0);
             mapValue.putLong(valueIndex + 1, 0);
@@ -77,20 +73,16 @@ public final class CountDistinctUuidGroupByFunction extends LongFunction impleme
 
     @Override
     public void computeNext(MapValue mapValue, Record record, long rowId) {
-        long lo = arg.getLong128Lo(record);
-        long hi = arg.getLong128Hi(record);
+        final long lo = arg.getLong128Lo(record);
+        final long hi = arg.getLong128Hi(record);
         if (!Uuid.isNull(lo, hi)) {
-            long ptr = mapValue.getLong(valueIndex + 1);
-            // Remap zero since it's used as the no entry key.
-            if (lo == 0 && hi == 0) {
-                lo = Numbers.LONG_NULL;
-                hi = Numbers.LONG_NULL;
-            }
+            final long ptr = mapValue.getLong(valueIndex + 1);
             final long index = setA.of(ptr).keyIndex(lo, hi);
             if (index >= 0) {
                 setA.addAt(index, lo, hi);
                 mapValue.addLong(valueIndex, 1);
                 mapValue.putLong(valueIndex + 1, setA.ptr());
+                cardinality++;
             }
         }
     }
@@ -101,6 +93,11 @@ public final class CountDistinctUuidGroupByFunction extends LongFunction impleme
     }
 
     @Override
+    public long getCardinalityStat() {
+        return cardinality;
+    }
+
+    @Override
     public long getLong(Record rec) {
         return rec.getLong(valueIndex);
     }
@@ -108,6 +105,11 @@ public final class CountDistinctUuidGroupByFunction extends LongFunction impleme
     @Override
     public String getName() {
         return "count_distinct";
+    }
+
+    @Override
+    public int getSampleByFlags() {
+        return GroupByFunction.SAMPLE_BY_FILL_ALL;
     }
 
     @Override
@@ -122,8 +124,10 @@ public final class CountDistinctUuidGroupByFunction extends LongFunction impleme
 
     @Override
     public void initValueTypes(ArrayColumnTypes columnTypes) {
-        this.valueIndex = columnTypes.getColumnCount();
+        valueIndex = columnTypes.getColumnCount();
+        // count
         columnTypes.add(ColumnType.LONG);
+        // GroupByLong128HashSet pointer (count>1)
         columnTypes.add(ColumnType.LONG);
     }
 
@@ -133,30 +137,30 @@ public final class CountDistinctUuidGroupByFunction extends LongFunction impleme
     }
 
     @Override
-    public boolean isReadThreadSafe() {
+    public boolean isThreadSafe() {
         return false;
     }
 
     @Override
     public void merge(MapValue destValue, MapValue srcValue) {
-        long srcCount = srcValue.getLong(valueIndex);
+        final long srcCount = srcValue.getLong(valueIndex);
         if (srcCount == 0 || srcCount == Numbers.LONG_NULL) {
             return;
         }
-        long srcPtr = srcValue.getLong(valueIndex + 1);
+        final long srcPtr = srcValue.getLong(valueIndex + 1);
 
-        long destCount = destValue.getLong(valueIndex);
+        final long destCount = destValue.getLong(valueIndex);
         if (destCount == 0 || destCount == Numbers.LONG_NULL) {
             destValue.putLong(valueIndex, srcCount);
             destValue.putLong(valueIndex + 1, srcPtr);
             return;
         }
-        long destPtr = destValue.getLong(valueIndex + 1);
+        final long destPtr = destValue.getLong(valueIndex + 1);
 
         setA.of(destPtr);
         setB.of(srcPtr);
 
-        if (setA.size() > (setB.size() >> 1)) {
+        if (setA.size() > (setB.size() >>> 1)) {
             setA.merge(setB);
             destValue.putLong(valueIndex, setA.size());
             destValue.putLong(valueIndex + 1, setA.ptr());
@@ -169,6 +173,11 @@ public final class CountDistinctUuidGroupByFunction extends LongFunction impleme
     }
 
     @Override
+    public void resetStats() {
+        this.cardinality = 0;
+    }
+
+    @Override
     public void setAllocator(GroupByAllocator allocator) {
         setA.setAllocator(allocator);
         setB.setAllocator(allocator);
@@ -176,7 +185,7 @@ public final class CountDistinctUuidGroupByFunction extends LongFunction impleme
 
     @Override
     public void setEmpty(MapValue mapValue) {
-        mapValue.putLong(valueIndex, 0L);
+        mapValue.putLong(valueIndex, 0);
         mapValue.putLong(valueIndex + 1, 0);
     }
 
@@ -195,10 +204,5 @@ public final class CountDistinctUuidGroupByFunction extends LongFunction impleme
     @Override
     public boolean supportsParallelism() {
         return UnaryFunction.super.supportsParallelism();
-    }
-
-    @Override
-    public void toTop() {
-        UnaryFunction.super.toTop();
     }
 }

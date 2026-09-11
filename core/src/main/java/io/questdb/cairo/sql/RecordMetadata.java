@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -26,8 +26,8 @@ package io.questdb.cairo.sql;
 
 import io.questdb.cairo.ColumnType;
 import io.questdb.cairo.ColumnTypes;
+import io.questdb.cairo.IndexType;
 import io.questdb.cairo.TableColumnMetadata;
-import io.questdb.cairo.TableDescriptor;
 import io.questdb.griffin.PlanSink;
 import io.questdb.griffin.Plannable;
 import io.questdb.std.str.Utf16Sink;
@@ -39,7 +39,7 @@ import io.questdb.std.str.Utf16Sink;
  * <p>
  * Types are defined in {@link io.questdb.cairo.ColumnType}
  */
-public interface RecordMetadata extends ColumnTypes, Plannable, TableDescriptor {
+public interface RecordMetadata extends ColumnTypes, Plannable {
 
     int COLUMN_NOT_FOUND = -1;
 
@@ -65,6 +65,11 @@ public interface RecordMetadata extends ColumnTypes, Plannable, TableDescriptor 
     /**
      * Performs the same function as {@link #getColumnIndex(CharSequence)}
      * but will not throw an exception if the column does not exist.
+     * <p>
+     * The lookup is verbatim: no compiler-alias unquoting is applied, so ingestion and
+     * storage paths cannot have wire-supplied names redirected into other columns. SQL
+     * compilation code resolving projection aliases must use
+     * {@link io.questdb.griffin.SqlUtil#getColumnIndexQuiet(RecordMetadata, CharSequence)} instead.
      *
      * @param columnName name of the column
      * @return index of the column
@@ -74,8 +79,12 @@ public interface RecordMetadata extends ColumnTypes, Plannable, TableDescriptor 
     }
 
     /**
-     * Gets the numeric index of a column by name.
-     * Will not throw an exception if the column does not exist.
+     * Gets the numeric index of a column by name over the {@code [lo, hi)} slice of the
+     * given sequence. Like {@link #getColumnIndexQuiet(CharSequence)}, no compiler-alias unquoting
+     * is applied. Most implementations match the slice verbatim; implementations that model composed
+     * {@code table.column} names (the join metadata used during SQL compilation) instead split the
+     * slice on an unquoted dot, so a caller needing a strictly verbatim match must not feed such a
+     * name to those implementations. Will not throw an exception if the column does not exist.
      *
      * @param columnName name of the column
      * @param lo         the low boundary index of the columnName chars, inclusive
@@ -148,6 +157,14 @@ public interface RecordMetadata extends ColumnTypes, Plannable, TableDescriptor 
      */
     int getTimestampIndex();
 
+    default int getTimestampType() {
+        int timestampIndex = getTimestampIndex();
+        if (timestampIndex < 0) {
+            return ColumnType.NULL;
+        }
+        return getColumnType(timestampIndex);
+    }
+
     /**
      * Writing index for the column
      *
@@ -163,10 +180,20 @@ public interface RecordMetadata extends ColumnTypes, Plannable, TableDescriptor 
     boolean hasColumn(int columnIndex);
 
     /**
+     * Returns the index type for the column.
+     *
+     * @param columnIndex numeric index of the column
+     * @return the index type (see {@link IndexType})
+     */
+    byte getColumnIndexType(int columnIndex);
+
+    /**
      * @param columnIndex numeric index of the column
      * @return true if column is indexed, otherwise false.
      */
-    boolean isColumnIndexed(int columnIndex);
+    default boolean isColumnIndexed(int columnIndex) {
+        return IndexType.isIndexed(getColumnIndexType(columnIndex));
+    }
 
     /**
      * @param columnIndex numeric index of the column
@@ -192,6 +219,21 @@ public interface RecordMetadata extends ColumnTypes, Plannable, TableDescriptor 
      * @return true if the record is from WAL enabled table, otherwise false.
      */
     default boolean isWalEnabled() {
+        return false;
+    }
+
+    /**
+     * Whether {@link #getColumnIndexQuiet(CharSequence, int, int)} resolves a composed
+     * {@code table.column} name by splitting the slice on an unquoted dot (the join metadata used
+     * during SQL compilation), rather than matching the slice verbatim. A caller that strips
+     * compiler-protective quotes off a dotted alias and retries the bare slice must NOT feed it to
+     * such an implementation, or the content dot would be mis-split into a spurious {@code table.column}
+     * and bind to an unrelated column. Wrappers (e.g. PriorityMetadata) forward this to their delegate,
+     * so an {@code instanceof} check on the concrete type is not sufficient.
+     *
+     * @return true if the ranged lookup splits on an unquoted dot, false if it matches verbatim
+     */
+    default boolean splitsOnDot() {
         return false;
     }
 

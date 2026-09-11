@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,20 +24,32 @@
 
 package io.questdb.griffin.engine.functions.catalogue;
 
-import io.questdb.TelemetryConfigLogger;
-import io.questdb.cairo.*;
+import io.questdb.cairo.AbstractRecordCursorFactory;
+import io.questdb.cairo.CairoConfiguration;
+import io.questdb.cairo.CairoEngine;
+import io.questdb.cairo.ColumnType;
+import io.questdb.cairo.GenericRecordMetadata;
+import io.questdb.cairo.TableColumnMetadata;
+import io.questdb.cairo.TableToken;
+import io.questdb.cairo.TableUtils;
+import io.questdb.cairo.sql.Function;
+import io.questdb.cairo.sql.NoRandomAccessRecordCursor;
 import io.questdb.cairo.sql.Record;
-import io.questdb.cairo.sql.*;
+import io.questdb.cairo.sql.RecordCursor;
+import io.questdb.cairo.sql.RecordMetadata;
+import io.questdb.cairo.sql.SqlExecutionCircuitBreaker;
 import io.questdb.griffin.FunctionFactory;
 import io.questdb.griffin.PlanSink;
-import io.questdb.griffin.SqlException;
 import io.questdb.griffin.SqlExecutionContext;
 import io.questdb.griffin.engine.functions.CursorFunction;
+import io.questdb.metrics.QueryTracingJob;
 import io.questdb.std.Chars;
 import io.questdb.std.IntList;
 import io.questdb.std.ObjHashSet;
 import io.questdb.std.ObjList;
 import io.questdb.tasks.TelemetryTask;
+
+import static io.questdb.TelemetryConfigLogger.TELEMETRY_CONFIG_TABLE_NAME;
 
 // information_schema.tables basic implementation
 // used in grafana meta queries
@@ -59,7 +71,7 @@ public class InformationSchemaTablesFunctionFactory implements FunctionFactory {
     @Override
     public Function newInstance(int position, ObjList<Function> args, IntList argPositions,
                                 CairoConfiguration configuration,
-                                SqlExecutionContext sqlExecutionContext) throws SqlException {
+                                SqlExecutionContext sqlExecutionContext) {
         return new CursorFunction(new InformationSchemaTablesCursorFactory(configuration, METADATA)) {
             @Override
             public boolean isRuntimeConstant() {
@@ -70,9 +82,10 @@ public class InformationSchemaTablesFunctionFactory implements FunctionFactory {
 
     public static class InformationSchemaTablesCursorFactory extends AbstractRecordCursorFactory {
         private final TableListRecordCursor cursor = new TableListRecordCursor();
-        private final boolean hideTelemetryTables;
+        private final boolean hideTelemetryTable;
         private final CharSequence sysTablePrefix;
         private final CharSequence tempPendingRenameTablePrefix;
+        private SqlExecutionCircuitBreaker circuitBreaker;
         private CairoEngine engine;
         private TableToken tableToken;
 
@@ -80,11 +93,13 @@ public class InformationSchemaTablesFunctionFactory implements FunctionFactory {
             super(metadata);
             tempPendingRenameTablePrefix = configuration.getTempRenamePendingTablePrefix();
             sysTablePrefix = configuration.getSystemTableNamePrefix();
-            hideTelemetryTables = configuration.getTelemetryConfiguration().hideTables();
+            hideTelemetryTable = configuration.getTelemetryConfiguration().hideTables();
         }
 
         @Override
         public RecordCursor getCursor(SqlExecutionContext executionContext) {
+            executionContext.getCircuitBreaker().statefulThrowExceptionIfTrippedTimeThrottled();
+            circuitBreaker = executionContext.getCircuitBreaker();
             engine = executionContext.getCairoEngine();
             cursor.toTop();
             return cursor;
@@ -103,6 +118,7 @@ public class InformationSchemaTablesFunctionFactory implements FunctionFactory {
         @Override
         protected void _close() {
             cursor.close();
+            circuitBreaker = null;
             engine = null;
         }
 
@@ -123,6 +139,7 @@ public class InformationSchemaTablesFunctionFactory implements FunctionFactory {
 
             @Override
             public boolean hasNext() {
+                circuitBreaker.statefulThrowExceptionIfTripped();
                 if (tableIndex < 0) {
                     engine.getTableTokens(tableBucket, false);
                     tableIndex = -1;
@@ -131,12 +148,17 @@ public class InformationSchemaTablesFunctionFactory implements FunctionFactory {
                 int n = tableBucket.size();
                 for (; tableIndex < n; tableIndex++) {
                     tableToken = tableBucket.get(tableIndex);
-                    if (!TableUtils.isPendingRenameTempTableName(tableToken.getTableName(), tempPendingRenameTablePrefix) &&
+                    if (TableUtils.isFinalTableName(tableToken.getTableName(), tempPendingRenameTablePrefix) &&
                             !isSystemTable(tableToken)) {
                         break;
                     }
                 }
                 return tableIndex < n;
+            }
+
+            @Override
+            public long preComputedStateSize() {
+                return 0;
             }
 
             @Override
@@ -150,9 +172,12 @@ public class InformationSchemaTablesFunctionFactory implements FunctionFactory {
             }
 
             private boolean isSystemTable(TableToken tableToken) {
-                return (hideTelemetryTables &&
-                        (Chars.equals(tableToken.getTableName(), TelemetryTask.TABLE_NAME) || Chars.equals(tableToken.getTableName(), TelemetryConfigLogger.TELEMETRY_CONFIG_TABLE_NAME)))
-                        || Chars.startsWith(tableToken.getTableName(), sysTablePrefix);
+                String tableName = tableToken.getTableName();
+                return (hideTelemetryTable &&
+                        (Chars.equals(tableName, TelemetryTask.TABLE_NAME) ||
+                                Chars.equals(tableName, TELEMETRY_CONFIG_TABLE_NAME)))
+                        || Chars.startsWith(tableName, sysTablePrefix)
+                        || Chars.equals(tableName, QueryTracingJob.TABLE_NAME);
             }
 
             private class TableListRecord implements Record {
@@ -161,7 +186,10 @@ public class InformationSchemaTablesFunctionFactory implements FunctionFactory {
                     if (col == COLUMN_IS_TYPED) {
                         return false;
                     }
-                    return col == COLUMN_IS_INSERTABLE_INTO;
+                    if (col == COLUMN_IS_INSERTABLE_INTO) {
+                        return !tableToken.isView() && !tableToken.isMatView() && !tableToken.isLiveView();
+                    }
+                    return false;
                 }
 
                 @Override
@@ -170,12 +198,19 @@ public class InformationSchemaTablesFunctionFactory implements FunctionFactory {
                         return tableToken.getTableName();
                     }
                     if (col == COLUMN_CATALOG) {
-                        return "qdb";
+                        return Constants.DB_NAME;
                     }
                     if (col == COLUMN_SCHEMA) {
-                        return "public";
+                        return Constants.PUBLIC_SCHEMA;
                     }
                     if (col == COLUMN_TYPE) {
+                        if (tableToken.isLiveView()) {
+                            return "LIVE VIEW";
+                        } else if (tableToken.isMatView()) {
+                            return "MATERIALIZED VIEW";
+                        } else if (tableToken.isView()) {
+                            return "VIEW";
+                        }
                         return "BASE TABLE";
                     }
                     return null;

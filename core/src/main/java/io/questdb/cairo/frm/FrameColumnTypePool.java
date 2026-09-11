@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,8 +24,55 @@
 
 package io.questdb.cairo.frm;
 
+import io.questdb.cairo.IndexType;
+import io.questdb.cairo.vm.api.MemoryCR;
 import io.questdb.std.str.Path;
 
 public interface FrameColumnTypePool {
-    FrameColumn create(Path partitionPath, CharSequence columnName, long columnTxn, int columnType, int indexBlockCapacity, long columnTop, int columnIndex, boolean init);
+    FrameColumn create(
+            Path partitionPath,
+            CharSequence columnName,
+            long columnTxn,
+            int columnType,
+            int indexBlockCapacity,
+            byte indexType,
+            long columnTop,
+            int columnIndex,
+            boolean init,
+            boolean canWrite
+    );
+
+    default FrameColumn create(
+            Path partitionPath,
+            CharSequence columnName,
+            long columnTxn,
+            int columnType,
+            int indexBlockCapacity,
+            long columnTop,
+            int columnIndex,
+            boolean init,
+            boolean canWrite
+    ) {
+        // Backward-compatible overload - defaults to BITMAP index type if indexed
+        return create(
+                partitionPath,
+                columnName,
+                columnTxn,
+                columnType,
+                indexBlockCapacity,
+                indexBlockCapacity > 0 ? IndexType.BITMAP : IndexType.NONE,
+                columnTop,
+                columnIndex,
+                init,
+                canWrite
+        );
+    }
+
+    FrameColumn createFromMemoryColumn(
+            int columnIndex,
+            int columnType,
+            long rowCount,
+            MemoryCR columnMemoryPrimary,
+            MemoryCR columnMemorySecondary
+    );
 }

@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -39,8 +39,14 @@ public class LongIntHashMap extends AbstractLongHashSet implements Mutable {
         this(initialCapacity, 0.5f);
     }
 
-    private LongIntHashMap(int initialCapacity, double loadFactor) {
+    public LongIntHashMap(int initialCapacity, double loadFactor) {
         super(initialCapacity, loadFactor);
+        values = new int[keys.length];
+        clear();
+    }
+
+    public LongIntHashMap(int initialCapacity, double loadFactor, long noKeyValue) {
+        super(initialCapacity, loadFactor, noKeyValue);
         values = new int[keys.length];
         clear();
     }

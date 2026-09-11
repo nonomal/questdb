@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -25,22 +25,33 @@
 package io.questdb.std.str;
 
 import io.questdb.std.Unsafe;
+import io.questdb.std.bytes.DirectByteSequence;
 
 /**
  * A sequence of UTF-8 bytes stored in native memory.
  */
-public interface DirectUtf8Sequence extends Utf8Sequence, DirectSequence {
+public interface DirectUtf8Sequence extends Utf8Sequence, DirectByteSequence {
 
     @Override
     default byte byteAt(int index) {
-        return Unsafe.getUnsafe().getByte(ptr() + index);
+        return Unsafe.getByte(ptr() + index);
+    }
+
+    @Override
+    default int intAt(int offset) {
+        return Unsafe.getInt(ptr() + offset);
     }
 
     @Override
     default long longAt(int offset) {
-        return Unsafe.getUnsafe().getLong(ptr() + offset);
+        return Unsafe.getLong(ptr() + offset);
     }
 
     @Override
     long ptr();
+
+    @Override
+    default short shortAt(int offset) {
+        return Unsafe.getShort(ptr() + offset);
+    }
 }

@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -29,9 +29,15 @@ import io.questdb.cairo.sql.Function;
 import io.questdb.cairo.sql.Record;
 import io.questdb.griffin.FunctionFactory;
 import io.questdb.griffin.SqlExecutionContext;
-import io.questdb.griffin.engine.functions.*;
+import io.questdb.griffin.engine.functions.Long256Function;
+import io.questdb.griffin.engine.functions.QuaternaryFunction;
 import io.questdb.griffin.engine.functions.constants.Long256Constant;
-import io.questdb.std.*;
+import io.questdb.std.IntList;
+import io.questdb.std.Long256;
+import io.questdb.std.Long256Impl;
+import io.questdb.std.Misc;
+import io.questdb.std.Numbers;
+import io.questdb.std.ObjList;
 import io.questdb.std.str.CharSink;
 
 public final class LongsToLong256FunctionFactory implements FunctionFactory {
@@ -55,12 +61,10 @@ public final class LongsToLong256FunctionFactory implements FunctionFactory {
     }
 
     private static class LongsToLong256Function extends Long256Function implements QuaternaryFunction {
-
         private final Function l0;
         private final Function l1;
         private final Function l2;
         private final Function l3;
-
         private final Long256Impl long256a = new Long256Impl();
         private final Long256Impl long256b = new Long256Impl();
 
@@ -77,11 +81,6 @@ public final class LongsToLong256FunctionFactory implements FunctionFactory {
             Misc.free(l1);
             Misc.free(l2);
             Misc.free(l3);
-        }
-
-        @Override
-        public void getLong256(Record rec, CharSink<?> sink) {
-            Numbers.appendLong256(l0.getLong(rec), l1.getLong(rec), l2.getLong(rec), l3.getLong(rec), sink);
         }
 
         @Override
@@ -102,6 +101,11 @@ public final class LongsToLong256FunctionFactory implements FunctionFactory {
         @Override
         public Function getFunc3() {
             return l3;
+        }
+
+        @Override
+        public void getLong256(Record rec, CharSink<?> sink) {
+            Numbers.appendLong256(l0.getLong(rec), l1.getLong(rec), l2.getLong(rec), l3.getLong(rec), sink);
         }
 
         @Override
@@ -135,5 +139,9 @@ public final class LongsToLong256FunctionFactory implements FunctionFactory {
             return "to_long256";
         }
 
+        @Override
+        public boolean isThreadSafe() {
+            return false;
+        }
     }
 }

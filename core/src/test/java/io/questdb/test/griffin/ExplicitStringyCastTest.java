@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -35,27 +35,6 @@ import java.util.Collection;
 @RunWith(Parameterized.class)
 public class ExplicitStringyCastTest extends AbstractCairoTest {
 
-    @Parameterized.Parameters(name = "{0}")
-    public static Collection<Object[]> data() {
-        return Arrays.asList(new Object[][]{
-                {"boolean", "false"},
-                {"byte", "0"},
-                {"short", "1"},
-                {"int", "1"},
-                {"long", "0"},
-                {"long256", "0x797fa69eb8fec6cce8beef38cd7bb3d8db2d34586f6275fab5b2159a23565217"},
-                {"float", "0.1312"},
-                {"double", "0.8423410920883345"},
-                {"date", "2024-11-26T02:19:54.316Z"},
-                {"timestamp", "2024-12-04T22:56:43.359212Z"},
-                {"char", "G"},
-                {"symbol", "sym1"},
-                {"uuid4", "83881d41-7184-4cf3-ae60-a01a5b3ea0db"},
-                {"string", "XIB"},
-                {"varchar", "鼷G\uD991\uDE7E"},
-        });
-    }
-
     private final String castTableDdl = "create table cast_table as (select" +
             " rnd_boolean() a_boolean," +
             " rnd_byte(0,1) a_byte," +
@@ -73,7 +52,6 @@ public class ExplicitStringyCastTest extends AbstractCairoTest {
             " rnd_str(3,3,0) a_string," +
             " rnd_varchar(3,3,0) a_varchar," +
             " from long_sequence(1))";
-
     private final String castType;
     private final String expectedCastValue;
 
@@ -82,23 +60,44 @@ public class ExplicitStringyCastTest extends AbstractCairoTest {
         this.expectedCastValue = expectedCastValue;
     }
 
+    @Parameterized.Parameters(name = "{0}")
+    public static Collection<Object[]> data() {
+        return Arrays.asList(new Object[][]{
+                {"boolean", "false"},
+                {"byte", "0"},
+                {"short", "1"},
+                {"int", "1"},
+                {"long", "0"},
+                {"long256", "0x797fa69eb8fec6cce8beef38cd7bb3d8db2d34586f6275fab5b2159a23565217"},
+                {"float", "0.13123357"},
+                {"double", "0.8423410920883345"},
+                {"date", "2024-11-26T02:19:54.316Z"},
+                {"timestamp", "2024-12-04T22:56:43.359212Z"},
+                {"char", "G"},
+                {"symbol", "sym1"},
+                {"uuid4", "83881d41-7184-4cf3-ae60-a01a5b3ea0db"},
+                {"string", "XIB"},
+                {"varchar", "鼷G\uD991\uDE7E"},
+        });
+    }
+
     @Test
     public void testCastToString() throws Exception {
-        assertQuery("a\ttypeOf\n" +
-                expectedCastValue + "\tSTRING\n",
-                String.format("select a, typeOf(a) typeOf from" +
-                        " (select cast(a_%s as string) a from cast_table)", castType),
-                castTableDdl, null, true, true
-        );
+        assertQuery(String.format("select a, typeOf(a) typeOf from" +
+                " (select cast(a_%s as string) a from cast_table)", castType))
+                .ddl(castTableDdl)
+                .expectSize()
+                .returns("a\ttypeOf\n" +
+                        expectedCastValue + "\tSTRING\n");
     }
 
     @Test
     public void testCastToVarchar() throws Exception {
-        assertQuery("a\ttypeOf\n" +
-                expectedCastValue + "\tVARCHAR\n",
-                String.format("select a, typeOf(a) typeOf from" +
-                        " (select cast(a_%s as varchar) a from cast_table)", castType),
-                castTableDdl, null, true, true
-        );
+        assertQuery(String.format("select a, typeOf(a) typeOf from" +
+                " (select cast(a_%s as varchar) a from cast_table)", castType))
+                .ddl(castTableDdl)
+                .expectSize()
+                .returns("a\ttypeOf\n" +
+                        expectedCastValue + "\tVARCHAR\n");
     }
 }

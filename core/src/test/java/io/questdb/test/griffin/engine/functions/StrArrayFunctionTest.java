@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,23 +24,28 @@
 
 package io.questdb.test.griffin.engine.functions;
 
+import io.questdb.cairo.sql.FunctionExtension;
 import io.questdb.cairo.sql.Record;
 import io.questdb.griffin.engine.functions.StrArrayFunction;
-import io.questdb.std.str.Utf16Sink;
 import org.junit.Test;
 
 public class StrArrayFunctionTest {
-    // assert that all type casts that are not possible will throw exception
 
     private static final StrArrayFunction function = new StrArrayFunction() {
+
+        @Override
+        public FunctionExtension extendedOps() {
+            return this;
+        }
+
         @Override
         public int getArrayLength() {
             return 1;
         }
 
         @Override
-        public CharSequence getStrA(Record rec) {
-            return "{hello}";
+        public Record getRecord(Record rec) {
+            throw new UnsupportedOperationException();
         }
 
         @Override
@@ -49,18 +54,8 @@ public class StrArrayFunctionTest {
         }
 
         @Override
-        public void getStr(Record rec, Utf16Sink utf16Sink) {
-            utf16Sink.put(getStrA(rec));
-        }
-
-        @Override
-        public void getStr(Record rec, Utf16Sink sink, int arrayIndex) {
-            sink.put(getStrA(rec, arrayIndex));
-        }
-
-        @Override
-        public CharSequence getStrB(Record rec) {
-            return getStrA(rec);
+        public CharSequence getStrA(Record rec) {
+            return "{hello}";
         }
 
         @Override
@@ -69,8 +64,8 @@ public class StrArrayFunctionTest {
         }
 
         @Override
-        public int getStrLen(Record rec) {
-            return getStrA(rec).length();
+        public CharSequence getStrB(Record rec) {
+            return getStrA(rec);
         }
 
         @Override
@@ -79,29 +74,21 @@ public class StrArrayFunctionTest {
         }
 
         @Override
-        public boolean isReadThreadSafe() {
+        public int getStrLen(Record rec) {
+            return getStrA(rec).length();
+        }
+
+        @Override
+        public boolean isThreadSafe() {
             return true;
         }
     };
 
-    @Test(expected = UnsupportedOperationException.class)
-    public void testGetGeoByte() {
-        function.getGeoByte(null);
-    }
+    // assert that all type casts that are not possible will throw exception
 
     @Test(expected = UnsupportedOperationException.class)
-    public void testGetGeoInt() {
-        function.getGeoInt(null);
-    }
-
-    @Test(expected = UnsupportedOperationException.class)
-    public void testGetGeoLong() {
-        function.getGeoLong(null);
-    }
-
-    @Test(expected = UnsupportedOperationException.class)
-    public void testGetGeoShort() {
-        function.getGeoShort(null);
+    public void testGetArray() {
+        function.getArray(null);
     }
 
     @Test(expected = UnsupportedOperationException.class)
@@ -135,18 +122,58 @@ public class StrArrayFunctionTest {
     }
 
     @Test(expected = UnsupportedOperationException.class)
+    public void testGetDecimal128() {
+        function.getDecimal128(null, null);
+    }
+
+    @Test(expected = UnsupportedOperationException.class)
+    public void testGetDecimal16() {
+        function.getDecimal16(null);
+    }
+
+    @Test(expected = UnsupportedOperationException.class)
+    public void testGetDecimal256() {
+        function.getDecimal256(null, null);
+    }
+
+    @Test(expected = UnsupportedOperationException.class)
+    public void testGetDecimal32() {
+        function.getDecimal32(null);
+    }
+
+    @Test(expected = UnsupportedOperationException.class)
+    public void testGetDecimal64() {
+        function.getDecimal64(null);
+    }
+
+    @Test(expected = UnsupportedOperationException.class)
+    public void testGetDecimal8() {
+        function.getDecimal8(null);
+    }
+
+    @Test(expected = UnsupportedOperationException.class)
+    public void testGetGeoByte() {
+        function.getGeoByte(null);
+    }
+
+    @Test(expected = UnsupportedOperationException.class)
+    public void testGetGeoInt() {
+        function.getGeoInt(null);
+    }
+
+    @Test(expected = UnsupportedOperationException.class)
+    public void testGetGeoLong() {
+        function.getGeoLong(null);
+    }
+
+    @Test(expected = UnsupportedOperationException.class)
+    public void testGetGeoShort() {
+        function.getGeoShort(null);
+    }
+
+    @Test(expected = UnsupportedOperationException.class)
     public void testGetIPv4() {
         function.getIPv4(null);
-    }
-
-    @Test(expected = UnsupportedOperationException.class)
-    public void testGetRecordCursorFactory() {
-        function.getRecordCursorFactory();
-    }
-
-    @Test(expected = UnsupportedOperationException.class)
-    public void testGetTimestamp() {
-        function.getTimestamp(null);
     }
 
     @Test(expected = UnsupportedOperationException.class)
@@ -175,8 +202,13 @@ public class StrArrayFunctionTest {
     }
 
     @Test(expected = UnsupportedOperationException.class)
-    public void testGetVarcharUtf8Sink() {
-        function.getVarchar(null, null);
+    public void testGetRecordCursorFactory() {
+        function.getRecordCursorFactory();
+    }
+
+    @Test(expected = UnsupportedOperationException.class)
+    public void testGetTimestamp() {
+        function.getTimestamp(null);
     }
 
     @Test(expected = UnsupportedOperationException.class)

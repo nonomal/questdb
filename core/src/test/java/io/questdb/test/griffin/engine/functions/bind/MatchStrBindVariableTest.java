@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -26,10 +26,8 @@ package io.questdb.test.griffin.engine.functions.bind;
 
 import io.questdb.cairo.sql.RecordCursor;
 import io.questdb.cairo.sql.RecordCursorFactory;
-import io.questdb.griffin.SqlException;
 import io.questdb.test.AbstractCairoTest;
 import io.questdb.test.tools.TestUtils;
-import org.junit.Assert;
 import org.junit.Test;
 
 public class MatchStrBindVariableTest extends AbstractCairoTest {
@@ -43,8 +41,10 @@ public class MatchStrBindVariableTest extends AbstractCairoTest {
                     println(factory, cursor);
                 }
 
-                TestUtils.assertEquals("x\n" +
-                        "1\n", sink);
+                TestUtils.assertEquals("""
+                        x
+                        1
+                        """, sink);
 
                 bindVariableService.setStr(0, "QTQ");
                 try (RecordCursor cursor = factory.getCursor(sqlExecutionContext)) {
@@ -54,31 +54,26 @@ public class MatchStrBindVariableTest extends AbstractCairoTest {
                 TestUtils.assertEquals("x\n", sink);
 
                 bindVariableService.setStr(0, null);
-                try {
-                    factory.getCursor(sqlExecutionContext);
-                    Assert.fail();
-                } catch (SqlException e) {
-                    Assert.assertEquals(47, e.getPosition());
-                    TestUtils.assertContains(e.getFlyweightMessage(), "NULL regex");
+                try (RecordCursor cursor = factory.getCursor(sqlExecutionContext)) {
+                    println(factory, cursor);
                 }
+
+                TestUtils.assertEquals("x\n", sink);
             }
         });
     }
 
     @Test
     public void testDynamicRegexFailure() throws Exception {
-        assertException(
-                "x where s ~ s",
-                "create table x as (select rnd_str() s from long_sequence(100))",
-                12,
-                "not implemented: dynamic pattern would be very slow to execute"
-        );
+        assertQuery("x where s ~ s")
+                .ddl("create table x as (select rnd_str() s from long_sequence(100))")
+                .fails(12, "not implemented: dynamic pattern would be very slow to execute");
     }
 
     @Test
     public void testSimple() throws Exception {
         assertMemoryLeak(() -> {
-            ddl("create table x as (select rnd_str() s from long_sequence(100))");
+            execute("create table x as (select rnd_str() s from long_sequence(100))");
 
             try (RecordCursorFactory factory = select("x where s ~ $1")) {
                 bindVariableService.setStr(0, "GQO");
@@ -86,25 +81,27 @@ public class MatchStrBindVariableTest extends AbstractCairoTest {
                     println(factory, cursor);
                 }
 
-                TestUtils.assertEquals("s\n" +
-                        "YCTGQO\n", sink);
+                TestUtils.assertEquals("""
+                        s
+                        YCTGQO
+                        """, sink);
 
                 bindVariableService.setStr(0, "QTQ");
                 try (RecordCursor cursor = factory.getCursor(sqlExecutionContext)) {
                     println(factory, cursor);
                 }
 
-                TestUtils.assertEquals("s\n" +
-                        "ZWEVQTQO\n", sink);
+                TestUtils.assertEquals("""
+                        s
+                        ZWEVQTQO
+                        """, sink);
 
                 bindVariableService.setStr(0, null);
-                try {
-                    factory.getCursor(sqlExecutionContext);
-                    Assert.fail();
-                } catch (SqlException e) {
-                    Assert.assertEquals(12, e.getPosition());
-                    TestUtils.assertContains(e.getFlyweightMessage(), "NULL regex");
+                try (RecordCursor cursor = factory.getCursor(sqlExecutionContext)) {
+                    println(factory, cursor);
                 }
+
+                TestUtils.assertEquals("s\n", sink);
             }
         });
     }

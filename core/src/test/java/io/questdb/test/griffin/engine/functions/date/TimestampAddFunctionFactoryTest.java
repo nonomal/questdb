@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -26,388 +26,204 @@ package io.questdb.test.griffin.engine.functions.date;
 
 import io.questdb.griffin.FunctionFactory;
 import io.questdb.griffin.engine.functions.date.TimestampAddFunctionFactory;
-import io.questdb.std.Numbers;
 import io.questdb.test.griffin.engine.AbstractFunctionFactoryTest;
 import org.junit.Test;
 
 public class TimestampAddFunctionFactoryTest extends AbstractFunctionFactoryTest {
 
+    public static char[] units = {'y', 'M', 'w', 'd', 'h', 'm', 's', 'T', 'U', 'n'};
 
     @Test
-    public void testCenterEmptyChar() throws Exception {
-        assertMemoryLeak(() -> call(Character.MIN_VALUE, 5, 1587275359886758L).andAssert(Double.NaN, 0.0001));
+    public void testDynamicFunction() throws Exception {
+        execute("create table x as (" +
+                "select " +
+                "x::int as x1," +
+                "rnd_symbol('u', 'n', 'T', 's') as s," +
+                "timestamp_sequence(0, 1000000) as ts, " +
+                "timestamp_sequence_ns(0, 1000000000) as ts_ns " +
+                "from long_sequence(20)" +
+                ") timestamp(ts)");
+        assertQuery("select dateadd('u', 1000000, ts) date1, dateadd('u', 1000000, ts) date2, datediff('T', date1, date2) from x;")
+                .timestamp("date1")
+                .expectSize()
+                .returns("""
+                        date1\tdate2\tdatediff
+                        1970-01-01T00:00:01.000000Z\t1970-01-01T00:00:01.000000Z\t0
+                        1970-01-01T00:00:02.000000Z\t1970-01-01T00:00:02.000000Z\t0
+                        1970-01-01T00:00:03.000000Z\t1970-01-01T00:00:03.000000Z\t0
+                        1970-01-01T00:00:04.000000Z\t1970-01-01T00:00:04.000000Z\t0
+                        1970-01-01T00:00:05.000000Z\t1970-01-01T00:00:05.000000Z\t0
+                        1970-01-01T00:00:06.000000Z\t1970-01-01T00:00:06.000000Z\t0
+                        1970-01-01T00:00:07.000000Z\t1970-01-01T00:00:07.000000Z\t0
+                        1970-01-01T00:00:08.000000Z\t1970-01-01T00:00:08.000000Z\t0
+                        1970-01-01T00:00:09.000000Z\t1970-01-01T00:00:09.000000Z\t0
+                        1970-01-01T00:00:10.000000Z\t1970-01-01T00:00:10.000000Z\t0
+                        1970-01-01T00:00:11.000000Z\t1970-01-01T00:00:11.000000Z\t0
+                        1970-01-01T00:00:12.000000Z\t1970-01-01T00:00:12.000000Z\t0
+                        1970-01-01T00:00:13.000000Z\t1970-01-01T00:00:13.000000Z\t0
+                        1970-01-01T00:00:14.000000Z\t1970-01-01T00:00:14.000000Z\t0
+                        1970-01-01T00:00:15.000000Z\t1970-01-01T00:00:15.000000Z\t0
+                        1970-01-01T00:00:16.000000Z\t1970-01-01T00:00:16.000000Z\t0
+                        1970-01-01T00:00:17.000000Z\t1970-01-01T00:00:17.000000Z\t0
+                        1970-01-01T00:00:18.000000Z\t1970-01-01T00:00:18.000000Z\t0
+                        1970-01-01T00:00:19.000000Z\t1970-01-01T00:00:19.000000Z\t0
+                        1970-01-01T00:00:20.000000Z\t1970-01-01T00:00:20.000000Z\t0
+                        """);
+
+        assertQuery("select s, dateadd(s, 1000000, 1000000::timestamp) date1, dateadd(s, 1000000, 1000000000::timestamp_ns) date2, datediff('n', date1, date2) from x;")
+                .expectSize()
+                .returns("""
+                        s\tdate1\tdate2\tdatediff
+                        u\t1970-01-01T00:00:02.000000Z\t1970-01-01T00:00:02.000000000Z\t0
+                        T\t1970-01-01T00:16:41.000000Z\t1970-01-01T00:16:41.000000000Z\t0
+                        n\t1970-01-01T00:00:01.001000Z\t1970-01-01T00:00:01.001000000Z\t0
+                        s\t1970-01-12T13:46:41.000000Z\t1970-01-12T13:46:41.000000000Z\t0
+                        n\t1970-01-01T00:00:01.001000Z\t1970-01-01T00:00:01.001000000Z\t0
+                        s\t1970-01-12T13:46:41.000000Z\t1970-01-12T13:46:41.000000000Z\t0
+                        T\t1970-01-01T00:16:41.000000Z\t1970-01-01T00:16:41.000000000Z\t0
+                        s\t1970-01-12T13:46:41.000000Z\t1970-01-12T13:46:41.000000000Z\t0
+                        T\t1970-01-01T00:16:41.000000Z\t1970-01-01T00:16:41.000000000Z\t0
+                        u\t1970-01-01T00:00:02.000000Z\t1970-01-01T00:00:02.000000000Z\t0
+                        u\t1970-01-01T00:00:02.000000Z\t1970-01-01T00:00:02.000000000Z\t0
+                        u\t1970-01-01T00:00:02.000000Z\t1970-01-01T00:00:02.000000000Z\t0
+                        T\t1970-01-01T00:16:41.000000Z\t1970-01-01T00:16:41.000000000Z\t0
+                        s\t1970-01-12T13:46:41.000000Z\t1970-01-12T13:46:41.000000000Z\t0
+                        n\t1970-01-01T00:00:01.001000Z\t1970-01-01T00:00:01.001000000Z\t0
+                        u\t1970-01-01T00:00:02.000000Z\t1970-01-01T00:00:02.000000000Z\t0
+                        u\t1970-01-01T00:00:02.000000Z\t1970-01-01T00:00:02.000000000Z\t0
+                        n\t1970-01-01T00:00:01.001000Z\t1970-01-01T00:00:01.001000000Z\t0
+                        n\t1970-01-01T00:00:01.001000Z\t1970-01-01T00:00:01.001000000Z\t0
+                        T\t1970-01-01T00:16:41.000000Z\t1970-01-01T00:16:41.000000000Z\t0
+                        """);
+
+        assertQuery("select s, dateadd(s, 1000000, ts) date1, dateadd(s, 1000000, ts_ns) date2, datediff('n', date1, date2) from x;")
+                .expectSize()
+                .returns("""
+                        s\tdate1\tdate2\tdatediff
+                        u\t1970-01-01T00:00:01.000000Z\t1970-01-01T00:00:01.000000000Z\t0
+                        T\t1970-01-01T00:16:41.000000Z\t1970-01-01T00:16:41.000000000Z\t0
+                        n\t1970-01-01T00:00:02.001000Z\t1970-01-01T00:00:02.001000000Z\t0
+                        s\t1970-01-12T13:46:43.000000Z\t1970-01-12T13:46:43.000000000Z\t0
+                        n\t1970-01-01T00:00:04.001000Z\t1970-01-01T00:00:04.001000000Z\t0
+                        s\t1970-01-12T13:46:45.000000Z\t1970-01-12T13:46:45.000000000Z\t0
+                        T\t1970-01-01T00:16:46.000000Z\t1970-01-01T00:16:46.000000000Z\t0
+                        s\t1970-01-12T13:46:47.000000Z\t1970-01-12T13:46:47.000000000Z\t0
+                        T\t1970-01-01T00:16:48.000000Z\t1970-01-01T00:16:48.000000000Z\t0
+                        u\t1970-01-01T00:00:10.000000Z\t1970-01-01T00:00:10.000000000Z\t0
+                        u\t1970-01-01T00:00:11.000000Z\t1970-01-01T00:00:11.000000000Z\t0
+                        u\t1970-01-01T00:00:12.000000Z\t1970-01-01T00:00:12.000000000Z\t0
+                        T\t1970-01-01T00:16:52.000000Z\t1970-01-01T00:16:52.000000000Z\t0
+                        s\t1970-01-12T13:46:53.000000Z\t1970-01-12T13:46:53.000000000Z\t0
+                        n\t1970-01-01T00:00:14.001000Z\t1970-01-01T00:00:14.001000000Z\t0
+                        u\t1970-01-01T00:00:16.000000Z\t1970-01-01T00:00:16.000000000Z\t0
+                        u\t1970-01-01T00:00:17.000000Z\t1970-01-01T00:00:17.000000000Z\t0
+                        n\t1970-01-01T00:00:17.001000Z\t1970-01-01T00:00:17.001000000Z\t0
+                        n\t1970-01-01T00:00:18.001000Z\t1970-01-01T00:00:18.001000000Z\t0
+                        T\t1970-01-01T00:16:59.000000Z\t1970-01-01T00:16:59.000000000Z\t0
+                        """);
     }
 
     @Test
-    public void testDaySimple() throws Exception {
-        assertMemoryLeak(() -> call('d', 5, 1587275359886758L).andAssert(1587707359886758L, 0.0001));
+    public void testNullStride() throws Exception {
+        for (int i = 0; i < units.length; i++) {
+            assertQuery("select dateadd('" + units[i] + "', null, 1587275359886758L)")
+                    .fails(20, "`null` is not a valid stride");
+        }
     }
 
     @Test
-    public void testDaySimpleNeg() throws Exception {
-        assertMemoryLeak(() -> call('d', -5, 1587275359886758L).andAssert(1586843359886758L, 0.0001));
+    public void testNullTimestamp() throws Exception {
+        for (int i = 0; i < units.length; i++) {
+            assertSqlWithTypes("dateadd\n:TIMESTAMP\n", "select dateadd('" + units[i] + "', 5, null)");
+        }
     }
 
     @Test
-    public void testHourSimple() throws Exception {
-        assertMemoryLeak(() -> call('h', 5, 1587275359886758L).andAssert(1587293359886758L, 0.0001));
+    public void testPeriodNullChar() throws Exception {
+        assertQuery("select dateadd('\0', 5, 1587275359886758L)")
+                .fails(15, "invalid time period [unit=\u0000]");
     }
 
     @Test
-    public void testHourSimpleNeg() throws Exception {
-        assertMemoryLeak(() -> call('h', -5, 1587275359886758L).andAssert(1587257359886758L, 0.0001));
+    public void testSimple() throws Exception {
+        assertSqlWithTypes("dateadd\n2025-04-19T05:49:19.886758Z:TIMESTAMP\n", "select dateadd('y', 5, 1587275359886758L)");
+        assertSqlWithTypes("dateadd\n2015-04-19T05:49:19.886758Z:TIMESTAMP\n", "select dateadd('y', -5, 1587275359886758L)");
+        assertSqlWithTypes("dateadd\n2020-09-19T05:49:19.886758Z:TIMESTAMP\n", "select dateadd('M', 5, 1587275359886758L)");
+        assertSqlWithTypes("dateadd\n2019-11-19T05:49:19.886758Z:TIMESTAMP\n", "select dateadd('M', -5, 1587275359886758L)");
+        assertSqlWithTypes("dateadd\n2020-05-24T05:49:19.886758Z:TIMESTAMP\n", "select dateadd('w', 5, 1587275359886758L)");
+        assertSqlWithTypes("dateadd\n2020-03-15T05:49:19.886758Z:TIMESTAMP\n", "select dateadd('w', -5, 1587275359886758L)");
+        assertSqlWithTypes("dateadd\n2020-04-24T05:49:19.886758Z:TIMESTAMP\n", "select dateadd('d', 5, 1587275359886758L)");
+        assertSqlWithTypes("dateadd\n2020-04-14T05:49:19.886758Z:TIMESTAMP\n", "select dateadd('d', -5, 1587275359886758L)");
+        assertSqlWithTypes("dateadd\n2020-04-19T10:49:19.886758Z:TIMESTAMP\n", "select dateadd('h', 5, 1587275359886758L)");
+        assertSqlWithTypes("dateadd\n2020-04-19T00:49:19.886758Z:TIMESTAMP\n", "select dateadd('h', -5, 1587275359886758L)");
+        assertSqlWithTypes("dateadd\n2020-04-19T05:54:19.886758Z:TIMESTAMP\n", "select dateadd('m', 5, 1587275359886758L)");
+        assertSqlWithTypes("dateadd\n2020-04-19T05:44:19.886758Z:TIMESTAMP\n", "select dateadd('m', -5, 1587275359886758L)");
+        assertSqlWithTypes("dateadd\n2020-04-19T05:49:24.886758Z:TIMESTAMP\n", "select dateadd('s', 5, 1587275359886758L)");
+        assertSqlWithTypes("dateadd\n2020-04-19T05:49:14.886758Z:TIMESTAMP\n", "select dateadd('s', -5, 1587275359886758L)");
+        assertSqlWithTypes("dateadd\n2020-04-19T05:49:19.891758Z:TIMESTAMP\n", "select dateadd('T', 5, 1587275359886758L)");
+        assertSqlWithTypes("dateadd\n2020-04-19T05:49:19.881758Z:TIMESTAMP\n", "select dateadd('T', -5, 1587275359886758L)");
+        assertSqlWithTypes("dateadd\n2020-04-19T05:49:19.886763Z:TIMESTAMP\n", "select dateadd('U', 5, 1587275359886758L)");
+        assertSqlWithTypes("dateadd\n2020-04-19T05:49:19.886763Z:TIMESTAMP\n", "select dateadd('n', 5000, 1587275359886758L)");
+        assertSqlWithTypes("dateadd\n2020-04-19T05:49:19.886753Z:TIMESTAMP\n", "select dateadd('U', -5, 1587275359886758L)");
+
+        assertSqlWithTypes("dateadd\n2025-04-19T05:49:19.886758123Z:TIMESTAMP_NS\n", "select dateadd('y', 5, 1587275359886758123L::timestamp_ns)");
+        assertSqlWithTypes("dateadd\n2015-04-19T05:49:19.886758123Z:TIMESTAMP_NS\n", "select dateadd('y', -5, 1587275359886758123L::timestamp_ns)");
+        assertSqlWithTypes("dateadd\n2020-09-19T05:49:19.886758123Z:TIMESTAMP_NS\n", "select dateadd('M', 5, 1587275359886758123L::timestamp_ns)");
+        assertSqlWithTypes("dateadd\n2019-11-19T05:49:19.886758123Z:TIMESTAMP_NS\n", "select dateadd('M', -5, 1587275359886758123L::timestamp_ns)");
+        assertSqlWithTypes("dateadd\n2020-05-24T05:49:19.886758123Z:TIMESTAMP_NS\n", "select dateadd('w', 5, 1587275359886758123L::timestamp_ns)");
+        assertSqlWithTypes("dateadd\n2020-03-15T05:49:19.886758123Z:TIMESTAMP_NS\n", "select dateadd('w', -5, 1587275359886758123L::timestamp_ns)");
+        assertSqlWithTypes("dateadd\n2020-04-24T05:49:19.886758123Z:TIMESTAMP_NS\n", "select dateadd('d', 5, 1587275359886758123L::timestamp_ns)");
+        assertSqlWithTypes("dateadd\n2020-04-14T05:49:19.886758123Z:TIMESTAMP_NS\n", "select dateadd('d', -5, 1587275359886758123L::timestamp_ns)");
+        assertSqlWithTypes("dateadd\n2020-04-19T10:49:19.886758123Z:TIMESTAMP_NS\n", "select dateadd('h', 5, 1587275359886758123L::timestamp_ns)");
+        assertSqlWithTypes("dateadd\n2020-04-19T00:49:19.886758123Z:TIMESTAMP_NS\n", "select dateadd('h', -5, 1587275359886758123L::timestamp_ns)");
+        assertSqlWithTypes("dateadd\n2020-04-19T05:54:19.886758123Z:TIMESTAMP_NS\n", "select dateadd('m', 5, 1587275359886758123L::timestamp_ns)");
+        assertSqlWithTypes("dateadd\n2020-04-19T05:44:19.886758123Z:TIMESTAMP_NS\n", "select dateadd('m', -5, 1587275359886758123L::timestamp_ns)");
+        assertSqlWithTypes("dateadd\n2020-04-19T05:49:24.886758123Z:TIMESTAMP_NS\n", "select dateadd('s', 5, 1587275359886758123L::timestamp_ns)");
+        assertSqlWithTypes("dateadd\n2020-04-19T05:49:14.886758123Z:TIMESTAMP_NS\n", "select dateadd('s', -5, 1587275359886758123L::timestamp_ns)");
+        assertSqlWithTypes("dateadd\n2020-04-19T05:49:19.891758123Z:TIMESTAMP_NS\n", "select dateadd('T', 5, 1587275359886758123L::timestamp_ns)");
+        assertSqlWithTypes("dateadd\n2020-04-19T05:49:19.881758123Z:TIMESTAMP_NS\n", "select dateadd('T', -5, 1587275359886758123L::timestamp_ns)");
+        assertSqlWithTypes("dateadd\n2020-04-19T05:49:19.886763123Z:TIMESTAMP_NS\n", "select dateadd('U', 5, 1587275359886758123L::timestamp_ns)");
+        assertSqlWithTypes("dateadd\n2020-04-19T05:49:19.886758100Z:TIMESTAMP_NS\n", "select dateadd('n', -23, 1587275359886758123L::timestamp_ns)");
+        assertSqlWithTypes("dateadd\n2020-04-19T05:49:19.886753123Z:TIMESTAMP_NS\n", "select dateadd('U', -5, 1587275359886758123L::timestamp_ns)");
     }
 
     @Test
-    public void testIntervalConstantPeriodVariableDayLeftNaN() throws Exception {
-        assertQuery(
-                "dateadd\n" +
-                        "\n" +
-                        "\n",
-                "select dateadd('d', cast(x as int), Cast(NaN as Long)) from long_sequence(2)",
-                null,
-                true,
-                true
-        );
-    }
+    public void testStrideConstantPeriodVariableWithNulls() throws Exception {
+        assertSqlWithTypes("dateadd\n:TIMESTAMP\n:TIMESTAMP\n", "select dateadd('y', cast(x as int), null) from long_sequence(2)");
+        assertSqlWithTypes("dateadd\n2021-04-19T05:49:19.886758Z:TIMESTAMP\n:TIMESTAMP\n", "select dateadd('y', case when x = 1 then cast(x as int) else null end, 1587275359886758L) from long_sequence(2)");
+        assertSqlWithTypes("dateadd\n:TIMESTAMP\n:TIMESTAMP\n", "select dateadd('M', cast(x as int), null) from long_sequence(2)");
+        assertSqlWithTypes("dateadd\n2020-05-19T05:49:19.886758Z:TIMESTAMP\n:TIMESTAMP\n", "select dateadd('M', case when x = 1 then cast(x as int) else null end, 1587275359886758L) from long_sequence(2)");
+        assertSqlWithTypes("dateadd\n:TIMESTAMP\n:TIMESTAMP\n", "select dateadd('w', cast(x as int), null) from long_sequence(2)");
+        assertSqlWithTypes("dateadd\n2020-04-26T05:49:19.886758Z:TIMESTAMP\n:TIMESTAMP\n", "select dateadd('w', case when x = 1 then cast(x as int) else null end, 1587275359886758L) from long_sequence(2)");
+        assertSqlWithTypes("dateadd\n:TIMESTAMP\n:TIMESTAMP\n", "select dateadd('d', cast(x as int), null) from long_sequence(2)");
+        assertSqlWithTypes("dateadd\n2020-04-20T05:49:19.886758Z:TIMESTAMP\n:TIMESTAMP\n", "select dateadd('d', case when x = 1 then cast(x as int) else null end, 1587275359886758L) from long_sequence(2)");
+        assertSqlWithTypes("dateadd\n:TIMESTAMP\n:TIMESTAMP\n", "select dateadd('h', cast(x as int), null) from long_sequence(2)");
+        assertSqlWithTypes("dateadd\n2020-04-19T06:49:19.886758Z:TIMESTAMP\n:TIMESTAMP\n", "select dateadd('h', case when x = 1 then cast(x as int) else null end, 1587275359886758L) from long_sequence(2)");
+        assertSqlWithTypes("dateadd\n:TIMESTAMP\n:TIMESTAMP\n", "select dateadd('m', cast(x as int), null) from long_sequence(2)");
+        assertSqlWithTypes("dateadd\n2020-04-19T05:50:19.886758Z:TIMESTAMP\n:TIMESTAMP\n", "select dateadd('m', case when x = 1 then cast(x as int) else null end, 1587275359886758L) from long_sequence(2)");
+        assertSqlWithTypes("dateadd\n:TIMESTAMP\n:TIMESTAMP\n", "select dateadd('s', cast(x as int), null) from long_sequence(2)");
+        assertSqlWithTypes("dateadd\n2020-04-19T05:49:20.886758Z:TIMESTAMP\n:TIMESTAMP\n", "select dateadd('s', case when x = 1 then cast(x as int) else null end, 1587275359886758L) from long_sequence(2)");
 
-    @Test
-    public void testIntervalConstantPeriodVariableDayRightNaN() throws Exception {
-        assertQuery(
-                "dateadd\n" +
-                        "2020-04-20T05:49:19.886758Z\n" +
-                        "\n",
-                "select dateadd('d', case when x = 1 then cast(x as int) else Cast(NaN as int) end, 1587275359886758L) from long_sequence(2)",
-                null,
-                true,
-                true
-        );
-    }
-
-    @Test
-    public void testIntervalConstantPeriodVariableHourLeftNaN() throws Exception {
-        assertQuery(
-                "dateadd\n" +
-                        "\n" +
-                        "\n",
-                "select dateadd('h', cast(x as int), Cast(NaN as Long)) from long_sequence(2)",
-                null,
-                true,
-                true
-        );
-    }
-
-    @Test
-    public void testIntervalConstantPeriodVariableHourRightNaN() throws Exception {
-        assertQuery(
-                "dateadd\n" +
-                        "2020-04-19T06:49:19.886758Z\n" +
-                        "\n",
-                "select dateadd('h', case when x = 1 then cast(x as int) else Cast(NaN as int) end, 1587275359886758L) from long_sequence(2)",
-                null,
-                true,
-                true
-        );
-    }
-
-    @Test
-    public void testIntervalConstantPeriodVariableMinuteLeftNaN() throws Exception {
-        assertQuery(
-                "dateadd\n" +
-                        "\n" +
-                        "\n",
-                "select dateadd('m', cast(x as int), Cast(NaN as Long)) from long_sequence(2)",
-                null,
-                true,
-                true
-        );
-    }
-
-    @Test
-    public void testIntervalConstantPeriodVariableMinuteRightNaN() throws Exception {
-        assertQuery(
-                "dateadd\n" +
-                        "2020-04-19T05:50:19.886758Z\n" +
-                        "\n",
-                "select dateadd('m', case when x = 1 then cast(x as int) else Cast(NaN as int) end, 1587275359886758L) from long_sequence(2)",
-                null,
-                true,
-                true
-        );
-    }
-
-    @Test
-    public void testIntervalConstantPeriodVariableMonthLeftNaN() throws Exception {
-        assertQuery(
-                "dateadd\n" +
-                        "\n" +
-                        "\n",
-                "select dateadd('M', cast(x as int), Cast(NaN as Long)) from long_sequence(2)",
-                null,
-                true,
-                true
-        );
-    }
-
-    @Test
-    public void testIntervalConstantPeriodVariableMonthRightNaN() throws Exception {
-        assertQuery(
-                "dateadd\n" +
-                        "2020-05-19T05:49:19.886758Z\n" +
-                        "\n",
-                "select dateadd('M', case when x = 1 then cast(x as int) else Cast(NaN as int) end, 1587275359886758L) from long_sequence(2)",
-                null,
-                true,
-                true
-        );
-    }
-
-    @Test
-    public void testIntervalConstantPeriodVariableSecondLeftNaN() throws Exception {
-        assertQuery(
-                "dateadd\n" +
-                        "\n" +
-                        "\n",
-                "select dateadd('s', cast(x as int), Cast(NaN as Long)) from long_sequence(2)",
-                null,
-                true,
-                true
-        );
-    }
-
-    @Test
-    public void testIntervalConstantPeriodVariableSecondRightNaN() throws Exception {
-        assertQuery(
-                "dateadd\n" +
-                        "2020-04-19T05:49:20.886758Z\n" +
-                        "\n",
-                "select dateadd('s', case when x = 1 then cast(x as int) else Cast(NaN as int) end, 1587275359886758L) from long_sequence(2)",
-                null,
-                true,
-                true
-        );
-    }
-
-    @Test
-    public void testIntervalConstantPeriodVariableWeekLeftNaN() throws Exception {
-        assertQuery(
-                "dateadd\n" +
-                        "\n" +
-                        "\n",
-                "select dateadd('w', cast(x as int), Cast(NaN as Long)) from long_sequence(2)",
-                null,
-                true,
-                true
-        );
-    }
-
-    @Test
-    public void testIntervalConstantPeriodVariableWeekRightNaN() throws Exception {
-        assertQuery(
-                "dateadd\n" +
-                        "2020-04-26T05:49:19.886758Z\n" +
-                        "\n",
-                "select dateadd('w', case when x = 1 then cast(x as int) else Cast(NaN as int) end, 1587275359886758L) from long_sequence(2)",
-                null,
-                true,
-                true
-        );
-    }
-
-    @Test
-    public void testIntervalConstantPeriodVariableYearLeftNaN() throws Exception {
-        assertQuery(
-                "dateadd\n" +
-                        "\n" +
-                        "\n",
-                "select dateadd('y', cast(x as int), Cast(NaN as Long)) from long_sequence(2)",
-                null,
-                true,
-                true
-        );
-    }
-
-    @Test
-    public void testIntervalConstantPeriodVariableYearRightNaN() throws Exception {
-        assertQuery(
-                "dateadd\n" +
-                        "2021-04-19T05:49:19.886758Z\n" +
-                        "\n",
-                "select dateadd('y', case when x = 1 then cast(x as int) else Cast(NaN as int) end, 1587275359886758L) from long_sequence(2)",
-                null,
-                true,
-                true
-        );
-    }
-
-    @Test
-    public void testLeftNaNDay() throws Exception {
-        assertMemoryLeak(() -> call('d', 5, Numbers.LONG_NULL).andAssert(Double.NaN, 0.0001));
-    }
-
-    @Test
-    public void testLeftNaNHour() throws Exception {
-        assertMemoryLeak(() -> call('h', 5, Numbers.LONG_NULL).andAssert(Double.NaN, 0.0001));
-    }
-
-    @Test
-    public void testLeftNaNMicro() throws Exception {
-        assertMemoryLeak(() -> call('u', 5, Numbers.LONG_NULL).andAssert(Double.NaN, 0.0001));
-    }
-
-    @Test
-    public void testLeftNaNMilli() throws Exception {
-        assertMemoryLeak(() -> call('T', 5, Numbers.LONG_NULL).andAssert(Double.NaN, 0.0001));
-    }
-
-    @Test
-    public void testLeftNaNMinute() throws Exception {
-        assertMemoryLeak(() -> call('m', 5, Numbers.LONG_NULL).andAssert(Double.NaN, 0.0001));
-    }
-
-    @Test
-    public void testLeftNaNMonth() throws Exception {
-        assertMemoryLeak(() -> call('M', 5, Numbers.LONG_NULL).andAssert(Double.NaN, 0.0001));
-    }
-
-    @Test
-    public void testLeftNaNSecond() throws Exception {
-        assertMemoryLeak(() -> call('s', 5, Numbers.LONG_NULL).andAssert(Double.NaN, 0.0001));
-    }
-
-    @Test
-    public void testLeftNaNWeek() throws Exception {
-        assertMemoryLeak(() -> call('w', 5, Numbers.LONG_NULL).andAssert(Double.NaN, 0.0001));
-    }
-
-    @Test
-    public void testLeftNaNYear() throws Exception {
-        assertMemoryLeak(() -> call('y', 5, Numbers.LONG_NULL).andAssert(Double.NaN, 0.0001));
-    }
-
-    @Test
-    public void testLeftNan() throws Exception {
-        assertMemoryLeak(() -> call('d', 5, Numbers.LONG_NULL).andAssert(Double.NaN, 0.0001));
-    }
-
-    @Test
-    public void testMicroSimple() throws Exception {
-        assertMemoryLeak(() -> call('u', 5, 1587275359886758L).andAssert(1587275359886763L, 0.0001));
-    }
-
-    @Test
-    public void testMicroSimpleNeg() throws Exception {
-        assertMemoryLeak(() -> call('u', -5, 1587275359886758L).andAssert(1587275359886753L, 0.0001));
-    }
-
-    @Test
-    public void testMilliSimple() throws Exception {
-        assertMemoryLeak(() -> call('T', 5, 1587275359886758L).andAssert(1587275359891758L, 0.0001));
-    }
-
-    @Test
-    public void testMilliSimpleNeg() throws Exception {
-        assertMemoryLeak(() -> call('T', -5, 1587275359886758L).andAssert(1587275359881758L, 0.0001));
-    }
-
-    @Test
-    public void testMinuteSimple() throws Exception {
-        assertMemoryLeak(() -> call('m', 5, 1587275359886758L).andAssert(1587275659886758L, 0.0001));
-    }
-
-    @Test
-    public void testMinuteSimpleNeg() throws Exception {
-        assertMemoryLeak(() -> call('m', -5, 1587275359886758L).andAssert(1587275059886758L, 0.0001));
-    }
-
-    @Test
-    public void testMonthSimple() throws Exception {
-        assertMemoryLeak(() -> call('M', 5, 1587275359886758L).andAssert(1600494559886758L, 0.0001));
-    }
-
-    @Test
-    public void testMonthSimpleNeg() throws Exception {
-        assertMemoryLeak(() -> call('M', -5, 1587275359886758L).andAssert(1574142559886758L, 0.0001));
-    }
-
-    @Test
-    public void testRightNaNDay() throws Exception {
-        assertMemoryLeak(() -> call('d', Numbers.INT_NULL, 1587275359886758L).andAssert(Double.NaN, 0.0001));
-    }
-
-    @Test
-    public void testRightNaNHour() throws Exception {
-        assertMemoryLeak(() -> call('h', Numbers.INT_NULL, 1587275359886758L).andAssert(Double.NaN, 0.0001));
-    }
-
-    @Test
-    public void testRightNaNMicro() throws Exception {
-        assertMemoryLeak(() -> call('u', Numbers.INT_NULL, 1587275359886758L).andAssert(Double.NaN, 0.0001));
-    }
-
-    @Test
-    public void testRightNaNMilli() throws Exception {
-        assertMemoryLeak(() -> call('T', Numbers.INT_NULL, 1587275359886758L).andAssert(Double.NaN, 0.0001));
-    }
-
-    @Test
-    public void testRightNaNMinute() throws Exception {
-        assertMemoryLeak(() -> call('m', Numbers.INT_NULL, 1587275359886758L).andAssert(Double.NaN, 0.0001));
-    }
-
-    @Test
-    public void testRightNaNMonth() throws Exception {
-        assertMemoryLeak(() -> call('M', Numbers.INT_NULL, 1587275359886758L).andAssert(Double.NaN, 0.0001));
-    }
-
-    @Test
-    public void testRightNaNSecond() throws Exception {
-        assertMemoryLeak(() -> call('s', Numbers.INT_NULL, 1587275359886758L).andAssert(Double.NaN, 0.0001));
-    }
-
-    @Test
-    public void testRightNaNWeek() throws Exception {
-        assertMemoryLeak(() -> call('w', Numbers.INT_NULL, 1587275359886758L).andAssert(Double.NaN, 0.0001));
-    }
-
-    @Test
-    public void testRightNaNYear() throws Exception {
-        assertMemoryLeak(() -> call('y', Numbers.INT_NULL, 1587275359886758L).andAssert(Double.NaN, 0.0001));
-    }
-
-    @Test
-    public void testSecondSimple() throws Exception {
-        assertMemoryLeak(() -> call('s', 5, 1587275359886758L).andAssert(1587275364886758L, 0.0001));
-    }
-
-    @Test
-    public void testSecondSimpleNeg() throws Exception {
-        assertMemoryLeak(() -> call('s', -5, 1587275359886758L).andAssert(1587275354886758L, 0.0001));
+        assertSqlWithTypes("dateadd\n:TIMESTAMP_NS\n:TIMESTAMP_NS\n", "select dateadd('y', cast(x as int), null::timestamp_ns) from long_sequence(2)");
+        assertSqlWithTypes("dateadd\n2021-04-19T05:49:19.886758000Z:TIMESTAMP_NS\n:TIMESTAMP_NS\n", "select dateadd('y', case when x = 1 then cast(x as int) else null end, 1587275359886758000L::timestamp_ns) from long_sequence(2)");
+        assertSqlWithTypes("dateadd\n:TIMESTAMP_NS\n:TIMESTAMP_NS\n", "select dateadd('M', cast(x as int), null::timestamp_ns) from long_sequence(2)");
+        assertSqlWithTypes("dateadd\n2020-05-19T05:49:19.886758000Z:TIMESTAMP_NS\n:TIMESTAMP_NS\n", "select dateadd('M', case when x = 1 then cast(x as int) else null end, 1587275359886758000L::timestamp_ns) from long_sequence(2)");
+        assertSqlWithTypes("dateadd\n:TIMESTAMP_NS\n:TIMESTAMP_NS\n", "select dateadd('w', cast(x as int), null::timestamp_ns) from long_sequence(2)");
+        assertSqlWithTypes("dateadd\n2020-04-26T05:49:19.886758000Z:TIMESTAMP_NS\n:TIMESTAMP_NS\n", "select dateadd('w', case when x = 1 then cast(x as int) else null end, 1587275359886758000L::timestamp_ns) from long_sequence(2)");
+        assertSqlWithTypes("dateadd\n:TIMESTAMP_NS\n:TIMESTAMP_NS\n", "select dateadd('d', cast(x as int), null::timestamp_ns) from long_sequence(2)");
+        assertSqlWithTypes("dateadd\n2020-04-20T05:49:19.886758000Z:TIMESTAMP_NS\n:TIMESTAMP_NS\n", "select dateadd('d', case when x = 1 then cast(x as int) else null end, 1587275359886758000L::timestamp_ns) from long_sequence(2)");
+        assertSqlWithTypes("dateadd\n:TIMESTAMP_NS\n:TIMESTAMP_NS\n", "select dateadd('h', cast(x as int), null::timestamp_ns) from long_sequence(2)");
+        assertSqlWithTypes("dateadd\n2020-04-19T06:49:19.886758000Z:TIMESTAMP_NS\n:TIMESTAMP_NS\n", "select dateadd('h', case when x = 1 then cast(x as int) else null end, 1587275359886758000L::timestamp_ns) from long_sequence(2)");
+        assertSqlWithTypes("dateadd\n:TIMESTAMP_NS\n:TIMESTAMP_NS\n", "select dateadd('m', cast(x as int), null::timestamp_ns) from long_sequence(2)");
+        assertSqlWithTypes("dateadd\n2020-04-19T05:50:19.886758000Z:TIMESTAMP_NS\n:TIMESTAMP_NS\n", "select dateadd('m', case when x = 1 then cast(x as int) else null end, 1587275359886758000L::timestamp_ns) from long_sequence(2)");
+        assertSqlWithTypes("dateadd\n:TIMESTAMP_NS\n:TIMESTAMP_NS\n", "select dateadd('s', cast(x as int), null::timestamp_ns) from long_sequence(2)");
+        assertSqlWithTypes("dateadd\n2020-04-19T05:49:20.886758000Z:TIMESTAMP_NS\n:TIMESTAMP_NS\n", "select dateadd('s', case when x = 1 then cast(x as int) else null end, 1587275359886758000L::timestamp_ns) from long_sequence(2)");
     }
 
     @Test
     public void testUnknownPeriod() throws Exception {
-        assertMemoryLeak(() -> call('q', 5, 1587275359886758L).andAssert(Double.NaN, 0.0001));
-    }
-
-    @Test
-    public void testWeekSimple() throws Exception {
-        assertMemoryLeak(() -> call('w', 5, 1587275359886758L).andAssert(1590299359886758L, 0.0001));
-    }
-
-    @Test
-    public void testWeekSimpleNeg() throws Exception {
-        assertMemoryLeak(() -> call('w', -5, 1587275359886758L).andAssert(1584251359886758L, 0.0001));
-    }
-
-    @Test
-    public void testYearsSimple() throws Exception {
-        assertMemoryLeak(() -> call('y', 5, 1587275359886758L).andAssert(1745041759886758L, 0.0001));
-    }
-
-    @Test
-    public void testYearsSimpleNeg() throws Exception {
-        assertMemoryLeak(() -> call('y', -5, 1587275359886758L).andAssert(1429422559886758L, 0.0001));
+        assertQuery("select dateadd('q', -5, 1587275359886758L)")
+                .fails(15, "invalid time period [unit=q]");
     }
 
     @Override

@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -143,7 +143,7 @@ public class O3CallbackFuzzTest extends AbstractCairoTest {
             }
         }
 
-        private void o3MoveUncommitted0(int rndInt, int i1, int timestampColumnIndex, long l, long l0, long l1, long l2, long l3) {
+        private void o3MoveUncommitted0(int rndInt, int i1, long timestampColumnIndex, long l, long l0, long l1, long l2, long l3) {
             //noinspection unused
             double result = 0;
             for (int i = 0; i < rndInt * complexity; i++) {

@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -25,14 +25,25 @@
 package io.questdb.std.datetime.millitime;
 
 
-import io.questdb.std.ThreadLocal;
-import io.questdb.std.*;
+import io.questdb.cairo.ColumnType;
+import io.questdb.std.BytecodeAssembler;
+import io.questdb.std.CharSequenceIntHashMap;
+import io.questdb.std.GenericLexer;
+import io.questdb.std.IntList;
+import io.questdb.std.LongList;
+import io.questdb.std.Numbers;
+import io.questdb.std.ObjList;
+import io.questdb.std.CarrierLocal;
 import io.questdb.std.datetime.AbstractDateFormat;
+import io.questdb.std.datetime.CommonUtils;
 import io.questdb.std.datetime.DateFormat;
 import io.questdb.std.datetime.DateLocale;
-import io.questdb.std.datetime.microtime.TimestampFormatUtils;
+import io.questdb.std.datetime.microtime.MicrosFormatUtils;
 import io.questdb.std.str.CharSink;
 import io.questdb.std.str.StringSink;
+
+import static io.questdb.std.datetime.CommonUtils.HOUR_24;
+import static io.questdb.std.datetime.CommonUtils.HOUR_AM;
 
 public class DateFormatCompiler {
     static final int OP_AM_PM = 14;
@@ -120,7 +131,7 @@ public class DateFormatCompiler {
     private static final int P_LO = 2;
     private static final int P_LOCALE = 4;
     private static final ObjList<String> opList;
-    private final static ThreadLocal<StringSink> tlSink = new ThreadLocal<>(StringSink::new);
+    private final static CarrierLocal<StringSink> tlSink = new CarrierLocal<>(StringSink::new);
     private final BytecodeAssembler asm = new BytecodeAssembler();
     private final IntList delimiterIndexes = new IntList();
     private final ObjList<String> delimiters = new ObjList<>();
@@ -514,19 +525,7 @@ public class DateFormatCompiler {
                     break;
                 // SEPARATORS
                 default:
-                    if (op < 0) {
-                        String delimiter = delimiters.getQuick(-op - 1);
-                        if (delimiter.length() > 1) {
-                            asm.aload(FA_LOCAL_SINK);
-                            asm.ldc(delimiterIndexes.getQuick(-op - 1));
-                            asm.invokeInterface(sinkPutStrIndex, 1);
-                        } else {
-                            asm.aload(FA_LOCAL_SINK);
-                            asm.iconst(delimiter.charAt(0));
-                            asm.invokeInterface(sinkPutChrIndex, 1);
-                        }
-                        asm.pop();
-                    }
+                    CommonUtils.assembleTimeZone(delimiters, sinkPutStrIndex, sinkPutChrIndex, op, asm, FA_LOCAL_SINK, delimiterIndexes);
                     break;
             }
         }
@@ -613,6 +612,16 @@ public class DateFormatCompiler {
         if (invokeConvertMillis(formatAttributes, FA_WEEK_OF_YEAR, getWeekOfYearIndex, index)) {
             fmtAttributeIndex[FA_WEEK_OF_YEAR] = index;
         }
+    }
+
+    private void assembleGetColumnTypeMethod(int getColumnTypeNameIndex, int getColumnTypeSigIndex, int columnTypeIndex) {
+        asm.startMethod(getColumnTypeNameIndex, getColumnTypeSigIndex, 1, 1);
+        asm.ldc(columnTypeIndex);
+        asm.ireturn();
+        asm.endMethodCode();
+        asm.putShort(0);
+        asm.putShort(0);
+        asm.endMethod();
     }
 
     private void assembleParseMethod(
@@ -711,7 +720,7 @@ public class DateFormatCompiler {
         asm.ldc2_w(minLongIndex);
         asm.lstore(LOCAL_OFFSET);
 
-        asm.iconst(DateFormatUtils.HOUR_24);
+        asm.iconst(HOUR_24);
         asm.istore(LOCAL_HOUR_TYPE);
 
         if ((stackState & (1 << LOCAL_ERA)) == 0) {
@@ -939,53 +948,7 @@ public class DateFormatCompiler {
                     asm.istore(LOCAL_YEAR);
                     break;
                 case OP_YEAR_FOUR_DIGITS: {
-                    asm.iload(LOCAL_POS);
-                    asm.iload(P_HI);
-                    int b1 = asm.if_icmpge();
-                    asm.aload(P_INPUT_STR);
-                    asm.iload(LOCAL_POS);
-                    asm.invokeInterface(charAtIndex, 1); //charAt
-                    asm.iconst('-');
-                    int b2 = asm.if_icmpne();
-                    asm.iload(LOCAL_POS);
-                    asm.iconst(4);
-                    asm.iadd();
-                    asm.iload(P_HI);
-                    asm.invokeStatic(assertRemainingIndex);
-                    asm.aload(P_INPUT_STR);
-                    asm.iload(LOCAL_POS);
-                    asm.iconst(1);
-                    asm.iadd();
-                    asm.iinc(LOCAL_POS, 5);
-                    asm.iload(LOCAL_POS);
-                    asm.invokeStatic(parseIntIndex);
-                    asm.ineg();
-                    asm.istore(LOCAL_YEAR);
-                    int b3 = asm.goto_();
-
-                    int p = asm.position();
-                    frameOffsets.add(Numbers.encodeLowHighInts(stackState, p));
-                    asm.setJmp(b1, p);
-                    asm.setJmp(b2, p);
-
-                    asm.iload(LOCAL_POS);
-                    asm.iconst(3);
-                    asm.iadd();
-                    asm.iload(P_HI);
-                    asm.invokeStatic(assertRemainingIndex);
-
-                    asm.aload(P_INPUT_STR);
-                    asm.iload(LOCAL_POS);
-                    asm.iinc(LOCAL_POS, 4);
-                    asm.iload(LOCAL_POS);
-                    asm.invokeStatic(parseIntIndex);
-                    asm.istore(LOCAL_YEAR);
-
-                    stackState &= ~(1 << LOCAL_YEAR);
-
-                    p = asm.position();
-                    frameOffsets.add(Numbers.encodeLowHighInts(stackState, p));
-                    asm.setJmp(b3, p);
+                    stackState = CommonUtils.assembleYear(assertRemainingIndex, parseIntIndex, charAtIndex, stackState, asm, LOCAL_POS, P_HI, P_INPUT_STR, LOCAL_YEAR, frameOffsets);
                 }
                 break;
                 case OP_YEAR_GREEDY:
@@ -1051,44 +1014,13 @@ public class DateFormatCompiler {
                     addTempToPos(decodeLenIndex);
                     break;
                 default:
-                    String delimiter = delimiters.getQuick(-op - 1);
-                    int len = delimiter.length();
-                    if (len == 1) {
-                        // TimestampFormatUtils.assertChar(' ', in, pos++, hi);
-                        asm.iconst(delimiter.charAt(0));
-                        asm.aload(P_INPUT_STR);
-                        asm.iload(LOCAL_POS);
-                        asm.iinc(LOCAL_POS, 1);
-                        asm.iload(P_HI);
-                        asm.invokeStatic(assertCharIndex);
-                    } else {
-                        // pos = TimestampFormatUtils.assertString(", ", 2, in, pos, hi);
-                        asm.ldc(delimIndices.getQuick(-op - 1));
-                        asm.iconst(len);
-                        asm.aload(P_INPUT_STR);
-                        asm.iload(LOCAL_POS);
-                        asm.iload(P_HI);
-                        asm.invokeStatic(assertStringIndex);
-                        asm.istore(LOCAL_POS);
-                    }
+                    CommonUtils.assembleDefault(assertStringIndex, assertCharIndex, delimIndices, op, delimiters, asm, P_INPUT_STR, LOCAL_POS, P_HI);
                     break;
             }
         }
 
         // check that there is no tail
-        asm.iload(LOCAL_POS);
-        asm.iload(P_HI);
-        asm.invokeStatic(assertNoTailIndex);
-        asm.aload(P_LOCALE);
-        asm.iload(LOCAL_ERA);
-        asm.iload(LOCAL_YEAR);
-        asm.iload(LOCAL_MONTH);
-        asm.iload(LOCAL_DAY);
-        asm.iload(LOCAL_HOUR);
-        asm.iload(LOCAL_MINUTE);
-        asm.iload(LOCAL_SECOND);
-        asm.iload(LOCAL_MILLIS);
-        asm.iload(LOCAL_TIMEZONE);
+        CommonUtils.assembleCheckTail(assertNoTailIndex, asm, LOCAL_POS, P_HI, P_LOCALE, LOCAL_ERA, LOCAL_YEAR, LOCAL_MONTH, LOCAL_DAY, LOCAL_HOUR, LOCAL_MINUTE, LOCAL_SECOND, LOCAL_MILLIS, LOCAL_TIMEZONE);
         asm.lload(LOCAL_OFFSET);
         asm.iload(LOCAL_HOUR_TYPE);
         asm.invokeStatic(computeMillisIndex);
@@ -1260,7 +1192,7 @@ public class DateFormatCompiler {
         int appendHour121PaddedIndex = asm.poolMethod(DateFormatUtils.class, "appendHour121Padded", "(Lio/questdb/std/str/CharSink;I)V");
         int appendHour241Index = asm.poolMethod(DateFormatUtils.class, "appendHour241", "(Lio/questdb/std/str/CharSink;I)V");
         int appendHour241PaddedIndex = asm.poolMethod(DateFormatUtils.class, "appendHour241Padded", "(Lio/questdb/std/str/CharSink;I)V");
-        int appendYear000Index = asm.poolMethod(TimestampFormatUtils.class, "appendYear000", "(Lio/questdb/std/str/CharSink;I)V");
+        int appendYear000Index = asm.poolMethod(MicrosFormatUtils.class, "appendYear000", "(Lio/questdb/std/str/CharSink;I)V");
         int append00Index = asm.poolMethod(DateFormatUtils.class, "append00", "(Lio/questdb/std/str/CharSink;I)V");
         int append0Index = asm.poolMethod(DateFormatUtils.class, "append0", "(Lio/questdb/std/str/CharSink;I)V");
 
@@ -1289,6 +1221,11 @@ public class DateFormatCompiler {
         int formatNameIndex = asm.poolUtf8("format");
         int formatSigIndex = asm.poolUtf8("(JLio/questdb/std/datetime/DateLocale;Ljava/lang/CharSequence;Lio/questdb/std/str/CharSink;)V");
 
+        int getColumnTypeNameIndex = asm.poolUtf8("getColumnType");
+        int getColumnTypeSigIndex = asm.poolUtf8("()I");
+        int columnTypeIndex = asm.getPoolCount();
+        asm.poolIntConst(ColumnType.DATE);
+
         // pool only delimiters over 1 char in length
         // when delimiter is 1 char we would use shorter code path
         // that doesn't require constant
@@ -1308,7 +1245,7 @@ public class DateFormatCompiler {
         asm.defineClass(thisClassIndex, superclassIndex);
         asm.interfaceCount(0);
         asm.fieldCount(0);
-        asm.methodCount(3);
+        asm.methodCount(4);
         asm.defineDefaultConstructor(superIndex);
 
         assembleParseMethod(
@@ -1381,6 +1318,8 @@ public class DateFormatCompiler {
                 formatNameIndex,
                 formatSigIndex
         );
+
+        assembleGetColumnTypeMethod(getColumnTypeNameIndex, getColumnTypeSigIndex, columnTypeIndex);
 
         // class attribute count
         asm.putShort(0);
@@ -1609,30 +1548,19 @@ public class DateFormatCompiler {
     }
 
     private int makeGreedy(int oldOp) {
-        switch (oldOp) {
-            case OP_YEAR_ONE_DIGIT:
-                return OP_YEAR_GREEDY;
-            case OP_MONTH_ONE_DIGIT:
-                return OP_MONTH_GREEDY;
-            case OP_DAY_ONE_DIGIT:
-                return OP_DAY_GREEDY;
-            case OP_HOUR_24_ONE_DIGIT:
-                return OP_HOUR_24_GREEDY;
-            case OP_HOUR_24_ONE_DIGIT_ONE_BASED:
-                return OP_HOUR_24_GREEDY_ONE_BASED;
-            case OP_HOUR_12_ONE_DIGIT:
-                return OP_HOUR_12_GREEDY;
-            case OP_HOUR_12_ONE_DIGIT_ONE_BASED:
-                return OP_HOUR_12_GREEDY_ONE_BASED;
-            case OP_MINUTE_ONE_DIGIT:
-                return OP_MINUTE_GREEDY;
-            case OP_SECOND_ONE_DIGIT:
-                return OP_SECOND_GREEDY;
-            case OP_MILLIS_ONE_DIGIT:
-                return OP_MILLIS_GREEDY;
-            default:
-                return oldOp;
-        }
+        return switch (oldOp) {
+            case OP_YEAR_ONE_DIGIT -> OP_YEAR_GREEDY;
+            case OP_MONTH_ONE_DIGIT -> OP_MONTH_GREEDY;
+            case OP_DAY_ONE_DIGIT -> OP_DAY_GREEDY;
+            case OP_HOUR_24_ONE_DIGIT -> OP_HOUR_24_GREEDY;
+            case OP_HOUR_24_ONE_DIGIT_ONE_BASED -> OP_HOUR_24_GREEDY_ONE_BASED;
+            case OP_HOUR_12_ONE_DIGIT -> OP_HOUR_12_GREEDY;
+            case OP_HOUR_12_ONE_DIGIT_ONE_BASED -> OP_HOUR_12_GREEDY_ONE_BASED;
+            case OP_MINUTE_ONE_DIGIT -> OP_MINUTE_GREEDY;
+            case OP_SECOND_ONE_DIGIT -> OP_SECOND_GREEDY;
+            case OP_MILLIS_ONE_DIGIT -> OP_MILLIS_GREEDY;
+            default -> oldOp;
+        };
     }
 
     private void makeLastOpGreedy(IntList compiled) {
@@ -1649,19 +1577,7 @@ public class DateFormatCompiler {
     }
 
     private void parseDigits(int assertRemainingIndex, int parseIntIndex, int digitCount, int target) {
-        asm.iload(LOCAL_POS);
-        if (digitCount > 1) {
-            asm.iconst(digitCount - 1);
-            asm.iadd();
-        }
-        asm.iload(P_HI);
-        asm.invokeStatic(assertRemainingIndex);
-
-        asm.aload(P_INPUT_STR);
-        asm.iload(LOCAL_POS);
-        asm.iinc(LOCAL_POS, digitCount);
-        asm.iload(LOCAL_POS);
-        asm.invokeStatic(parseIntIndex);
+        CommonUtils.parseDigits(assertRemainingIndex, parseIntIndex, digitCount, asm, LOCAL_POS, P_HI, P_INPUT_STR);
         asm.istore(target);
     }
 
@@ -1671,9 +1587,9 @@ public class DateFormatCompiler {
 
     private void setHourType(int stackState) {
         asm.iload(LOCAL_HOUR_TYPE);
-        asm.iconst(DateFormatUtils.HOUR_24);
+        asm.iconst(HOUR_24);
         int branch = asm.if_icmpne();
-        asm.iconst(DateFormatUtils.HOUR_AM);
+        asm.iconst(HOUR_AM);
         asm.istore(LOCAL_HOUR_TYPE);
         int p = asm.position();
         frameOffsets.add(Numbers.encodeLowHighInts(stackState, p));

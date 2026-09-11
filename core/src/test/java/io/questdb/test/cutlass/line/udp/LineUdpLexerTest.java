@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -33,6 +33,7 @@ import io.questdb.std.Files;
 import io.questdb.std.MemoryTag;
 import io.questdb.std.Unsafe;
 import io.questdb.std.str.StringSink;
+import io.questdb.test.AbstractCairoTest;
 import io.questdb.test.tools.TestUtils;
 import org.junit.Assert;
 import org.junit.Before;
@@ -41,7 +42,7 @@ import org.junit.Test;
 import java.util.HashMap;
 import java.util.Map;
 
-public class LineUdpLexerTest {
+public class LineUdpLexerTest extends AbstractCairoTest {
 
     private final static LineUdpLexer lexer = new LineUdpLexer(4096);
     protected final StringSink sink = new StringSink();
@@ -75,9 +76,11 @@ public class LineUdpLexerTest {
         System.arraycopy(bytesA, 0, bytes, 0, bytesA.length);
         System.arraycopy(bytesB, 0, bytes, bytesA.length, bytesB.length);
         System.arraycopy(bytesC, 0, bytes, bytesA.length + bytesB.length, bytesC.length);
-        assertThat("违法违,控网站漏洞风=不一定代,网站可能存在=комитета 的风险=10000i,вышел=\"险\" 100000\n" +
-                        "-- error --\n" +
-                        "меморандум,tag=value,tag2=value field=10000i,field2=\"str\" 100000\n",
+        assertThat("""
+                        违法违,控网站漏洞风=不一定代,网站可能存在=комитета 的风险=10000i,вышел="险" 100000
+                        -- error --
+                        меморандум,tag=value,tag2=value field=10000i,field2="str" 100000
+                        """,
                 bytes);
     }
 
@@ -88,11 +91,15 @@ public class LineUdpLexerTest {
 
     @Test
     public void testEmptyLine() {
-        assertThat("measurement,tag=value,tag2=value field=10000i,field2=\"str\" 100000\n" +
-                        "measurement,tag=value3,tag2=value2 field=100i,field2=\"ok\"\n",
-                "measurement,tag=value,tag2=value field=10000i,field2=\"str\" 100000\n" +
-                        "\n" +
-                        "measurement,tag=value3,tag2=value2 field=100i,field2=\"ok\"\n");
+        assertThat("""
+                        measurement,tag=value,tag2=value field=10000i,field2="str" 100000
+                        measurement,tag=value3,tag2=value2 field=100i,field2="ok"
+                        """,
+                """
+                        measurement,tag=value,tag2=value field=10000i,field2="str" 100000
+                        
+                        measurement,tag=value3,tag2=value2 field=100i,field2="ok"
+                        """);
     }
 
     @Test
@@ -122,10 +129,14 @@ public class LineUdpLexerTest {
 
     @Test
     public void testMultiLines() {
-        assertThat("measurement,tag=value,tag2=value field=10000i,field2=\"str\" 100000\n" +
-                        "measurement,tag=value3,tag2=value2 field=100i,field2=\"ok\"\n",
-                "measurement,tag=value,tag2=value field=10000i,field2=\"str\" 100000\n" +
-                        "measurement,tag=value3,tag2=value2 field=100i,field2=\"ok\"\n");
+        assertThat("""
+                        measurement,tag=value,tag2=value field=10000i,field2="str" 100000
+                        measurement,tag=value3,tag2=value2 field=100i,field2="ok"
+                        """,
+                """
+                        measurement,tag=value,tag2=value field=10000i,field2="str" 100000
+                        measurement,tag=value3,tag2=value2 field=100i,field2="ok"
+                        """);
     }
 
     @Test
@@ -241,14 +252,18 @@ public class LineUdpLexerTest {
 
     @Test
     public void testSkipLine() {
-        assertThat("measurement,tag=value,tag2=value field=10000i,field2=\"str\" 100000\n" +
-                        "measurement,tag=value3,tag2=value2 field=,field2=\"ok\"\n" +
-                        "measurement,tag=value3,tag2=value2 field=-- error --\n" +
-                        "measurement,tag=value4,tag2=value4 field=200i,field2=\"super\"\n",
-                "measurement,tag=value,tag2=value field=10000i,field2=\"str\" 100000\n" +
-                        "measurement,tag=value3,tag2=value2 field=,field2=\"ok\"\n" +
-                        "measurement,tag=value3,tag2=value2 field= field2=\"not ok\"\n" +
-                        "measurement,tag=value4,tag2=value4 field=200i,field2=\"super\"\n");
+        assertThat("""
+                        measurement,tag=value,tag2=value field=10000i,field2="str" 100000
+                        measurement,tag=value3,tag2=value2 field=,field2="ok"
+                        measurement,tag=value3,tag2=value2 field=-- error --
+                        measurement,tag=value4,tag2=value4 field=200i,field2="super"
+                        """,
+                """
+                        measurement,tag=value,tag2=value field=10000i,field2="str" 100000
+                        measurement,tag=value3,tag2=value2 field=,field2="ok"
+                        measurement,tag=value3,tag2=value2 field= field2="not ok"
+                        measurement,tag=value4,tag2=value4 field=200i,field2="super"
+                        """);
     }
 
     @Test
@@ -263,8 +278,10 @@ public class LineUdpLexerTest {
 
     @Test
     public void testTrailingSpace() {
-        assertError("measurement,tag=value,tag2=value field=10000i,field2=\"str\" \n" +
-                "measurement,tag=value3,tag2=value2 field=100i,field2=\"ok\"\n", LineUdpParser.EVT_TIMESTAMP, LineUdpParser.ERROR_EMPTY, 59);
+        assertError("""
+                measurement,tag=value,tag2=value field=10000i,field2="str"\s
+                measurement,tag=value3,tag2=value2 field=100i,field2="ok"
+                """, LineUdpParser.EVT_TIMESTAMP, LineUdpParser.ERROR_EMPTY, 59);
     }
 
     @Test
@@ -288,7 +305,7 @@ public class LineUdpLexerTest {
         try {
             final int len = bytes.length;
             for (int i = 0; i < len; i++) {
-                Unsafe.getUnsafe().putByte(mem + i, bytes[i]);
+                Unsafe.putByte(mem + i, bytes[i]);
             }
             for (int i = 0; i < len; i++) {
                 lineAssemblingParser.clear();
@@ -315,7 +332,7 @@ public class LineUdpLexerTest {
         long mem = Unsafe.malloc(line.length, MemoryTag.NATIVE_DEFAULT);
         try {
             for (int i = 0; i < len; i++) {
-                Unsafe.getUnsafe().putByte(mem + i, line[i]);
+                Unsafe.putByte(mem + i, line[i]);
             }
 
             if (len < 10) {
@@ -342,12 +359,13 @@ public class LineUdpLexerTest {
             }
 
             // assert small buffer
-            LineUdpLexer smallBufLexer = new LineUdpLexer(64);
-            lineAssemblingParser.clear();
-            smallBufLexer.withParser(lineAssemblingParser);
-            smallBufLexer.parse(mem, mem + len);
-            smallBufLexer.parseLast();
-            TestUtils.assertEquals(expected, sink);
+            try (LineUdpLexer smallBufLexer = new LineUdpLexer(64)) {
+                lineAssemblingParser.clear();
+                smallBufLexer.withParser(lineAssemblingParser);
+                smallBufLexer.parse(mem, mem + len);
+                smallBufLexer.parseLast();
+                TestUtils.assertEquals(expected, sink);
+            }
         } finally {
             Unsafe.free(mem, len, MemoryTag.NATIVE_DEFAULT);
         }
@@ -393,7 +411,7 @@ public class LineUdpLexerTest {
                     sink.put(token);
                     break;
                 case EVT_TIMESTAMP:
-                    if (token.length() > 0) {
+                    if (!token.isEmpty()) {
                         sink.put(' ').put(token);
                     }
                     break;

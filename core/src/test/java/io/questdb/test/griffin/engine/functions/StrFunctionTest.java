@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -25,16 +25,14 @@
 package io.questdb.test.griffin.engine.functions;
 
 import io.questdb.cairo.ImplicitCastException;
+import io.questdb.cairo.NanosTimestampDriver;
 import io.questdb.cairo.sql.Record;
 import io.questdb.griffin.engine.functions.StrFunction;
 import io.questdb.griffin.engine.functions.constants.StrConstant;
 import io.questdb.std.Numbers;
 import io.questdb.std.NumericException;
-import io.questdb.std.datetime.microtime.TimestampFormatUtils;
 import io.questdb.std.datetime.millitime.DateFormatUtils;
 import io.questdb.std.str.Utf8Sequence;
-import io.questdb.std.str.Utf8Sink;
-import io.questdb.std.str.Utf8StringSink;
 import io.questdb.test.tools.TestUtils;
 import org.junit.Assert;
 import org.junit.Test;
@@ -396,7 +394,7 @@ public class StrFunctionTest {
 
     @Test
     public void testCastToTimestamp() throws NumericException {
-        Assert.assertEquals(TimestampFormatUtils.parseTimestamp("2021-09-10T10:12:33.887889Z"), new StrConstant("2021-09-10T10:12:33.887889").getTimestamp(null));
+        Assert.assertEquals(NanosTimestampDriver.INSTANCE.parseFloorLiteral("2021-09-10T10:12:33.887889Z"), new StrConstant("2021-09-10T10:12:33.887889").getTimestamp(null));
     }
 
     @Test
@@ -405,13 +403,63 @@ public class StrFunctionTest {
             new StrConstant("").getTimestamp(null);
             Assert.fail();
         } catch (ImplicitCastException e) {
-            TestUtils.assertContains(e.getFlyweightMessage(), "inconvertible value: `` [STRING -> TIMESTAMP]");
+            TestUtils.assertContains(e.getFlyweightMessage(), "inconvertible value: `` [STRING -> TIMESTAMP_NS]");
         }
     }
 
     @Test
     public void testCastToTimestampNull() {
         Assert.assertEquals(Numbers.LONG_NULL, new StrConstant(null).getTimestamp(null));
+    }
+
+    @Test(expected = UnsupportedOperationException.class)
+    public void testGetArray() {
+        function.getArray(null);
+    }
+
+    @Test(expected = UnsupportedOperationException.class)
+    public void testGetBin() {
+        function.getBin(null);
+    }
+
+    @Test(expected = UnsupportedOperationException.class)
+    public void testGetBinLen() {
+        function.getBinLen(null);
+    }
+
+    @Test(expected = UnsupportedOperationException.class)
+    public void testGetBool() {
+        function.getBool(null);
+    }
+
+    @Test(expected = UnsupportedOperationException.class)
+    public void testGetDecimal128() {
+        function.getDecimal128(null, null);
+    }
+
+    @Test(expected = UnsupportedOperationException.class)
+    public void testGetDecimal16() {
+        function.getDecimal16(null);
+    }
+
+    @Test(expected = UnsupportedOperationException.class)
+    public void testGetDecimal256() {
+        function.getDecimal256(null, null);
+    }
+
+    @Test(expected = UnsupportedOperationException.class)
+    public void testGetDecimal32() {
+        function.getDecimal32(null);
+    }
+
+    @Test(expected = UnsupportedOperationException.class)
+    public void testGetDecimal64() {
+        function.getDecimal64(null);
+    }
+
+    @Test(expected = UnsupportedOperationException.class)
+    public void testGetDecimal8() {
+        function.getDecimal8(null);
     }
 
     @Test(expected = UnsupportedOperationException.class)
@@ -432,41 +480,6 @@ public class StrFunctionTest {
     @Test(expected = UnsupportedOperationException.class)
     public void testGetGeoShort() {
         function.getGeoShort(null);
-    }
-
-    @Test(expected = UnsupportedOperationException.class)
-    public void testGetBin() {
-        function.getBin(null);
-    }
-
-    @Test(expected = UnsupportedOperationException.class)
-    public void testGetBinLen() {
-        function.getBinLen(null);
-    }
-
-    @Test(expected = UnsupportedOperationException.class)
-    public void testGetBool() {
-        function.getBool(null);
-    }
-
-    @Test(expected = UnsupportedOperationException.class)
-    public void testGetRecordCursorFactory() {
-        function.getRecordCursorFactory();
-    }
-
-    @Test
-    public void testGetStrLen() {
-        Assert.assertEquals(1, function.getStrLen(null));
-    }
-
-    @Test
-    public void testGetSymbol() {
-        TestUtils.assertEquals("a", function.getSymbol(null));
-    }
-
-    @Test
-    public void testGetSymbolB() {
-        TestUtils.assertEquals("a", function.getSymbolB(null));
     }
 
     @Test(expected = UnsupportedOperationException.class)
@@ -494,11 +507,24 @@ public class StrFunctionTest {
         function.getLong256B(null);
     }
 
+    @Test(expected = UnsupportedOperationException.class)
+    public void testGetRecordCursorFactory() {
+        function.getRecordCursorFactory();
+    }
+
     @Test
-    public void testGetVarcharToSink() {
-        Utf8Sink sink = new Utf8StringSink();
-        function.getVarchar(null, sink);
-        TestUtils.assertEquals("a", sink.toString());
+    public void testGetStrLen() {
+        Assert.assertEquals(1, function.getStrLen(null));
+    }
+
+    @Test
+    public void testGetSymbol() {
+        TestUtils.assertEquals("a", function.getSymbol(null));
+    }
+
+    @Test
+    public void testGetSymbolB() {
+        TestUtils.assertEquals("a", function.getSymbolB(null));
     }
 
     @Test

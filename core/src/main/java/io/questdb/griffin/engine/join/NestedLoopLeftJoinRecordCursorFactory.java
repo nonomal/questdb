@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,9 +24,15 @@
 
 package io.questdb.griffin.engine.join;
 
+import io.questdb.cairo.CairoException;
 import io.questdb.cairo.TableToken;
+import io.questdb.cairo.sql.Function;
+import io.questdb.cairo.sql.ParquetDecodeHint;
 import io.questdb.cairo.sql.Record;
-import io.questdb.cairo.sql.*;
+import io.questdb.cairo.sql.RecordCursor;
+import io.questdb.cairo.sql.RecordCursorFactory;
+import io.questdb.cairo.sql.RecordMetadata;
+import io.questdb.cairo.sql.SqlExecutionCircuitBreaker;
 import io.questdb.griffin.PlanSink;
 import io.questdb.griffin.SqlException;
 import io.questdb.griffin.SqlExecutionContext;
@@ -39,8 +45,8 @@ import org.jetbrains.annotations.NotNull;
  * and returns all row pairs matching filter plus all unmatched rows from master factory.
  */
 public class NestedLoopLeftJoinRecordCursorFactory extends AbstractJoinRecordCursorFactory {
-    private final NestedLoopLeftRecordCursor cursor;
-    private final Function filter;
+    private NestedLoopLeftRecordCursor cursor;
+    private Function filter;
 
     public NestedLoopLeftJoinRecordCursorFactory(
             RecordMetadata metadata,
@@ -66,6 +72,7 @@ public class NestedLoopLeftJoinRecordCursorFactory extends AbstractJoinRecordCur
         RecordCursor slaveCursor = null;
         try {
             slaveCursor = slaveFactory.getCursor(executionContext);
+            slaveCursor.setParquetDecodeHint(ParquetDecodeHint.SCATTERED);
             cursor.of(masterCursor, slaveCursor, executionContext);
             return cursor;
         } catch (Throwable ex) {
@@ -100,15 +107,20 @@ public class NestedLoopLeftJoinRecordCursorFactory extends AbstractJoinRecordCur
 
     @Override
     protected void _close() {
-        Misc.freeIfCloseable(getMetadata());
-        Misc.free(masterFactory);
-        Misc.free(slaveFactory);
-        Misc.free(filter);
+        final NestedLoopLeftRecordCursor cursor = this.cursor;
+        this.cursor = null;
+        final Function filter = this.filter;
+        this.filter = null;
+        Throwable failure = closeJoinOwnersBestEffort();
+        failure = Misc.freeBestEffort(failure, filter);
+        failure = Misc.freeBestEffort(failure, cursor);
+        CairoException.rethrowCleanupFailure(failure);
     }
 
     private static class NestedLoopLeftRecordCursor extends AbstractJoinCursor {
         private final Function filter;
         private final OuterJoinRecord record;
+        private SqlExecutionCircuitBreaker circuitBreaker;
         private boolean isMasterHasNextPending;
         private boolean isMatch;
         private boolean masterHasNext;
@@ -128,6 +140,7 @@ public class NestedLoopLeftJoinRecordCursorFactory extends AbstractJoinRecordCur
         @Override
         public boolean hasNext() {
             while (true) {
+                circuitBreaker.statefulThrowExceptionIfTripped();
                 if (isMasterHasNextPending) {
                     masterHasNext = masterCursor.hasNext();
                     isMasterHasNextPending = false;
@@ -138,6 +151,7 @@ public class NestedLoopLeftJoinRecordCursorFactory extends AbstractJoinRecordCur
                 }
 
                 while (slaveCursor.hasNext()) {
+                    circuitBreaker.statefulThrowExceptionIfTripped();
                     if (filter.getBool(record)) {
                         isMatch = true;
                         return true;
@@ -155,6 +169,11 @@ public class NestedLoopLeftJoinRecordCursorFactory extends AbstractJoinRecordCur
                 record.hasSlave(true);
                 isMasterHasNextPending = true;
             }
+        }
+
+        @Override
+        public long preComputedStateSize() {
+            return masterCursor.preComputedStateSize() + slaveCursor.preComputedStateSize();
         }
 
         @Override
@@ -178,6 +197,7 @@ public class NestedLoopLeftJoinRecordCursorFactory extends AbstractJoinRecordCur
             filter.init(this, executionContext);
             record.of(masterCursor.getRecord(), slaveCursor.getRecord());
             isMasterHasNextPending = true;
+            circuitBreaker = executionContext.getCircuitBreaker();
         }
     }
 }

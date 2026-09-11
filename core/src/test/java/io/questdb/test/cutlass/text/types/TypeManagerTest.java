@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -32,30 +32,38 @@ import io.questdb.cutlass.text.DefaultTextConfiguration;
 import io.questdb.cutlass.text.TextConfiguration;
 import io.questdb.cutlass.text.types.InputFormatConfiguration;
 import io.questdb.cutlass.text.types.TypeManager;
+import io.questdb.std.Decimal256;
 import io.questdb.std.Misc;
+import io.questdb.std.datetime.DateFormat;
 import io.questdb.std.datetime.DateLocaleFactory;
-import io.questdb.std.datetime.microtime.TimestampFormatFactory;
 import io.questdb.std.datetime.millitime.DateFormatFactory;
-import io.questdb.std.datetime.millitime.DateFormatUtils;
 import io.questdb.std.str.DirectUtf16Sink;
 import io.questdb.std.str.DirectUtf8Sink;
 import io.questdb.test.AbstractTest;
 import io.questdb.test.tools.TestUtils;
-import org.junit.*;
+import org.junit.AfterClass;
+import org.junit.Assert;
+import org.junit.Before;
+import org.junit.BeforeClass;
+import org.junit.Test;
 
 import java.io.File;
 import java.io.IOException;
+
+import static io.questdb.std.datetime.DateLocaleFactory.EN_LOCALE;
 
 public class TypeManagerTest extends AbstractTest {
     private static JsonLexer jsonLexer;
     private static DirectUtf16Sink utf16Sink;
     private static DirectUtf8Sink utf8Sink;
+    private static Decimal256 decimal256;
 
     @BeforeClass
     public static void setUpStatic() throws Exception {
         AbstractTest.setUpStatic();
         utf16Sink = new DirectUtf16Sink(64);
         utf8Sink = new DirectUtf8Sink(64);
+        decimal256 = new Decimal256();
         jsonLexer = new JsonLexer(1024, 2048);
     }
 
@@ -69,6 +77,33 @@ public class TypeManagerTest extends AbstractTest {
     @Before
     public void setUp2() {
         jsonLexer.clear();
+    }
+
+    @Test
+    public void testAdaptiveGetTimestampFormat_MicrosecondPrecision() {
+        assertMicrosFormat("yyyy-MM-dd HH:mm:ss");
+        assertMicrosFormat("yyyy-MM-dd HH:mm:ss.SSS");
+        assertMicrosFormat("yyyy-MM-ddTHH:mm:ss.SSSUUU");
+        assertMicrosFormat("dd/MM/yyyy HH:mm:ss.SSSUUU+z");
+        assertMicrosFormat("yyyy-MM-dd HH:mm:ss.U+");
+        assertMicrosFormat("");
+        assertMicrosFormat("yyyy-MM-dd");
+        assertMicrosFormat("HH:mm:ss");
+        assertMicrosFormat("yyyy-MM-dd HH:mm:ss.NN");
+    }
+
+    @Test
+    public void testAdaptiveGetTimestampFormat_NanosecondPrecision() {
+        assertNanosFormat("yyyy-MM-dd HH:mm:ss.N");
+        assertNanosFormat("yyyy-MM-dd HH:mm:ss.NNN");
+        assertNanosFormat("yyyy-MM-dd HH:mm:ss.N+");
+        assertNanosFormat("yyyy-MM-ddTHH:mm:ss.SSSUUUNNN");
+        assertNanosFormat("yyyy-MM-ddTHH:mm:ss.SSSUUUN");
+        assertNanosFormat("dd/MM/yyyy HH:mm:ss.N+z");
+
+        // Multiple N patterns in same format
+        assertNanosFormat("yyyy-MM-dd HH:mm:ss.NNN-N");
+        assertNanosFormat("N yyyy-MM-dd HH:mm:ss");
     }
 
     @Test
@@ -126,13 +161,13 @@ public class TypeManagerTest extends AbstractTest {
         File configFile = new File(root, "text_loader.json");
         TestUtils.writeStringToFile(configFile, "{\n}\n");
         TypeManager typeManager = createTypeManager("/text_loader.json");
-        Assert.assertEquals("[CHAR,INT,LONG,DOUBLE,BOOLEAN,LONG256,UUID,IPv4]", typeManager.getAllAdapters().toString());
+        Assert.assertEquals("[CHAR,INT,LONG,DOUBLE,BOOLEAN,LONG256,UUID,IPv4,DECIMAL(18,3)]", typeManager.getAllAdapters().toString());
     }
 
     @Test
     public void testEmpty() throws JsonException {
         TypeManager typeManager = createTypeManager("/textloader/types/empty.json");
-        Assert.assertEquals("[CHAR,INT,LONG,DOUBLE,BOOLEAN,LONG256,UUID,IPv4]", typeManager.getAllAdapters().toString());
+        Assert.assertEquals("[CHAR,INT,LONG,DOUBLE,BOOLEAN,LONG256,UUID,IPv4,DECIMAL(18,3)]", typeManager.getAllAdapters().toString());
     }
 
     @Test
@@ -143,6 +178,12 @@ public class TypeManagerTest extends AbstractTest {
     @Test
     public void testIllegalMethodParameterDate() {
         testIllegalParameterForGetTypeAdapter(ColumnType.DATE);
+    }
+
+    @Test
+    public void testIllegalMethodParameterDecimalSurrogate() {
+        // the bare DECIMAL tag is a surrogate for overload resolution, it has no storage size
+        testIllegalParameterForGetTypeAdapter(ColumnType.DECIMAL);
     }
 
     @Test
@@ -160,12 +201,22 @@ public class TypeManagerTest extends AbstractTest {
         File configFile = new File(root, "my_awesome_text_loader.json");
         TestUtils.writeStringToFile(configFile, "{\n}\n");
         TypeManager typeManager = createTypeManager("/my_awesome_text_loader.json");
-        Assert.assertEquals("[CHAR,INT,LONG,DOUBLE,BOOLEAN,LONG256,UUID,IPv4]", typeManager.getAllAdapters().toString());
+        Assert.assertEquals("[CHAR,INT,LONG,DOUBLE,BOOLEAN,LONG256,UUID,IPv4,DECIMAL(18,3)]", typeManager.getAllAdapters().toString());
     }
 
     @Test
     public void testResourceNotFound() {
         assertFailure("/textloader/types/not_found.json", 0, "could not find input format config");
+    }
+
+    @Test
+    public void testStoredDecimalTypesHaveTypeAdapter() {
+        TypeManager typeManager = new TypeManager(new DefaultTextConfiguration(), utf16Sink, utf8Sink, decimal256);
+        // one precision per storage width, from DECIMAL8 up to DECIMAL256
+        for (int precision : new int[]{2, 4, 9, 18, 38, 76}) {
+            int type = ColumnType.getDecimalType(precision, 1);
+            Assert.assertEquals(type, typeManager.getTypeAdapter(type).getType());
+        }
     }
 
     @Test
@@ -233,21 +284,30 @@ public class TypeManagerTest extends AbstractTest {
         }
     }
 
+    private void assertMicrosFormat(CharSequence pattern) {
+        DateFormat format = TypeManager.adaptiveGetTimestampFormat(pattern);
+        Assert.assertEquals(ColumnType.TIMESTAMP_MICRO, format.getColumnType());
+    }
+
+    private void assertNanosFormat(CharSequence pattern) {
+        DateFormat format = TypeManager.adaptiveGetTimestampFormat(pattern);
+        Assert.assertEquals(ColumnType.TIMESTAMP_NANO, format.getColumnType());
+    }
+
     private TypeManager createTypeManager(String fileResource) throws JsonException {
         InputFormatConfiguration inputFormatConfiguration = new InputFormatConfiguration(
-                new DateFormatFactory(),
+                DateFormatFactory.INSTANCE,
                 DateLocaleFactory.INSTANCE,
-                new TimestampFormatFactory(),
-                DateFormatUtils.EN_LOCALE
+                EN_LOCALE
         );
 
         inputFormatConfiguration.parseConfiguration(getClass(), jsonLexer, root, fileResource);
-        return new TypeManager(new DefaultTextConfiguration(getClass(), root, fileResource), utf16Sink, utf8Sink);
+        return new TypeManager(new DefaultTextConfiguration(getClass(), root, fileResource), utf16Sink, utf8Sink, decimal256);
     }
 
     private void testIllegalParameterForGetTypeAdapter(int columnType) {
         TextConfiguration textConfiguration = new DefaultTextConfiguration();
-        TypeManager typeManager = new TypeManager(textConfiguration, utf16Sink, utf8Sink);
+        TypeManager typeManager = new TypeManager(textConfiguration, utf16Sink, utf8Sink, decimal256);
         try {
             typeManager.getTypeAdapter(columnType);
             Assert.fail();

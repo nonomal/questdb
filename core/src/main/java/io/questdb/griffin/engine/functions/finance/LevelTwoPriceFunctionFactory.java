@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -44,7 +44,7 @@ public class LevelTwoPriceFunctionFactory implements FunctionFactory {
 
     @Override
     public String getSignature() {
-        return "l2price(DV)";
+        return "l2price(DDDV)";
     }
 
     @Override
@@ -70,22 +70,29 @@ public class LevelTwoPriceFunctionFactory implements FunctionFactory {
         if (numberOfPairs == 0) {
             throw SqlException.position(argPositions.getLast()).put("not enough arguments for l2price");
         }
+        // have to copy, args is mutable
+        args = new ObjList<>(args);
         final IntList positions = new IntList();
         positions.addAll(argPositions);
         switch (numberOfPairs) {
             case 1:
-                return new L2PriceFunction1(new ObjList<>(args), positions);
+                return new L2PriceFunction1(args, positions);
             case 2:
-                return new L2PriceFunction2(new ObjList<>(args), positions);
+                return new L2PriceFunction2(args, positions);
             case 3:
-                return new L2PriceFunction3(new ObjList<>(args), positions);
+                return new L2PriceFunction3(args, positions);
             case 4:
-                return new L2PriceFunction4(new ObjList<>(args), positions);
+                return new L2PriceFunction4(args, positions);
             case 5:
-                return new L2PriceFunction5(new ObjList<>(args), positions);
+                return new L2PriceFunction5(args, positions);
             default:
-                return new L2PriceFunctionN(new ObjList<>(args), positions);
+                return new L2PriceFunctionN(args, positions);
         }
+    }
+
+    @Override
+    public int resolvePreferredVariadicType(int sqlPos, int argPos, ObjList<Function> args) {
+        return ColumnType.DOUBLE;
     }
 
     private static boolean allowedColumnType(int type, boolean allowUndefined) {
@@ -118,16 +125,16 @@ public class LevelTwoPriceFunctionFactory implements FunctionFactory {
     }
 
     private abstract static class L2PriceBaseFunction extends DoubleFunction implements MultiArgFunction {
-        final IntList argPositions;
-        final ObjList<Function> args;
+        protected final ObjList<Function> args;
+        private final IntList argPositions;
 
-        L2PriceBaseFunction(ObjList<Function> args, IntList argPositions) {
+        public L2PriceBaseFunction(ObjList<Function> args, IntList argPositions) {
             this.args = args;
             this.argPositions = argPositions;
         }
 
         @Override
-        public ObjList<Function> getArgs() {
+        public ObjList<Function> args() {
             return args;
         }
 

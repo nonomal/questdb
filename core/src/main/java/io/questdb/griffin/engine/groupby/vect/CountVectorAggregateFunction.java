@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -28,12 +28,14 @@ import io.questdb.cairo.ArrayColumnTypes;
 import io.questdb.cairo.ColumnType;
 import io.questdb.cairo.sql.Record;
 import io.questdb.griffin.PlanSink;
-import io.questdb.griffin.SqlCodeGenerator;
 import io.questdb.griffin.engine.functions.LongFunction;
 import io.questdb.std.Rosti;
 import io.questdb.std.Unsafe;
 
 import java.util.concurrent.atomic.LongAdder;
+
+import static io.questdb.griffin.SqlCodeGenerator.GKK_MICRO_HOUR_INT;
+import static io.questdb.griffin.SqlCodeGenerator.GKK_NANO_HOUR_INT;
 
 public class CountVectorAggregateFunction extends LongFunction implements VectorAggregateFunction {
     private final LongAdder count = new LongAdder();
@@ -41,17 +43,23 @@ public class CountVectorAggregateFunction extends LongFunction implements Vector
     private int valueOffset;
 
     public CountVectorAggregateFunction(int keyKind) {
-        countFunc = keyKind == SqlCodeGenerator.GKK_HOUR_INT ? Rosti::keyedHourCount : Rosti::keyedIntCount;
+        if (keyKind == GKK_MICRO_HOUR_INT) {
+            countFunc = Rosti::keyedMicroHourCount;
+        } else if (keyKind == GKK_NANO_HOUR_INT) {
+            countFunc = Rosti::keyedNanoHourCount;
+        } else {
+            countFunc = Rosti::keyedIntCount;
+        }
     }
 
     @Override
-    public void aggregate(long address, long addressSize, int columnSizeHint, int workerId) {
-        this.count.add(addressSize >>> columnSizeHint);
+    public void aggregate(long address, long frameRowCount, int workerId) {
+        this.count.add(frameRowCount);
     }
 
     @Override
-    public boolean aggregate(long pRosti, long keyAddress, long valueAddress, long valueAddressSize, int columnSizeShr, int workerId) {
-        return countFunc.count(pRosti, keyAddress, valueAddressSize >>> columnSizeShr, valueOffset);
+    public boolean aggregate(long pRosti, long keyAddress, long valueAddress, long frameRowCount) {
+        return countFunc.count(pRosti, keyAddress, frameRowCount, valueOffset);
     }
 
     @Override
@@ -76,7 +84,7 @@ public class CountVectorAggregateFunction extends LongFunction implements Vector
 
     @Override
     public void initRosti(long pRosti) {
-        Unsafe.getUnsafe().putLong(Rosti.getInitialValueSlot(pRosti, valueOffset), 0);
+        Unsafe.putLong(Rosti.getInitialValueSlot(pRosti, valueOffset), 0);
     }
 
     @Override

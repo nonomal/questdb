@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2023 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -60,6 +60,7 @@ public class SwarUtilsTest {
     public void testMarkZeroBytes() {
         Assert.assertEquals(0x0L, SwarUtils.markZeroBytes(-1L));
         Assert.assertEquals(0x0L, SwarUtils.markZeroBytes(Long.MAX_VALUE));
+        Assert.assertEquals(0x8080808080808080L, SwarUtils.markZeroBytes(0x0000));
         Assert.assertEquals(0x8080808080808080L, SwarUtils.markZeroBytes(0L));
         Assert.assertEquals(0x8080808080808000L, SwarUtils.markZeroBytes(1L));
         Assert.assertEquals(0x8080808080800080L, SwarUtils.markZeroBytes(1L << 9));
@@ -70,8 +71,7 @@ public class SwarUtilsTest {
         Assert.assertEquals(0x8000808080808080L, SwarUtils.markZeroBytes(1L << 49));
         Assert.assertEquals(0x0080808080808080L, SwarUtils.markZeroBytes(1L << 57));
         Assert.assertEquals(0x0080808080808080L, SwarUtils.markZeroBytes(Long.MIN_VALUE));
-
+        // false positive:
         Assert.assertEquals(0x8080808080808080L, SwarUtils.markZeroBytes(0x0100));
-        Assert.assertEquals(0x8080808080808080L, SwarUtils.markZeroBytes(0x0000));
     }
 }

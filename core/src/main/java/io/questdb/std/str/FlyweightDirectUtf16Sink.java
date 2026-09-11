@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -29,10 +29,11 @@ import io.questdb.std.Unsafe;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
-public class FlyweightDirectUtf16Sink implements MutableUtf16Sink, DirectCharSequence, Utf16Sink {
+public class FlyweightDirectUtf16Sink implements MutableUtf16Sink, DirectCharSequence, CloneableMutable {
     private long hi;
     private long lo;
     private long ptr;
+    private int[] ryuE10;
 
     public FlyweightDirectUtf16Sink() {
         lo = hi = ptr = 0;
@@ -51,7 +52,7 @@ public class FlyweightDirectUtf16Sink implements MutableUtf16Sink, DirectCharSeq
 
     @Override
     public char charAt(int index) {
-        return Unsafe.getUnsafe().getChar(ptr + index * 2L);
+        return Unsafe.getChar(ptr + index * 2L);
     }
 
     @Override
@@ -65,6 +66,12 @@ public class FlyweightDirectUtf16Sink implements MutableUtf16Sink, DirectCharSeq
 
     public void close() {
         lo = hi = ptr = 0;
+    }
+
+    @Override
+    @SuppressWarnings("unchecked")
+    public <T> T copy() {
+        return (T) toString();
     }
 
     @Override
@@ -101,7 +108,7 @@ public class FlyweightDirectUtf16Sink implements MutableUtf16Sink, DirectCharSeq
             assert checkCapacity(l);
             int l2 = l * 2;
             for (int i = 0; i < l; i++) {
-                Unsafe.getUnsafe().putChar(lo + i * 2L, cs.charAt(i));
+                Unsafe.putChar(lo + i * 2L, cs.charAt(i));
             }
             this.lo += l2;
         }
@@ -113,7 +120,7 @@ public class FlyweightDirectUtf16Sink implements MutableUtf16Sink, DirectCharSeq
         assert checkCapacity(len);
         int l2 = len * 2;
         for (int i = 0; i < len; i++) {
-            Unsafe.getUnsafe().putChar(lo + i * 2L, chars[i + start]);
+            Unsafe.putChar(lo + i * 2L, chars[i + start]);
         }
 
         this.lo += l2;
@@ -123,9 +130,17 @@ public class FlyweightDirectUtf16Sink implements MutableUtf16Sink, DirectCharSeq
     @Override
     public Utf16Sink put(char c) {
         assert checkCapacity(1);
-        Unsafe.getUnsafe().putChar(lo, c);
+        Unsafe.putChar(lo, c);
         lo += 2;
         return this;
+    }
+
+    @Override
+    public int[] ryuScratch() {
+        if (ryuE10 == null) {
+            ryuE10 = new int[1];
+        }
+        return ryuE10;
     }
 
     @Override

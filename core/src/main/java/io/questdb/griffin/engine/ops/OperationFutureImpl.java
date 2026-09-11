@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -40,7 +40,11 @@ import io.questdb.log.LogFactory;
 import io.questdb.mp.FanOut;
 import io.questdb.mp.RingQueue;
 import io.questdb.mp.SCSequence;
-import io.questdb.std.*;
+import io.questdb.std.AbstractSelfReturningObject;
+import io.questdb.std.Misc;
+import io.questdb.std.Os;
+import io.questdb.std.Unsafe;
+import io.questdb.std.WeakSelfReturningObjectPool;
 import io.questdb.std.datetime.millitime.MillisecondClock;
 import io.questdb.tasks.TableWriterTask;
 
@@ -75,7 +79,9 @@ class OperationFutureImpl extends AbstractSelfReturningObject<OperationFutureImp
             await(engine.getConfiguration().getWriterAsyncCommandMaxTimeout() - busyWaitTimeout);
         }
         if (status != QUERY_COMPLETE) {
-            throw SqlTimeoutException.timeout("Timeout expired on waiting for the async command execution result [instance=").put(correlationId).put(']');
+            throw SqlTimeoutException
+                    .timeout("Timeout expired on waiting for the async command execution result [instance=").put(correlationId)
+                    .put(", timeout=").put(busyWaitTimeout).put("ms]");
         }
     }
 
@@ -104,11 +110,6 @@ class OperationFutureImpl extends AbstractSelfReturningObject<OperationFutureImp
     @Override
     public long getAffectedRowsCount() {
         return affectedRowsCount;
-    }
-
-    @Override
-    public long getInstanceId() {
-        return correlationId;
     }
 
     @Override
@@ -217,10 +218,10 @@ class OperationFutureImpl extends AbstractSelfReturningObject<OperationFutureImp
                     Os.pause();
                 } else if (type == TSK_COMPLETE) {
                     LOG.info().$("writer command response received [instance=").$(correlationId).I$();
-                    final int code = Unsafe.getUnsafe().getInt(event.getData());
+                    final int code = Unsafe.getInt(event.getData());
                     switch (code) {
                         case OK:
-                            affectedRowsCount = Unsafe.getUnsafe().getInt(event.getData() + Integer.BYTES);
+                            affectedRowsCount = Unsafe.getInt(event.getData() + Integer.BYTES);
                             queryFutureUpdateListener.reportProgress(correlationId, QUERY_COMPLETE);
                             return QUERY_COMPLETE;
                         case READER_OUT_OF_DATE:
@@ -228,7 +229,7 @@ class OperationFutureImpl extends AbstractSelfReturningObject<OperationFutureImp
                         default:
                             LOG.error().$("error writer command response [instance=").$(correlationId)
                                     .$(", errorCode=").$(code).I$();
-                            final int strLen = Unsafe.getUnsafe().getInt(event.getData() + Integer.BYTES);
+                            final int strLen = Unsafe.getInt(event.getData() + Integer.BYTES);
                             final long strLo = event.getData() + 2L * Integer.BYTES;
                             if (strLen == 0) {
                                 throw SqlException.$(tableNamePositionInSql, "statement execution failed");

@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -27,20 +27,30 @@ package io.questdb.cairo;
 public class DefaultDdlListener implements DdlListener {
     public static final DdlListener INSTANCE = new DefaultDdlListener();
 
+    protected DefaultDdlListener() {
+    }
+
     @Override
     public void onColumnAdded(SecurityContext securityContext, TableToken tableToken, CharSequence columnName) {
     }
 
     @Override
-    public void onColumnRenamed(SecurityContext securityContext, TableToken tableToken, CharSequence oldColumnName, CharSequence newColumnName) {
+    public void onColumnDropped(TableToken tableToken, CharSequence columnName) {
     }
 
     @Override
-    public void onTableCreated(SecurityContext securityContext, TableToken tableToken) {
+    public void onColumnRenamed(TableToken tableToken, CharSequence oldColumnName, CharSequence newColumnName) {
     }
 
     @Override
-    public void onTableRenamed(SecurityContext securityContext, TableToken oldTableToken, TableToken newTableToken) {
+    public void onTableOrViewOrMatViewCreated(SecurityContext securityContext, TableToken tableToken, int tableKind) {
+    }
 
+    @Override
+    public void onTableOrViewOrMatViewDropped(TableToken tableToken) {
+    }
+
+    @Override
+    public void onTableRenamed(TableToken oldTableToken, TableToken newTableToken) {
     }
 }

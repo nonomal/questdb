@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -25,19 +25,14 @@
 package io.questdb.network;
 
 public interface EpollFacade {
+
     int epollCreate();
 
-    int epollCtl(int epfd, int op, int fd, long eventPtr);
+    int epollCtl(long epfd, int op, long fd, long eventPtr);
 
-    int epollWait(int epfd, long eventPtr, int eventCount, int timeout);
+    int epollWait(long epfd, long eventPtr, int eventCount, int timeout);
 
     int errno();
 
-    int eventFd();
-
     NetworkFacade getNetworkFacade();
-
-    long readEventFd(int fd);
-
-    int writeEventFd(int fd);
 }

@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -22,22 +22,29 @@
  *
  ******************************************************************************/
 
-/**
- * HistogramTest.java
- * Written by Gil Tene of Azul Systems, and released to the public domain,
- * as explained at http://creativecommons.org/publicdomain/zero/1.0/
- *
- * @author Gil Tene
- */
+// Written by Gil Tene of Azul Systems, and released to the public domain,
+// as explained at http://creativecommons.org/publicdomain/zero/1.0/
+//
+// @author Gil Tene
 
 package io.questdb.test.std.histogram.org.HdrHistogram;
 
 import io.questdb.cairo.CairoException;
-import io.questdb.std.histogram.org.HdrHistogram.*;
+import io.questdb.std.histogram.org.HdrHistogram.DoubleHistogram;
+import io.questdb.std.histogram.org.HdrHistogram.Histogram;
+import io.questdb.std.histogram.org.HdrHistogram.IntCountsHistogram;
+import io.questdb.std.histogram.org.HdrHistogram.PackedDoubleHistogram;
+import io.questdb.std.histogram.org.HdrHistogram.PackedHistogram;
+import io.questdb.std.histogram.org.HdrHistogram.ShortCountsHistogram;
 import org.junit.Assert;
 import org.junit.Test;
 
-import java.io.*;
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.ObjectInput;
+import java.io.ObjectInputStream;
+import java.io.ObjectOutput;
+import java.io.ObjectOutputStream;
 import java.util.zip.Deflater;
 
 import static io.questdb.test.std.histogram.org.HdrHistogram.HistogramTestUtils.constructDoubleHistogram;
@@ -71,21 +78,21 @@ public class DoubleHistogramTest {
     }
 
     @Test
-    public void testConstructionArgumentGets() throws Exception {
+    public void testConstructionArgumentGets() {
         for (Class<?> histoClass : testClasses) {
             testConstructionArgumentGets(histoClass);
         }
     }
 
     @Test
-    public void testCopy() throws Exception {
+    public void testCopy() {
         for (Class<?> histoClass : testClasses) {
             testCopy(histoClass);
         }
     }
 
     @Test
-    public void testCopyInto() throws Exception {
+    public void testCopyInto() {
         for (Class<?> histoClass : testClasses) {
             testCopyInto(histoClass);
         }
@@ -127,42 +134,42 @@ public class DoubleHistogramTest {
     }
 
     @Test
-    public void testNumberOfSignificantValueDigitsMustBeLessThanSix() throws Exception {
+    public void testNumberOfSignificantValueDigitsMustBeLessThanSix() {
         for (Class<?> histoClass : testClasses) {
             testNumberOfSignificantValueDigitsMustBeLessThanSix(histoClass);
         }
     }
 
     @Test
-    public void testNumberOfSignificantValueDigitsMustBePositive() throws Exception {
+    public void testNumberOfSignificantValueDigitsMustBePositive() {
         for (Class<?> histoClass : testClasses) {
             testNumberOfSignificantValueDigitsMustBePositive(histoClass);
         }
     }
 
     @Test
-    public void testRecordValue() throws Exception {
+    public void testRecordValue() {
         for (Class<?> histoClass : testClasses) {
             testRecordValue(histoClass);
         }
     }
 
     @Test
-    public void testRecordValueWithExpectedInterval() throws Exception {
+    public void testRecordValueWithExpectedInterval() {
         for (Class<?> histoClass : testClasses) {
             testRecordValueWithExpectedInterval(histoClass);
         }
     }
 
     @Test
-    public void testRecordValue_Overflow_ShouldThrowException() throws Exception {
+    public void testRecordValue_Overflow_ShouldThrowException() {
         for (Class<?> histoClass : testClasses) {
             testRecordValue_Overflow_ShouldThrowException(histoClass);
         }
     }
 
     @Test
-    public void testReset() throws Exception {
+    public void testReset() {
         for (Class<?> histoClass : testClasses) {
             testReset(histoClass);
         }
@@ -220,7 +227,7 @@ public class DoubleHistogramTest {
     }
 
     @Test
-    public void testTrackableValueRangeMustBeGreaterThanTwo() throws Exception {
+    public void testTrackableValueRangeMustBeGreaterThanTwo() {
         for (Class<?> histoClass : testClasses) {
             testTrackableValueRangeMustBeGreaterThanTwo(histoClass);
         }
@@ -228,7 +235,7 @@ public class DoubleHistogramTest {
 
     private void assertEqual(DoubleHistogram expectedHistogram, DoubleHistogram actualHistogram) {
         assertEquals(expectedHistogram, actualHistogram);
-        Assert.assertTrue(expectedHistogram.hashCode() == actualHistogram.hashCode());
+        assertEquals(expectedHistogram.hashCode(), actualHistogram.hashCode());
         assertEquals(
                 expectedHistogram.getCountAtValue(testValueLevel),
                 actualHistogram.getCountAtValue(testValueLevel));
@@ -334,7 +341,7 @@ public class DoubleHistogramTest {
         assertEquals(10.0, merged.getMaxValue(), 0.01);
     }
 
-    private void testConstructionArgumentGets(Class histoClass) throws Exception {
+    private void testConstructionArgumentGets(Class<?> histoClass) {
         DoubleHistogram histogram =
                 constructDoubleHistogram(histoClass, trackableValueRangeSize, numberOfSignificantValueDigits);
         // Record 1.0, and verify that the range adjust to it:
@@ -357,7 +364,7 @@ public class DoubleHistogramTest {
         assertEquals(1.0 / 1024, histogram3.getCurrentLowestTrackableNonZeroValue(), 0.001);
     }
 
-    private void testCopy(final Class<?> histoClass) throws Exception {
+    private void testCopy(final Class<?> histoClass) {
         DoubleHistogram histogram = new DoubleHistogram(trackableValueRangeSize, numberOfSignificantValueDigits);
         histogram.recordValue(testValueLevel);
         histogram.recordValue(testValueLevel * 10);
@@ -385,7 +392,7 @@ public class DoubleHistogramTest {
         assertEqual(withShortHistogram, withShortHistogram.copy());
     }
 
-    private void testCopyInto(final Class<?> histoClass) throws Exception {
+    private void testCopyInto(final Class<?> histoClass) {
         DoubleHistogram histogram = new DoubleHistogram(trackableValueRangeSize, numberOfSignificantValueDigits);
         DoubleHistogram targetHistogram = new DoubleHistogram(trackableValueRangeSize, numberOfSignificantValueDigits);
         histogram.recordValue(testValueLevel);
@@ -526,21 +533,17 @@ public class DoubleHistogramTest {
         assertNotSame(null, histogram);
     }
 
-    private void testNumberOfSignificantValueDigitsMustBeLessThanSix(final Class<?> histoClass) throws Exception {
+    private void testNumberOfSignificantValueDigitsMustBeLessThanSix(final Class<?> histoClass) {
         Assert.assertThrows(IllegalArgumentException.class,
-                () -> {
-                    constructDoubleHistogram(histoClass, trackableValueRangeSize, 6);
-                });
+                () -> constructDoubleHistogram(histoClass, trackableValueRangeSize, 6));
     }
 
-    private void testNumberOfSignificantValueDigitsMustBePositive(final Class<?> histoClass) throws Exception {
+    private void testNumberOfSignificantValueDigitsMustBePositive(final Class<?> histoClass) {
         Assert.assertThrows(IllegalArgumentException.class,
-                () -> {
-                    constructDoubleHistogram(histoClass, trackableValueRangeSize, -1);
-                });
+                () -> constructDoubleHistogram(histoClass, trackableValueRangeSize, -1));
     }
 
-    private void testRecordValue(final Class<?> histoClass) throws Exception {
+    private void testRecordValue(final Class<?> histoClass) {
         DoubleHistogram histogram =
                 constructDoubleHistogram(histoClass, trackableValueRangeSize, numberOfSignificantValueDigits);
         histogram.recordValue(testValueLevel);
@@ -548,7 +551,7 @@ public class DoubleHistogramTest {
         assertEquals(1L, histogram.getTotalCount());
     }
 
-    private void testRecordValueWithExpectedInterval(final Class<?> histoClass) throws Exception {
+    private void testRecordValueWithExpectedInterval(final Class<?> histoClass) {
         DoubleHistogram histogram =
                 constructDoubleHistogram(histoClass, trackableValueRangeSize, numberOfSignificantValueDigits);
         histogram.recordValue(0);
@@ -573,7 +576,7 @@ public class DoubleHistogramTest {
         assertEquals(5L, histogram.getTotalCount());
     }
 
-    private void testRecordValue_Overflow_ShouldThrowException(final Class<?> histoClass) throws Exception {
+    private void testRecordValue_Overflow_ShouldThrowException(final Class<?> histoClass) {
         Assert.assertThrows(CairoException.class,
                 () -> {
                     DoubleHistogram histogram =
@@ -583,7 +586,7 @@ public class DoubleHistogramTest {
                 });
     }
 
-    private void testReset(final Class<?> histoClass) throws Exception {
+    private void testReset(final Class<?> histoClass) {
         DoubleHistogram histogram =
                 constructDoubleHistogram(histoClass, trackableValueRangeSize, numberOfSignificantValueDigits);
         histogram.recordValue(testValueLevel);
@@ -596,8 +599,8 @@ public class DoubleHistogramTest {
         assertEquals(0L, histogram.getTotalCount());
         histogram.recordValue(20);
         histogram.recordValue(80);
-        Assert.assertEquals(histogram.getMinValue(), 20.0, 1.0);
-        Assert.assertEquals(histogram.getMaxValue(), 80.0, 1.0);
+        Assert.assertEquals(20.0, histogram.getMinValue(), 1.0);
+        Assert.assertEquals(80.0, histogram.getMaxValue(), 1.0);
     }
 
     private void testResize(final Class<?> histoClass) {
@@ -629,7 +632,7 @@ public class DoubleHistogramTest {
                 8, histogram.sizeOfEquivalentValueRange(10000), 0.001);
     }
 
-    private void testTrackableValueRangeMustBeGreaterThanTwo(final Class<?> histoClass) throws Exception {
+    private void testTrackableValueRangeMustBeGreaterThanTwo(final Class<?> histoClass) {
         Assert.assertThrows(IllegalArgumentException.class,
                 () -> constructDoubleHistogram(histoClass, 1, numberOfSignificantValueDigits));
     }
@@ -642,7 +645,7 @@ public class DoubleHistogramTest {
         ObjectOutput out = null;
         ByteArrayInputStream bis = null;
         ObjectInput in = null;
-        DoubleHistogram newHistogram = null;
+        DoubleHistogram newHistogram;
         try {
             out = new ObjectOutputStream(bos);
             out.writeObject(histogram);

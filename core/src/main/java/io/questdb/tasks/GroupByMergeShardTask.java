@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,16 +24,16 @@
 
 package io.questdb.tasks;
 
-import io.questdb.cairo.sql.AtomicBooleanCircuitBreaker;
-import io.questdb.griffin.engine.table.AsyncGroupByAtom;
+import io.questdb.griffin.engine.groupby.PostAggregationCircuitBreaker;
+import io.questdb.griffin.engine.table.GroupByShardingContext;
 import io.questdb.mp.CountDownLatchSPI;
 import io.questdb.std.Mutable;
 
 import java.util.concurrent.atomic.AtomicInteger;
 
 public class GroupByMergeShardTask implements Mutable {
-    private AsyncGroupByAtom atom;
-    private AtomicBooleanCircuitBreaker circuitBreaker;
+    private GroupByShardingContext shardingCtx;
+    private PostAggregationCircuitBreaker circuitBreaker;
     private CountDownLatchSPI doneLatch;
     private int shardIndex = -1;
     private AtomicInteger startedCounter;
@@ -41,17 +41,17 @@ public class GroupByMergeShardTask implements Mutable {
     @Override
     public void clear() {
         shardIndex = -1;
-        atom = null;
+        shardingCtx = null;
         circuitBreaker = null;
         doneLatch = null;
         startedCounter = null;
     }
 
-    public AsyncGroupByAtom getAtom() {
-        return atom;
+    public GroupByShardingContext getShardingContext() {
+        return shardingCtx;
     }
 
-    public AtomicBooleanCircuitBreaker getCircuitBreaker() {
+    public PostAggregationCircuitBreaker getCircuitBreaker() {
         return circuitBreaker;
     }
 
@@ -68,16 +68,16 @@ public class GroupByMergeShardTask implements Mutable {
     }
 
     public void of(
-            AtomicBooleanCircuitBreaker circuitBreaker,
+            PostAggregationCircuitBreaker circuitBreaker,
             AtomicInteger startedCounter,
             CountDownLatchSPI doneLatch,
-            AsyncGroupByAtom atom,
+            GroupByShardingContext shardingCtx,
             int shardIndex
     ) {
         this.circuitBreaker = circuitBreaker;
         this.startedCounter = startedCounter;
         this.doneLatch = doneLatch;
-        this.atom = atom;
+        this.shardingCtx = shardingCtx;
         this.shardIndex = shardIndex;
     }
 }

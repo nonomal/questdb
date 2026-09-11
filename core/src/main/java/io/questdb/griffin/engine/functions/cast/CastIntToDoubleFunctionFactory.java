@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -51,6 +51,9 @@ public class CastIntToDoubleFunctionFactory implements FunctionFactory {
 
         @Override
         public double getDouble(Record rec) {
+            // Each INT cast reads the getter its IntFunction counterpart reads, so an explicit
+            // cast never disagrees with an implicit read of the same expression. getDouble()
+            // reads getInt(), so overflowing INT arithmetic wraps here as it does in i * j + 0.0.
             final int value = arg.getInt(rec);
             return value != Numbers.INT_NULL ? value : Double.NaN;
         }

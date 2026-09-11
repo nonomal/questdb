@@ -1,0 +1,354 @@
+/*+*****************************************************************************
+ *     ___                  _   ____  ____
+ *    / _ \ _   _  ___  ___| |_|  _ \| __ )
+ *   | | | | | | |/ _ \/ __| __| | | |  _ \
+ *   | |_| | |_| |  __/\__ \ |_| |_| | |_) |
+ *    \__\_\\__,_|\___||___/\__|____/|____/
+ *
+ *  Copyright (c) 2014-2019 Appsicle
+ *  Copyright (c) 2019-2026 QuestDB
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *
+ *  http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ *
+ ******************************************************************************/
+
+package io.questdb.test.griffin.engine.functions.groupby;
+
+import io.questdb.cairo.sql.Function;
+import io.questdb.cairo.sql.Record;
+import io.questdb.griffin.engine.functions.GroupByFunction;
+import io.questdb.griffin.engine.functions.columns.IPv4Column;
+import io.questdb.griffin.engine.functions.groupby.CountIPv4GroupByFunction;
+import io.questdb.griffin.engine.functions.groupby.FirstIPv4GroupByFunctionFactory;
+import io.questdb.griffin.engine.functions.groupby.FirstNotNullIPv4GroupByFunctionFactory;
+import io.questdb.griffin.engine.functions.groupby.LastIPv4GroupByFunctionFactory;
+import io.questdb.griffin.engine.functions.groupby.LastNotNullIPv4GroupByFunctionFactory;
+import io.questdb.griffin.engine.functions.groupby.MaxIPv4GroupByFunction;
+import io.questdb.griffin.engine.functions.groupby.MinIPv4GroupByFunction;
+import io.questdb.griffin.engine.groupby.SimpleMapValue;
+import io.questdb.std.IntList;
+import io.questdb.std.Numbers;
+import io.questdb.std.ObjList;
+import org.junit.Assert;
+import org.junit.Test;
+
+public class IPv4GroupByFunctionBatchTest extends AbstractGroupByFunctionBatchTest {
+    // Stands in for a row whose IPv4 column is NULL, as a column-top row reads.
+    private static final Record NULL_IPv4_RECORD = new Record() {
+        @Override
+        public int getIPv4(int col) {
+            return Numbers.IPv4_NULL;
+        }
+    };
+
+    @Test
+    public void testCountIPv4Batch() {
+        CountIPv4GroupByFunction function = new CountIPv4GroupByFunction(IPv4Column.newInstance(COLUMN_INDEX));
+        try (SimpleMapValue value = prepare(function)) {
+
+            long ptr = allocateInts(ipv4("1.1.1.1"), Numbers.IPv4_NULL, ipv4("2.2.2.2"), ipv4("3.3.3.3"));
+            function.computeBatch(value, ptr, 4, 0);
+
+            Assert.assertEquals(3L, function.getLong(value));
+            Assert.assertTrue(function.supportsBatchComputation());
+        }
+    }
+
+    @Test
+    public void testCountIPv4BatchAccumulates() {
+        CountIPv4GroupByFunction function = new CountIPv4GroupByFunction(IPv4Column.newInstance(COLUMN_INDEX));
+        try (SimpleMapValue value = prepare(function)) {
+            long ptr = allocateInts(ipv4("1.1.1.1"), Numbers.IPv4_NULL);
+            function.computeBatch(value, ptr, 2, 0);
+
+            ptr = allocateInts(ipv4("2.2.2.2"), ipv4("3.3.3.3"));
+            function.computeBatch(value, ptr, 2, 0);
+
+            Assert.assertEquals(3L, function.getLong(value));
+        }
+    }
+
+    @Test
+    public void testCountIPv4BatchAllNull() {
+        CountIPv4GroupByFunction function = new CountIPv4GroupByFunction(IPv4Column.newInstance(COLUMN_INDEX));
+        try (SimpleMapValue value = prepare(function)) {
+            long ptr = allocateInts(Numbers.IPv4_NULL, Numbers.IPv4_NULL);
+            function.computeBatch(value, ptr, 2, 0);
+
+            Assert.assertEquals(0L, function.getLong(value));
+        }
+    }
+
+    @Test
+    public void testFirstIPv4Batch() {
+        GroupByFunction function = newFirstIPv4Function(IPv4Column.newInstance(COLUMN_INDEX));
+        try (SimpleMapValue value = prepare(function)) {
+            long ptr = allocateInts(ipv4("10.0.0.1"), ipv4("10.0.0.2"));
+            function.computeBatch(value, ptr, 2, 0);
+
+            Assert.assertEquals(ipv4("10.0.0.1"), function.getIPv4(value));
+            Assert.assertTrue(function.supportsBatchComputation());
+        }
+    }
+
+    @Test
+    public void testFirstIPv4BatchAccumulates() {
+        GroupByFunction function = newFirstIPv4Function(IPv4Column.newInstance(COLUMN_INDEX));
+        try (SimpleMapValue value = prepare(function)) {
+            long ptr = allocateInts(ipv4("10.0.0.1"), ipv4("10.0.0.2"));
+            function.computeBatch(value, ptr, 2, 0);
+
+            ptr = allocateInts(ipv4("10.0.0.3"), ipv4("10.0.0.4"));
+            function.computeBatch(value, ptr, 2, 2);
+
+            Assert.assertEquals(ipv4("10.0.0.1"), function.getIPv4(value));
+        }
+    }
+
+    @Test
+    public void testFirstIPv4SetEmpty() {
+        GroupByFunction function = newFirstIPv4Function(IPv4Column.newInstance(COLUMN_INDEX));
+        try (SimpleMapValue value = prepare(function)) {
+            Assert.assertEquals(Numbers.IPv4_NULL, function.getIPv4(value));
+        }
+    }
+
+    @Test
+    public void testFirstNotNullIPv4Batch() {
+        GroupByFunction function = newFirstNotNullIPv4Function(IPv4Column.newInstance(COLUMN_INDEX));
+        try (SimpleMapValue value = prepare(function)) {
+            long ptr = allocateInts(Numbers.IPv4_NULL, ipv4("10.0.0.7"), Numbers.IPv4_NULL);
+            function.computeBatch(value, ptr, 3, 0);
+
+            Assert.assertEquals(ipv4("10.0.0.7"), function.getIPv4(value));
+            Assert.assertTrue(function.supportsBatchComputation());
+        }
+    }
+
+    @Test
+    public void testFirstNotNullIPv4BatchAccumulates() {
+        GroupByFunction function = newFirstNotNullIPv4Function(IPv4Column.newInstance(COLUMN_INDEX));
+        try (SimpleMapValue value = prepare(function)) {
+            long ptr = allocateInts(Numbers.IPv4_NULL, ipv4("10.0.0.7"));
+            function.computeBatch(value, ptr, 2, 0);
+
+            ptr = allocateInts(ipv4("10.0.0.8"), Numbers.IPv4_NULL);
+            function.computeBatch(value, ptr, 2, 2);
+
+            Assert.assertEquals(ipv4("10.0.0.7"), function.getIPv4(value));
+        }
+    }
+
+    @Test
+    public void testLastIPv4Batch() {
+        GroupByFunction function = newLastIPv4Function(IPv4Column.newInstance(COLUMN_INDEX));
+        try (SimpleMapValue value = prepare(function)) {
+            function.setNull(value);
+
+            long ptr = allocateInts(ipv4("192.168.1.1"), ipv4("192.168.1.2"), Numbers.IPv4_NULL, ipv4("192.168.1.3"));
+            function.computeBatch(value, ptr, 4, 0);
+
+            Assert.assertEquals(ipv4("192.168.1.3"), function.getIPv4(value));
+            Assert.assertTrue(function.supportsBatchComputation());
+        }
+    }
+
+    @Test
+    public void testLastIPv4BatchAccumulates() {
+        GroupByFunction function = newLastIPv4Function(IPv4Column.newInstance(COLUMN_INDEX));
+        try (SimpleMapValue value = prepare(function)) {
+            function.setNull(value);
+
+            long ptr = allocateInts(ipv4("192.168.1.1"), ipv4("192.168.1.2"));
+            function.computeBatch(value, ptr, 2, 0);
+
+            ptr = allocateInts(ipv4("192.168.1.3"), ipv4("192.168.1.4"));
+            function.computeBatch(value, ptr, 2, 2);
+
+            Assert.assertEquals(ipv4("192.168.1.4"), function.getIPv4(value));
+        }
+    }
+
+    @Test
+    public void testLastNotNullIPv4Batch() {
+        GroupByFunction function = newLastNotNullIPv4Function(IPv4Column.newInstance(COLUMN_INDEX));
+        try (SimpleMapValue value = prepare(function)) {
+            function.setNull(value);
+
+            long ptr = allocateInts(Numbers.IPv4_NULL, ipv4("1.2.3.4"), Numbers.IPv4_NULL, ipv4("5.6.7.8"));
+            function.computeBatch(value, ptr, 4, 0);
+
+            Assert.assertEquals(ipv4("5.6.7.8"), function.getIPv4(value));
+            Assert.assertTrue(function.supportsBatchComputation());
+        }
+    }
+
+    @Test
+    public void testLastNotNullIPv4BatchAccumulates() {
+        GroupByFunction function = newLastNotNullIPv4Function(IPv4Column.newInstance(COLUMN_INDEX));
+        try (SimpleMapValue value = prepare(function)) {
+            function.setNull(value);
+
+            long ptr = allocateInts(ipv4("1.2.3.4"), Numbers.IPv4_NULL);
+            function.computeBatch(value, ptr, 2, 0);
+
+            ptr = allocateInts(Numbers.IPv4_NULL, ipv4("5.6.7.8"));
+            function.computeBatch(value, ptr, 2, 2);
+
+            Assert.assertEquals(ipv4("5.6.7.8"), function.getIPv4(value));
+        }
+    }
+
+    @Test
+    public void testLastNotNullIPv4BatchKeepsHigherRowIdNonNull() {
+        GroupByFunction function = newLastNotNullIPv4Function(IPv4Column.newInstance(COLUMN_INDEX));
+        try (SimpleMapValue value = prepare(function)) {
+            function.setNull(value);
+
+            // A stored non-null must survive a batch that arrives at a lower rowId. See the class javadoc.
+            long ptr = allocateInts(ipv4("9.9.9.9"));
+            function.computeBatch(value, ptr, 1, 100);
+            Assert.assertEquals(ipv4("9.9.9.9"), function.getIPv4(value));
+
+            ptr = allocateInts(ipv4("10.0.0.7"));
+            function.computeBatch(value, ptr, 1, 10);
+
+            Assert.assertEquals(ipv4("9.9.9.9"), function.getIPv4(value));
+        }
+    }
+
+    @Test
+    public void testLastNotNullIPv4BatchReplacesStoredNull() {
+        GroupByFunction function = newLastNotNullIPv4Function(IPv4Column.newInstance(COLUMN_INDEX));
+        try (SimpleMapValue value = prepare(function)) {
+            // A frame with column tops or type casts falls back to the row-by-row path, whose
+            // computeFirst writes through unconditionally - NULL value included - leaving the
+            // accumulator holding a real rowId next to a NULL value. Frames reach a worker out of
+            // order, so a later frame can carry a non-null at a LOWER rowId, and computeBatch must
+            // still take it: a stored NULL is not a value to keep. computeNext already does this.
+            function.computeFirst(value, NULL_IPv4_RECORD, 100);
+            Assert.assertEquals(Numbers.IPv4_NULL, function.getIPv4(value));
+
+            long ptr = allocateInts(ipv4("10.0.0.7"));
+            function.computeBatch(value, ptr, 1, 10);
+
+            Assert.assertEquals(ipv4("10.0.0.7"), function.getIPv4(value));
+        }
+    }
+
+    @Test
+    public void testMaxIPv4Batch() {
+        MaxIPv4GroupByFunction function = new MaxIPv4GroupByFunction(IPv4Column.newInstance(COLUMN_INDEX));
+        try (SimpleMapValue value = prepare(function)) {
+            value.putInt(function.getValueIndex(), Numbers.IPv4_NULL);
+
+            long ptr = allocateInts(ipv4("8.8.8.8"), ipv4("1.1.1.1"), Numbers.IPv4_NULL, ipv4("9.9.9.9"));
+            function.computeBatch(value, ptr, 4, 0);
+
+            Assert.assertEquals(ipv4("9.9.9.9"), function.getIPv4(value));
+            Assert.assertTrue(function.supportsBatchComputation());
+        }
+    }
+
+    @Test
+    public void testMaxIPv4BatchAccumulates() {
+        MaxIPv4GroupByFunction function = new MaxIPv4GroupByFunction(IPv4Column.newInstance(COLUMN_INDEX));
+        try (SimpleMapValue value = prepare(function)) {
+            long ptr = allocateInts(ipv4("1.1.1.1"), ipv4("5.5.5.5"));
+            function.computeBatch(value, ptr, 2, 0);
+
+            ptr = allocateInts(ipv4("3.3.3.3"), ipv4("2.2.2.2"));
+            function.computeBatch(value, ptr, 2, 0);
+
+            Assert.assertEquals(ipv4("5.5.5.5"), function.getIPv4(value));
+        }
+    }
+
+    @Test
+    public void testMinIPv4Batch() {
+        MinIPv4GroupByFunction function = new MinIPv4GroupByFunction(IPv4Column.newInstance(COLUMN_INDEX));
+        try (SimpleMapValue value = prepare(function)) {
+            value.putInt(function.getValueIndex(), Numbers.IPv4_NULL);
+
+            long ptr = allocateInts(Numbers.IPv4_NULL, ipv4("8.8.4.4"), ipv4("1.1.1.1"));
+            function.computeBatch(value, ptr, 3, 0);
+
+            Assert.assertEquals(ipv4("1.1.1.1"), function.getIPv4(value));
+            Assert.assertTrue(function.supportsBatchComputation());
+        }
+    }
+
+    @Test
+    public void testMinIPv4BatchAccumulates() {
+        MinIPv4GroupByFunction function = new MinIPv4GroupByFunction(IPv4Column.newInstance(COLUMN_INDEX));
+        try (SimpleMapValue value = prepare(function)) {
+            long ptr = allocateInts(ipv4("5.5.5.5"), ipv4("3.3.3.3"));
+            function.computeBatch(value, ptr, 2, 0);
+
+            ptr = allocateInts(ipv4("4.4.4.4"), ipv4("1.1.1.1"));
+            function.computeBatch(value, ptr, 2, 0);
+
+            Assert.assertEquals(ipv4("1.1.1.1"), function.getIPv4(value));
+        }
+    }
+
+    @Test
+    public void testMinIPv4BatchSimple() {
+        MinIPv4GroupByFunction function = new MinIPv4GroupByFunction(IPv4Column.newInstance(COLUMN_INDEX));
+        try (SimpleMapValue value = prepare(function)) {
+            value.putInt(function.getValueIndex(), Numbers.IPv4_NULL);
+
+            long ptr = allocateInts(ipv4("8.8.4.4"), ipv4("1.1.1.1"));
+            function.computeBatch(value, ptr, 2, 0);
+
+            Assert.assertEquals(ipv4("1.1.1.1"), function.getIPv4(value));
+            Assert.assertTrue(function.supportsBatchComputation());
+        }
+    }
+
+    private int ipv4(String value) {
+        return Numbers.parseIPv4Quiet(value);
+    }
+
+    private GroupByFunction newFirstIPv4Function(Function columnFunction) {
+        ObjList<Function> args = new ObjList<>();
+        args.add(columnFunction);
+        IntList argPositions = new IntList();
+        argPositions.add(0);
+        return (GroupByFunction) new FirstIPv4GroupByFunctionFactory().newInstance(0, args, argPositions, null, null);
+    }
+
+    private GroupByFunction newFirstNotNullIPv4Function(Function columnFunction) {
+        ObjList<Function> args = new ObjList<>();
+        args.add(columnFunction);
+        IntList argPositions = new IntList();
+        argPositions.add(0);
+        return (GroupByFunction) new FirstNotNullIPv4GroupByFunctionFactory().newInstance(0, args, argPositions, null, null);
+    }
+
+    private GroupByFunction newLastIPv4Function(Function columnFunction) {
+        ObjList<Function> args = new ObjList<>();
+        args.add(columnFunction);
+        IntList argPositions = new IntList();
+        argPositions.add(0);
+        return (GroupByFunction) new LastIPv4GroupByFunctionFactory().newInstance(0, args, argPositions, null, null);
+    }
+
+    private GroupByFunction newLastNotNullIPv4Function(Function columnFunction) {
+        ObjList<Function> args = new ObjList<>();
+        args.add(columnFunction);
+        IntList argPositions = new IntList();
+        argPositions.add(0);
+        return (GroupByFunction) new LastNotNullIPv4GroupByFunctionFactory().newInstance(0, args, argPositions, null, null);
+    }
+}

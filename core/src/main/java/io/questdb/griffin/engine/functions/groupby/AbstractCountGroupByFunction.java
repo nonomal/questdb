@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -35,10 +35,24 @@ import io.questdb.griffin.engine.functions.LongFunction;
 import io.questdb.griffin.engine.functions.UnaryFunction;
 import io.questdb.std.Numbers;
 
+/**
+ * Abstract base class for count group by functions.
+ */
 public abstract class AbstractCountGroupByFunction extends LongFunction implements GroupByFunction, UnaryFunction {
+    /**
+     * The function argument.
+     */
     protected final Function arg;
+    /**
+     * The value index in the map.
+     */
     protected int valueIndex;
 
+    /**
+     * Constructs a new count group by function.
+     *
+     * @param arg the function argument
+     */
     protected AbstractCountGroupByFunction(Function arg) {
         this.arg = arg;
     }
@@ -51,6 +65,11 @@ public abstract class AbstractCountGroupByFunction extends LongFunction implemen
     @Override
     public long getLong(Record rec) {
         return rec.getLong(valueIndex);
+    }
+
+    @Override
+    public int getSampleByFlags() {
+        return GroupByFunction.SAMPLE_BY_FILL_ALL;
     }
 
     @Override
@@ -75,14 +94,21 @@ public abstract class AbstractCountGroupByFunction extends LongFunction implemen
     }
 
     @Override
-    public boolean isReadThreadSafe() {
-        return UnaryFunction.super.isReadThreadSafe();
+    public boolean isThreadSafe() {
+        return UnaryFunction.super.isThreadSafe();
     }
 
     @Override
     public void merge(MapValue destValue, MapValue srcValue) {
-        long srcCount = srcValue.getLong(valueIndex);
-        destValue.addLong(valueIndex, srcCount);
+        final long srcCount = srcValue.getLong(valueIndex);
+        if (srcCount > 0) {
+            final long destCount = destValue.getLong(valueIndex);
+            if (destCount > 0) {
+                destValue.putLong(valueIndex, destCount + srcCount);
+            } else {
+                destValue.putLong(valueIndex, srcCount);
+            }
+        }
     }
 
     @Override

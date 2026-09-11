@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -22,12 +22,10 @@
  *
  ******************************************************************************/
 
-/**
- * Written by Gil Tene of Azul Systems, and released to the public domain,
- * as explained at http://creativecommons.org/publicdomain/zero/1.0/
- *
- * @author Gil Tene
- */
+// Written by Gil Tene of Azul Systems, and released to the public domain,
+// as explained at http://creativecommons.org/publicdomain/zero/1.0/
+//
+// @author Gil Tene
 
 package io.questdb.std.histogram.org.HdrHistogram;
 
@@ -122,31 +120,31 @@ public class HistogramLogReader implements Closeable {
         @Override
         public boolean onHistogram(String tag, double timestamp, double length,
                                    HistogramLogScanner.EncodableHistogramSupplier lazyReader) {
-            final double logTimeStampInSec = timestamp; // Timestamp is expected to be in seconds
+            // Timestamp is expected to be in seconds
 
             if (!observedStartTime) {
                 // No explicit start time noted. Use 1st observed time:
-                startTimeSec = logTimeStampInSec;
+                startTimeSec = timestamp;
                 observedStartTime = true;
             }
             if (!observedBaseTime) {
                 // No explicit base time noted. Deduce from 1st observed time (compared to start time):
-                if (logTimeStampInSec < startTimeSec - (365 * 24 * 3600.0)) {
+                if (timestamp < startTimeSec - (365 * 24 * 3600.0)) {
                     // Criteria Note: if log timestamp is more than a year in the past (compared to
                     // StartTime), we assume that timestamps in the log are not absolute
                     baseTimeSec = startTimeSec;
                 } else {
-                    // Timestamps are absolute
+                    // Micros are absolute
                     baseTimeSec = 0.0;
                 }
                 observedBaseTime = true;
             }
 
-            final double absoluteStartTimeStampSec = logTimeStampInSec + baseTimeSec;
+            final double absoluteStartTimeStampSec = timestamp + baseTimeSec;
             final double offsetStartTimeStampSec = absoluteStartTimeStampSec - startTimeSec;
 
-            final double intervalLengthSec = length; // Timestamp length is expect to be in seconds
-            final double absoluteEndTimeStampSec = absoluteStartTimeStampSec + intervalLengthSec;
+            // Timestamp length is expect to be in seconds
+            final double absoluteEndTimeStampSec = absoluteStartTimeStampSec + length;
 
             final double startTimeStampToCheckRangeOn = absolute ? absoluteStartTimeStampSec : offsetStartTimeStampSec;
 
@@ -246,7 +244,7 @@ public class HistogramLogReader implements Closeable {
      * absoluteStartTimeSec and absoluteEndTimeSec, or null if no such
      * interval line is found.
      * <p>
-     * Timestamps are assumed to appear in order in the log file, and as such
+     * Micros are assumed to appear in order in the log file, and as such
      * this method will return a null upon encountering a timestamp larger than
      * rangeEndTimeSec.
      * <p>
@@ -284,7 +282,7 @@ public class HistogramLogReader implements Closeable {
      * timestamp value found in each interval line in the log, and not
      * in absolute time.
      * <p>
-     * Timestamps are assumed to appear in order in the log file, and as such
+     * Micros are assumed to appear in order in the log file, and as such
      * this method will return a null upon encountering a timestamp larger than
      * rangeEndTimeSec.
      * <p>

@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -39,7 +39,8 @@ public final class StdoutSink implements Utf8Sink, Closeable {
     private final long buffer = Unsafe.malloc(bufferCapacity, MemoryTag.NATIVE_DEFAULT);
     private final long limit = buffer + bufferCapacity;
     private long ptr = buffer;
-    private final int stdout = Files.getStdOutFd();
+    private final long stdout = Files.getStdOutFdInternal();
+    private int[] ryuE10;
 
     @Override
     public void close() {
@@ -69,7 +70,7 @@ public final class StdoutSink implements Utf8Sink, Closeable {
         if (ptr == limit) {
             flush();
         }
-        Unsafe.getUnsafe().putByte(ptr++, b);
+        Unsafe.putByte(ptr++, b);
         return this;
     }
 
@@ -89,5 +90,13 @@ public final class StdoutSink implements Utf8Sink, Closeable {
             }
         }
         return this;
+    }
+
+    @Override
+    public int[] ryuScratch() {
+        if (ryuE10 == null) {
+            ryuE10 = new int[1];
+        }
+        return ryuE10;
     }
 }

@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,45 +24,67 @@
 
 package io.questdb.griffin.engine.groupby;
 
-import io.questdb.cairo.*;
+import io.questdb.cairo.AbstractRecordCursorFactory;
+import io.questdb.cairo.ArrayColumnTypes;
+import io.questdb.cairo.CairoConfiguration;
+import io.questdb.cairo.CairoException;
+import io.questdb.cairo.ColumnType;
+import io.questdb.cairo.EntityColumnFilter;
+import io.questdb.cairo.ListColumnFilter;
+import io.questdb.cairo.RecordSink;
+import io.questdb.cairo.RecordSinkFactory;
+import io.questdb.cairo.TimestampDriver;
 import io.questdb.cairo.map.Map;
 import io.questdb.cairo.map.MapFactory;
 import io.questdb.cairo.map.MapKey;
 import io.questdb.cairo.map.MapValue;
+import io.questdb.cairo.sql.Function;
 import io.questdb.cairo.sql.Record;
-import io.questdb.cairo.sql.*;
+import io.questdb.cairo.sql.RecordCursor;
+import io.questdb.cairo.sql.RecordCursorFactory;
+import io.questdb.cairo.sql.RecordMetadata;
+import io.questdb.cairo.sql.SqlExecutionCircuitBreaker;
 import io.questdb.griffin.PlanSink;
 import io.questdb.griffin.SqlException;
 import io.questdb.griffin.SqlExecutionContext;
 import io.questdb.griffin.engine.functions.GroupByFunction;
 import io.questdb.griffin.engine.functions.columns.TimestampColumn;
-import io.questdb.griffin.model.QueryModel;
-import io.questdb.std.*;
+import io.questdb.griffin.model.IQueryModel;
+import io.questdb.std.BytecodeAssembler;
+import io.questdb.std.IntList;
+import io.questdb.std.MemoryTag;
+import io.questdb.std.Misc;
+import io.questdb.std.Numbers;
+import io.questdb.std.NumericException;
+import io.questdb.std.ObjList;
+import io.questdb.std.Transient;
+import io.questdb.std.Unsafe;
+import io.questdb.std.datetime.DateLocaleFactory;
 import io.questdb.std.datetime.TimeZoneRules;
-import io.questdb.std.datetime.microtime.TimestampFormatUtils;
-import io.questdb.std.datetime.microtime.Timestamps;
+import io.questdb.std.datetime.millitime.Dates;
 import org.jetbrains.annotations.NotNull;
-
-import static io.questdb.std.datetime.TimeZoneRuleFactory.RESOLUTION_MICROS;
-import static io.questdb.std.datetime.microtime.Timestamps.MINUTE_MICROS;
 
 public class SampleByInterpolateRecordCursorFactory extends AbstractRecordCursorFactory {
 
-    protected final RecordCursorFactory base;
-    private final SampleByInterpolateRecordCursor cursor;
+    protected RecordCursorFactory base;
+    private SampleByInterpolateRecordCursor cursor;
     private final int groupByFunctionCount;
-    private final ObjList<GroupByFunction> groupByFunctions;
+    private ObjList<GroupByFunction> groupByFunctions;
     private final int groupByScalarFunctionCount;
-    private final ObjList<GroupByFunction> groupByScalarFunctions;
+    private ObjList<GroupByFunction> groupByScalarFunctions;
     private final int groupByTwoPointFunctionCount;
-    private final ObjList<GroupByFunction> groupByTwoPointFunctions;
-    private final ObjList<InterpolationUtil.InterpolatorFunction> interpolatorFunctions;
+    private ObjList<GroupByFunction> groupByTwoPointFunctions;
+    private ObjList<InterpolationUtil.InterpolatorFunction> interpolatorFunctions;
     private final RecordSink mapSink;
+    private Function offsetFunc;
+    private Function sampleFromFunc;
+    private Function sampleToFunc;
+    private Function timezoneNameFunc;
     // this sink is used to copy recordKeyMap keys to dataMap
     private final RecordSink mapSink2;
-    private final ObjList<Function> recordFunctions;
+    private ObjList<Function> recordFunctions;
     private final TimestampSampler sampler;
-    private final ObjList<InterpolationUtil.StoreYFunction> storeYFunctions;
+    private ObjList<InterpolationUtil.StoreYFunction> storeYFunctions;
     private final int timestampIndex;
     private final int yDataSize;
     private long yData;
@@ -75,17 +97,20 @@ public class SampleByInterpolateRecordCursorFactory extends AbstractRecordCursor
             ObjList<GroupByFunction> groupByFunctions,
             ObjList<Function> recordFunctions,
             @NotNull TimestampSampler timestampSampler,
-            @Transient @NotNull QueryModel model,
+            @Transient @NotNull IQueryModel model,
             @Transient @NotNull ListColumnFilter listColumnFilter,
             @Transient @NotNull ArrayColumnTypes keyTypes,
             @Transient @NotNull ArrayColumnTypes valueTypes,
             @Transient @NotNull EntityColumnFilter entityColumnFilter,
             @Transient @NotNull IntList groupByFunctionPositions,
             int timestampIndex,
+            int timestampType,
             Function timezoneNameFunc,
             int timezoneNameFuncPos,
             Function offsetFunc,
-            int offsetFuncPos
+            int offsetFuncPos,
+            Function sampleFromFunc,
+            Function sampleToFunc
     ) throws SqlException {
         super(metadata);
         try {
@@ -94,9 +119,15 @@ public class SampleByInterpolateRecordCursorFactory extends AbstractRecordCursor
             this.groupByFunctions = groupByFunctions;
             this.recordFunctions = recordFunctions;
             this.sampler = timestampSampler;
+            // adopt the temporal parameter functions first, so close() reaches them if the
+            // remainder of the construction throws
+            this.timezoneNameFunc = timezoneNameFunc;
+            this.offsetFunc = offsetFunc;
+            this.sampleFromFunc = sampleFromFunc;
+            this.sampleToFunc = sampleToFunc;
 
             // create timestamp column
-            TimestampColumn timestampColumn = TimestampColumn.newInstance(valueTypes.getColumnCount() + keyTypes.getColumnCount());
+            TimestampColumn timestampColumn = TimestampColumn.newInstance(valueTypes.getColumnCount() + keyTypes.getColumnCount(), timestampType);
             for (int i = 0, n = recordFunctions.size(); i < n; i++) {
                 if (recordFunctions.getQuick(i) == null) {
                     recordFunctions.setQuick(i, timestampColumn);
@@ -153,13 +184,13 @@ public class SampleByInterpolateRecordCursorFactory extends AbstractRecordCursor
             this.yData = Unsafe.malloc(yDataSize, MemoryTag.NATIVE_FUNC_RSS);
 
             // sink will be storing record columns to map key
-            this.mapSink = RecordSinkFactory.getInstance(asm, base.getMetadata(), listColumnFilter);
+            this.mapSink = RecordSinkFactory.getInstance(configuration, asm, base.getMetadata(), listColumnFilter);
             entityColumnFilter.of(keyTypes.getColumnCount());
-            this.mapSink2 = RecordSinkFactory.getInstance(asm, keyTypes, entityColumnFilter);
+            this.mapSink2 = RecordSinkFactory.getInstance(configuration, asm, keyTypes, entityColumnFilter);
 
-            this.cursor = new SampleByInterpolateRecordCursor(configuration, recordFunctions, groupByFunctions, keyTypes, valueTypes, timezoneNameFunc, timezoneNameFuncPos, offsetFunc, offsetFuncPos);
+            this.cursor = new SampleByInterpolateRecordCursor(configuration, recordFunctions, groupByFunctions, keyTypes, valueTypes, timestampType, timezoneNameFunc, timezoneNameFuncPos, offsetFunc, offsetFuncPos, sampleFromFunc, sampleToFunc);
         } catch (Throwable th) {
-            close();
+            Misc.free(this, th);
             throw th;
         }
     }
@@ -181,13 +212,18 @@ public class SampleByInterpolateRecordCursorFactory extends AbstractRecordCursor
         final RecordCursor baseCursor = base.getCursor(executionContext);
         try {
             // init all record functions for this cursor, in case functions require metadata and/or symbol tables
-            Function.init(recordFunctions, baseCursor, executionContext);
+            Function.init(recordFunctions, baseCursor, executionContext, null);
+        } catch (Throwable th) {
+            baseCursor.close();
+            throw th;
+        }
+
+        try {
             cursor.of(baseCursor, executionContext);
             return cursor;
-        } catch (Throwable e) {
-            baseCursor.close();
+        } catch (Throwable th) {
             cursor.close();
-            throw e;
+            throw th;
         }
     }
 
@@ -198,7 +234,7 @@ public class SampleByInterpolateRecordCursorFactory extends AbstractRecordCursor
 
     @Override
     public void toPlan(PlanSink sink) {
-        sink.type("SampleBy");
+        sink.type("Sample By");
         sink.attr("fill").val("linear");
         sink.optAttr("keys", GroupByRecordCursorFactory.getKeys(recordFunctions, getMetadata()));
         sink.optAttr("values", groupByFunctions, true);
@@ -215,18 +251,63 @@ public class SampleByInterpolateRecordCursorFactory extends AbstractRecordCursor
         return base.usesIndex();
     }
 
-    private void freeYData() {
+    private void freeYData(long yData) {
         if (yData != 0) {
-            yData = Unsafe.free(yData, yDataSize, MemoryTag.NATIVE_FUNC_RSS);
+            Unsafe.free(yData, yDataSize, MemoryTag.NATIVE_FUNC_RSS);
         }
     }
 
     @Override
     protected void _close() {
-        Misc.freeObjList(recordFunctions);
-        freeYData();
-        Misc.free(base);
-        Misc.free(cursor);
+        final RecordCursorFactory base = this.base;
+        this.base = null;
+        final SampleByInterpolateRecordCursor cursor = this.cursor;
+        this.cursor = null;
+        this.groupByFunctions = null;
+        this.groupByScalarFunctions = null;
+        this.groupByTwoPointFunctions = null;
+        this.interpolatorFunctions = null;
+        final Function offsetFunc = this.offsetFunc;
+        this.offsetFunc = null;
+        final ObjList<Function> recordFunctions = this.recordFunctions;
+        this.recordFunctions = null;
+        final Function sampleFromFunc = this.sampleFromFunc;
+        this.sampleFromFunc = null;
+        final Function sampleToFunc = this.sampleToFunc;
+        this.sampleToFunc = null;
+        this.storeYFunctions = null;
+        final Function timezoneNameFunc = this.timezoneNameFunc;
+        this.timezoneNameFunc = null;
+        final long yData = this.yData;
+        this.yData = 0;
+
+        Throwable failure = Misc.freeObjListBestEffort(null, recordFunctions);
+        try {
+            freeYData(yData);
+        } catch (Throwable th) {
+            if (failure == null) {
+                failure = th;
+            } else if (th != failure) {
+                failure.addSuppressed(th);
+            }
+        }
+        failure = Misc.freeBestEffort(failure, base);
+        failure = Misc.freeBestEffort(failure, cursor);
+        // The factory is the lifetime owner of the temporal parameter functions (timezone,
+        // offset, FROM, TO); the cursor only borrows them across the executions of this cached
+        // factory. The generator accepts runtime-constant expressions here, which may own child
+        // functions, so they must be closed exactly once.
+        failure = Misc.freeBestEffort(failure, timezoneNameFunc);
+        if (offsetFunc != timezoneNameFunc) {
+            failure = Misc.freeBestEffort(failure, offsetFunc);
+        }
+        if (sampleFromFunc != timezoneNameFunc && sampleFromFunc != offsetFunc) {
+            failure = Misc.freeBestEffort(failure, sampleFromFunc);
+        }
+        if (sampleToFunc != timezoneNameFunc && sampleToFunc != offsetFunc && sampleToFunc != sampleFromFunc) {
+            failure = Misc.freeBestEffort(failure, sampleToFunc);
+        }
+        CairoException.rethrowCleanupFailure(failure);
     }
 
     private class SampleByInterpolateRecordCursor extends VirtualFunctionSkewedSymbolRecordCursor {
@@ -235,13 +316,16 @@ public class SampleByInterpolateRecordCursorFactory extends AbstractRecordCursor
         private final Map dataMap;
         private final Function offsetFunc;
         private final int offsetFuncPos;
+        private final Function sampleFromFunc;
+        private final int sampleFromFuncType;
+        private final Function sampleToFunc;
+        private final TimestampDriver timestampDriver;
         private final Function timezoneNameFunc;
         private final int timezoneNameFuncPos;
         private boolean areTimestampsInitialized;
         private SqlExecutionCircuitBreaker circuitBreaker;
         private long fixedOffset;
         private long hiSample = -1;
-        private boolean isHasNextPending;
         private boolean isMapBuilt;
         private boolean isMapFilled;
         private boolean isMapInitialized;
@@ -259,76 +343,93 @@ public class SampleByInterpolateRecordCursorFactory extends AbstractRecordCursor
                 ObjList<GroupByFunction> groupByFunctions,
                 @Transient @NotNull ArrayColumnTypes keyTypes,
                 @Transient @NotNull ArrayColumnTypes valueTypes,
+                int timestampType,
                 Function timezoneNameFunc,
                 int timezoneNameFuncPos,
                 Function offsetFunc,
-                int offsetFuncPos
+                int offsetFuncPos,
+                Function sampleFromFunc,
+                Function sampleToFunc
         ) {
             super(functions);
             try {
-                isOpen = true;
+                // Lazy variants (openOnInit=false): start closed so of() allocates the backing
+                // under the bound MemoryTracker on the first cursor, keeping the per-query counter
+                // balanced between malloc and the matching free at cursor close.
+                isOpen = false;
                 // this is the map itself, which we must not forget to free when factory closes
-                recordKeyMap = MapFactory.createOrderedMap(configuration, keyTypes);
+                recordKeyMap = MapFactory.createOrderedMap(configuration, keyTypes, null, false);
                 // data map will contain rounded timestamp value as last key column
-                keyTypes.add(ColumnType.TIMESTAMP);
-                dataMap = MapFactory.createOrderedMap(configuration, keyTypes, valueTypes);
-                allocator = GroupByAllocatorFactory.createThreadUnsafeAllocator(configuration);
+                keyTypes.add(timestampType);
+                dataMap = MapFactory.createOrderedMap(configuration, keyTypes, valueTypes, false);
+                allocator = GroupByAllocatorFactory.createAllocator(configuration, false);
                 GroupByUtils.setAllocator(groupByFunctions, allocator);
 
                 this.timezoneNameFunc = timezoneNameFunc;
                 this.timezoneNameFuncPos = timezoneNameFuncPos;
                 this.offsetFunc = offsetFunc;
                 this.offsetFuncPos = offsetFuncPos;
+                this.sampleFromFunc = sampleFromFunc;
+                this.sampleToFunc = sampleToFunc;
+                this.timestampDriver = ColumnType.getTimestampDriver(timestampType);
+                this.sampleFromFuncType = ColumnType.getTimestampType(sampleFromFunc.getType());
             } catch (Throwable th) {
-                close();
+                Misc.free(this, th);
                 throw th;
             }
         }
 
         @Override
         public void close() {
+            super.close();
             if (isOpen) {
                 isOpen = false;
-                recordKeyMap.close();
-                dataMap.close();
-                allocator.close();
+                Misc.free(recordKeyMap);
+                Misc.free(dataMap);
+                Misc.free(allocator);
                 Misc.clearObjList(groupByFunctions);
                 super.close();
             }
-            Misc.clear(timezoneNameFunc);
-            Misc.free(timezoneNameFunc);
-            Misc.clear(offsetFunc);
-            Misc.free(offsetFunc);
+            // The temporal parameter functions (timezone, offset, FROM, TO) are borrowed from
+            // the owning factory, which closes them exactly once at teardown; per-execution
+            // cursor close must leave them usable for the next execution of the cached factory.
         }
 
         @Override
         public boolean hasNext() {
-            if (!isMapBuilt) {
-                buildMap();
-                isMapBuilt = true;
-            }
+            buildMapConditionally();
             return super.hasNext();
         }
 
         public void of(RecordCursor managedCursor, SqlExecutionContext executionContext) throws SqlException {
+            super.of(managedCursor, dataMap.getCursor());
             if (!isOpen) {
                 isOpen = true;
+                recordKeyMap.setMemoryTracker(executionContext.getMemoryTracker());
                 recordKeyMap.reopen();
+                dataMap.setMemoryTracker(executionContext.getMemoryTracker());
                 dataMap.reopen();
+                allocator.setMemoryTracker(executionContext.getMemoryTracker());
+                allocator.reopen();
             }
-            super.of(managedCursor, dataMap.getCursor());
             circuitBreaker = executionContext.getCircuitBreaker();
             managedRecord = managedCursor.getRecord();
             loSample = -1;
             hiSample = -1;
             prevSample = -1;
             rowId = 0;
-            isHasNextPending = false;
             isMapInitialized = false;
             isMapFilled = false;
             isMapBuilt = false;
             parseParams(this, executionContext);
+            sampleFromFunc.init(managedCursor, executionContext);
+            sampleToFunc.init(managedCursor, executionContext);
             areTimestampsInitialized = false;
+        }
+
+        @Override
+        public long preComputedStateSize() {
+            return isMapBuilt ? 1 : 0;
         }
 
         @Override
@@ -347,7 +448,6 @@ public class SampleByInterpolateRecordCursorFactory extends AbstractRecordCursor
                 hiSample = -1;
                 prevSample = -1;
                 rowId = 0;
-                isHasNextPending = false;
                 isMapInitialized = false;
                 isMapFilled = false;
             }
@@ -496,6 +596,13 @@ public class SampleByInterpolateRecordCursorFactory extends AbstractRecordCursor
             baseCursor = dataMap.getCursor();
         }
 
+        private void buildMapConditionally() {
+            if (!isMapBuilt) {
+                buildMap();
+                isMapBuilt = true;
+            }
+        }
+
         private void computeYPoints(MapValue x1Value, MapValue x2value) {
             for (int i = 0; i < groupByScalarFunctionCount; i++) {
                 InterpolationUtil.StoreYFunction storeYFunction = storeYFunctions.getQuick(i);
@@ -537,49 +644,39 @@ public class SampleByInterpolateRecordCursorFactory extends AbstractRecordCursor
             do {
                 circuitBreaker.statefulThrowExceptionIfTripped();
 
-                if (!isHasNextPending) {
-                    // this seems inefficient, but we only double-sample
-                    // very first record and nothing else
-                    long sample = sampler.round(managedRecord.getTimestamp(timestampIndex));
-                    if (sample != prevSample) {
-                        // before we continue with next interval
-                        // we need to fill gaps in current interval
-                        // we will go over unique keys and attempt to
-                        // find them in data map with current timestamp
+                // this seems inefficient, but we only double-sample
+                // very first record and nothing else
+                long sample = sampler.round(managedRecord.getTimestamp(timestampIndex));
+                if (sample != prevSample) {
+                    // before we continue with next interval
+                    // we need to fill gaps in current interval
+                    // we will go over unique keys and attempt to
+                    // find them in data map with current timestamp
 
-                        fillGaps(prevSample, sample);
-                        prevSample = sample;
-                        GroupByUtils.toTop(groupByFunctions);
-                    }
-
-                    // same data group - evaluate group-by functions
-                    MapKey key = dataMap.withKey();
-                    mapSink.copy(managedRecord, key);
-                    key.putLong(sample);
-
-                    MapValue value = key.createValue();
-                    if (value.isNew()) {
-                        value.putByte(0, (byte) 0); // not a gap
-                        for (int i = 0; i < groupByFunctionCount; i++) {
-                            groupByFunctions.getQuick(i).computeFirst(value, managedRecord, rowId++);
-                        }
-                    } else {
-                        for (int i = 0; i < groupByFunctionCount; i++) {
-                            groupByFunctions.getQuick(i).computeNext(value, managedRecord, rowId++);
-                        }
-                    }
+                    fillGaps(prevSample, sample);
+                    prevSample = sample;
+                    GroupByUtils.toTop(groupByFunctions);
                 }
 
-                isHasNextPending = true;
-                boolean hasNext = managedCursor.hasNext();
-                isHasNextPending = false;
+                // same data group - evaluate group-by functions
+                MapKey key = dataMap.withKey();
+                mapSink.copy(managedRecord, key);
+                key.putLong(sample);
 
-                if (!hasNext) {
-                    hiSample = sampler.nextTimestamp(prevSample);
-                    break;
+                MapValue value = key.createValue();
+                if (value.isNew()) {
+                    value.putByte(0, (byte) 0); // not a gap
+                    for (int i = 0; i < groupByFunctionCount; i++) {
+                        groupByFunctions.getQuick(i).computeFirst(value, managedRecord, rowId++);
+                    }
+                } else {
+                    for (int i = 0; i < groupByFunctionCount; i++) {
+                        groupByFunctions.getQuick(i).computeNext(value, managedRecord, rowId++);
+                    }
                 }
-            } while (true);
+            } while (managedCursor.hasNext());
 
+            hiSample = sampler.nextTimestamp(prevSample);
             // fill gaps if any at the end of base cursor
             fillGaps(prevSample, hiSample);
         }
@@ -692,7 +789,13 @@ public class SampleByInterpolateRecordCursorFactory extends AbstractRecordCursor
                 // this is the default path, we align time intervals to the first observation
                 sampler.setStart(timestamp);
             } else {
-                sampler.setStart(fixedOffset != Long.MIN_VALUE ? fixedOffset : 0L);
+                // FROM-TO may apply to align to calendar queries, fixing the lower bound.
+                if (sampleFromFunc != timestampDriver.getTimestampConstantNull()) {
+                    long from = sampleFromFunc.getTimestamp(null);
+                    sampler.setStart(from != Long.MIN_VALUE ? timestampDriver.from(from, sampleFromFuncType) : 0);
+                } else {
+                    sampler.setOffset(fixedOffset != Long.MIN_VALUE ? fixedOffset : 0L);
+                }
             }
             prevSample = sampler.round(timestamp);
             loSample = prevSample; // the lowest timestamp value
@@ -707,17 +810,17 @@ public class SampleByInterpolateRecordCursorFactory extends AbstractRecordCursor
             final CharSequence tz = timezoneNameFunc.getStrA(null);
             if (tz != null) {
                 try {
-                    long opt = Timestamps.parseOffset(tz);
+                    long opt = Dates.parseOffset(tz);
                     if (opt == Long.MIN_VALUE) {
                         // this is timezone name
                         // fixed rules means the timezone does not have historical or daylight time changes
-                        rules = TimestampFormatUtils.EN_LOCALE.getZoneRules(
-                                Numbers.decodeLowInt(TimestampFormatUtils.EN_LOCALE.matchZone(tz, 0, tz.length())),
-                                RESOLUTION_MICROS
+                        rules = DateLocaleFactory.EN_LOCALE.getZoneRules(
+                                Numbers.decodeLowInt(DateLocaleFactory.EN_LOCALE.matchZone(tz, 0, tz.length())),
+                                timestampDriver.getTZRuleResolution()
                         );
                     } else {
                         // here timezone is in numeric offset format
-                        tzOffset = Numbers.decodeLowInt(opt) * MINUTE_MICROS;
+                        tzOffset = timestampDriver.fromMinutes(Numbers.decodeLowInt(opt));
                     }
                 } catch (NumericException e) {
                     throw SqlException.$(timezoneNameFuncPos, "invalid timezone: ").put(tz);
@@ -728,12 +831,12 @@ public class SampleByInterpolateRecordCursorFactory extends AbstractRecordCursor
 
             final CharSequence offset = offsetFunc.getStrA(null);
             if (offset != null) {
-                final long val = Timestamps.parseOffset(offset);
+                final long val = Dates.parseOffset(offset);
                 if (val == Numbers.LONG_NULL) {
                     // bad value for offset
                     throw SqlException.$(offsetFuncPos, "invalid offset: ").put(offset);
                 }
-                fixedOffset = Numbers.decodeLowInt(val) * MINUTE_MICROS;
+                fixedOffset = timestampDriver.fromMinutes(Numbers.decodeLowInt(val));
             } else {
                 fixedOffset = Long.MIN_VALUE;
             }

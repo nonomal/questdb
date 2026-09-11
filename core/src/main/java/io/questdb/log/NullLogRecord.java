@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,6 +24,7 @@
 
 package io.questdb.log;
 
+import io.questdb.cairo.TimestampDriver;
 import io.questdb.std.str.DirectUtf8Sequence;
 import io.questdb.std.str.Sinkable;
 import io.questdb.std.str.Utf8Sequence;
@@ -34,8 +35,8 @@ import org.jetbrains.annotations.Nullable;
 import java.io.File;
 
 final class NullLogRecord implements LogRecord {
-
     public static final NullLogRecord INSTANCE = new NullLogRecord();
+    private int[] ryuE10;
 
     private NullLogRecord() {
     }
@@ -56,11 +57,6 @@ final class NullLogRecord implements LogRecord {
 
     @Override
     public LogRecord $(@Nullable DirectUtf8Sequence sequence) {
-        return this;
-    }
-
-    @Override
-    public LogRecord $(@NotNull CharSequence sequence, int lo, int hi) {
         return this;
     }
 
@@ -105,11 +101,6 @@ final class NullLogRecord implements LogRecord {
     }
 
     @Override
-    public LogRecord $uuid(long lo, long hi) {
-        return this;
-    }
-
-    @Override
     public LogRecord $(@Nullable Sinkable x) {
         return this;
     }
@@ -135,7 +126,37 @@ final class NullLogRecord implements LogRecord {
     }
 
     @Override
+    public LogRecord $safe(@NotNull CharSequence sequence, int lo, int hi) {
+        return this;
+    }
+
+    @Override
+    public LogRecord $safe(@Nullable DirectUtf8Sequence sequence) {
+        return this;
+    }
+
+    @Override
+    public LogRecord $safe(@Nullable Utf8Sequence sequence) {
+        return this;
+    }
+
+    @Override
+    public LogRecord $safe(long lo, long hi) {
+        return this;
+    }
+
+    @Override
+    public LogRecord $safe(@Nullable CharSequence sequence) {
+        return this;
+    }
+
+    @Override
     public LogRecord $size(long memoryBytes) {
+        return this;
+    }
+
+    @Override
+    public LogRecord $substr(int from, @Nullable DirectUtf8Sequence sequence) {
         return this;
     }
 
@@ -145,7 +166,12 @@ final class NullLogRecord implements LogRecord {
     }
 
     @Override
-    public LogRecord $utf8(long lo, long hi) {
+    public LogRecord $ts(TimestampDriver driver, long x) {
+        return this;
+    }
+
+    @Override
+    public LogRecord $uuid(long lo, long hi) {
         return this;
     }
 
@@ -180,12 +206,15 @@ final class NullLogRecord implements LogRecord {
     }
 
     @Override
-    public LogRecord ts() {
-        return this;
+    public int[] ryuScratch() {
+        if (ryuE10 == null) {
+            ryuE10 = new int[1];
+        }
+        return ryuE10;
     }
 
     @Override
-    public LogRecord utf8(@Nullable CharSequence sequence) {
+    public LogRecord ts() {
         return this;
     }
 }

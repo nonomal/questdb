@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -31,61 +31,51 @@ public class FloorFunctionFactoryTest extends AbstractCairoTest {
 
     @Test
     public void testDoubleNegative() throws Exception {
-        assertQuery(
-                "floor\n" +
-                        "-14.0\n",
-                "select floor(-13.1)",
-                null,
-                true,
-                true
-        );
+        assertQuery("select floor(-13.1)")
+                .expectSize()
+                .returns("""
+                        floor
+                        -14.0
+                        """);
     }
 
     @Test
     public void testDoublePositive() throws Exception {
-        assertQuery(
-                "floor\n" +
-                        "13.0\n",
-                "select floor(13.1)",
-                null,
-                true,
-                true
-        );
+        assertQuery("select floor(13.1)")
+                .expectSize()
+                .returns("""
+                        floor
+                        13.0
+                        """);
     }
 
     @Test
     public void testFloatNegative() throws Exception {
-        assertQuery(
-                "floor\n" +
-                        "-14.0000\n",
-                "select floor(-13.1f)",
-                null,
-                true,
-                true
-        );
+        assertQuery("select floor(-13.1f)")
+                .expectSize()
+                .returns("""
+                        floor
+                        -14.0
+                        """);
     }
 
     @Test
     public void testFloatPositive() throws Exception {
-        assertQuery(
-                "floor\n" +
-                        "13.0000\n",
-                "select floor(13.1f)",
-                null,
-                true,
-                true
-        );
+        assertQuery("select floor(13.1f)")
+                .expectSize()
+                .returns("""
+                        floor
+                        13.0
+                        """);
     }
 
     @Test
     public void testNaN() throws Exception {
-        assertQuery(
-                "floor\n" +
-                        "null\n",
-                "select floor(NaN)",
-                null,
-                true,
-                true
-        );
+        assertQuery("select floor(NaN)")
+                .expectSize()
+                .returns("""
+                        floor
+                        null
+                        """);
     }
 }

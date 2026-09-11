@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -27,6 +27,8 @@ package io.questdb.test.cutlass.http.line;
 import io.questdb.log.Log;
 import io.questdb.log.LogFactory;
 import io.questdb.std.Os;
+import io.questdb.std.Rnd;
+import io.questdb.test.tools.TestUtils;
 import org.junit.Test;
 
 public class LineHttpReceiverFuzzTest extends AbstractLineHttpFuzzTest {
@@ -35,8 +37,12 @@ public class LineHttpReceiverFuzzTest extends AbstractLineHttpFuzzTest {
 
     @Test
     public void testAddColumns() throws Exception {
-        initLoadParameters(15, 2, 2, 5, 75);
-        initFuzzParameters(-1, -1, -1, 4, -1, false, true, false, 0.05);
+        Rnd rnd = TestUtils.generateRandom(LOG);
+        initLoadParameters(15 + rnd.nextInt(100), 5 + rnd.nextInt(5),
+                2 + rnd.nextInt(Os.isWindows() ? 5 : 20), 1 + rnd.nextInt(4),
+                rnd.nextInt(75));
+
+        initFuzzParameters(-1, -1, 1, 1 + rnd.nextInt(3), -1, false, true, false, 0.05);
         runTest();
     }
 
@@ -85,7 +91,7 @@ public class LineHttpReceiverFuzzTest extends AbstractLineHttpFuzzTest {
     @Test
     public void testDuplicatesReorderingColumnsSendSymbolsWithSpace() throws Exception {
         initLoadParameters(100, Os.isWindows() ? 3 : 5, 5, 5, 50);
-        initFuzzParameters(4, 4, -1, -1, -1, true, true, false, 0.05);
+        initFuzzParameters(4, 4, -1, -1, -1, true, true, true, 0.05);
         runTest();
     }
 

@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -27,31 +27,49 @@ package io.questdb.cairo.wal;
 import io.questdb.cairo.CairoException;
 import io.questdb.cairo.ColumnType;
 import io.questdb.cairo.VarcharTypeDriver;
+import io.questdb.cairo.arr.ArrayView;
+import io.questdb.cairo.arr.BorrowedArray;
 import io.questdb.cairo.sql.BindVariableService;
 import io.questdb.cairo.vm.Vm;
-import io.questdb.cairo.vm.api.MemoryMR;
+import io.questdb.cairo.vm.api.MemoryCMR;
 import io.questdb.griffin.SqlException;
 import io.questdb.std.BinarySequence;
 import io.questdb.std.Chars;
+import io.questdb.std.Decimals;
+import io.questdb.std.DirectByteSequenceView;
+import io.questdb.std.LongList;
+import io.questdb.std.LowerCaseCharSequenceHashSet;
+import io.questdb.std.LowerCaseCharSequenceObjHashMap;
+import io.questdb.std.Numbers;
+import io.questdb.std.ObjectPool;
 import io.questdb.std.str.StringSink;
 import io.questdb.std.str.Utf8Sequence;
 
 import static io.questdb.cairo.wal.WalTxnType.*;
-import static io.questdb.cairo.wal.WalUtils.WALE_HEADER_SIZE;
+import static io.questdb.cairo.wal.WalUtils.*;
 
 public class WalEventCursor {
     public static final long END_OF_EVENTS = -1L;
-
+    private static final int DEDUP_MODE_OFFSET = Byte.BYTES;
+    private static final int REPLACE_RANGE_HI_OFFSET = DEDUP_MODE_OFFSET + Long.BYTES;
+    private static final int REPLACE_RANGE_LO_OFFSET = REPLACE_RANGE_HI_OFFSET + Long.BYTES;
+    private static final int REPLACE_RANGE_EXTRA_OFFSET = REPLACE_RANGE_LO_OFFSET + Long.BYTES;
+    private static final int DEDUP_FOOTER_SIZE = REPLACE_RANGE_EXTRA_OFFSET;
     private final DataInfo dataInfo = new DataInfo();
-    private final MemoryMR eventMem;
+    private final MemoryCMR eventMem;
+    private final LiveViewDataInfo lvDataInfo = new LiveViewDataInfo();
+    private final MatViewDataInfo mvDataInfo = new MatViewDataInfo();
+    private final MatViewInvalidationInfo mvInvalidationInfo = new MatViewInvalidationInfo();
     private final SqlInfo sqlInfo = new SqlInfo();
+    private final UnknownInfo unknownInfo = new UnknownInfo();
+    private final ViewDefinitionInfo viewDefinitionInfo = new ViewDefinitionInfo();
     private long memSize;
     private long nextOffset = Integer.BYTES;
     private long offset = Integer.BYTES; // skip wal meta version
     private long txn = END_OF_EVENTS;
     private byte type = NONE;
 
-    public WalEventCursor(MemoryMR eventMem) {
+    public WalEventCursor(MemoryCMR eventMem) {
         this.eventMem = eventMem;
     }
 
@@ -77,10 +95,40 @@ public class WalEventCursor {
     }
 
     public DataInfo getDataInfo() {
-        if (type != DATA) {
+        if (!WalTxnType.isDataType(type)) {
             throw CairoException.critical(CairoException.ILLEGAL_OPERATION).put("WAL event type is not DATA, type=").put(type);
         }
-        return dataInfo;
+        switch (type) {
+            case DATA:
+                return dataInfo;
+            case MAT_VIEW_DATA:
+                return mvDataInfo;
+            case LIVE_VIEW_DATA:
+                return lvDataInfo;
+            default:
+                throw CairoException.critical(CairoException.ILLEGAL_OPERATION).put("unexpected WAL data type=").put(type);
+        }
+    }
+
+    public LiveViewDataInfo getLiveViewDataInfo() {
+        if (type != LIVE_VIEW_DATA) {
+            throw CairoException.critical(CairoException.ILLEGAL_OPERATION).put("WAL event type is not LIVE_VIEW_DATA, type=").put(type);
+        }
+        return lvDataInfo;
+    }
+
+    public MatViewDataInfo getMatViewDataInfo() {
+        if (type != MAT_VIEW_DATA) {
+            throw CairoException.critical(CairoException.ILLEGAL_OPERATION).put("WAL event type is not MAT_VIEW_DATA, type=").put(type);
+        }
+        return mvDataInfo;
+    }
+
+    public MatViewInvalidationInfo getMatViewInvalidationInfo() {
+        if (type != MAT_VIEW_INVALIDATE) {
+            throw CairoException.critical(CairoException.ILLEGAL_OPERATION).put("WAL event type is not MAT_VIEW_INVALIDATION, type=").put(type);
+        }
+        return mvInvalidationInfo;
     }
 
     public SqlInfo getSqlInfo() {
@@ -96,6 +144,20 @@ public class WalEventCursor {
 
     public byte getType() {
         return type;
+    }
+
+    public UnknownInfo getUnknownInfo() {
+        if (!WalTxnType.isDownstreamType(type)) {
+            throw CairoException.critical(CairoException.ILLEGAL_OPERATION).put("WAL event type is not unknown, type=").put(type);
+        }
+        return unknownInfo;
+    }
+
+    public ViewDefinitionInfo getViewDefinitionInfo() {
+        if (type != VIEW_DEFINITION) {
+            throw CairoException.critical(CairoException.ILLEGAL_OPERATION).put("WAL event type is not VIEW_DEFINITION, type=").put(type);
+        }
+        return viewDefinitionInfo;
     }
 
     public boolean hasNext() {
@@ -126,6 +188,33 @@ public class WalEventCursor {
         type = WalTxnType.NONE;
     }
 
+    /**
+     * Positions the cursor so the next {@link #hasNext()} reads the record at
+     * {@code resumeOffset}, which must be a value previously returned by
+     * {@link #resumeOffset()} for this segment's event file. Extends the mapping to
+     * cover that offset first, because a fresh {@code WalEventReader.of(path, -1)}
+     * maps only the header. Used by {@link WalReader} to fold only newly-appended
+     * events into the symbol maps across same-segment rebinds, since WAL event files
+     * are append-only (new records overwrite the trailing end-of-events marker).
+     */
+    void resumeFrom(long resumeOffset) {
+        eventMem.extend(resumeOffset + Integer.BYTES);
+        memSize = eventMem.size();
+        nextOffset = resumeOffset;
+        txn = END_OF_EVENTS;
+        type = WalTxnType.NONE;
+    }
+
+    /**
+     * The offset the next {@link #hasNext()} would read from. After a walk stops at
+     * the trailing end-of-events marker this is the marker's position - exactly where
+     * the next appended record lands - so it is a valid resume point for a later
+     * {@link #resumeFrom(long)}.
+     */
+    long resumeOffset() {
+        return nextOffset;
+    }
+
     private void checkMemSize(long requiredBytes) {
         if (memSize < offset + requiredBytes) {
             throw CairoException.critical(0).put("WAL event file is too small, size=").put(memSize)
@@ -133,14 +222,25 @@ public class WalEventCursor {
         }
     }
 
-    private BinarySequence readBin() {
+    private ArrayView readArray(BorrowedArray array) {
+        checkMemSize(Long.BYTES);
+        long totalSize = eventMem.getLong(offset);
+        if (totalSize < 0) {
+            totalSize = 0;
+        }
+        checkMemSize(totalSize + Long.BYTES);
+        eventMem.getArray(offset, array);
+        offset += Long.BYTES + totalSize;
+        return array;
+    }
+
+    private BinarySequence readBin(DirectByteSequenceView view) {
         checkMemSize(Long.BYTES);
         final long binLength = eventMem.getBinLen(offset);
-
         checkMemSize(binLength);
-        final BinarySequence value = eventMem.getBin(offset);
+        view.of((DirectByteSequenceView) eventMem.getBin(offset));
         offset += binLength + Long.BYTES;
-        return value;
+        return view;
     }
 
     private boolean readBool() {
@@ -162,6 +262,74 @@ public class WalEventCursor {
         final char value = eventMem.getChar(offset);
         offset += Character.BYTES;
         return value;
+    }
+
+    /**
+     * Reads a decimal of the given type and binds it, either by index when {@code name} is null, or by name.
+     * Stored values are sign-extended to 256 bits, stored nulls are turned back into the 256-bit null.
+     */
+    private void readDecimal(BindVariableService bindVariableService, int index, CharSequence name, int type) throws SqlException {
+        long hh = Decimals.DECIMAL256_HH_NULL;
+        long hl = Decimals.DECIMAL256_HL_NULL;
+        long lh = Decimals.DECIMAL256_LH_NULL;
+        long ll = Decimals.DECIMAL256_LL_NULL;
+        switch (ColumnType.tagOf(type)) {
+            case ColumnType.DECIMAL8: {
+                final byte value = readByte();
+                if (value != Decimals.DECIMAL8_NULL) {
+                    hh = hl = lh = value < 0 ? -1 : 0;
+                    ll = value;
+                }
+                break;
+            }
+            case ColumnType.DECIMAL16: {
+                final short value = readShort();
+                if (value != Decimals.DECIMAL16_NULL) {
+                    hh = hl = lh = value < 0 ? -1 : 0;
+                    ll = value;
+                }
+                break;
+            }
+            case ColumnType.DECIMAL32: {
+                final int value = readInt();
+                if (value != Decimals.DECIMAL32_NULL) {
+                    hh = hl = lh = value < 0 ? -1 : 0;
+                    ll = value;
+                }
+                break;
+            }
+            case ColumnType.DECIMAL64: {
+                final long value = readLong();
+                if (value != Decimals.DECIMAL64_NULL) {
+                    hh = hl = lh = value < 0 ? -1 : 0;
+                    ll = value;
+                }
+                break;
+            }
+            case ColumnType.DECIMAL128: {
+                final long hi = readLong();
+                final long lo = readLong();
+                if (hi != Decimals.DECIMAL128_HI_NULL || lo != Decimals.DECIMAL128_LO_NULL) {
+                    hh = hl = hi < 0 ? -1 : 0;
+                    lh = hi;
+                    ll = lo;
+                }
+                break;
+            }
+            case ColumnType.DECIMAL256:
+                hh = readLong();
+                hl = readLong();
+                lh = readLong();
+                ll = readLong();
+                break;
+            default:
+                throw new UnsupportedOperationException("unsupported column type: " + ColumnType.nameOf(type));
+        }
+        if (name != null) {
+            bindVariableService.setDecimal(name, hh, hl, lh, ll, type);
+        } else {
+            bindVariableService.setDecimal(index, hh, hl, lh, ll, type);
+        }
     }
 
     private double readDouble() {
@@ -198,13 +366,31 @@ public class WalEventCursor {
             case DATA:
                 dataInfo.read();
                 break;
+            case MAT_VIEW_DATA:
+                mvDataInfo.read();
+                break;
+            case LIVE_VIEW_DATA:
+                lvDataInfo.read();
+                break;
             case SQL:
                 sqlInfo.read();
                 break;
             case TRUNCATE:
                 break;
+            case MAT_VIEW_INVALIDATE:
+                mvInvalidationInfo.read();
+                break;
+            case VIEW_DEFINITION:
+                viewDefinitionInfo.read();
+                break;
             default:
-                throw CairoException.critical(CairoException.METADATA_VALIDATION).put("Unsupported WAL event type: ").put(type);
+                // Only the reserved downstream range 64..127 is a valid unknown payload;
+                // any other unhandled byte is a corrupt record, not a custom event.
+                if (!WalTxnType.isDownstreamType(type)) {
+                    throw CairoException.critical(CairoException.METADATA_VALIDATION).put("Unsupported WAL event type: ").put(type);
+                }
+                unknownInfo.read();
+                break;
         }
     }
 
@@ -226,8 +412,18 @@ public class WalEventCursor {
         return value;
     }
 
+    private long readStrOffset() {
+        checkMemSize(Integer.BYTES);
+        final int strLength = eventMem.getStrLen(offset);
+        final long storageLength = strLength > 0 ? Vm.getStorageLength(strLength) : Integer.BYTES;
+
+        checkMemSize(storageLength);
+        offset += storageLength;
+        return offset - storageLength;
+    }
+
     private Utf8Sequence readVarchar() {
-        Utf8Sequence seq = VarcharTypeDriver.getPlainValue(eventMem, offset, 1);
+        Utf8Sequence seq = VarcharTypeDriver.getPlainValue(eventMem, offset);
         if (seq == null) {
             offset += Integer.BYTES;
             return null;
@@ -245,9 +441,8 @@ public class WalEventCursor {
             this.nextOffset = offset + size;
             this.txn = readLong();
             this.memSize = eventMem.size();
-            this.readRecord();
-        } else {
-            reset();
+
+            readRecord();
         }
     }
 
@@ -270,18 +465,27 @@ public class WalEventCursor {
             entry.clear();
             return null;
         }
-        final CharSequence symbol = readStr();
-        entry.of(key, symbol);
+        final long symbolOffset = readStrOffset();
+        entry.of(key, symbolOffset, eventMem);
         return entry;
     }
 
     public class DataInfo implements SymbolMapDiffCursor {
         private final SymbolMapDiffImpl symbolMapDiff = new SymbolMapDiffImpl(WalEventCursor.this);
+        // extra field, for now used only in mat views
+        protected long replaceRangeExtra;
+        private byte dedupMode;
         private long endRowID;
         private long maxTimestamp;
         private long minTimestamp;
         private boolean outOfOrder;
+        private long replaceRangeTsHi;
+        private long replaceRangeTsLow;
         private long startRowID;
+
+        public byte getDedupMode() {
+            return dedupMode;
+        }
 
         public long getEndRowID() {
             return endRowID;
@@ -295,6 +499,14 @@ public class WalEventCursor {
             return minTimestamp;
         }
 
+        public long getReplaceRangeTsHi() {
+            return replaceRangeTsHi;
+        }
+
+        public long getReplaceRangeTsLow() {
+            return replaceRangeTsLow;
+        }
+
         public long getStartRowID() {
             return startRowID;
         }
@@ -303,20 +515,157 @@ public class WalEventCursor {
             return outOfOrder;
         }
 
+        @Override
         public SymbolMapDiff nextSymbolMapDiff() {
             return readNextSymbolMapDiff(symbolMapDiff);
         }
 
-        private void read() {
+        protected void read() {
             startRowID = readLong();
             endRowID = readLong();
             minTimestamp = readLong();
             maxTimestamp = readLong();
             outOfOrder = readBool();
+
+            // Read the footer that may contains replace range timestamps and dedup mode
+            // The footer is not written when the dedup mode is default
+            // Format:
+            // [replaceRangeTsLow:long, replaceRangeTsHi:long, dedupMode:byte]
+            // Length of this footer is 2 * Long.BYTES + Byte.BYTES
+            dedupMode = WAL_DEDUP_MODE_DEFAULT;
+            replaceRangeTsLow = 0;
+            replaceRangeTsHi = 0;
+
+            if (nextOffset - offset >= Integer.BYTES + DEDUP_FOOTER_SIZE) {
+                // This is big enough to contain the footer.
+                // But it can be still populated with symbol map values instead of the footer.
+                // Check that the last symbol map diff entry contains the END of symbol diffs marker.
+
+                // Read column index before the footer.
+                int symbolColIndex = eventMem.getInt(nextOffset - (Integer.BYTES + DEDUP_FOOTER_SIZE));
+
+                if (symbolColIndex == SymbolMapDiffImpl.END_OF_SYMBOL_DIFFS) {
+                    dedupMode = eventMem.getByte(nextOffset - DEDUP_MODE_OFFSET);
+                    if (dedupMode >= 0 && dedupMode <= WAL_DEDUP_MODE_MAX) {
+                        replaceRangeExtra = eventMem.getLong(nextOffset - REPLACE_RANGE_EXTRA_OFFSET);
+                        replaceRangeTsLow = eventMem.getLong(nextOffset - REPLACE_RANGE_LO_OFFSET);
+                        replaceRangeTsHi = eventMem.getLong(nextOffset - REPLACE_RANGE_HI_OFFSET);
+                    } else {
+                        // This WAL record does not have dedup mode recognised, clean unrecognised mode value
+                        dedupMode = WAL_DEDUP_MODE_DEFAULT;
+                    }
+                }
+            }
+        }
+    }
+
+    public class LiveViewDataInfo extends DataInfo {
+        private long maxBaseSeqTxnInBlock;
+
+        public long getMaxBaseSeqTxnInBlock() {
+            return maxBaseSeqTxnInBlock;
+        }
+
+        @Override
+        protected void read() {
+            super.read();
+            // The single LV-specific extra field; symbol map diffs follow.
+            maxBaseSeqTxnInBlock = readLong();
+        }
+    }
+
+    public class MatViewDataInfo extends DataInfo {
+        private long lastRefreshBaseTableTxn;
+        private long lastRefreshTimestampUs;
+
+        public long getLastPeriodHi() {
+            return replaceRangeExtra;
+        }
+
+        public long getLastRefreshBaseTableTxn() {
+            return lastRefreshBaseTableTxn;
+        }
+
+        public long getLastRefreshTimestampUs() {
+            return lastRefreshTimestampUs;
+        }
+
+        @Override
+        protected void read() {
+            super.read();
+            // read the extra fields in the fixed part
+            // symbol map will start after this
+            lastRefreshBaseTableTxn = readLong();
+            lastRefreshTimestampUs = readLong();
+        }
+    }
+
+    public class MatViewInvalidationInfo {
+        private final StringSink error = new StringSink();
+        private final LongList refreshIntervals = new LongList();
+        private boolean invalid;
+        private long lastPeriodHi;
+        private long lastRefreshBaseTableTxn;
+        private long lastRefreshTimestampUs;
+        private long refreshIntervalsBaseTxn;
+
+        public CharSequence getInvalidationReason() {
+            return error;
+        }
+
+        public long getLastPeriodHi() {
+            return lastPeriodHi;
+        }
+
+        public long getLastRefreshBaseTableTxn() {
+            return lastRefreshBaseTableTxn;
+        }
+
+        public long getLastRefreshTimestampUs() {
+            return lastRefreshTimestampUs;
+        }
+
+        public LongList getRefreshIntervals() {
+            return refreshIntervals;
+        }
+
+        public long getRefreshIntervalsBaseTxn() {
+            return refreshIntervalsBaseTxn;
+        }
+
+        public boolean isInvalid() {
+            return invalid;
+        }
+
+        private void read() {
+            lastRefreshBaseTableTxn = readLong();
+            lastRefreshTimestampUs = readLong();
+            invalid = readBool();
+            error.clear();
+            error.put(readStr());
+
+            if (nextOffset - offset >= Long.BYTES) {
+                lastPeriodHi = readLong();
+            } else {
+                lastPeriodHi = Numbers.LONG_NULL;
+            }
+
+            refreshIntervals.clear();
+            if (nextOffset - offset >= Long.BYTES + Integer.BYTES) {
+                refreshIntervalsBaseTxn = readLong();
+                final int intervalsLen = readInt();
+                for (int i = 0; i < intervalsLen; i++) {
+                    refreshIntervals.add(readLong());
+                }
+            } else {
+                refreshIntervalsBaseTxn = -1;
+            }
         }
     }
 
     public class SqlInfo {
+        private final ObjectPool<BorrowedArray> arrayViewPool = new ObjectPool<>(BorrowedArray::new, 1);
+        private final ObjectPool<DirectByteSequenceView> byteViewPool = new ObjectPool<>(DirectByteSequenceView::new, 1);
         private final StringSink sql = new StringSink();
         private int cmdType;
         private long rndSeed0;
@@ -387,7 +736,7 @@ public class WalEventCursor {
                         bindVariableService.setVarchar(i, readVarchar());
                         break;
                     case ColumnType.BINARY:
-                        bindVariableService.setBin(i, readBin());
+                        bindVariableService.setBin(i, readBin(byteViewPool.next()));
                         break;
                     case ColumnType.GEOBYTE:
                         bindVariableService.setGeoHash(i, readByte(), type);
@@ -402,9 +751,21 @@ public class WalEventCursor {
                         bindVariableService.setGeoHash(i, readLong(), type);
                         break;
                     case ColumnType.UUID:
-                        long lo = readLong();
-                        long hi = readLong();
-                        bindVariableService.setUuid(i, lo, hi);
+                        bindVariableService.setUuid(i, readLong(), readLong());
+                        break;
+                    case ColumnType.ARRAY:
+                        // Multiple arrayView objects might be bind to variables, and in `ArrayBindVariable`,
+                        // arrayView does not clone its meta information, so `arrayViewPool` is needed.
+                        // Same as `setBin`
+                        bindVariableService.setArray(i, readArray(arrayViewPool.next()));
+                        break;
+                    case ColumnType.DECIMAL8:
+                    case ColumnType.DECIMAL16:
+                    case ColumnType.DECIMAL32:
+                    case ColumnType.DECIMAL64:
+                    case ColumnType.DECIMAL128:
+                    case ColumnType.DECIMAL256:
+                        readDecimal(bindVariableService, i, null, type);
                         break;
                     default:
                         throw new UnsupportedOperationException("unsupported column type: " + ColumnType.nameOf(type));
@@ -453,7 +814,7 @@ public class WalEventCursor {
                         bindVariableService.setVarchar(name, readVarchar());
                         break;
                     case ColumnType.BINARY:
-                        bindVariableService.setBin(name, readBin());
+                        bindVariableService.setBin(name, readBin(byteViewPool.next()));
                         break;
                     case ColumnType.GEOBYTE:
                         bindVariableService.setGeoHash(name, readByte(), type);
@@ -470,6 +831,20 @@ public class WalEventCursor {
                     case ColumnType.UUID:
                         bindVariableService.setUuid(name, readLong(), readLong());
                         break;
+                    case ColumnType.ARRAY:
+                        // Multiple arrayView objects might be bind to variables, and in `ArrayBindVariable`,
+                        // arrayView does not clone its meta information, so `arrayViewPool` is needed.
+                        // Same as `setBin`
+                        bindVariableService.setArray(i, readArray(arrayViewPool.next()));
+                        break;
+                    case ColumnType.DECIMAL8:
+                    case ColumnType.DECIMAL16:
+                    case ColumnType.DECIMAL32:
+                    case ColumnType.DECIMAL64:
+                    case ColumnType.DECIMAL128:
+                    case ColumnType.DECIMAL256:
+                        readDecimal(bindVariableService, -1, name, type);
+                        break;
                     default:
                         throw new UnsupportedOperationException("unsupported column type: " + ColumnType.nameOf(type));
                 }
@@ -482,6 +857,74 @@ public class WalEventCursor {
             sql.put(readStr());
             rndSeed0 = readLong();
             rndSeed1 = readLong();
+            arrayViewPool.clear();
+            byteViewPool.clear();
+        }
+    }
+
+    public class UnknownInfo {
+        private long payloadAddr;
+        private long payloadSize;
+
+        public long getPayloadAddr() {
+            return payloadAddr;
+        }
+
+        public long getPayloadSize() {
+            return payloadSize;
+        }
+
+        public byte getType() {
+            return type;
+        }
+
+        private void read() {
+            if (nextOffset < offset) {
+                throw CairoException.critical(CairoException.METADATA_VALIDATION)
+                        .put("corrupt WAL event frame, payload size is negative [offset=").put(offset)
+                        .put(", nextOffset=").put(nextOffset).put(']');
+            }
+            payloadSize = nextOffset - offset;
+            checkMemSize(payloadSize);
+            payloadAddr = eventMem.addressOf(offset);
+            offset = nextOffset;
+        }
+    }
+
+    public class ViewDefinitionInfo {
+        private final StringSink sink = new StringSink();
+        private final LowerCaseCharSequenceObjHashMap<LowerCaseCharSequenceHashSet> viewDependencies = new LowerCaseCharSequenceObjHashMap<>();
+        private String viewSql;
+
+        public LowerCaseCharSequenceObjHashMap<LowerCaseCharSequenceHashSet> getViewDependencies() {
+            return viewDependencies;
+        }
+
+        public String getViewSql() {
+            return viewSql;
+        }
+
+        private void read() {
+            viewSql = readString();
+
+            viewDependencies.clear();
+            final int numOfDependencies = readInt();
+            for (int i = 0; i < numOfDependencies; i++) {
+                final String tableName = readString();
+                final int numOfColumns = readInt();
+                final LowerCaseCharSequenceHashSet columns = new LowerCaseCharSequenceHashSet();
+                for (int j = 0; j < numOfColumns; j++) {
+                    columns.add(readString());
+                }
+                // table and column names have to be string objects,
+                // they will be used in the view definition
+                viewDependencies.put(tableName, columns);
+            }
+        }
+
+        private String readString() {
+            sink.clear();
+            return sink.put(readStr()).toString();
         }
     }
 }

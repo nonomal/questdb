@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -26,18 +26,22 @@ package io.questdb.test.cutlass.line.tcp.load;
 
 import io.questdb.cairo.TableColumnMetadata;
 import io.questdb.cairo.TableReaderMetadata;
-import io.questdb.std.IntLongPriorityQueue;
+import io.questdb.std.IntLongSortedList;
 import io.questdb.std.ObjList;
 import io.questdb.std.Os;
 import io.questdb.std.Rnd;
 
 import java.util.concurrent.atomic.AtomicLong;
 
+import static io.questdb.cairo.ColumnType.BYTE;
 import static io.questdb.cairo.ColumnType.DOUBLE;
 import static io.questdb.cairo.ColumnType.FLOAT;
+import static io.questdb.cairo.ColumnType.INT;
+import static io.questdb.cairo.ColumnType.LONG;
+import static io.questdb.cairo.ColumnType.SHORT;
 
 public class TableData {
-    private final IntLongPriorityQueue index = new IntLongPriorityQueue();
+    private final IntLongSortedList index = new IntLongSortedList();
     private final ObjList<LineData> rows = new ObjList<>();
     private final CharSequence tableName;
     private final AtomicLong writePermits = new AtomicLong();
@@ -64,22 +68,26 @@ public class TableData {
     }
 
     public synchronized CharSequence generateRows(TableReaderMetadata metadata) {
+        return generateRows(metadata, false);
+    }
+
+    public synchronized CharSequence generateRows(TableReaderMetadata metadata, boolean includeAllRows) {
         final StringBuilder sb = new StringBuilder();
         final ObjList<CharSequence> columns = new ObjList<>();
         final ObjList<CharSequence> defaults = new ObjList<>();
         for (int i = 0, n = metadata.getColumnCount(); i < n; i++) {
             TableColumnMetadata colMetaData = metadata.getColumnMetadata(i);
-            CharSequence column = colMetaData.getName();
+            CharSequence column = colMetaData.getColumnName();
             columns.add(column);
-            defaults.add(getDefaultValue((short) colMetaData.getType()));
+            defaults.add(getDefaultValue((short) colMetaData.getColumnType()));
             sb.append(column).append(i == n - 1 ? "\n" : "\t");
         }
         for (int i = 0, n = rows.size(); i < n; i++) {
-            final LineData line = rows.get(index.popIndex());
-            if (line.isValid()) {
+            final LineData line = rows.get(index.peekIndex());
+            if (includeAllRows || line.isValid()) {
                 sb.append(line.getRow(columns, defaults));
             }
-            index.popValue();
+            index.pollValue();
         }
         return sb.toString();
     }
@@ -111,6 +119,13 @@ public class TableData {
     }
 
     public synchronized int size() {
+        return size(false);
+    }
+
+    public synchronized int size(boolean includeAllRows) {
+        if (includeAllRows) {
+            return rows.size();
+        }
         int count = 0;
         for (int i = 0, n = rows.size(); i < n; i++) {
             if (rows.get(i).isValid()) {
@@ -126,12 +141,15 @@ public class TableData {
     }
 
     private String getDefaultValue(short colType) {
-        switch (colType) {
-            case DOUBLE:
-            case FLOAT:
-                return "null";
-            default:
-                return "";
-        }
+        // NULL renderings must match CursorPrinter.printColumn for each type:
+        // - DOUBLE/FLOAT NULL: "null"
+        // - INT/LONG NULL: Numbers.append() prints "null"
+        // - BYTE/SHORT: no NULL sentinel; cursor renders the stored 0 as "0"
+        // - CHAR/UUID/LONG256/TIMESTAMP and string-like types: empty
+        return switch (colType) {
+            case DOUBLE, FLOAT, INT, LONG -> "null";
+            case BYTE, SHORT -> "0";
+            default -> "";
+        };
     }
 }

@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -116,7 +116,7 @@ public class ResponseTest {
                         n = bufRemaining;
                     }
                     for (int i = 0; i < n; i++) {
-                        Unsafe.getUnsafe().putByte(bufLo + i, (byte) frag.charAt(o + i));
+                        Unsafe.putByte(bufLo + i, (byte) frag.charAt(o + i));
                     }
                     return n;
                 }
@@ -129,7 +129,7 @@ public class ResponseTest {
                 Assert.assertNotNull(fragment);
                 sink.clear();
                 for (long p = rsp.lo(); p < rsp.hi(); p++) {
-                    sink.put((char) Unsafe.getUnsafe().getByte(p));
+                    sink.put((char) Unsafe.getByte(p));
                 }
                 TestUtils.assertEquals(expectedFragment, sink);
             }

@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -25,32 +25,33 @@
 package io.questdb.test.griffin.engine.functions.math;
 
 import io.questdb.griffin.FunctionFactory;
-import io.questdb.griffin.SqlException;
-import io.questdb.test.griffin.engine.AbstractFunctionFactoryTest;
 import io.questdb.griffin.engine.functions.math.AddIntFunctionFactory;
-import io.questdb.std.Numbers;
+import io.questdb.test.griffin.engine.AbstractFunctionFactoryTest;
 import org.junit.Test;
 
 public class AddIntFunctionFactoryTest extends AbstractFunctionFactoryTest {
 
     @Test
-    public void testLeftNull() throws SqlException {
-        call(Numbers.INT_NULL, 10).andAssert(Numbers.INT_NULL);
+    public void testLeftNull() throws Exception {
+        assertQuery("SELECT (null + 10)").expectSize().returns("column\nnull\n");
     }
 
     @Test
-    public void testOverflow() throws SqlException {
-        call(5, Integer.MAX_VALUE).andAssert(-2147483644);
+    public void testOverflow() throws Exception {
+        // A constant INT+INT that overflows wraps mod 2^32, exactly like the column/
+        // bind path - it is no longer folded to a wider LONG. Wider numeric/temporal
+        // casts still widen.
+        assertQuery("SELECT 2_147_483_647 + 3").expectSize().returns("column\n-2147483646\n");
     }
 
     @Test
-    public void testRightNull() throws SqlException {
-        call(4, Numbers.INT_NULL).andAssert(Numbers.INT_NULL);
+    public void testRightNull() throws Exception {
+        assertQuery("SELECT (4 + null)").expectSize().returns("column\nnull\n");
     }
 
     @Test
-    public void testSimple() throws SqlException {
-        call(5, 8).andAssert(13);
+    public void testSimple() throws Exception {
+        assertQuery("SELECT 10 + 5").expectSize().returns("column\n15\n");
     }
 
     @Override

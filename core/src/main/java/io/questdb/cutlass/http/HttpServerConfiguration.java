@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,28 +24,48 @@
 
 package io.questdb.cutlass.http;
 
-import io.questdb.cutlass.http.processors.JsonQueryProcessorConfiguration;
-import io.questdb.cutlass.http.processors.LineHttpProcessorConfiguration;
-import io.questdb.cutlass.http.processors.StaticContentProcessorConfiguration;
+import io.questdb.FactoryProvider;
 import io.questdb.mp.WorkerPoolConfiguration;
+import io.questdb.network.IODispatcherConfiguration;
+import io.questdb.std.ObjHashSet;
 
-public interface HttpServerConfiguration extends WorkerPoolConfiguration, HttpMinServerConfiguration {
-    String DEFAULT_PROCESSOR_URL = "*";
-    int MIN_SEND_BUFFER_SIZE = 128;
+public interface HttpServerConfiguration extends IODispatcherConfiguration, WorkerPoolConfiguration {
 
-    JsonQueryProcessorConfiguration getJsonQueryProcessorConfiguration();
+    default ObjHashSet<String> getContextPathLifecycle() {
+        return new ObjHashSet<>() {{
+            add("/lifecycle");
+        }};
+    }
 
-    LineHttpProcessorConfiguration getLineHttpProcessorConfiguration();
+    default ObjHashSet<String> getContextPathMetrics() {
+        return new ObjHashSet<>() {{
+            add("/metrics");
+        }};
+    }
 
-    String getPassword();
+    default ObjHashSet<String> getContextPathStatus() {
+        return new ObjHashSet<>() {{
+            add(getHttpContextConfiguration().getMetrics().isEnabled() ? "/status" : "*");
+        }};
+    }
 
-    int getQueryCacheBlockCount();
+    FactoryProvider getFactoryProvider();
 
-    int getQueryCacheRowCount();
+    HttpContextConfiguration getHttpContextConfiguration();
 
-    StaticContentProcessorConfiguration getStaticContentProcessorConfiguration();
+    byte getRequiredAuthType();
 
-    String getUsername();
+    WaitProcessorConfiguration getWaitProcessorConfiguration();
 
-    boolean isQueryCacheEnabled();
+    /**
+     * Enables fiber execution for this HTTP server when its resolved worker pool also
+     * uses {@link io.questdb.mp.WorkerPoolMode#FIBER_HOST}.
+     */
+    default boolean isFiberEnabled() {
+        return true;
+    }
+
+    boolean isPessimisticHealthCheckEnabled();
+
+    boolean preAllocateBuffers();
 }

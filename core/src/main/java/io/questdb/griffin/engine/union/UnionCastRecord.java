@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,23 +24,32 @@
 
 package io.questdb.griffin.engine.union;
 
+import io.questdb.cairo.arr.ArrayView;
 import io.questdb.cairo.sql.Function;
 import io.questdb.std.BinarySequence;
+import io.questdb.std.Decimal128;
+import io.questdb.std.Decimal256;
+import io.questdb.std.Interval;
 import io.questdb.std.Long256;
 import io.questdb.std.ObjList;
 import io.questdb.std.str.CharSink;
-import io.questdb.std.str.Utf16Sink;
 import io.questdb.std.str.Utf8Sequence;
-import io.questdb.std.str.Utf8Sink;
 
 public class UnionCastRecord extends AbstractUnionRecord {
-
     private final ObjList<Function> castFunctionsA;
     private final ObjList<Function> castFunctionsB;
 
     public UnionCastRecord(ObjList<Function> castFunctionsA, ObjList<Function> castFunctionsB) {
         this.castFunctionsA = castFunctionsA;
         this.castFunctionsB = castFunctionsB;
+    }
+
+    @Override
+    public ArrayView getArray(int col, int columnType) {
+        if (useA) {
+            return castFunctionsA.getQuick(col).getArray(recordA);
+        }
+        return castFunctionsB.getQuick(col).getArray(recordB);
     }
 
     @Override
@@ -97,6 +106,56 @@ public class UnionCastRecord extends AbstractUnionRecord {
             return castFunctionsA.getQuick(col).getDate(recordA);
         }
         return castFunctionsB.getQuick(col).getDate(recordB);
+    }
+
+    @Override
+    public void getDecimal128(int col, Decimal128 decimal128) {
+        if (useA) {
+            castFunctionsA.getQuick(col).getDecimal128(recordA, decimal128);
+        } else {
+            castFunctionsB.getQuick(col).getDecimal128(recordB, decimal128);
+        }
+    }
+
+    @Override
+    public short getDecimal16(int col) {
+        if (useA) {
+            return castFunctionsA.getQuick(col).getDecimal16(recordA);
+        }
+        return castFunctionsB.getQuick(col).getDecimal16(recordB);
+    }
+
+    @Override
+    public void getDecimal256(int col, Decimal256 decimal256) {
+        if (useA) {
+            castFunctionsA.getQuick(col).getDecimal256(recordA, decimal256);
+        } else {
+            castFunctionsB.getQuick(col).getDecimal256(recordB, decimal256);
+        }
+    }
+
+    @Override
+    public int getDecimal32(int col) {
+        if (useA) {
+            return castFunctionsA.getQuick(col).getDecimal32(recordA);
+        }
+        return castFunctionsB.getQuick(col).getDecimal32(recordB);
+    }
+
+    @Override
+    public long getDecimal64(int col) {
+        if (useA) {
+            return castFunctionsA.getQuick(col).getDecimal64(recordA);
+        }
+        return castFunctionsB.getQuick(col).getDecimal64(recordB);
+    }
+
+    @Override
+    public byte getDecimal8(int col) {
+        if (useA) {
+            return castFunctionsA.getQuick(col).getDecimal8(recordA);
+        }
+        return castFunctionsB.getQuick(col).getDecimal8(recordB);
     }
 
     @Override
@@ -164,6 +223,14 @@ public class UnionCastRecord extends AbstractUnionRecord {
     }
 
     @Override
+    public Interval getInterval(int col) {
+        if (useA) {
+            return castFunctionsA.getQuick(col).getInterval(recordA);
+        }
+        return castFunctionsB.getQuick(col).getInterval(recordB);
+    }
+
+    @Override
     public long getLong(int col) {
         if (useA) {
             return castFunctionsA.getQuick(col).getLong(recordA);
@@ -227,15 +294,6 @@ public class UnionCastRecord extends AbstractUnionRecord {
     }
 
     @Override
-    public void getStr(int col, Utf16Sink utf16Sink) {
-        if (useA) {
-            castFunctionsA.getQuick(col).getStr(recordA, utf16Sink);
-        } else {
-            castFunctionsB.getQuick(col).getStr(recordB, utf16Sink);
-        }
-    }
-
-    @Override
     public CharSequence getStrA(int col) {
         if (useA) {
             return castFunctionsA.getQuick(col).getStrA(recordA);
@@ -265,15 +323,6 @@ public class UnionCastRecord extends AbstractUnionRecord {
             return castFunctionsA.getQuick(col).getTimestamp(recordA);
         }
         return castFunctionsB.getQuick(col).getTimestamp(recordB);
-    }
-
-    @Override
-    public void getVarchar(int col, Utf8Sink utf8Sink) {
-        if (useA) {
-            castFunctionsA.getQuick(col).getVarchar(recordA, utf8Sink);
-        } else {
-            castFunctionsB.getQuick(col).getVarchar(recordB, utf8Sink);
-        }
     }
 
     @Override

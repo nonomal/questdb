@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -37,7 +37,6 @@ import io.questdb.std.Misc;
 import io.questdb.std.ObjList;
 import io.questdb.std.str.DirectUtf8Sink;
 import io.questdb.std.str.Utf8Sequence;
-import io.questdb.std.str.Utf8Sink;
 import org.jetbrains.annotations.Nullable;
 
 class StringAggVarcharGroupByFunction extends VarcharFunction implements UnaryFunction, GroupByFunction {
@@ -46,8 +45,9 @@ class StringAggVarcharGroupByFunction extends VarcharFunction implements UnaryFu
     private static final int LIST_CLEAR_THRESHOLD = 64;
     private final Function arg;
     private final char delimiter;
-    private final ObjList<DirectUtf8Sink> sinks = new ObjList<>();
+    private boolean isShared;
     private int sinkIndex = 0;
+    private ObjList<DirectUtf8Sink> sinks = new ObjList<>();
     private int valueIndex;
 
     public StringAggVarcharGroupByFunction(Function arg, char delimiter) {
@@ -57,6 +57,9 @@ class StringAggVarcharGroupByFunction extends VarcharFunction implements UnaryFu
 
     @Override
     public void clear() {
+        if (isShared) {
+            return;
+        }
         // Free extra sinks.
         if (sinks.size() > LIST_CLEAR_THRESHOLD) {
             for (int i = sinks.size() - 1; i > LIST_CLEAR_THRESHOLD - 1; i--) {
@@ -124,11 +127,6 @@ class StringAggVarcharGroupByFunction extends VarcharFunction implements UnaryFu
     }
 
     @Override
-    public void getVarchar(Record rec, Utf8Sink utf8Sink) {
-        utf8Sink.put(getVarcharA(rec));
-    }
-
-    @Override
     public @Nullable Utf8Sequence getVarcharA(Record rec) {
         final boolean nullValue = rec.getBool(valueIndex + 1);
         if (nullValue) {
@@ -143,6 +141,12 @@ class StringAggVarcharGroupByFunction extends VarcharFunction implements UnaryFu
     }
 
     @Override
+    public void initSharedFrom(GroupByFunction primary) {
+        this.valueIndex = primary.getValueIndex();
+        this.sinks = ((StringAggVarcharGroupByFunction) primary).sinks;
+        this.isShared = true;
+    }
+
     public void initValueIndex(int valueIndex) {
         this.valueIndex = valueIndex;
     }

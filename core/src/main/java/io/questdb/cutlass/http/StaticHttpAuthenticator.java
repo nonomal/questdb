@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,11 +24,10 @@
 
 package io.questdb.cutlass.http;
 
-import io.questdb.std.ObjList;
+import io.questdb.cairo.SecurityContext;
 import io.questdb.std.str.DirectUtf8Sequence;
 import io.questdb.std.str.Utf8Sequence;
 import io.questdb.std.str.Utf8s;
-import org.jetbrains.annotations.Nullable;
 
 public final class StaticHttpAuthenticator implements HttpAuthenticator {
     private final Utf8Sequence expectedHeader;
@@ -49,8 +48,8 @@ public final class StaticHttpAuthenticator implements HttpAuthenticator {
     }
 
     @Override
-    public @Nullable ObjList<CharSequence> getGroups() {
-        return null;
+    public byte getAuthType() {
+        return SecurityContext.AUTH_TYPE_CREDENTIALS;
     }
 
     @Override

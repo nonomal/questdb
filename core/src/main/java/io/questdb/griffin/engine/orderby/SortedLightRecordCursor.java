@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,36 +24,48 @@
 
 package io.questdb.griffin.engine.orderby;
 
+import io.questdb.cairo.sql.DelegatingRecordCursor;
+import io.questdb.cairo.sql.ParquetDecodeHint;
 import io.questdb.cairo.sql.Record;
-import io.questdb.cairo.sql.*;
+import io.questdb.cairo.sql.RecordCursor;
+import io.questdb.cairo.sql.SqlExecutionCircuitBreaker;
+import io.questdb.cairo.sql.SymbolTable;
 import io.questdb.griffin.SqlExecutionContext;
 import io.questdb.griffin.engine.RecordComparator;
+import io.questdb.std.DirectIntList;
 import io.questdb.std.Misc;
+import io.questdb.std.ObjList;
 
 class SortedLightRecordCursor implements DelegatingRecordCursor {
     private final LongTreeChain chain;
     private final LongTreeChain.TreeCursor chainCursor;
     private final RecordComparator comparator;
-    private RecordCursor base;
+    private final ObjList<DirectIntList> rankMaps;
+    private RecordCursor baseCursor;
     private Record baseRecord;
     private SqlExecutionCircuitBreaker circuitBreaker;
     private boolean isChainBuilt;
     private boolean isOpen;
 
-    public SortedLightRecordCursor(LongTreeChain chain, RecordComparator comparator) {
+    public SortedLightRecordCursor(LongTreeChain chain, RecordComparator comparator, ObjList<DirectIntList> rankMaps) {
         this.chain = chain;
         this.comparator = comparator;
         // assign it once, it's the same instance anyway
         this.chainCursor = chain.getCursor();
-        this.isOpen = true;
+        // Lazy variant: the chain skeleton is constructed but the key/value heaps
+        // are not allocated yet. The first of() call binds the MemoryTracker and
+        // calls chain.reopen() to allocate the initial backing under it.
+        this.isOpen = false;
+        this.rankMaps = rankMaps;
     }
 
     @Override
     public void close() {
         if (isOpen) {
             isOpen = false;
+            Misc.freeObjListAndKeepObjects(rankMaps);
             Misc.free(chain);
-            base = Misc.free(base);
+            baseCursor = Misc.free(baseCursor);
             baseRecord = null;
         }
     }
@@ -65,12 +77,12 @@ class SortedLightRecordCursor implements DelegatingRecordCursor {
 
     @Override
     public Record getRecordB() {
-        return base.getRecordB();
+        return baseCursor.getRecordB();
     }
 
     @Override
     public SymbolTable getSymbolTable(int columnIndex) {
-        return base.getSymbolTable(columnIndex);
+        return baseCursor.getSymbolTable(columnIndex);
     }
 
     @Override
@@ -80,7 +92,8 @@ class SortedLightRecordCursor implements DelegatingRecordCursor {
             isChainBuilt = true;
         }
         if (chainCursor.hasNext()) {
-            base.recordAt(baseRecord, chainCursor.next());
+            circuitBreaker.statefulThrowExceptionIfTripped();
+            baseCursor.recordAt(baseRecord, chainCursor.next());
             return true;
         }
         return false;
@@ -88,30 +101,45 @@ class SortedLightRecordCursor implements DelegatingRecordCursor {
 
     @Override
     public SymbolTable newSymbolTable(int columnIndex) {
-        return base.newSymbolTable(columnIndex);
+        return baseCursor.newSymbolTable(columnIndex);
     }
 
     @Override
-    public void of(RecordCursor base, SqlExecutionContext executionContext) {
+    public void of(RecordCursor baseCursor, SqlExecutionContext executionContext) {
+        this.baseCursor = baseCursor;
+        baseRecord = baseCursor.getRecord();
+        baseCursor.setParquetDecodeHint(ParquetDecodeHint.SCATTERED);
         if (!isOpen) {
             isOpen = true;
+            chain.setMemoryTracker(executionContext.getMemoryTracker());
             chain.reopen();
+        } else {
+            chain.clear();
         }
-
-        this.base = base;
-        baseRecord = base.getRecord();
+        SortKeyEncoder.buildRankMaps(baseCursor, rankMaps, comparator);
         circuitBreaker = executionContext.getCircuitBreaker();
         isChainBuilt = false;
     }
 
     @Override
+    public long preComputedStateSize() {
+        return RecordCursor.fromBool(isChainBuilt);
+    }
+
+    @Override
     public void recordAt(Record record, long atRowId) {
-        base.recordAt(record, atRowId);
+        baseCursor.recordAt(record, atRowId);
+    }
+
+    @Override
+    public void setParquetDecodeHint(ParquetDecodeHint hint) {
+        // We emit out of order, so of() pins the base to SCATTERED. An outer MONOTONIC push
+        // (e.g. an ASOF light join slave) must not downgrade it and force base re-decodes.
     }
 
     @Override
     public long size() {
-        return base.size();
+        return baseCursor.size();
     }
 
     @Override
@@ -120,8 +148,10 @@ class SortedLightRecordCursor implements DelegatingRecordCursor {
     }
 
     private void buildChain() {
-        final Record placeHolderRecord = base.getRecordB();
-        while (base.hasNext()) {
+        // Consult the breaker before consuming the base, so an empty base scan still observes cancellation.
+        circuitBreaker.statefulThrowExceptionIfTrippedTimeThrottled();
+        final Record placeHolderRecord = baseCursor.getRecordB();
+        while (baseCursor.hasNext()) {
             circuitBreaker.statefulThrowExceptionIfTripped();
             // Tree chain is liable to re-position record to
             // other rows to do record comparison. We must use our
@@ -129,7 +159,7 @@ class SortedLightRecordCursor implements DelegatingRecordCursor {
             // state in the record it returns.
             chain.put(
                     baseRecord,
-                    base,
+                    baseCursor,
                     placeHolderRecord,
                     comparator
             );

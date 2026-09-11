@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -42,10 +42,12 @@ import io.questdb.std.histogram.org.HdrHistogram.DoubleHistogram;
 public class ApproxPercentileDoubleGroupByFunction extends DoubleFunction implements GroupByFunction, BinaryFunction {
     private final Function exprFunc;
     private final int funcPosition;
-    private final ObjList<DoubleHistogram> histograms = new ObjList<>();
     private final Function percentileFunc;
     private final int precision;
     private int histogramIndex;
+    private ObjList<DoubleHistogram> histograms = new ObjList<>();
+    private boolean isShared;
+    private double percentile;
     private int valueIndex;
 
     public ApproxPercentileDoubleGroupByFunction(Function exprFunc, Function percentileFunc, int precision, int funcPosition) {
@@ -58,6 +60,9 @@ public class ApproxPercentileDoubleGroupByFunction extends DoubleFunction implem
 
     @Override
     public void clear() {
+        if (isShared) {
+            return;
+        }
         histograms.clear();
         histogramIndex = 0;
     }
@@ -101,7 +106,7 @@ public class ApproxPercentileDoubleGroupByFunction extends DoubleFunction implem
         if (histogram.getTotalCount() == 0) {
             return Double.NaN;
         }
-        return histogram.getValueAtPercentile(percentileFunc.getDouble(null) * 100);
+        return histogram.getValueAtPercentile(percentile * 100);
     }
 
     @Override
@@ -128,10 +133,17 @@ public class ApproxPercentileDoubleGroupByFunction extends DoubleFunction implem
     public void init(SymbolTableSource symbolTableSource, SqlExecutionContext executionContext) throws SqlException {
         BinaryFunction.super.init(symbolTableSource, executionContext);
 
-        final double percentile = percentileFunc.getDouble(null);
+        percentile = percentileFunc.getDouble(null);
         if (Numbers.isNull(percentile) || percentile < 0 || percentile > 1) {
             throw SqlException.$(funcPosition, "percentile must be between 0.0 and 1.0");
         }
+    }
+
+    @Override
+    public void initSharedFrom(GroupByFunction primary) {
+        this.valueIndex = primary.getValueIndex();
+        this.histograms = ((ApproxPercentileDoubleGroupByFunction) primary).histograms;
+        this.isShared = true;
     }
 
     @Override
@@ -151,7 +163,7 @@ public class ApproxPercentileDoubleGroupByFunction extends DoubleFunction implem
     }
 
     @Override
-    public boolean isReadThreadSafe() {
+    public boolean isThreadSafe() {
         return false;
     }
 

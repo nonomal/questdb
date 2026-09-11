@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -25,23 +25,43 @@
 package io.questdb.griffin.engine.functions;
 
 import io.questdb.cairo.ColumnType;
+import io.questdb.cairo.NanosTimestampDriver;
+import io.questdb.cairo.TableUtils;
+import io.questdb.cairo.arr.ArrayView;
+import io.questdb.cairo.sql.Function;
 import io.questdb.cairo.sql.Record;
-import io.questdb.cairo.sql.*;
+import io.questdb.cairo.sql.RecordCursorFactory;
+import io.questdb.cairo.sql.StaticSymbolTable;
+import io.questdb.cairo.sql.SymbolTable;
 import io.questdb.std.BinarySequence;
+import io.questdb.std.Decimal128;
+import io.questdb.std.Decimal256;
+import io.questdb.std.Interval;
 import io.questdb.std.Long256;
-import io.questdb.std.str.*;
+import io.questdb.std.str.CharSink;
+import io.questdb.std.str.Utf8Sequence;
+import io.questdb.std.str.Utf8StringSink;
+import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
 /**
  * Symbol API allows record cursor consumers to store "int" value of symbol function
  * and then retrieve CharSequence values via SymbolTable. Symbol Table is typically
  * populated by function dynamically, in that values that have not yet been returned via
- * getInt() are not cached.*
+ * getInt() are not cached.
+ * <p>
+ * A function that opts into {@link #supportsKeyValueAccess()} must return
+ * {@link SymbolTable#VALUE_IS_NULL} from {@link #getInt(Record)} for a null symbol and a
+ * non-negative key for every non-null symbol. See {@link SymbolTable#supportsKeyValueAccess()}.
  */
-public abstract class SymbolFunction implements ScalarFunction, SymbolTable {
-
+public abstract class SymbolFunction implements Function, SymbolTable {
     private final Utf8StringSink utf8SinkA = new Utf8StringSink();
     private final Utf8StringSink utf8SinkB = new Utf8StringSink();
+
+    @Override
+    public ArrayView getArray(Record rec) {
+        throw new UnsupportedOperationException();
+    }
 
     @Override
     public final BinarySequence getBin(Record rec) {
@@ -65,11 +85,42 @@ public abstract class SymbolFunction implements ScalarFunction, SymbolTable {
 
     @Override
     public char getChar(Record rec) {
-        throw new UnsupportedOperationException();
+        CharSequence value = getSymbol(rec);
+        return value == null ? 0 : value.charAt(0);
     }
 
     @Override
     public final long getDate(Record rec) {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public final void getDecimal128(Record rec, Decimal128 sink) {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public final short getDecimal16(Record rec) {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public final void getDecimal256(Record rec, Decimal256 sink) {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public final int getDecimal32(Record rec) {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public final long getDecimal64(Record rec) {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public final byte getDecimal8(Record rec) {
         throw new UnsupportedOperationException();
     }
 
@@ -105,6 +156,11 @@ public abstract class SymbolFunction implements ScalarFunction, SymbolTable {
 
     @Override
     public final int getIPv4(Record rec) {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public @NotNull Interval getInterval(Record rec) {
         throw new UnsupportedOperationException();
     }
 
@@ -154,11 +210,6 @@ public abstract class SymbolFunction implements ScalarFunction, SymbolTable {
     }
 
     @Override
-    public void getStr(Record rec, Utf16Sink utf16Sink) {
-        throw new UnsupportedOperationException();
-    }
-
-    @Override
     public CharSequence getStrA(Record rec) {
         return getSymbol(rec);
     }
@@ -169,23 +220,18 @@ public abstract class SymbolFunction implements ScalarFunction, SymbolTable {
     }
 
     @Override
-    public final int getStrLen(Record rec) {
-        throw new UnsupportedOperationException();
+    public int getStrLen(Record rec) {
+        return TableUtils.lengthOf(getSymbol(rec));
     }
 
     @Override
     public final long getTimestamp(Record rec) {
-        throw new UnsupportedOperationException();
+        return NanosTimestampDriver.INSTANCE.implicitCast(getSymbol(rec), ColumnType.SYMBOL);
     }
 
     @Override
     public final int getType() {
         return ColumnType.SYMBOL;
-    }
-
-    @Override
-    public void getVarchar(Record rec, Utf8Sink utf8Sink) {
-        utf8Sink.put(getStrA(rec));
     }
 
     @Override
@@ -215,16 +261,31 @@ public abstract class SymbolFunction implements ScalarFunction, SymbolTable {
         throw new UnsupportedOperationException();
     }
 
+    /**
+     * Returns true if the symbol table is static (immutable).
+     *
+     * @return true if the symbol table is static
+     */
     public abstract boolean isSymbolTableStatic();
 
     /**
-     * A clone of function's symbol table to enable concurrent SQL execution.
-     * During such execution symbol table clones will be assigned to individual executing
-     * thread.
+     * A symbol table to enable concurrent SQL execution. During such execution the returned
+     * tables are assigned to individual executing threads.
+     * <p>
+     * A function that reports {@link #supportsParallelism()} {@code == true} must return an
+     * independent snapshot here, safe to read from another thread while this function keeps
+     * advancing. A function that reports {@code supportsParallelism() == false} is cloned per
+     * worker for a parallel filter (it is also thread-unsafe), so each instance stays
+     * single-threaded and MAY instead return a live view over its own state.
+     * Such a view is valid only for serial reads, but like any other implementation it must return
+     * values that stay readable for the life of the table: a caller may hold a value across further
+     * reads of the source function.
+     * {@link io.questdb.griffin.engine.functions.cast.CastStrToSymbolFunctionFactory.Func} returns
+     * such a live view, backed by append-only storage so its values survive later interning.
      *
-     * @return clone of symbol table
+     * @return symbol table for concurrent execution (an independent snapshot when parallel, otherwise
+     * possibly a live serial view)
      */
-    @Nullable
     public SymbolTable newSymbolTable() {
         return null;
     }

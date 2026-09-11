@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -29,27 +29,27 @@ import io.questdb.cairo.sql.TableMetadata;
 import io.questdb.cairo.vm.Vm;
 import io.questdb.cairo.vm.api.MemoryMR;
 import io.questdb.std.Chars;
+import io.questdb.std.IntList;
+import io.questdb.std.str.Utf8Sequence;
+import org.jetbrains.annotations.NotNull;
 
 import static io.questdb.cairo.TableUtils.META_OFFSET_PARTITION_BY;
 
-public class TableWriterMetadata extends AbstractRecordMetadata implements TableMetadata, TableStructure {
+public class TableWriterMetadata extends AbstractRecordMetadata implements TableMetadata {
     private int maxUncommittedRows;
     private long metadataVersion;
     private long o3MaxLag;
     private int partitionBy;
     private int symbolMapCount;
+    private int tableFormat;
     private int tableId;
     private TableToken tableToken;
+    private int ttlHoursOrMonths;
+    private TxReader txReader;
     private boolean walEnabled;
 
-    public TableWriterMetadata(TableToken tableToken, MemoryMR metaMem) {
+    public TableWriterMetadata(TableToken tableToken) {
         this.tableToken = tableToken;
-        reload(metaMem);
-    }
-
-    @Override
-    public boolean isSoftLink() {
-        return false;
     }
 
     @Override
@@ -58,8 +58,18 @@ public class TableWriterMetadata extends AbstractRecordMetadata implements Table
     }
 
     @Override
+    public IntList getCoveringColumnIndices(int columnIndex) {
+        return getColumnMetadata(columnIndex).getCoveringColumnIndices();
+    }
+
+    @Override
     public int getIndexBlockCapacity(int columnIndex) {
         return getColumnMetadata(columnIndex).getIndexValueBlockCapacity();
+    }
+
+    @Override
+    public byte getIndexType(int columnIndex) {
+        return getColumnMetadata(columnIndex).getIndexType();
     }
 
     @Override
@@ -78,22 +88,36 @@ public class TableWriterMetadata extends AbstractRecordMetadata implements Table
     }
 
     @Override
+    public int getParquetEncodingConfig(int columnIndex) {
+        return getColumnMetadata(columnIndex).getParquetEncodingConfig();
+    }
+
+    @Override
     public int getPartitionBy() {
         return partitionBy;
     }
 
+    public int getReplacingColumnIndex(int columnIndex) {
+        return columnMetadata.get(columnIndex).getReplacingIndex();
+    }
+
     @Override
     public boolean getSymbolCacheFlag(int columnIndex) {
-        return getColumnMetadata(columnIndex).isSymbolTableStatic();
+        return getColumnMetadata(columnIndex).isSymbolCacheFlag();
     }
 
     @Override
     public int getSymbolCapacity(int columnIndex) {
-        return ((WriterTableColumnMetadata) getColumnMetadata(columnIndex)).symbolCapacity;
+        return getColumnMetadata(columnIndex).getSymbolCapacity();
     }
 
     public int getSymbolMapCount() {
         return symbolMapCount;
+    }
+
+    @Override
+    public int getTableFormat() {
+        return tableFormat;
     }
 
     @Override
@@ -112,13 +136,13 @@ public class TableWriterMetadata extends AbstractRecordMetadata implements Table
     }
 
     @Override
-    public boolean isIndexed(int columnIndex) {
-        return getColumnMetadata(columnIndex).isIndexed();
+    public int getTtlHoursOrMonths() {
+        return ttlHoursOrMonths;
     }
 
     @Override
-    public boolean isSequential(int columnIndex) {
-        return ((WriterTableColumnMetadata) getColumnMetadata(columnIndex)).sequential;
+    public boolean hasParquetPartitions() {
+        return txReader != null && txReader.hasParquetPartitions();
     }
 
     @Override
@@ -126,42 +150,49 @@ public class TableWriterMetadata extends AbstractRecordMetadata implements Table
         return walEnabled;
     }
 
-    public final void reload(MemoryMR metaMem) {
+    public final void reload(@NotNull Utf8Sequence metaPath, MemoryMR metaMem) {
         this.partitionBy = metaMem.getInt(META_OFFSET_PARTITION_BY);
         this.columnCount = metaMem.getInt(TableUtils.META_OFFSET_COUNT);
         this.columnNameIndexMap.clear();
         this.tableId = metaMem.getInt(TableUtils.META_OFFSET_TABLE_ID);
         this.maxUncommittedRows = metaMem.getInt(TableUtils.META_OFFSET_MAX_UNCOMMITTED_ROWS);
         this.o3MaxLag = metaMem.getLong(TableUtils.META_OFFSET_O3_MAX_LAG);
-        TableUtils.validateMeta(metaMem, columnNameIndexMap, ColumnType.VERSION);
+        TableUtils.validateMeta(metaPath, metaMem, columnNameIndexMap, ColumnType.VERSION);
         this.timestampIndex = metaMem.getInt(TableUtils.META_OFFSET_TIMESTAMP_INDEX);
         this.columnMetadata.clear();
         this.metadataVersion = metaMem.getLong(TableUtils.META_OFFSET_METADATA_VERSION);
         this.walEnabled = metaMem.getBool(TableUtils.META_OFFSET_WAL_ENABLED);
+        this.ttlHoursOrMonths = TableUtils.getTtlHoursOrMonths(metaMem);
+        this.tableFormat = TableUtils.getTableFormat(metaMem);
 
         long offset = TableUtils.getColumnNameOffset(columnCount);
         this.symbolMapCount = 0;
         columnNameIndexMap.clear();
+        boolean hasParquetEncodingConfig = TableUtils.hasParquetEncodingConfig(metaMem);
         // don't create strings in this loop, we already have them in columnNameIndexMap
         for (int i = 0; i < columnCount; i++) {
             CharSequence name = metaMem.getStrA(offset);
             assert name != null;
             int type = TableUtils.getColumnType(metaMem, i);
             String nameStr = Chars.toString(name);
-            columnMetadata.add(
-                    new WriterTableColumnMetadata(
-                            nameStr,
-                            type,
-                            TableUtils.isColumnIndexed(metaMem, i),
-                            TableUtils.getIndexBlockCapacity(metaMem, i),
-                            TableUtils.isSymbolCached(metaMem, i),
-                            null,
-                            i,
-                            TableUtils.isSequential(metaMem, i),
-                            TableUtils.getSymbolCapacity(metaMem, i),
-                            TableUtils.isColumnDedupKey(metaMem, i)
-                    )
+            int replacingIndex = TableUtils.getReplacingColumnIndex(metaMem, i);
+            int origWriterIndex = TableUtils.getReplacingChainHead(metaMem, i);
+            WriterTableColumnMetadata colMeta = new WriterTableColumnMetadata(
+                    nameStr,
+                    type,
+                    TableUtils.getColumnIndexType(metaMem, i),
+                    TableUtils.getIndexBlockCapacity(metaMem, i),
+                    true,
+                    null,
+                    i,
+                    TableUtils.getSymbolCapacity(metaMem, i),
+                    TableUtils.isColumnDedupKey(metaMem, i),
+                    replacingIndex,
+                    TableUtils.isSymbolCached(metaMem, i),
+                    origWriterIndex
             );
+            colMeta.setParquetEncodingConfig(hasParquetEncodingConfig ? TableUtils.getParquetEncodingConfig(metaMem, i) : 0);
+            columnMetadata.add(colMeta);
             if (type > -1) {
                 columnNameIndexMap.put(nameStr, i);
                 if (ColumnType.isSymbol(type)) {
@@ -169,6 +200,28 @@ public class TableWriterMetadata extends AbstractRecordMetadata implements Table
                 }
             }
             offset += Vm.getStorageLength(name);
+        }
+        long metaSize = metaMem.size();
+        if (offset < metaSize) {
+            for (int i = 0; i < columnCount; i++) {
+                if (TableUtils.isColumnCovering(metaMem, i)) {
+                    if (offset + Integer.BYTES > metaSize) {
+                        break;
+                    }
+                    int includeCount = metaMem.getInt(offset);
+                    offset += Integer.BYTES;
+                    if (includeCount > 0 && offset + (long) includeCount * Integer.BYTES <= metaSize) {
+                        IntList indices = new IntList(includeCount);
+                        for (int j = 0; j < includeCount; j++) {
+                            indices.add(metaMem.getInt(offset));
+                            offset += Integer.BYTES;
+                        }
+                        columnMetadata.getQuick(i).setCoveringColumnIndices(indices);
+                    } else if (includeCount > 0) {
+                        break;
+                    }
+                }
+            }
         }
     }
 
@@ -184,25 +237,53 @@ public class TableWriterMetadata extends AbstractRecordMetadata implements Table
         this.o3MaxLag = o3MaxLagUs;
     }
 
+    public void setTableFormat(int tableFormat) {
+        this.tableFormat = tableFormat;
+    }
+
+    public void setTtlHoursOrMonths(int ttlHoursOrMonths) {
+        this.ttlHoursOrMonths = ttlHoursOrMonths;
+    }
+
+    public void setTxReader(TxReader txReader) {
+        this.txReader = txReader;
+    }
+
     public void updateTableToken(TableToken tableToken) {
         this.tableToken = tableToken;
     }
 
-    void addColumn(CharSequence name, int type, boolean indexFlag, int indexValueBlockCapacity, int columnIndex, boolean sequential, int symbolCapacity, boolean isDedupKey) {
+    void addColumn(
+            CharSequence name,
+            int type,
+            byte indexType,
+            int indexValueBlockCapacity,
+            int columnIndex,
+            int symbolCapacity,
+            boolean isDedupKey,
+            int replacingIndex,
+            boolean isSymbolCached
+    ) {
+        int origWriterIndex = columnIndex;
+        if (replacingIndex >= 0 && replacingIndex < columnMetadata.size()) {
+            origWriterIndex = columnMetadata.get(replacingIndex).getOriginalWriterIndex();
+        }
         String str = name.toString();
         columnNameIndexMap.put(str, columnMetadata.size());
         columnMetadata.add(
                 new WriterTableColumnMetadata(
                         str,
                         type,
-                        indexFlag,
+                        indexType,
                         indexValueBlockCapacity,
                         true,
                         null,
                         columnIndex,
-                        sequential,
                         symbolCapacity,
-                        isDedupKey
+                        isDedupKey,
+                        replacingIndex,
+                        isSymbolCached,
+                        origWriterIndex
                 )
         );
         columnCount++;
@@ -217,11 +298,11 @@ public class TableWriterMetadata extends AbstractRecordMetadata implements Table
 
     void removeColumn(int columnIndex) {
         TableColumnMetadata deletedMeta = columnMetadata.getQuick(columnIndex);
-        if (ColumnType.isSymbol(deletedMeta.getType())) {
+        if (ColumnType.isSymbol(deletedMeta.getColumnType())) {
             symbolMapCount--;
         }
         deletedMeta.markDeleted();
-        columnNameIndexMap.remove(deletedMeta.getName());
+        columnNameIndexMap.remove(deletedMeta.getColumnName());
     }
 
     void renameColumn(CharSequence name, CharSequence newName) {
@@ -230,17 +311,68 @@ public class TableWriterMetadata extends AbstractRecordMetadata implements Table
         columnNameIndexMap.put(newNameStr, columnIndex);
 
         TableColumnMetadata oldColumnMetadata = columnMetadata.get(columnIndex);
-        oldColumnMetadata.setName(newNameStr);
+        oldColumnMetadata.rename(newNameStr);
     }
 
-    private static class WriterTableColumnMetadata extends TableColumnMetadata {
-        private final boolean sequential;
-        private final int symbolCapacity;
+    void updateColumnSymbolCapacity(int columnIndex, int newSymbolCapacity) {
+        TableColumnMetadata oldMeta = columnMetadata.getQuick(columnIndex);
+        assert oldMeta.getColumnType() == ColumnType.SYMBOL;
 
-        public WriterTableColumnMetadata(String nameStr, int type, boolean columnIndexed, int indexBlockCapacity, boolean symbolTableStatic, RecordMetadata parent, int i, boolean sequential, int symbolCapacity, boolean isDedupKey) {
-            super(nameStr, type, columnIndexed, indexBlockCapacity, symbolTableStatic, parent, i, isDedupKey);
-            this.sequential = sequential;
-            this.symbolCapacity = symbolCapacity;
+        var newColumnMetadata = new WriterTableColumnMetadata(
+                oldMeta.getColumnName(),
+                ColumnType.SYMBOL,
+                oldMeta.getIndexType(),
+                oldMeta.getIndexValueBlockCapacity(),
+                oldMeta.isSymbolTableStatic(),
+                null,
+                columnIndex,
+                newSymbolCapacity,
+                oldMeta.isDedupKeyFlag(),
+                oldMeta.getReplacingIndex(),
+                oldMeta.isSymbolCacheFlag(),
+                oldMeta.getOriginalWriterIndex()
+        );
+        newColumnMetadata.setParquetEncodingConfig(oldMeta.getParquetEncodingConfig());
+        // Preserve the covering-index schema across a symbol-capacity change.
+        // The covering column indices (and, derived from them, the column's
+        // covering flag) live on the column metadata; rebuilding the column to
+        // change its capacity must carry them over, otherwise the next
+        // rewriteAndSwapMetadata() persists a _meta with no covering flag/section
+        // and every reader thereafter sees the posting index as non-covering.
+        newColumnMetadata.setCoveringColumnIndices(oldMeta.getCoveringColumnIndices());
+        columnMetadata.set(columnIndex, newColumnMetadata);
+    }
+
+    protected static class WriterTableColumnMetadata extends TableColumnMetadata {
+
+        public WriterTableColumnMetadata(
+                String nameStr,
+                int type,
+                byte indexType,
+                int indexBlockCapacity,
+                boolean symbolTableStatic,
+                RecordMetadata parent,
+                int writerIndex,
+                int symbolCapacity,
+                boolean isDedupKey,
+                int replacingIndex,
+                boolean symbolCached,
+                int originalWriterIndex
+        ) {
+            super(
+                    nameStr,
+                    type,
+                    indexType,
+                    indexBlockCapacity,
+                    symbolTableStatic,
+                    parent,
+                    writerIndex,
+                    isDedupKey,
+                    replacingIndex,
+                    symbolCached,
+                    symbolCapacity,
+                    originalWriterIndex
+            );
         }
     }
 }

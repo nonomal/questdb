@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,137 +24,284 @@
 
 package io.questdb.test.griffin;
 
+import io.questdb.PropertyKey;
+import io.questdb.cairo.sql.RecordCursor;
+import io.questdb.cairo.sql.RecordCursorFactory;
+import io.questdb.griffin.CompiledQuery;
+import io.questdb.griffin.SqlCompiler;
 import io.questdb.test.AbstractCairoTest;
+import org.junit.Before;
 import org.junit.Test;
 
 public class ShowTablesTest extends AbstractCairoTest {
 
+    @Before
+    public void beforeAll() {
+        node1.setProperty(PropertyKey.CAIRO_METADATA_CACHE_SNAPSHOT_ORDERED, true);
+    }
+
+    @Test
+    public void testDropAndRecreateTable() throws Exception {
+        // Tests that cached query plans of `tables() correctly handle table recreation
+        //
+        // Purpose: Verify that when a table is dropped and recreated, pre-existing
+        // query plans using tables() function correctly show the new table ID.
+        //
+        // Key assumption: Table IDs must change when a table is dropped and recreated.
+        //
+        // Background: This is a regression test for an issue where the tables() function
+        // returned stale table IDs from cached plans after DROP TABLE + CREATE TABLE operations.
+
+        // mutateWith() reuses the same cached tables() factory across the drop/recreate,
+        // mimicking a cached query plan; the second result must show the new table ID.
+        assertQuery("tables()")
+                .ddl("create table x (ts timestamp) timestamp(ts) partition by DAY")
+                .noRandomAccess()
+                .expectSize()
+                .sizeMayVary()
+                .mutateWith("drop table x", "create table x (ts timestamp) timestamp(ts) partition by DAY")
+                .returns(
+                        """
+                                id	table_name	designatedTimestamp	partitionBy	walEnabled	dedup	ttlValue	ttlUnit	matView	directoryName	maxUncommittedRows	o3MaxLag	table_suspended	table_type	table_row_count	table_min_timestamp	table_max_timestamp	table_last_write_timestamp	table_txn	table_memory_pressure_level	table_write_amp_count	table_write_amp_p50	table_write_amp_p90	table_write_amp_p99	table_write_amp_max	table_merge_rate_count	table_merge_rate_p50	table_merge_rate_p90	table_merge_rate_p99	table_merge_rate_max	wal_pending_row_count	wal_dedup_row_count_since_start	wal_txn	wal_max_timestamp	wal_tx_count	wal_tx_size_p50	wal_tx_size_p90	wal_tx_size_p99	wal_tx_size_max	replica_batch_count	replica_batch_size_p50	replica_batch_size_p90	replica_batch_size_p99	replica_batch_size_max	replica_more_pending
+                                1	x	ts	DAY	false	false	0	HOUR	false	x~	1000	300000000	false	T	null				null	null	0	0.0	0.0	0.0	0.0	0	0	0	0	0	0	0	null		0	0	0	0	0	0	0	0	0	0	false
+                                """,
+                        """
+                                id	table_name	designatedTimestamp	partitionBy	walEnabled	dedup	ttlValue	ttlUnit	matView	directoryName	maxUncommittedRows	o3MaxLag	table_suspended	table_type	table_row_count	table_min_timestamp	table_max_timestamp	table_last_write_timestamp	table_txn	table_memory_pressure_level	table_write_amp_count	table_write_amp_p50	table_write_amp_p90	table_write_amp_p99	table_write_amp_max	table_merge_rate_count	table_merge_rate_p50	table_merge_rate_p90	table_merge_rate_p99	table_merge_rate_max	wal_pending_row_count	wal_dedup_row_count_since_start	wal_txn	wal_max_timestamp	wal_tx_count	wal_tx_size_p50	wal_tx_size_p90	wal_tx_size_p99	wal_tx_size_max	replica_batch_count	replica_batch_size_p50	replica_batch_size_p90	replica_batch_size_p99	replica_batch_size_max	replica_more_pending
+                                2	x	ts	DAY	false	false	0	HOUR	false	x~	1000	300000000	false	T	null				null	null	0	0.0	0.0	0.0	0.0	0	0	0	0	0	0	0	null		0	0	0	0	0	0	0	0	0	0	false
+                                """
+                );
+    }
+
     @Test
     public void testShowColumnsWithFunction() throws Exception {
         assertMemoryLeak(() -> {
-            ddl("create table balances(cust_id int, ccy symbol, balance double)");
-            assertQuery(
-                    "column\ttype\tindexed\tindexBlockCapacity\tsymbolCached\tsymbolCapacity\tdesignated\tupsertKey\n" +
-                            "cust_id\tINT\tfalse\t0\tfalse\t0\tfalse\tfalse\n" +
-                            "ccy\tSYMBOL\tfalse\t256\ttrue\t128\tfalse\tfalse\n" +
-                            "balance\tDOUBLE\tfalse\t0\tfalse\t0\tfalse\tfalse\n",
-                    "select * from table_columns('balances')",
-                    null,
-                    null,
-                    false
-            );
+            execute("create table balances (cust_id int, ccy symbol, balance double)");
+            execute("insert into balances values (0, null, 0)");
+            execute("insert into balances values (1, 'a', 1)");
+            execute("insert into balances values (2, 'b', 2)");
+            execute("insert into balances values (3, 'c', 3)");
+            assertQuery("select * from table_columns('balances')")
+                    .noLeakCheck()
+                    .ddl(null)
+                    .noRandomAccess()
+                    .returns("""
+                            column\ttype\tindexed\tindexBlockCapacity\tsymbolCached\tsymbolCapacity\tsymbolTableSize\tdesignated\tupsertKey\tindexType\tindexInclude
+                            cust_id\tINT\tfalse\t0\tfalse\t0\t0\tfalse\tfalse\t\t
+                            ccy\tSYMBOL\tfalse\t256\ttrue\t128\t4\tfalse\tfalse\t\t
+                            balance\tDOUBLE\tfalse\t0\tfalse\t0\t0\tfalse\tfalse\t\t
+                            """);
+        });
+    }
+
+    @Test
+    public void testShowColumnsWithFunctionAndMissingTable() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("create table balances(cust_id int, ccy symbol, balance double)");
+            assertQuery("select * from table_columns('balances2')")
+                    .fails(28, "table does not exist");
         });
     }
 
     @Test
     public void testShowColumnsWithMissingTable() throws Exception {
         assertMemoryLeak(() -> {
-            ddl("create table balances(cust_id int, ccy symbol, balance double)");
-            assertException(
-                    "show columns from balances2",
-                    18,
-                    "table does not exist"
-            );
+            execute("create table balances(cust_id int, ccy symbol, balance double)");
+            assertQuery("show columns from balances2")
+                    .fails(18, "table does not exist");
         });
     }
 
     @Test
     public void testShowColumnsWithSimpleTable() throws Exception {
         assertMemoryLeak(() -> {
-            ddl("create table balances(cust_id int, ccy symbol, balance double)");
-            assertQuery(
-                    "column\ttype\tindexed\tindexBlockCapacity\tsymbolCached\tsymbolCapacity\tdesignated\tupsertKey\n" +
-                            "cust_id\tINT\tfalse\t0\tfalse\t0\tfalse\tfalse\n" +
-                            "ccy\tSYMBOL\tfalse\t256\ttrue\t128\tfalse\tfalse\n" +
-                            "balance\tDOUBLE\tfalse\t0\tfalse\t0\tfalse\tfalse\n",
-                    "show columns from balances",
-                    null,
-                    null,
-                    false
-            );
+            execute("create table balances (cust_id int, ccx symbol, ccy symbol, balance double)");
+            execute("insert into balances values (1, 'foo', 'bar', 1)");
+            execute("insert into balances values (2, 'foo', null, 2)");
+            assertQuery("show columns from balances")
+                    .noLeakCheck()
+                    .ddl(null)
+                    .noRandomAccess()
+                    .returns("""
+                            column\ttype\tindexed\tindexBlockCapacity\tsymbolCached\tsymbolCapacity\tsymbolTableSize\tdesignated\tupsertKey\tindexType\tindexInclude
+                            cust_id\tINT\tfalse\t0\tfalse\t0\t0\tfalse\tfalse\t\t
+                            ccx\tSYMBOL\tfalse\t256\ttrue\t128\t1\tfalse\tfalse\t\t
+                            ccy\tSYMBOL\tfalse\t256\ttrue\t128\t2\tfalse\tfalse\t\t
+                            balance\tDOUBLE\tfalse\t0\tfalse\t0\t0\tfalse\tfalse\t\t
+                            """);
         });
     }
 
     @Test
     public void testShowStandardConformingStrings() throws Exception {
-        assertMemoryLeak(() -> assertQuery("standard_conforming_strings\n" +
-                "on\n", "show standard_conforming_strings", null, null, false, true));
+        assertMemoryLeak(() -> assertQuery("show standard_conforming_strings")
+                .ddl(null)
+                .noRandomAccess()
+                .expectSize()
+                .returns("""
+                        standard_conforming_strings
+                        on
+                        """));
     }
 
     @Test
     public void testShowTablesWithDrop() throws Exception {
         assertMemoryLeak(() -> {
-            ddl("create table balances(cust_id int, ccy symbol, balance double)");
-            assertSql("table_name\nbalances\n", "show tables");
-            ddl("create table balances2(cust_id int, ccy symbol, balance double)");
-            drop("drop table balances");
-            assertSql("table_name\nbalances2\n", "show tables");
+            execute("create table balances(cust_id int, ccy symbol, balance double)");
+            assertQuery("show tables")
+                    .noLeakCheck()
+                    .noRandomAccess()
+                    .returns("table_name\nbalances\n");
+            execute("create table balances2(cust_id int, ccy symbol, balance double)");
+            execute("drop table balances");
+            assertQuery("show tables")
+                    .noLeakCheck()
+                    .noRandomAccess()
+                    .returns("table_name\nbalances2\n");
         });
     }
 
     @Test
     public void testShowTablesWithFunction() throws Exception {
         assertMemoryLeak(() -> {
-            ddl("create table balances(cust_id int, ccy symbol, balance double)");
-            assertSql("table_name\nbalances\n", "select * from all_tables()");
+            execute("create table balances(cust_id int, ccy symbol, balance double)");
+            assertQuery("select * from all_tables()")
+                    .noLeakCheck()
+                    .noRandomAccess()
+                    .returns("table_name\nbalances\n");
         });
     }
 
     @Test
     public void testShowTablesWithSingleTable() throws Exception {
         assertMemoryLeak(() -> {
-            ddl("create table balances(cust_id int, ccy symbol, balance double)");
-            assertSql("table_name\nbalances\n", "show tables");
+            execute("create table balances(cust_id int, ccy symbol, balance double)");
+            assertQuery("show tables")
+                    .noLeakCheck()
+                    .noRandomAccess()
+                    .returns("table_name\nbalances\n");
+        });
+    }
+
+    @Test
+    public void testShowTablesReturnsOrderedList() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("create table deposits(account_no int, currency symbol, amount double)");
+            execute("create table balances(account_no int, currency symbol, amount double)");
+            execute("create table accounts(account_no int, currency symbol)");
+            execute("create table card_payments(account_from_no int, account_to_no int, currency symbol, amount double)");
+            assertQuery("SHOW TABLES")
+                    .noLeakCheck()
+                    .noRandomAccess()
+                    .returns("table_name\naccounts\nbalances\ncard_payments\ndeposits\n");
+        });
+    }
+
+    @Test
+    public void testShowTablesWithFunctionReturnsOrderedList() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("create table deposits(account_no int, currency symbol, amount double)");
+            execute("create table balances(account_no int, currency symbol, amount double)");
+            execute("create table accounts(account_no int, currency symbol)");
+            execute("create table card_payments(account_from_no int, account_to_no int, currency symbol, amount double)");
+            assertQuery("select * from all_tables()")
+                    .noLeakCheck()
+                    .noRandomAccess()
+                    .returns("table_name\naccounts\nbalances\ncard_payments\ndeposits\n");
+        });
+    }
+
+    @Test
+    public void testTablesOrderedAfterDropAndCreate() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("create table deposits(account_no int, currency symbol, amount double)");
+            execute("create table balances(account_no int, currency symbol, amount double)");
+            execute("create table accounts(account_no int, currency symbol)");
+            execute("create table card_payments(account_from_no int, account_to_no int, currency symbol, amount double)");
+            execute("drop table balances");
+            execute("create table businesses(name symbol)");
+            execute("create table balances2(account_no int, currency symbol, amount double)");
+            assertQuery("select * from all_tables()")
+                    .noLeakCheck()
+                    .noRandomAccess()
+                    .returns("table_name\naccounts\nbalances2\nbusinesses\ncard_payments\ndeposits\n");
+        });
+    }
+
+    @Test
+    public void testTablesOrderedAfterRename() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("create table deposits(account_no int, currency symbol, amount double)");
+            execute("create table balances(account_no int, currency symbol, amount double)");
+            execute("create table accounts(account_no int, currency symbol)");
+            execute("create table card_payments(account_from_no int, account_to_no int, currency symbol, amount double)");
+            execute("rename table balances to statement_balances");
+            execute("create table businesses(name symbol)");
+            execute("create table balances2(account_no int, currency symbol, amount double)");
+            assertQuery("select * from all_tables()")
+                    .noLeakCheck()
+                    .noRandomAccess()
+                    .returns("table_name\naccounts\nbalances2\nbusinesses\ncard_payments\ndeposits\nstatement_balances\n");
         });
     }
 
     @Test
     public void testShowTimeZone() throws Exception {
-        assertMemoryLeak(() -> assertQuery(
-                "TimeZone\nUTC\n",
-                "show time zone", null, false, true
-        ));
+        assertMemoryLeak(() -> assertQuery("show time zone")
+                .noRandomAccess()
+                .expectSize()
+                .returns("TimeZone\nUTC\n"));
     }
 
     @Test
     public void testShowTimeZoneWrongSyntax() throws Exception {
-        assertMemoryLeak(() -> assertException("show time", 9, "expected 'TABLES', 'COLUMNS FROM <tab>', 'PARTITIONS FROM <tab>', 'TRANSACTION ISOLATION LEVEL', 'transaction_isolation', 'max_identifier_length', 'standard_conforming_strings', 'parameters', 'server_version', 'search_path', 'datestyle', or 'time zone'"
-        ));
+        assertMemoryLeak(() -> assertQuery("show time")
+                .fails(9, "expected 'TABLES', 'COLUMNS FROM <tab>', 'PARTITIONS FROM <tab>', 'TRANSACTION ISOLATION LEVEL', 'transaction_isolation', 'max_identifier_length', 'standard_conforming_strings', 'parameters', 'server_version', 'server_version_num', 'search_path', 'datestyle', or 'time zone'"));
     }
 
     @Test
     public void testSqlSyntax1() throws Exception {
         assertMemoryLeak(() -> {
-            ddl("create table balances(cust_id int, ccy symbol, balance double)");
-            assertException(
-                    "show",
-                    4,
-                    "expected 'TABLES', 'COLUMNS FROM <tab>', 'PARTITIONS FROM <tab>', 'TRANSACTION ISOLATION LEVEL', 'transaction_isolation', 'max_identifier_length', 'standard_conforming_strings', 'parameters', 'server_version', 'search_path', 'datestyle', or 'time zone'"
-            );
+            execute("create table balances(cust_id int, ccy symbol, balance double)");
+            assertQuery("show")
+                    .fails(4, "expected 'TABLES', 'COLUMNS FROM <tab>', 'PARTITIONS FROM <tab>', 'TRANSACTION ISOLATION LEVEL', 'transaction_isolation', 'max_identifier_length', 'standard_conforming_strings', 'parameters', 'server_version', 'server_version_num', 'search_path', 'datestyle', or 'time zone'");
         });
     }
 
     @Test
     public void testSqlSyntax2() throws Exception {
         assertMemoryLeak(() -> {
-            ddl("create table balances(cust_id int, ccy symbol, balance double)");
-            assertException(
-                    "show columns balances",
-                    13,
-                    "expected 'from'"
-            );
+            execute("create table balances(cust_id int, ccy symbol, balance double)");
+            assertQuery("show columns balances")
+                    .fails(13, "expected 'from'");
         });
     }
 
     @Test
     public void testSqlSyntax3() throws Exception {
         assertMemoryLeak(() -> {
-            ddl("create table balances(cust_id int, ccy symbol, balance double)");
-            assertException(
-                    "show columns from balances where",
-                    27,
-                    "unexpected token [where]"
-            );
+            execute("create table balances(cust_id int, ccy symbol, balance double)");
+            assertQuery("show columns from balances where")
+                    .fails(27, "unexpected token [where]");
+        });
+    }
+
+    @Test
+    public void testTables() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("create table balances (ts timestamp, cust_id int, ccy symbol, balance double) timestamp(ts) partition by day wal");
+            execute("create materialized view balances_1h as (select ts, max(balance) from balances sample by 1h) partition by week");
+            execute("create view balances_view as (select ts, max(balance) from balances sample by 1h)");
+            drainWalAndViewQueues();
+            assertQuery("tables()")
+                    .noLeakCheck()
+                    .expectSize()
+                    .noRandomAccess()
+                    .returns("""
+                            id	table_name	designatedTimestamp	partitionBy	walEnabled	dedup	ttlValue	ttlUnit	matView	directoryName	maxUncommittedRows	o3MaxLag	table_suspended	table_type	table_row_count	table_min_timestamp	table_max_timestamp	table_last_write_timestamp	table_txn	table_memory_pressure_level	table_write_amp_count	table_write_amp_p50	table_write_amp_p90	table_write_amp_p99	table_write_amp_max	table_merge_rate_count	table_merge_rate_p50	table_merge_rate_p90	table_merge_rate_p99	table_merge_rate_max	wal_pending_row_count	wal_dedup_row_count_since_start	wal_txn	wal_max_timestamp	wal_tx_count	wal_tx_size_p50	wal_tx_size_p90	wal_tx_size_p99	wal_tx_size_max	replica_batch_count	replica_batch_size_p50	replica_batch_size_p90	replica_batch_size_p99	replica_batch_size_max	replica_more_pending
+                            1	balances	ts	DAY	true	false	0	HOUR	false	balances~1	1000	300000000	false	T	null				null	0	0	0.0	0.0	0.0	0.0	0	0	0	0	0	0	0	null		0	0	0	0	0	0	0	0	0	0	false
+                            2	balances_1h	ts	WEEK	true	false	0	HOUR	true	balances_1h~2	1000	-1	false	M	null				null	0	0	0.0	0.0	0.0	0.0	0	0	0	0	0	0	0	null		0	0	0	0	0	0	0	0	0	0	false
+                            3	balances_view	ts	N/A	true	false	0	HOUR	false	balances_view~3	0	0	false	V	null				null	0	0	0.0	0.0	0.0	0.0	0	0	0	0	0	0	0	null		0	0	0	0	0	0	0	0	0	0	false
+                            """);
         });
     }
 }

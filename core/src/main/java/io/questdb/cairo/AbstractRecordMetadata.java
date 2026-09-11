@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -59,18 +59,23 @@ public abstract class AbstractRecordMetadata implements RecordMetadata, Mutable 
     }
 
     @Override
+    public byte getColumnIndexType(int columnIndex) {
+        return getColumnMetadata(columnIndex).getIndexType();
+    }
+
+    @Override
     public TableColumnMetadata getColumnMetadata(int index) {
         return columnMetadata.getQuick(index);
     }
 
     @Override
     public String getColumnName(int columnIndex) {
-        return getColumnMetadata(columnIndex).getName();
+        return getColumnMetadata(columnIndex).getColumnName();
     }
 
     @Override
     public int getColumnType(int columnIndex) {
-        return getColumnMetadata(columnIndex).getType();
+        return getColumnMetadata(columnIndex).getColumnType();
     }
 
     @Override
@@ -81,6 +86,10 @@ public abstract class AbstractRecordMetadata implements RecordMetadata, Mutable 
     @Override
     public RecordMetadata getMetadata(int columnIndex) {
         return getColumnMetadata(columnIndex).getMetadata();
+    }
+
+    public int getOriginalWriterIndex(int columnIndex) {
+        return getColumnMetadata(columnIndex).getOriginalWriterIndex();
     }
 
     @Override
@@ -100,13 +109,8 @@ public abstract class AbstractRecordMetadata implements RecordMetadata, Mutable 
     }
 
     @Override
-    public boolean isColumnIndexed(int columnIndex) {
-        return getColumnMetadata(columnIndex).isIndexed();
-    }
-
-    @Override
     public boolean isDedupKey(int columnIndex) {
-        return getColumnMetadata(columnIndex).isDedupKey();
+        return getColumnMetadata(columnIndex).isDedupKeyFlag();
     }
 
     @Override

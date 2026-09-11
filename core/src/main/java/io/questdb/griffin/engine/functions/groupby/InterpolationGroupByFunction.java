@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -25,20 +25,24 @@
 package io.questdb.griffin.engine.functions.groupby;
 
 import io.questdb.cairo.ArrayColumnTypes;
+import io.questdb.cairo.arr.ArrayView;
 import io.questdb.cairo.map.MapValue;
+import io.questdb.cairo.sql.FunctionExtension;
 import io.questdb.cairo.sql.Record;
 import io.questdb.cairo.sql.RecordCursorFactory;
 import io.questdb.griffin.PlanSink;
 import io.questdb.griffin.engine.functions.GroupByFunction;
 import io.questdb.griffin.engine.groupby.InterpolationUtil;
 import io.questdb.std.BinarySequence;
+import io.questdb.std.Decimal128;
+import io.questdb.std.Decimal256;
+import io.questdb.std.Interval;
 import io.questdb.std.Long256;
 import io.questdb.std.str.CharSink;
-import io.questdb.std.str.Utf16Sink;
 import io.questdb.std.str.Utf8Sequence;
-import io.questdb.std.str.Utf8Sink;
+import org.jetbrains.annotations.NotNull;
 
-public class InterpolationGroupByFunction implements GroupByFunction {
+public class InterpolationGroupByFunction implements GroupByFunction, FunctionExtension {
     private final GroupByFunction wrappedFunction;
     private long current;
     private long endTime;
@@ -66,8 +70,18 @@ public class InterpolationGroupByFunction implements GroupByFunction {
     }
 
     @Override
+    public FunctionExtension extendedOps() {
+        return this;
+    }
+
+    @Override
+    public ArrayView getArray(Record rec) {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
     public int getArrayLength() {
-        return wrappedFunction.getArrayLength();
+        return wrappedFunction.extendedOps().getArrayLength();
     }
 
     @Override
@@ -106,6 +120,36 @@ public class InterpolationGroupByFunction implements GroupByFunction {
     @Override
     public long getDate(Record rec) {
         return wrappedFunction.getDate(rec);
+    }
+
+    @Override
+    public void getDecimal128(Record rec, Decimal128 sink) {
+        wrappedFunction.getDecimal128(rec, sink);
+    }
+
+    @Override
+    public short getDecimal16(Record rec) {
+        return wrappedFunction.getDecimal16(rec);
+    }
+
+    @Override
+    public void getDecimal256(Record rec, Decimal256 sink) {
+        wrappedFunction.getDecimal256(rec, sink);
+    }
+
+    @Override
+    public int getDecimal32(Record rec) {
+        return wrappedFunction.getDecimal32(rec);
+    }
+
+    @Override
+    public long getDecimal64(Record rec) {
+        return wrappedFunction.getDecimal64(rec);
+    }
+
+    @Override
+    public byte getDecimal8(Record rec) {
+        return wrappedFunction.getDecimal8(rec);
     }
 
     @Override
@@ -161,6 +205,11 @@ public class InterpolationGroupByFunction implements GroupByFunction {
     }
 
     @Override
+    public @NotNull Interval getInterval(Record rec) {
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
     public long getLong(Record rec) {
         long value = wrappedFunction.getLong(rec);
         if (interpolating) {
@@ -196,7 +245,7 @@ public class InterpolationGroupByFunction implements GroupByFunction {
 
     @Override
     public Record getRecord(Record rec) {
-        return wrappedFunction.getRecord(rec);
+        return wrappedFunction.extendedOps().getRecord(rec);
     }
 
     @Override
@@ -214,23 +263,13 @@ public class InterpolationGroupByFunction implements GroupByFunction {
     }
 
     @Override
-    public void getStr(Record rec, Utf16Sink utf16Sink) {
-        wrappedFunction.getStr(rec, utf16Sink);
-    }
-
-    @Override
-    public void getStr(Record rec, Utf16Sink sink, int arrayIndex) {
-        wrappedFunction.getStr(rec, sink, arrayIndex);
-    }
-
-    @Override
     public CharSequence getStrA(Record rec) {
         return wrappedFunction.getStrA(rec);
     }
 
     @Override
     public CharSequence getStrA(Record rec, int arrayIndex) {
-        return wrappedFunction.getStrA(rec, arrayIndex);
+        return wrappedFunction.extendedOps().getStrA(rec, arrayIndex);
     }
 
     @Override
@@ -240,7 +279,7 @@ public class InterpolationGroupByFunction implements GroupByFunction {
 
     @Override
     public CharSequence getStrB(Record rec, int arrayIndex) {
-        return wrappedFunction.getStrB(rec, arrayIndex);
+        return wrappedFunction.extendedOps().getStrB(rec, arrayIndex);
     }
 
     @Override
@@ -250,7 +289,7 @@ public class InterpolationGroupByFunction implements GroupByFunction {
 
     @Override
     public int getStrLen(Record rec, int arrayIndex) {
-        return wrappedFunction.getStrLen(rec, arrayIndex);
+        return wrappedFunction.extendedOps().getStrLen(rec, arrayIndex);
     }
 
     @Override
@@ -276,11 +315,6 @@ public class InterpolationGroupByFunction implements GroupByFunction {
     @Override
     public int getValueIndex() {
         return wrappedFunction.getValueIndex();
-    }
-
-    @Override
-    public void getVarchar(Record rec, Utf8Sink utf8Sink) {
-        wrappedFunction.getVarchar(rec, utf8Sink);
     }
 
     @Override

@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -25,14 +25,15 @@
 package io.questdb.cairo;
 
 import io.questdb.log.LogRecord;
-import io.questdb.std.str.Utf16Sink;
 import io.questdb.std.str.Sinkable;
+import io.questdb.std.str.Utf16Sink;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
 public class LogRecordSinkAdapter implements Utf16Sink {
 
     private LogRecord line;
+    private int[] ryuE10;
 
     public LogRecordSinkAdapter of(LogRecord line) {
         this.line = line;
@@ -64,19 +65,7 @@ public class LogRecordSinkAdapter implements Utf16Sink {
     }
 
     @Override
-    public Utf16Sink put(float value, int scale) {
-        line.$(value);
-        return this;
-    }
-
-    @Override
     public Utf16Sink put(double value) {
-        line.$(value);
-        return this;
-    }
-
-    @Override
-    public Utf16Sink put(double value, int scale) {
         line.$(value);
         return this;
     }
@@ -114,5 +103,13 @@ public class LogRecordSinkAdapter implements Utf16Sink {
     public Utf16Sink putQuoted(@NotNull CharSequence cs) {
         line.$('\"').$(cs).I$();
         return this;
+    }
+
+    @Override
+    public int[] ryuScratch() {
+        if (ryuE10 == null) {
+            ryuE10 = new int[1];
+        }
+        return ryuE10;
     }
 }

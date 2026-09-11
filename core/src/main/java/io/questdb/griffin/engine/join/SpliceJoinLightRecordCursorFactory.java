@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -25,22 +25,28 @@
 package io.questdb.griffin.engine.join;
 
 import io.questdb.cairo.CairoConfiguration;
+import io.questdb.cairo.CairoException;
+import io.questdb.cairo.ColumnType;
 import io.questdb.cairo.ColumnTypes;
 import io.questdb.cairo.RecordSink;
 import io.questdb.cairo.map.Map;
 import io.questdb.cairo.map.MapFactory;
 import io.questdb.cairo.map.MapKey;
 import io.questdb.cairo.map.MapValue;
+import io.questdb.cairo.sql.ParquetDecodeHint;
 import io.questdb.cairo.sql.Record;
 import io.questdb.cairo.sql.RecordCursor;
 import io.questdb.cairo.sql.RecordCursorFactory;
 import io.questdb.cairo.sql.RecordMetadata;
+import io.questdb.cairo.sql.SqlExecutionCircuitBreaker;
 import io.questdb.griffin.PlanSink;
 import io.questdb.griffin.SqlException;
 import io.questdb.griffin.SqlExecutionContext;
 import io.questdb.griffin.model.JoinContext;
 import io.questdb.std.Misc;
 import io.questdb.std.Transient;
+
+import static io.questdb.griffin.engine.join.AbstractAsOfJoinFastRecordCursor.scaleTimestamp;
 
 /**
  * Splice join compares time series that do not always align on timestamp. Consider
@@ -59,9 +65,9 @@ public class SpliceJoinLightRecordCursorFactory extends AbstractJoinRecordCursor
     private static final int VAL_MASTER_PREV = 0;
     private static final int VAL_SLAVE_NEXT = 3;
     private static final int VAL_SLAVE_PREV = 2;
-    private final SpliceJoinLightRecordCursor cursor;
     private final RecordSink masterKeySink;
     private final RecordSink slaveKeySink;
+    private SpliceJoinLightRecordCursor cursor;
 
     public SpliceJoinLightRecordCursorFactory(
             CairoConfiguration cairoConfiguration,
@@ -76,23 +82,29 @@ public class SpliceJoinLightRecordCursorFactory extends AbstractJoinRecordCursor
             JoinContext joinContext
     ) {
         super(metadata, joinContext, masterFactory, slaveFactory);
+        Map joinKeyMap = null;
         try {
             this.masterKeySink = masterSink;
             this.slaveKeySink = slaveSink;
-            Map joinKeyMap = MapFactory.createUnorderedMap(
+            joinKeyMap = MapFactory.createUnorderedMap(
                     cairoConfiguration,
                     joinColumnTypes,
-                    valueTypes
+                    valueTypes,
+                    false,
+                    false
             );
             cursor = new SpliceJoinLightRecordCursor(
                     joinKeyMap,
                     columnSplit,
                     masterFactory.getMetadata().getTimestampIndex(),
                     slaveFactory.getMetadata().getTimestampIndex(),
+                    masterFactory.getMetadata().getTimestampType(),
+                    slaveFactory.getMetadata().getTimestampType(),
                     NullRecordFactory.getInstance(masterFactory.getMetadata()),
                     NullRecordFactory.getInstance(slaveFactory.getMetadata())
             );
         } catch (Throwable th) {
+            Misc.free(joinKeyMap);
             close();
             throw th;
         }
@@ -109,11 +121,15 @@ public class SpliceJoinLightRecordCursorFactory extends AbstractJoinRecordCursor
         RecordCursor slaveCursor = null;
         try {
             slaveCursor = slaveFactory.getCursor(executionContext);
-            cursor.of(masterCursor, slaveCursor);
+            slaveCursor.setParquetDecodeHint(ParquetDecodeHint.MONOTONIC);
+            cursor.of(masterCursor, slaveCursor, executionContext);
             return cursor;
         } catch (Throwable e) {
             Misc.free(slaveCursor);
             Misc.free(masterCursor);
+            // of() binds the per-query tracker and reopens the join map before it can throw;
+            // close() frees it under that tracker and resets isOpen so the factory is reusable.
+            Misc.free(cursor);
             throw e;
         }
     }
@@ -140,19 +156,23 @@ public class SpliceJoinLightRecordCursorFactory extends AbstractJoinRecordCursor
 
     @Override
     protected void _close() {
-        Misc.freeIfCloseable(getMetadata());
-        Misc.free(masterFactory);
-        Misc.free(slaveFactory);
-        Misc.free(cursor);
+        final SpliceJoinLightRecordCursor cursor = this.cursor;
+        this.cursor = null;
+        Throwable failure = closeJoinOwnersBestEffort();
+        failure = Misc.freeBestEffort(failure, cursor);
+        CairoException.rethrowCleanupFailure(failure);
     }
 
     private class SpliceJoinLightRecordCursor extends AbstractJoinCursor {
         private final Map joinKeyMap;
         private final int masterTimestampIndex;
+        private final long masterTimestampScale;
         private final Record nullMasterRecord;
         private final Record nullSlaveRecord;
         private final JoinRecord record;
         private final int slaveTimestampIndex;
+        private final long slaveTimestampScale;
+        private SqlExecutionCircuitBreaker circuitBreaker;
         private boolean dualRecord;
         private boolean fetchMaster = true;
         private boolean fetchSlave = true;
@@ -175,6 +195,8 @@ public class SpliceJoinLightRecordCursorFactory extends AbstractJoinRecordCursor
                 int columnSplit,
                 int masterTimestampIndex,
                 int slaveTimestampIndex,
+                int masterTimestampType,
+                int slaveTimestampType,
                 Record nullMasterRecord,
                 Record nullSlaveRecord
         ) {
@@ -185,7 +207,13 @@ public class SpliceJoinLightRecordCursorFactory extends AbstractJoinRecordCursor
             this.slaveTimestampIndex = slaveTimestampIndex;
             this.nullMasterRecord = nullMasterRecord;
             this.nullSlaveRecord = nullSlaveRecord;
-            isOpen = true;
+            isOpen = false;
+            if (masterTimestampType == slaveTimestampType) {
+                masterTimestampScale = slaveTimestampScale = 1L;
+            } else {
+                masterTimestampScale = ColumnType.getTimestampDriver(masterTimestampType).toNanosScale();
+                slaveTimestampScale = ColumnType.getTimestampDriver(slaveTimestampType).toNanosScale();
+            }
         }
 
         @Override
@@ -204,6 +232,7 @@ public class SpliceJoinLightRecordCursorFactory extends AbstractJoinRecordCursor
 
         @Override
         public boolean hasNext() {
+            circuitBreaker.statefulThrowExceptionIfTripped();
             if (dualRecord) {
                 slaveRecordLeads();
                 dualRecord = false;
@@ -228,7 +257,7 @@ public class SpliceJoinLightRecordCursorFactory extends AbstractJoinRecordCursor
                         value.putLong(VAL_MASTER_PREV, value.getLong(VAL_MASTER_NEXT));
                     }
                     value.putLong(VAL_MASTER_NEXT, masterRecord.getRowId());
-                    masterTimestamp = masterRecord.getTimestamp(masterTimestampIndex);
+                    masterTimestamp = scaleTimestamp(masterRecord.getTimestamp(masterTimestampIndex), masterTimestampScale);
                 } else {
                     masterTimestamp = Long.MAX_VALUE;
                 }
@@ -252,7 +281,7 @@ public class SpliceJoinLightRecordCursorFactory extends AbstractJoinRecordCursor
                         value.putLong(VAL_SLAVE_PREV, value.getLong(VAL_SLAVE_NEXT));
                     }
                     value.putLong(VAL_SLAVE_NEXT, slaveRecord.getRowId());
-                    slaveTimestamp = slaveRecord.getTimestamp(slaveTimestampIndex);
+                    slaveTimestamp = scaleTimestamp(slaveRecord.getTimestamp(slaveTimestampIndex), slaveTimestampScale);
                 } else {
                     slaveTimestamp = Long.MAX_VALUE;
                 }
@@ -284,6 +313,11 @@ public class SpliceJoinLightRecordCursorFactory extends AbstractJoinRecordCursor
                 fetchSlave = true;
             }
             return true;
+        }
+
+        @Override
+        public long preComputedStateSize() {
+            return 0;
         }
 
         @Override
@@ -334,9 +368,11 @@ public class SpliceJoinLightRecordCursorFactory extends AbstractJoinRecordCursor
             }
         }
 
-        void of(RecordCursor masterCursor, RecordCursor slaveCursor) {
+        void of(RecordCursor masterCursor, RecordCursor slaveCursor, SqlExecutionContext executionContext) {
+            this.circuitBreaker = executionContext.getCircuitBreaker();
             if (!isOpen) {
                 isOpen = true;
+                joinKeyMap.setMemoryTracker(executionContext.getMemoryTracker());
                 joinKeyMap.reopen();
             }
             // avoid resetting these

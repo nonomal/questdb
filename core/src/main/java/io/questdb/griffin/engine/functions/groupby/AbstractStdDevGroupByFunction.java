@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -97,6 +97,43 @@ public abstract class AbstractStdDevGroupByFunction extends DoubleFunction imple
         return false;
     }
 
+    // Chan et al. [CGL82; CGL83]
+    @Override
+    public void merge(MapValue destValue, MapValue srcValue) {
+        long srcCount = srcValue.getLong(valueIndex + 2);
+        if (srcCount == 0) {
+            return;
+        }
+        long destCount = destValue.getLong(valueIndex + 2);
+        if (destCount == 0) {
+            destValue.putDouble(valueIndex, srcValue.getDouble(valueIndex));
+            destValue.putDouble(valueIndex + 1, srcValue.getDouble(valueIndex + 1));
+            destValue.putLong(valueIndex + 2, srcCount);
+            return;
+        }
+
+        double srcMean = srcValue.getDouble(valueIndex);
+        double srcSum = srcValue.getDouble(valueIndex + 1);
+
+        double destMean = destValue.getDouble(valueIndex);
+        double destSum = destValue.getDouble(valueIndex + 1);
+
+        long mergedCount = srcCount + destCount;
+        double delta = destMean - srcMean;
+
+        // This is only valid when countA is much larger than countB.
+        // If both are large and similar sizes, delta is not scaled down.
+        // double mergedMean = srcMean + delta * ((double) destCount / mergedCount);
+
+        // So we use this instead:
+        double mergedMean = (srcCount * srcMean + destCount * destMean) / mergedCount;
+        double mergedSum = srcSum + destSum + (delta * delta) * ((double) (srcCount * destCount) / mergedCount);
+
+        destValue.putDouble(valueIndex, mergedMean);
+        destValue.putDouble(valueIndex + 1, mergedSum);
+        destValue.putLong(valueIndex + 2, mergedCount);
+    }
+
     @Override
     public void setDouble(MapValue mapValue, double value) {
         mapValue.putDouble(valueIndex, value);
@@ -112,7 +149,7 @@ public abstract class AbstractStdDevGroupByFunction extends DoubleFunction imple
 
     @Override
     public boolean supportsParallelism() {
-        return false;
+        return UnaryFunction.super.supportsParallelism();
     }
 
     protected void aggregate(MapValue mapValue, double value) {
@@ -128,4 +165,3 @@ public abstract class AbstractStdDevGroupByFunction extends DoubleFunction imple
         mapValue.addLong(valueIndex + 2, 1L);
     }
 }
-

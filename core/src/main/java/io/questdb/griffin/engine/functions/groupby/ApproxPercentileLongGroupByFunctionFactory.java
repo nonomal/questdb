@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -32,6 +32,9 @@ import io.questdb.griffin.SqlExecutionContext;
 import io.questdb.std.IntList;
 import io.questdb.std.ObjList;
 
+import static io.questdb.griffin.engine.functions.groupby.ApproxPercentileDoubleGroupByFunctionFactory.checkAndReturnPrecision;
+import static io.questdb.griffin.engine.functions.groupby.ApproxPercentileDoubleGroupByFunctionFactory.checkPercentile;
+
 public class ApproxPercentileLongGroupByFunctionFactory implements FunctionFactory {
 
     @Override
@@ -56,17 +59,8 @@ public class ApproxPercentileLongGroupByFunctionFactory implements FunctionFacto
         final Function percentileFunc = args.getQuick(1);
         final Function precisionFunc = args.getQuick(2);
 
-        if (!percentileFunc.isConstant() && !percentileFunc.isRuntimeConstant()) {
-            throw SqlException.$(argPositions.getQuick(1), "percentile must be a constant");
-        }
-        if (!precisionFunc.isConstant()) {
-            throw SqlException.$(argPositions.getQuick(2), "precision must be a constant");
-        }
-
-        final int precision = precisionFunc.getInt(null);
-        if (precision < 0 || precision > 5) {
-            throw SqlException.$(position, "precision must be between 0 and 5");
-        }
+        checkPercentile(percentileFunc, argPositions.getQuick(1));
+        final int precision = checkAndReturnPrecision(precisionFunc, argPositions.getQuick(2));
 
         if (precision > 2) {
             return new ApproxPercentileLongPackedGroupByFunction(exprFunc, percentileFunc, precision, position);

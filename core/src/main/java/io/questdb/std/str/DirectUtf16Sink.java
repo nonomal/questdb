@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -32,12 +32,13 @@ import org.jetbrains.annotations.TestOnly;
 
 import java.io.Closeable;
 
-public class DirectUtf16Sink implements MutableUtf16Sink, DirectCharSequence, Closeable, Utf16Sink {
+public class DirectUtf16Sink implements MutableUtf16Sink, DirectCharSequence, Closeable, CloneableMutable {
     private final long initialCapacity;
     private long capacity;
     private long hi;
     private long lo;
     private long ptr;
+    private int[] ryuE10;
     private FloatingCharSequence subSequence;
 
     public DirectUtf16Sink(long capacity) {
@@ -50,7 +51,7 @@ public class DirectUtf16Sink implements MutableUtf16Sink, DirectCharSequence, Cl
 
     @Override
     public char charAt(int index) {
-        return Unsafe.getUnsafe().getChar(ptr + index * 2L);
+        return Unsafe.getChar(ptr + index * 2L);
     }
 
     @Override
@@ -60,7 +61,13 @@ public class DirectUtf16Sink implements MutableUtf16Sink, DirectCharSequence, Cl
 
     @Override
     public void close() {
-        Unsafe.free(ptr, capacity, MemoryTag.NATIVE_DIRECT_CHAR_SINK);
+        ptr = Unsafe.free(ptr, capacity, MemoryTag.NATIVE_DIRECT_CHAR_SINK);
+    }
+
+    @Override
+    @SuppressWarnings("unchecked")
+    public <T> T copy() {
+        return (T) toString();
     }
 
     @TestOnly
@@ -87,7 +94,7 @@ public class DirectUtf16Sink implements MutableUtf16Sink, DirectCharSequence, Cl
                 resize(Math.max(capacity * 2L, (lo - ptr + l2) * 2L));
             }
             for (int i = 0; i < l; i++) {
-                Unsafe.getUnsafe().putChar(lo + i * 2L, cs.charAt(i));
+                Unsafe.putChar(lo + i * 2L, cs.charAt(i));
             }
             this.lo += l2;
         }
@@ -99,7 +106,7 @@ public class DirectUtf16Sink implements MutableUtf16Sink, DirectCharSequence, Cl
         if (lo == hi) {
             resize(this.capacity * 2);
         }
-        Unsafe.getUnsafe().putChar(lo, c);
+        Unsafe.putChar(lo, c);
         lo += 2;
         return this;
     }
@@ -111,7 +118,7 @@ public class DirectUtf16Sink implements MutableUtf16Sink, DirectCharSequence, Cl
             resize((int) Math.max(capacity * 2L, (lo - ptr + l2) * 2L));
         }
         for (int i = 0; i < len; i++) {
-            Unsafe.getUnsafe().putChar(lo + i * 2L, chars[i + start]);
+            Unsafe.putChar(lo + i * 2L, chars[i + start]);
         }
         this.lo += l2;
         return this;
@@ -124,7 +131,7 @@ public class DirectUtf16Sink implements MutableUtf16Sink, DirectCharSequence, Cl
             resize(Math.max(capacity * 2L, (lo - ptr + l2) * 2L));
         }
         for (int i = 0; i < l; i++) {
-            Unsafe.getUnsafe().putChar(lo + i * 2L, (char) us.byteAt(i));
+            Unsafe.putChar(lo + i * 2L, (char) us.byteAt(i));
         }
         this.lo += l2;
         return this;
@@ -133,6 +140,14 @@ public class DirectUtf16Sink implements MutableUtf16Sink, DirectCharSequence, Cl
     public void resetCapacity() {
         resize(initialCapacity);
         clear();
+    }
+
+    @Override
+    public int[] ryuScratch() {
+        if (ryuE10 == null) {
+            ryuE10 = new int[1];
+        }
+        return ryuE10;
     }
 
     @Override
@@ -169,7 +184,7 @@ public class DirectUtf16Sink implements MutableUtf16Sink, DirectCharSequence, Cl
 
         @Override
         public char charAt(int index) {
-            return Unsafe.getUnsafe().getChar(ptr + (startIndex + index) * 2L);
+            return Unsafe.getChar(ptr + (startIndex + index) * 2L);
         }
 
         @Override

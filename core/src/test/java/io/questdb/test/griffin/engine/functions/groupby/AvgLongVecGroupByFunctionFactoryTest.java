@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -36,67 +36,94 @@ public class AvgLongVecGroupByFunctionFactoryTest extends AbstractCairoTest {
 
         setProperty(PropertyKey.CAIRO_SQL_PAGE_FRAME_MAX_ROWS, 10_000);
 
-        assertQuery("avg\n" +
-                        "5261.376146789\n", "select round(avg(f),9) avg from tab", "create table tab as (select rnd_int(-55, 9009, 2) f from long_sequence(131))", null, "alter table tab add column b long", "avg\n" +
-                        "5261.376146789\n", false, true, false);
+        assertQuery("select round(avg(f),9) avg from tab")
+                .ddl("create table tab as (select rnd_int(-55, 9009, 2) f from long_sequence(131))")
+                .mutateWith("alter table tab add column b long")
+                .noRandomAccess()
+                .expectSize()
+                .returns("""
+                        avg
+                        5261.376146789
+                        """, """
+                        avg
+                        5261.376146789
+                        """);
 
-        assertQuery(
-                "avg\tavg2\n" +
-                        "14.792007\t52790.018932\n",
-                "select round(avg(f),6) avg, round(avg(b),6) avg2 from tab",
-                "insert into tab select rnd_int(2, 10, 2), rnd_long(16772, 88965, 4) from long_sequence(78057)",
-                null,
-                false,
-                true
-        );
+        assertQuery("select round(avg(f),6) avg, round(avg(b),6) avg2 from tab")
+                .ddl("insert into tab select rnd_int(2, 10, 2), rnd_long(16772, 88965, 4) from long_sequence(78057)")
+                .noRandomAccess()
+                .expectSize()
+                .returns("""
+                        avg\tavg2
+                        14.792007\t52790.018932
+                        """);
     }
 
     @Test
     public void testAllNullThenOne() throws Exception {
-        assertQuery("avg\n" +
-                "null\n", "select avg(f) from tab", "create table tab as (select cast(null as long) f from long_sequence(33))", null, "insert into tab select 123L from long_sequence(1)", "avg\n" +
-                        "123.0\n", false, true, false);
+        assertQuery("select avg(f) from tab")
+                .ddl("create table tab as (select cast(null as long) f from long_sequence(33))")
+                .mutateWith("insert into tab select 123L from long_sequence(1)")
+                .noRandomAccess()
+                .expectSize()
+                .returns("""
+                        avg
+                        null
+                        """, """
+                        avg
+                        123.0
+                        """);
     }
 
     @Test
     public void testAvgLongOverflow() throws Exception {
         assertMemoryLeak(() -> {
-            ddl("create table test as(select 21474836475L * x as x, rnd_symbol('a', 'b', 'c') sym from long_sequence(1000000));");
-            String expected = "sym\tavg\n" +
-                    "a\t1.0731625369352276E16\n" +
-                    "b\t1.0731385513028126E16\n" +
-                    "c\t1.0749264817744848E16\n";
+            execute("create table test as(select 21474836475L * x as x, rnd_symbol('a', 'b', 'c') sym from long_sequence(1000000));");
+            String expected = """
+                    sym\tavg
+                    a\t1.0731625369352276E16
+                    b\t1.0731385513028126E16
+                    c\t1.0749264817744848E16
+                    """;
 
 
-            assertSql(expected, "select sym, avg(cast(x as double)) from test order by sym");
-            assertSql(expected, "select sym, avg(x) from test where x > 0 order by sym");
+            assertQuery("select sym, avg(cast(x as double)) from test order by sym")
+                    .noLeakCheck()
+                    .expectSize()
+                    .returns(expected);
+            assertQuery("select sym, avg(x) from test where x > 0 order by sym")
+                    .noLeakCheck()
+                    .expectSize()
+                    .returns(expected);
 
-            final String diffExpected = "sym\tcolumn\n" +
-                    "a\ttrue\n" +
-                    "b\ttrue\n" +
-                    "c\ttrue\n";
+            final String diffExpected = """
+                    sym\tcolumn
+                    a\ttrue
+                    b\ttrue
+                    c\ttrue
+                    """;
 
             // Here 6000 is a hack.
             // Difference between avg(double) and avg(long) depends on column values range and rows count.
-            assertSql(diffExpected, "with a as (select sym, avg(x) from test), b as (select sym, avg(x) from test where x > 0) " +
-                    "select a.sym, b.avg-a.avg < 6000 from a join b on(sym) order by sym");
+            assertQuery("with a as (select sym, avg(x) from test), b as (select sym, avg(x) from test where x > 0) " +
+                    "select a.sym, b.avg-a.avg < 6000 from a join b on(sym) order by sym")
+                    .noLeakCheck()
+                    .returns(diffExpected);
         });
     }
 
     @Test
     public void testSimple() throws Exception {
         // fix page frame size, because it affects AVG accuracy
-
         setProperty(PropertyKey.CAIRO_SQL_PAGE_FRAME_MAX_ROWS, 10_000);
 
-        assertQuery(
-                "avg\n" +
-                        "4289.100917431191\n",
-                "select avg(f) from tab",
-                "create table tab as (select rnd_long(-55, 9009, 2) f from long_sequence(131))",
-                null,
-                false,
-                true
-        );
+        assertQuery("select avg(f) from tab")
+                .ddl("create table tab as (select rnd_long(-55, 9009, 2) f from long_sequence(131))")
+                .noRandomAccess()
+                .expectSize()
+                .returns("""
+                        avg
+                        4289.100917431193
+                        """);
     }
 }

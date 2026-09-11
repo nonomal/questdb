@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -27,6 +27,7 @@ package io.questdb.test.cairo;
 import io.questdb.cairo.CairoException;
 import io.questdb.cairo.ColumnType;
 import io.questdb.cairo.GenericRecordMetadata;
+import io.questdb.cairo.IndexType;
 import io.questdb.cairo.TableColumnMetadata;
 import io.questdb.cairo.sql.InvalidColumnException;
 import io.questdb.std.str.StringSink;
@@ -41,7 +42,7 @@ public class GenericRecordMetadataTest {
     public void testBaseInterfaceDefaults() {
         GenericRecordMetadata metadata = new GenericRecordMetadata();
         metadata.add(new TableColumnMetadata("abc", ColumnType.INT));
-        metadata.add(new TableColumnMetadata("cde", ColumnType.SYMBOL, true, 1024, true, null));
+        metadata.add(new TableColumnMetadata("cde", ColumnType.SYMBOL, IndexType.BITMAP, 1024, true, null));
         metadata.add(new TableColumnMetadata("timestamp", ColumnType.TIMESTAMP));
         metadata.setTimestampIndex(2);
 
@@ -73,7 +74,7 @@ public class GenericRecordMetadataTest {
             metadata.add(new TableColumnMetadata("abc", ColumnType.FLOAT));
             Assert.fail();
         } catch (CairoException e) {
-            TestUtils.assertContains(e.getFlyweightMessage(), "Duplicate column [name=abc]");
+            TestUtils.assertContains(e.getFlyweightMessage(), "duplicate column [name=abc]");
         }
 
         sink.clear();
@@ -97,7 +98,7 @@ public class GenericRecordMetadataTest {
             metadata.add(new TableColumnMetadata("ABC", ColumnType.FLOAT));
             Assert.fail();
         } catch (CairoException e) {
-            TestUtils.assertContains(e.getFlyweightMessage(), "Duplicate column [name=ABC]");
+            TestUtils.assertContains(e.getFlyweightMessage(), "duplicate column [name=ABC]");
         }
 
         sink.clear();
@@ -121,7 +122,7 @@ public class GenericRecordMetadataTest {
 
         String expected2 = "{\"columnCount\":2,\"columns\":[{\"index\":0,\"name\":\"x\",\"type\":\"SYMBOL\"},{\"index\":1,\"name\":\"z\",\"type\":\"DATE\"}],\"timestampIndex\":-1}";
         metadata.clear();
-        metadata.add(new TableColumnMetadata("x", ColumnType.SYMBOL, false, 0, false, null));
+        metadata.add(new TableColumnMetadata("x", ColumnType.SYMBOL, IndexType.NONE, 0, false, null));
         metadata.add(new TableColumnMetadata("z", ColumnType.DATE));
         sink.clear();
         metadata.toJson(sink);

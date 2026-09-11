@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -33,6 +33,8 @@ import io.questdb.std.Unsafe;
 import io.questdb.test.tools.TestUtils;
 import org.junit.Assert;
 
+import java.util.function.IntConsumer;
+
 public class NetUtils {
 
     public static void playScript(
@@ -41,7 +43,17 @@ public class NetUtils {
             CharSequence ipv4Address,
             int port
     ) {
-        int clientFd = nf.socketTcp(true);
+        playScript(nf, script, ipv4Address, port, null);
+    }
+
+    public static void playScript(
+            NetworkFacade nf,
+            String script,
+            CharSequence ipv4Address,
+            int port,
+            IntConsumer afterReceive
+    ) {
+        long clientFd = nf.socketTcp(true);
         long sockAddress = nf.sockaddr(Net.parseIPv4(ipv4Address), port);
         TestUtils.assertConnect(clientFd, sockAddress);
 
@@ -55,6 +67,7 @@ public class NetUtils {
 
             int line = 0;
             int mode = 0;
+            int receiveCount = 0;
             int n = script.length();
             int i = 0;
             while (i < n) {
@@ -88,6 +101,9 @@ public class NetUtils {
                                     i = n;
                                 } else {
                                     assertBuffers(line, sendBuf, expectedLen, recvBuf, actualLen);
+                                    if (afterReceive != null) {
+                                        afterReceive.accept(++receiveCount);
+                                    }
                                     // clear sendBuf
                                     sendPtr = sendBuf;
                                 }
@@ -112,7 +128,7 @@ public class NetUtils {
                         } else {
                             try {
                                 byte b = (byte) ((Numbers.hexToDecimal(c1) << 4) | Numbers.hexToDecimal(c2));
-                                Unsafe.getUnsafe().putByte(sendPtr++, b);
+                                Unsafe.putByte(sendPtr++, b);
                             } catch (NumericException e) {
                                 e.printStackTrace();
                             }
@@ -140,6 +156,9 @@ public class NetUtils {
                     } else {
                         int actualLen = nf.recvRaw(clientFd, recvBuf, expectedLen);
                         assertBuffers(line, sendBuf, expectedLen, recvBuf, actualLen);
+                        if (afterReceive != null) {
+                            afterReceive.accept(++receiveCount);
+                        }
                     }
                 }
             }
@@ -154,8 +173,8 @@ public class NetUtils {
     private static void assertBuffers(int line, long expectedBuf, int expectedLen, long actualBuf, int actualLen) {
         Assert.assertEquals(expectedLen, actualLen);
         for (int j = 0; j < expectedLen; j++) {
-            if (Unsafe.getUnsafe().getByte(expectedBuf + j) != Unsafe.getUnsafe().getByte(actualBuf + j)) {
-                Assert.fail("line = " + line + ", pos = " + j + ", expected: " + Unsafe.getUnsafe().getByte(expectedBuf + j) + ", actual: " + Unsafe.getUnsafe().getByte(actualBuf + j));
+            if (Unsafe.getByte(expectedBuf + j) != Unsafe.getByte(actualBuf + j)) {
+                Assert.fail("line = " + line + ", pos = " + j + ", expected: " + Unsafe.getByte(expectedBuf + j) + ", actual: " + Unsafe.getByte(actualBuf + j));
             }
         }
     }

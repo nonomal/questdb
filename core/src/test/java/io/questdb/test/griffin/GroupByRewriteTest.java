@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,90 +24,291 @@
 
 package io.questdb.test.griffin;
 
-import io.questdb.griffin.SqlException;
 import io.questdb.test.AbstractCairoTest;
-import org.junit.Assert;
 import org.junit.Test;
 
 public class GroupByRewriteTest extends AbstractCairoTest {
 
     @Test
+    public void testRewriteAggregateDoesNotCreateDuplicateKey() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("CREATE TABLE trades (sym symbol, price double, amount double, ts timestamp) timestamp(ts) partition by day;");
+            execute("CREATE TABLE trades2 (sym symbol, price double, amount double, ts timestamp) timestamp(ts) partition by day;");
+
+            // key first
+            assertQuery("SELECT ts, price, price / sum(amount) FROM trades;")
+                    .noLeakCheck()
+                    .assertsPlan("""
+                            VirtualRecord
+                              functions: [ts,price,price/sum]
+                                Async Group By workers: 1
+                                  keys: [ts,price]
+                                  values: [sum(amount)]
+                                  filter: null
+                                    PageFrame
+                                        Row forward scan
+                                        Frame forward scan on: trades
+                            """);
+            // key first, aliased
+            assertQuery("SELECT ts, PricE as price0, price / sum(amount) FROM trades;")
+                    .noLeakCheck()
+                    .assertsPlan("""
+                            VirtualRecord
+                              functions: [ts,price0,price0/sum]
+                                Async Group By workers: 1
+                                  keys: [ts,price0]
+                                  values: [sum(amount)]
+                                  filter: null
+                                    PageFrame
+                                        Row forward scan
+                                        Frame forward scan on: trades
+                            """);
+            // key first, multiple column occurrences
+            assertQuery("SELECT ts, price, (price + price) / sum(amount) FROM trades;")
+                    .noLeakCheck()
+                    .assertsPlan("""
+                            VirtualRecord
+                              functions: [ts,price,price+price/sum]
+                                Async Group By workers: 1
+                                  keys: [ts,price]
+                                  values: [sum(amount)]
+                                  filter: null
+                                    PageFrame
+                                        Row forward scan
+                                        Frame forward scan on: trades
+                            """);
+            // key first, multiple keys, multiple column occurrences
+            assertQuery("SELECT ts, price, price as price0, (price + price) / sum(amount) FROM trades;")
+                    .noLeakCheck()
+                    .assertsPlan("""
+                            VirtualRecord
+                              functions: [ts,price,price,price+price/sum]
+                                Async Group By workers: 1
+                                  keys: [ts,price]
+                                  values: [sum(amount)]
+                                  filter: null
+                                    PageFrame
+                                        Row forward scan
+                                        Frame forward scan on: trades
+                            """);
+            // key first, aliased, multiple column occurrences
+            assertQuery("SELECT ts, price as price0, (price + price) / sum(amount) FROM trades;")
+                    .noLeakCheck()
+                    .assertsPlan("""
+                            VirtualRecord
+                              functions: [ts,price0,price0+price0/sum]
+                                Async Group By workers: 1
+                                  keys: [ts,price0]
+                                  values: [sum(amount)]
+                                  filter: null
+                                    PageFrame
+                                        Row forward scan
+                                        Frame forward scan on: trades
+                            """);
+
+            // key second
+            assertQuery("SELECT ts, price / sum(amount), price FROM trades;")
+                    .noLeakCheck()
+                    .assertsPlan("""
+                            VirtualRecord
+                              functions: [ts,price/sum,price]
+                                Async Group By workers: 1
+                                  keys: [ts,price]
+                                  values: [sum(amount)]
+                                  filter: null
+                                    PageFrame
+                                        Row forward scan
+                                        Frame forward scan on: trades
+                            """);
+            // key second, aliased
+            assertQuery("SELECT ts, price / sum(amount), PricE as price0 FROM trades;")
+                    .noLeakCheck()
+                    .assertsPlan("""
+                            VirtualRecord
+                              functions: [ts,price/sum,price]
+                                Async Group By workers: 1
+                                  keys: [ts,price]
+                                  values: [sum(amount)]
+                                  filter: null
+                                    PageFrame
+                                        Row forward scan
+                                        Frame forward scan on: trades
+                            """);
+            // key second, aliased, multiple columns
+            assertQuery("SELECT ts, sym price, price / sum(amount), price price1 FROM trades;")
+                    .noLeakCheck()
+                    .assertsPlan("""
+                            VirtualRecord
+                              functions: [ts,price,price1/sum,price1]
+                                Async Group By workers: 1
+                                  keys: [ts,price,price1]
+                                  values: [sum(amount)]
+                                  filter: null
+                                    PageFrame
+                                        Row forward scan
+                                        Frame forward scan on: trades
+                            """);
+            // key second, multiple column occurrences
+            assertQuery("SELECT ts, (price + price) / sum(amount), price FROM trades;")
+                    .noLeakCheck()
+                    .assertsPlan("""
+                            VirtualRecord
+                              functions: [ts,price+price/sum,price]
+                                Async Group By workers: 1
+                                  keys: [ts,price]
+                                  values: [sum(amount)]
+                                  filter: null
+                                    PageFrame
+                                        Row forward scan
+                                        Frame forward scan on: trades
+                            """);
+            // key second, multiple keys, multiple column occurrences
+            assertQuery("SELECT ts, (price + price) / sum(amount), price, price as price0 FROM trades;")
+                    .noLeakCheck()
+                    .assertsPlan("""
+                            VirtualRecord
+                              functions: [ts,price+price/sum,price,price]
+                                Async Group By workers: 1
+                                  keys: [ts,price]
+                                  values: [sum(amount)]
+                                  filter: null
+                                    PageFrame
+                                        Row forward scan
+                                        Frame forward scan on: trades
+                            """);
+            // key second, aliased, multiple column occurrences
+            assertQuery("SELECT ts, (price + price) / sum(amount), price as price0 FROM trades;")
+                    .noLeakCheck()
+                    .assertsPlan("""
+                            VirtualRecord
+                              functions: [ts,price+price/sum,price]
+                                Async Group By workers: 1
+                                  keys: [ts,price]
+                                  values: [sum(amount)]
+                                  filter: null
+                                    PageFrame
+                                        Row forward scan
+                                        Frame forward scan on: trades
+                            """);
+
+            // joined tables with same column names - the rewrite should not deduplicate the keys
+            assertQuery("SELECT t1.ts, t1.price, t2.price / sum(t1.amount) FROM trades t1 JOIN trades2 t2 ON (sym);")
+                    .noLeakCheck()
+                    .assertsPlan("""
+                            VirtualRecord
+                              functions: [ts,price,price1/sum]
+                                GroupBy vectorized: false
+                                  keys: [ts,price,price1]
+                                  values: [sum(amount)]
+                                    SelectedRecord
+                                        Hash Join Light
+                                          condition: t2.sym=t1.sym
+                                          symbolKeyJoin: true
+                                            PageFrame
+                                                Row forward scan
+                                                Frame forward scan on: trades
+                                            Hash
+                                                PageFrame
+                                                    Row forward scan
+                                                    Frame forward scan on: trades2
+                            """);
+        });
+    }
+
+    @Test
+    public void testRewriteAggregateExtractsConstantKeys() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("CREATE TABLE trades (price double, amount double, ts timestamp) timestamp(ts) partition by day;");
+            assertQuery("SELECT 42, 'foobar', amount, sum(price) FROM trades;")
+                    .noLeakCheck()
+                    .assertsPlan("""
+                            VirtualRecord
+                              functions: [42,'foobar',amount,sum]
+                                Async Group By workers: 1
+                                  keys: [amount]
+                                  values: [sum(price)]
+                                  filter: null
+                                    PageFrame
+                                        Row forward scan
+                                        Frame forward scan on: trades
+                            """);
+        });
+    }
+
+    @Test
     public void testRewriteAggregateOnJoin1() throws Exception {
         assertMemoryLeak(() -> {
-            compile("CREATE TABLE taba ( ax int, aid int );");
-            insert("INSERT INTO taba values (1,1), (2,2)");
-            compile("CREATE TABLE tabb ( bx int, bid int );");
-            insert("INSERT INTO tabb values (3,1), (4,2)");
+            execute("CREATE TABLE taba ( ax int, aid int );");
+            execute("INSERT INTO taba values (1,1), (2,2)");
+            execute("CREATE TABLE tabb ( bx int, bid int );");
+            execute("INSERT INTO tabb values (3,1), (4,2)");
 
-            assertQueryNoLeakCheck("sum\tsum1\tsum2\tsum3\n" +
-                            "3\t7\t23\t27\n",
-                    "SELECT sum(ax), sum(bx), sum(ax+10), sum(bx+10) " +
-                            "FROM taba " +
-                            "join tabb on aid = bid", null, false, false, true);
+            assertQuery("SELECT sum(ax), sum(bx), sum(ax+10), sum(bx+10) " +
+                    "FROM taba " +
+                    "join tabb on aid = bid")
+                    .noLeakCheck()
+                    .noRandomAccess()
+                    .sizeMayVary()
+                    .returns("""
+                            sum\tsum1\tsum2\tsum3
+                            3\t7\t23\t27
+                            """);
         });
     }
 
     @Test
     public void testRewriteAggregateOnJoin3() throws Exception {
         assertMemoryLeak(() -> {
-            compile("CREATE TABLE taba ( x int, aid int );");
-            compile("CREATE TABLE tabb ( x int, bid int );");
+            execute("CREATE TABLE taba ( x int, aid int );");
+            execute("CREATE TABLE tabb ( x int, bid int );");
         });
 
-        assertException("SELECT sum(tabc.x*1),sum(x), sum(ax+10), sum(bx+10) " +
+        assertQuery("SELECT sum(tabc.x*1),sum(x), sum(ax+10), sum(bx+10) " +
                 "FROM taba " +
-                "join tabb on aid = bid", 11, "Invalid table name or alias");
+                "join tabb on aid = bid")
+                .fails(11, "Invalid table name or alias");
     }
 
     @Test
     public void testRewriteAggregateOnJoin4() throws Exception {
         assertMemoryLeak(() -> {
-            compile("CREATE TABLE taba ( x int, aid int );");
-            compile("CREATE TABLE tabb ( x int, bid int );");
-            assertException("SELECT sum(taba.k*1),sum(x), sum(ax+10), sum(bx+10) " +
+            execute("CREATE TABLE taba ( x int, aid int );");
+            execute("CREATE TABLE tabb ( x int, bid int );");
+            assertQuery("SELECT sum(taba.k*1),sum(x), sum(ax+10), sum(bx+10) " +
                     "FROM taba " +
-                    "join tabb on aid = bid", 11, "Invalid column: taba.k");
+                    "join tabb on aid = bid")
+                    .fails(11, "Invalid column: taba.k");
         });
     }
 
     @Test
     public void testRewriteAggregateOnJoinFailsOnAmbiguousColumn() throws Exception {
         assertMemoryLeak(() -> {
-            compile("  CREATE TABLE taba ( x int, aid int );");
-            compile("  CREATE TABLE tabb ( x int, bid int );");
-            assertException("SELECT sum(x*1),sum(x), sum(ax+10), sum(bx+10) " +
+            execute("  CREATE TABLE taba ( x int, aid int );");
+            execute("  CREATE TABLE tabb ( x int, bid int );");
+            assertQuery("SELECT sum(x*1),sum(x), sum(ax+10), sum(bx+10) " +
                     "FROM taba " +
-                    "join tabb on aid = bid", 11, "Ambiguous column [name=x]");
+                    "join tabb on aid = bid")
+                    .fails(11, "Ambiguous column [name=x]");
         });
     }
 
     @Test
     public void testRewriteAggregateOnOrderBySumBadQuery() throws Exception {
         assertMemoryLeak(() -> {
-            try {
-                compile("CREATE TABLE telemetry (created timestamp)");
-
-                assertQueryNoLeakCheck(
-                        "sum\tsum1\tsum2\tsum3\n" +
-                                "3\t7\t23\t27\n",
-                        "SELECT telemetry.created FROM telemetry ORDER BY SUM(1, 1 IN (telemetry.created), 1);",
-                        null,
-                        false,
-                        false,
-                        true
-                );
-                Assert.fail("query above should have thrown");
-            } catch (SqlException e) {
-                String expected = "[49] unexpected argument for function: SUM. expected args: (DOUBLE). actual args: (INT constant,BOOLEAN,INT constant)";
-                Assert.assertEquals(expected, e.getMessage());
-            }
+            execute("CREATE TABLE telemetry (created timestamp)");
+            assertQuery("SELECT telemetry.created FROM telemetry ORDER BY SUM(1, 1 IN (telemetry.created), 1);")
+                    .noLeakCheck()
+                    .fails(49, "there is no matching function `SUM` with the argument types: (INT, BOOLEAN, INT)");
         });
     }
 
     @Test
     public void testSumOfAddition1() throws Exception {
-        assertAggQuery("r\n" +
-                        "65\n",
+        assertAggQuery("""
+                        r
+                        65
+                        """,
                 "select sum(x+1) r from y",
                 "create table y as ( select x from long_sequence(10) )"
         );
@@ -115,8 +316,10 @@ public class GroupByRewriteTest extends AbstractCairoTest {
 
     @Test
     public void testSumOfAddition2() throws Exception {
-        assertAggQuery("r\n" +
-                        "65\n",
+        assertAggQuery("""
+                        r
+                        65
+                        """,
                 "select sum(1+x) r from y",
                 "create table y as ( select x from long_sequence(10) )"
         );
@@ -125,18 +328,22 @@ public class GroupByRewriteTest extends AbstractCairoTest {
     @Test
     public void testSumOfAdditionOfDouble1() throws Exception {
         assertAggQuery(
-                "r\n" +
-                        "66.0\n",
+                """
+                        r
+                        66.0
+                        """,
                 "select sum(d+1) r from y",
                 "create table y as ( select x + 0.1d as d from long_sequence(10) )"
         );
     }
 
-    @Test // all values except first are Infinity and thus ignored
+    @Test // all values except first overflow to Infinity, sum overflows to null
     public void testSumOfAdditionOfDouble2() throws Exception {
         assertAggQuery(
-                "r\n" +
-                        "1.7E308\n",
+                """
+                        r
+                        null
+                        """,
                 "select sum(d+1) r from y",
                 "create table y as ( select 1.7E308 * x as d  from long_sequence(10) )"
         );
@@ -145,8 +352,10 @@ public class GroupByRewriteTest extends AbstractCairoTest {
     @Test // all values except first are null and thus ignored
     public void testSumOfAdditionOfDouble3() throws Exception {
         assertAggQuery(
-                "r\n" +
-                        "2.0\n",
+                """
+                        r
+                        2.0
+                        """,
                 "select sum(d+1) r from y",
                 "create table y as ( select (1.7E308 * x)/(1.7E308*x) as d  from long_sequence(10) )"
         );
@@ -155,8 +364,10 @@ public class GroupByRewriteTest extends AbstractCairoTest {
     @Test
     public void testSumOfAdditionOfShort() throws Exception {
         assertAggQuery(
-                "r\n" +
-                        "65\n",
+                """
+                        r
+                        65
+                        """,
                 "select sum(x+1) r from y",
                 "create table y as ( select x::short x from long_sequence(10) )"
         );
@@ -165,8 +376,10 @@ public class GroupByRewriteTest extends AbstractCairoTest {
     @Test
     public void testSumOfAdditionOverflow1() throws Exception {
         assertAggQuery(
-                "r\n" +
-                        "-9223372036854775805\n",
+                """
+                        r
+                        -9223372036854775805
+                        """,
                 "select sum(x+9223372036854775807) r from y",
                 "create table y as ( select x from long_sequence(3) )"
         );
@@ -175,8 +388,10 @@ public class GroupByRewriteTest extends AbstractCairoTest {
     @Test
     public void testSumOfAdditionOverflow2() throws Exception {
         assertAggQuery(
-                "r\n" +
-                        "-9223372036854775805\n",
+                """
+                        r
+                        -9223372036854775805
+                        """,
                 "select sum(x) + 9223372036854775807*3 r from y",
                 "create table y as ( select x from long_sequence(3) )"
         );
@@ -185,15 +400,19 @@ public class GroupByRewriteTest extends AbstractCairoTest {
     @Test
     public void testSumOfAdditionWithNull() throws Exception {
         assertAggQuery(
-                "r\n" +
-                        "null\n",
+                """
+                        r
+                        null
+                        """,
                 "select sum(x+null) r from y",
                 "create table y as ( select x from long_sequence(10) )"
         );
 
         assertAggQuery(
-                "r\n" +
-                        "null\n",
+                """
+                        r
+                        null
+                        """,
                 "select sum(null+x) r from y",
                 null
         );
@@ -203,8 +422,10 @@ public class GroupByRewriteTest extends AbstractCairoTest {
     @Test
     public void testSumOfMultiplication1() throws Exception {
         assertAggQuery(
-                "r\n" +
-                        "55\n",
+                """
+                        r
+                        55
+                        """,
                 "select sum(x*1) r from y",
                 "create table y as ( select x from long_sequence(10) )"
         );
@@ -213,8 +434,10 @@ public class GroupByRewriteTest extends AbstractCairoTest {
     @Test
     public void testSumOfMultiplication2() throws Exception {
         assertAggQuery(
-                "r\n" +
-                        "55\n",
+                """
+                        r
+                        55
+                        """,
                 "select sum(1*x) r from y",
                 "create table y as ( select x from long_sequence(10) )"
         );
@@ -223,18 +446,22 @@ public class GroupByRewriteTest extends AbstractCairoTest {
     @Test
     public void testSumOfMultiplicationOfDouble1() throws Exception {
         assertAggQuery(
-                "r\n" +
-                        "112.00000000000001\n",
+                """
+                        r
+                        112.00000000000001
+                        """,
                 "select sum(d*2) r from y",
                 "create table y as ( select x + 0.1d as d from long_sequence(10) )"
         );
     }
 
-    @Test // all values except first are Infinity and thus ignored
+    @Test // all values except first overflow to Infinity, sum overflows to null
     public void testSumOfMultiplicationOfDouble2() throws Exception {
         assertAggQuery(
-                "r\n" +
-                        "1.7E308\n",
+                """
+                        r
+                        null
+                        """,
                 "select sum(d*2) r from y",
                 "create table y as ( select (1.7E308/2)*x as d  from long_sequence(10) )"
         );
@@ -243,8 +470,10 @@ public class GroupByRewriteTest extends AbstractCairoTest {
     @Test // all values except first are null and thus ignored
     public void testSumOfMultiplicationOfDouble3() throws Exception {
         assertAggQuery(
-                "r\n" +
-                        "2.0\n",
+                """
+                        r
+                        2.0
+                        """,
                 "select sum(d*2) r from y",
                 "create table y as ( select (1.7E308 * x)/(1.7E308*x) as d  from long_sequence(10) )"
         );
@@ -253,8 +482,10 @@ public class GroupByRewriteTest extends AbstractCairoTest {
     @Test
     public void testSumOfMultiplicationOverflow1() throws Exception {
         assertAggQuery(
-                "r\n" +
-                        "-6\n",
+                """
+                        r
+                        -6
+                        """,
                 "select sum(x*9223372036854775807) r from y",
                 "create table y as ( select x from long_sequence(3) )"
         );
@@ -263,8 +494,10 @@ public class GroupByRewriteTest extends AbstractCairoTest {
     @Test
     public void testSumOfMultiplicationOverflow2() throws Exception {
         assertAggQuery(
-                "r\n" +
-                        "-6\n",
+                """
+                        r
+                        -6
+                        """,
                 "select sum(x) * 9223372036854775807 r from y",
                 "create table y as ( select x from long_sequence(3) )"
         );
@@ -273,15 +506,19 @@ public class GroupByRewriteTest extends AbstractCairoTest {
     @Test
     public void testSumOfMultiplicationWithNull() throws Exception {
         assertAggQuery(
-                "r\n" +
-                        "null\n",
+                """
+                        r
+                        null
+                        """,
                 "select sum(x*null) r from y",
                 "create table y as ( select x from long_sequence(10) )"
         );
 
         assertAggQuery(
-                "r\n" +
-                        "null\n",
+                """
+                        r
+                        null
+                        """,
                 "select sum(null*x) r from y",
                 null
         );
@@ -291,8 +528,10 @@ public class GroupByRewriteTest extends AbstractCairoTest {
     @Test
     public void testSumOfSubtraction1() throws Exception {
         assertAggQuery(
-                "r\n" +
-                        "45\n",
+                """
+                        r
+                        45
+                        """,
                 "select sum(x-1) r from y",
                 "create table y as ( select x from long_sequence(10) )"
         );
@@ -301,8 +540,10 @@ public class GroupByRewriteTest extends AbstractCairoTest {
     @Test
     public void testSumOfSubtraction2() throws Exception {
         assertAggQuery(
-                "r\n" +
-                        "-45\n",
+                """
+                        r
+                        -45
+                        """,
                 "select sum(1-x) r from y",
                 "create table y as ( select x from long_sequence(10) )"
         );
@@ -311,18 +552,22 @@ public class GroupByRewriteTest extends AbstractCairoTest {
     @Test
     public void testSumOfSubtractionOfDouble1() throws Exception {
         assertAggQuery(
-                "r\n" +
-                        "46.0\n",
+                """
+                        r
+                        46.0
+                        """,
                 "select sum(d-1) r from y",
                 "create table y as ( select x + 0.1d as d from long_sequence(10) )"
         );
     }
 
-    @Test // all values except first are Infinity and thus ignored
+    @Test // all values except first overflow to Infinity, sum overflows to null
     public void testSumOfSubtractionOfDouble2() throws Exception {
         assertAggQuery(
-                "r\n" +
-                        "-1.7E308\n",
+                """
+                        r
+                        null
+                        """,
                 "select sum(d-1) r from y",
                 "create table y as ( select -1.7E308 * x as d  from long_sequence(10) )"
         );
@@ -331,8 +576,10 @@ public class GroupByRewriteTest extends AbstractCairoTest {
     @Test // all values except first are null and thus ignored
     public void testSumOfSubtractionOfDouble3() throws Exception {
         assertAggQuery(
-                "r\n" +
-                        "0.0\n",
+                """
+                        r
+                        0.0
+                        """,
                 "select sum(d-1) r from y",
                 "create table y as ( select (1.7E308 * x)/(1.7E308 * x) as d from long_sequence(10) )"
         );
@@ -341,8 +588,10 @@ public class GroupByRewriteTest extends AbstractCairoTest {
     @Test
     public void testSumOfSubtractionOfShort() throws Exception {
         assertAggQuery(
-                "r\n" +
-                        "45\n",
+                """
+                        r
+                        45
+                        """,
                 "select sum(x-1) r from y",
                 "create table y as ( select x::short x from long_sequence(10) )"
         );
@@ -351,8 +600,10 @@ public class GroupByRewriteTest extends AbstractCairoTest {
     @Test
     public void testSumOfSubtractionOverflow1() throws Exception {
         assertAggQuery(
-                "r\n" +
-                        "9223372036854775805\n",
+                """
+                        r
+                        9223372036854775805
+                        """,
                 "select sum(x-9223372036854775807) r from y",
                 "create table y as ( select -x x from long_sequence(3) )"
         );
@@ -361,8 +612,10 @@ public class GroupByRewriteTest extends AbstractCairoTest {
     @Test
     public void testSumOfSubtractionOverflow2() throws Exception {
         assertAggQuery(
-                "r\n" +
-                        "9223372036854775805\n",
+                """
+                        r
+                        9223372036854775805
+                        """,
                 "select sum(x) - 9223372036854775807*3 r from y",
                 "create table y as ( select -x x from long_sequence(3) )"
         );
@@ -371,15 +624,19 @@ public class GroupByRewriteTest extends AbstractCairoTest {
     @Test
     public void testSumOfSubtractionWithNull() throws Exception {
         assertAggQuery(
-                "r\n" +
-                        "null\n",
+                """
+                        r
+                        null
+                        """,
                 "select sum(x-null) r from y",
                 "create table y as ( select x from long_sequence(10) )"
         );
 
         assertAggQuery(
-                "r\n" +
-                        "null\n",
+                """
+                        r
+                        null
+                        """,
                 "select sum(null-x) r from y",
                 null
         );
@@ -390,13 +647,10 @@ public class GroupByRewriteTest extends AbstractCairoTest {
             String query,
             String ddl
     ) throws Exception {
-        assertQuery(
-                expected,
-                query,
-                ddl,
-                null,
-                false,
-                true
-        );
+        assertQuery(query)
+                .ddl(ddl)
+                .noRandomAccess()
+                .expectSize()
+                .returns(expected);
     }
 }

@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -25,32 +25,69 @@
 package io.questdb.cutlass.http;
 
 import io.questdb.Metrics;
+import io.questdb.cairo.CairoEngine;
 import io.questdb.cairo.CairoException;
 import io.questdb.cairo.SecurityContext;
 import io.questdb.cairo.security.DenyAllSecurityContext;
+import io.questdb.cairo.security.PrincipalContext;
 import io.questdb.cairo.security.SecurityContextFactory;
+import io.questdb.cairo.sql.NetworkSqlExecutionCircuitBreaker;
 import io.questdb.cairo.sql.RecordCursorFactory;
-import io.questdb.cutlass.http.ex.*;
+import io.questdb.cutlass.http.ex.BufferOverflowException;
+import io.questdb.cutlass.http.ex.NotEnoughLinesException;
+import io.questdb.cutlass.http.ex.RetryFailedOperationException;
+import io.questdb.cutlass.http.ex.RetryOperationException;
+import io.questdb.cutlass.http.ex.TooFewBytesReceivedException;
 import io.questdb.cutlass.http.processors.RejectProcessor;
+import io.questdb.griffin.SqlExecutionContextImpl;
 import io.questdb.log.Log;
 import io.questdb.log.LogFactory;
-import io.questdb.network.*;
-import io.questdb.std.*;
-import io.questdb.std.str.*;
+import io.questdb.mp.continuation.FiberTask;
+import io.questdb.mp.continuation.SuspensionScope;
+import io.questdb.network.HeartBeatException;
+import io.questdb.network.IOContext;
+import io.questdb.network.IODispatcher;
+import io.questdb.network.IOOperation;
+import io.questdb.network.Net;
+import io.questdb.network.NetworkFacade;
+import io.questdb.network.PeerDisconnectedException;
+import io.questdb.network.PeerIsSlowToReadException;
+import io.questdb.network.PeerIsSlowToWriteException;
+import io.questdb.network.ServerDisconnectException;
+import io.questdb.network.Socket;
+import io.questdb.network.SocketFactory;
+import io.questdb.network.TlsSessionInitFailedException;
+import io.questdb.std.AssociativeCache;
+import io.questdb.std.CharSequenceObjHashMap;
+import io.questdb.std.Chars;
+import io.questdb.std.MemoryTag;
+import io.questdb.std.Misc;
+import io.questdb.std.ObjectPool;
+import io.questdb.std.Unsafe;
+import io.questdb.std.Vect;
+import io.questdb.std.datetime.Clock;
+import io.questdb.std.str.DirectUtf8Sequence;
+import io.questdb.std.str.DirectUtf8String;
+import io.questdb.std.str.StdoutSink;
+import io.questdb.std.str.StringSink;
+import io.questdb.std.str.Utf8s;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.TestOnly;
 
-import static io.questdb.cairo.SecurityContext.AUTH_TYPE_NONE;
-import static io.questdb.cutlass.http.HttpConstants.HEADER_CONTENT_ACCEPT_ENCODING;
-import static io.questdb.cutlass.http.HttpConstants.HEADER_TRANSFER_ENCODING;
+import static io.questdb.cutlass.http.HttpConstants.*;
+import static io.questdb.cutlass.http.HttpResponseSink.HTTP_TOO_MANY_REQUESTS;
 import static io.questdb.network.IODispatcher.*;
 import static java.net.HttpURLConnection.*;
 
 public class HttpConnectionContext extends IOContext<HttpConnectionContext> implements Locality, Retry {
+    private static final String FALSE = "false";
     private static final Log LOG = LogFactory.getLog(HttpConnectionContext.class);
+    private static final int NO_RESUME_PROCESSOR = Integer.MIN_VALUE;
+    private static final String TRUE = "true";
+    private final ActiveConnectionTracker activeConnectionTracker;
     private final HttpAuthenticator authenticator;
     private final ChunkedContentParser chunkedContentParser = new ChunkedContentParser();
-    private final HttpContextConfiguration configuration;
+    private final HttpServerConfiguration configuration;
     private final HttpCookieHandler cookieHandler;
     private final ObjectPool<DirectUtf8String> csPool;
     private final boolean dumpNetworkTraffic;
@@ -63,100 +100,182 @@ public class HttpConnectionContext extends IOContext<HttpConnectionContext> impl
     private final long multipartIdleSpinCount;
     private final MultipartParserState multipartParserState = new MultipartParserState();
     private final NetworkFacade nf;
-    private final int recvBufferSize;
+    private final CharSequenceObjHashMap<CharSequence> parsedCookies = new CharSequenceObjHashMap<>();
+    private final boolean preAllocateBuffers;
     private final RejectProcessor rejectProcessor;
+    private final HttpRequestValidator requestValidator = new HttpRequestValidator();
     private final HttpResponseSink responseSink;
     private final RetryAttemptAttributes retryAttemptAttributes = new RetryAttemptAttributes();
-    private final RescheduleContext retryRescheduleContext = retry -> {
-        LOG.info().$("Retry is requested after successful writer allocation. Retry will be re-scheduled [thread=").$(Thread.currentThread().getId()).I$();
+    private final RescheduleContext retryRescheduleContext = _ -> {
+        LOG.info().$("Retry is requested after successful writer allocation. Retry will be re-scheduled [thread=").$(Thread.currentThread().threadId()).I$();
         throw RetryOperationException.INSTANCE;
     };
     private final AssociativeCache<RecordCursorFactory> selectCache;
+    private final StringSink sessionIdSink = new StringSink();
+    private final HttpSessionStore sessionStore;
     private long authenticationNanos = 0L;
+    private boolean connectionCounted;
+    private int currentHandlerId = HttpRequestProcessorSelector.REJECT_PROCESSOR_ID;
+    private volatile HttpConnectionFiberTask fiberTask;
+    private boolean forceDisconnectOnComplete;
+    private NetworkSqlExecutionCircuitBreaker httpCircuitBreaker;
+    private SqlExecutionContextImpl httpSqlExecutionContext;
+    private boolean isProtocolSwitched = false;  // WebSocket protocol switch flag
     private int nCompletedRequests;
     private boolean pendingRetry = false;
+    private String processorName;
     private int receivedBytes;
     private long recvBuffer;
+    private int recvBufferReadSize;
+    private int recvBufferSize;
     private long recvPos;
-    private HttpRequestProcessor resumeProcessor = null;
+    private int resumeHandlerId = NO_RESUME_PROCESSOR;
     private SecurityContext securityContext;
-    private SuspendEvent suspendEvent;
     private long totalBytesSent;
     private long totalReceived;
 
     @TestOnly
     public HttpConnectionContext(
-            HttpMinServerConfiguration configuration,
-            Metrics metrics,
+            HttpServerConfiguration configuration,
             SocketFactory socketFactory
     ) {
         this(
                 configuration,
-                metrics,
                 socketFactory,
-                DefaultHttpCookieHandler.INSTANCE,
-                DefaultHttpHeaderParserFactory.INSTANCE,
-                HttpServer.NO_OP_CACHE
+                HttpServer.NO_OP_CACHE,
+                ActiveConnectionTracker.NO_TRACKING
         );
     }
 
     public HttpConnectionContext(
-            HttpMinServerConfiguration configuration,
-            Metrics metrics,
+            HttpServerConfiguration configuration,
             SocketFactory socketFactory,
-            HttpCookieHandler cookieHandler,
-            HttpHeaderParserFactory headerParserFactory,
-            AssociativeCache<RecordCursorFactory> selectCache
+            AssociativeCache<RecordCursorFactory> selectCache,
+            ActiveConnectionTracker activeConnectionTracker
     ) {
         super(
                 socketFactory,
                 configuration.getHttpContextConfiguration().getNetworkFacade(),
-                LOG,
-                metrics.jsonQuery().connectionCountGauge()
+                LOG
         );
-        final HttpContextConfiguration contextConfiguration = configuration.getHttpContextConfiguration();
-        this.configuration = contextConfiguration;
-        this.cookieHandler = cookieHandler;
-        this.nf = contextConfiguration.getNetworkFacade();
-        this.csPool = new ObjectPool<>(DirectUtf8String.FACTORY, contextConfiguration.getConnectionStringPoolCapacity());
-        this.headerParser = headerParserFactory.newParser(contextConfiguration.getRequestHeaderBufferSize(), csPool);
-        this.multipartContentHeaderParser = new HttpHeaderParser(contextConfiguration.getMultipartHeaderBufferSize(), csPool);
-        this.multipartContentParser = new HttpMultipartContentParser(multipartContentHeaderParser);
-        this.responseSink = new HttpResponseSink(contextConfiguration);
-        this.recvBufferSize = contextConfiguration.getRecvBufferSize();
-        this.multipartIdleSpinCount = contextConfiguration.getMultipartIdleSpinCount();
-        this.dumpNetworkTraffic = contextConfiguration.getDumpNetworkTraffic();
-        // This is default behaviour until the security context is overridden with correct principal.
-        this.securityContext = DenyAllSecurityContext.INSTANCE;
-        this.metrics = metrics;
-        this.authenticator = contextConfiguration.getFactoryProvider().getHttpAuthenticatorFactory().getHttpAuthenticator();
-        this.rejectProcessor = contextConfiguration.getFactoryProvider().getRejectProcessorFactory().getRejectProcessor(this);
-        this.forceFragmentationReceiveChunkSize = contextConfiguration.getForceRecvFragmentationChunkSize();
-        this.selectCache = selectCache;
+        // Both header parsers, the response sink and the receive buffer allocate natively, and the
+        // cookie handler, the session store and the context configuration the try opens with are
+        // extension points that can throw before any of that. super() has already taken the socket,
+        // so the rollback scope starts here rather than at the first allocation: a throw anywhere
+        // below leaves a half-built context that the pool never sees and nothing ever closes,
+        // leaking everything taken so far. Locals mirror the owners because the catch cannot read a
+        // blank final the failing statement never assigned.
+        HttpHeaderParser parser = null;
+        HttpHeaderParser multipartParser = null;
+        HttpResponseSink sink = null;
+        HttpAuthenticator auth = null;
+        long recvBuf = 0;
+        try {
+            this.configuration = configuration;
+            this.cookieHandler = configuration.getFactoryProvider().getHttpCookieHandler();
+            this.sessionStore = configuration.getFactoryProvider().getHttpSessionStore();
+            this.activeConnectionTracker = activeConnectionTracker;
+            final HttpContextConfiguration contextConfiguration = configuration.getHttpContextConfiguration();
+            this.nf = contextConfiguration.getNetworkFacade();
+            this.csPool = new ObjectPool<>(DirectUtf8String.FACTORY, contextConfiguration.getConnectionStringPoolCapacity());
+            this.headerParser = parser = configuration.getFactoryProvider().getHttpHeaderParserFactory().newParser(contextConfiguration.getRequestHeaderBufferSize(), csPool);
+            this.multipartContentHeaderParser = multipartParser = new HttpHeaderParser(contextConfiguration.getMultipartHeaderBufferSize(), csPool);
+            this.multipartContentParser = new HttpMultipartContentParser(multipartParser);
+            this.responseSink = sink = new HttpResponseSink(configuration);
+            this.recvBufferSize = configuration.getRecvBufferSize();
+            this.preAllocateBuffers = configuration.preAllocateBuffers();
+            if (preAllocateBuffers) {
+                recvBuffer = recvBuf = Unsafe.malloc(recvBufferSize, MemoryTag.NATIVE_HTTP_CONN);
+                this.responseSink.open(configuration.getSendBufferSize());
+            }
+            this.multipartIdleSpinCount = contextConfiguration.getMultipartIdleSpinCount();
+            this.dumpNetworkTraffic = contextConfiguration.getDumpNetworkTraffic();
+            // This is default behaviour until the security context is overridden with correct principal.
+            this.securityContext = DenyAllSecurityContext.INSTANCE;
+            this.metrics = contextConfiguration.getMetrics();
+            this.authenticator = auth = contextConfiguration.getFactoryProvider().getHttpAuthenticatorFactory().getHttpAuthenticator();
+            this.rejectProcessor = contextConfiguration.getFactoryProvider().getRejectProcessorFactory().getRejectProcessor(this);
+            this.forceFragmentationReceiveChunkSize = contextConfiguration.getForceRecvFragmentationChunkSize();
+            this.recvBufferReadSize = Math.min(forceFragmentationReceiveChunkSize, recvBufferSize);
+            this.selectCache = selectCache;
+        } catch (Throwable th) {
+            // Reverse order of acquisition. multipartContentParser only delegates close() to the
+            // parser it wraps, so freeing that parser once covers both.
+            Misc.free(auth, th);
+            // The sink owns the send buffer that responseSink.open() took after the receive buffer,
+            // and its close() releases both, so it goes before the receive buffer.
+            Misc.free(sink, th);
+            if (recvBuf != 0) {
+                this.recvBuffer = Unsafe.free(recvBuf, recvBufferSize, MemoryTag.NATIVE_HTTP_CONN);
+            }
+            Misc.free(multipartParser, th);
+            Misc.free(parser, th);
+            // IOContext took the socket before this try was entered, so it is the one resource the
+            // catch has to reach past its own acquisitions for. Only close() releases it, and the
+            // half-built context never gets there. Both the socket factory and the authenticator
+            // above come from FactoryProvider, an extension point whose implementations may own
+            // native state even though the OSS defaults are lightweight.
+            Misc.free(socket, th);
+            throw th;
+        }
+    }
+
+    public void abandonRetry() {
+        pendingRetry = false;
+        receivedBytes = 0;
     }
 
     @Override
+    public boolean claimRetryClose(long taskIncarnation) {
+        if (taskIncarnation == 0) {
+            return true;
+        }
+        final HttpConnectionFiberTask task = fiberTask;
+        if (task == null) {
+            return false;
+        }
+        if (task.signalAxisA(taskIncarnation, FiberTask.SIGNAL_DISCONNECT)) {
+            return false;
+        }
+        return task.tryCancelIdle(taskIncarnation);
+    }
+
+    // called when returning the context back to a pool (=connection closed)
+    @Override
     public void clear() {
         LOG.debug().$("clear [fd=").$(getFd()).I$();
+        decrementActiveConnections(getFd());
         super.clear();
         reset();
         if (this.pendingRetry) {
             LOG.error().$("reused context with retry pending").$();
         }
         this.pendingRetry = false;
-        this.recvBuffer = Unsafe.free(recvBuffer, recvBufferSize, MemoryTag.NATIVE_HTTP_CONN);
+        if (!preAllocateBuffers) {
+            this.recvBuffer = Unsafe.free(recvBuffer, recvBufferSize, MemoryTag.NATIVE_HTTP_CONN);
+            this.responseSink.close();
+            this.headerParser.close();
+            this.multipartContentHeaderParser.close();
+        }
+        this.forceDisconnectOnComplete = false;
         this.localValueMap.disconnect();
-    }
-
-    @Override
-    public void clearSuspendEvent() {
-        suspendEvent = Misc.free(suspendEvent);
+        // SECURITY: these unconditional resets are the safety net for the conditional skips in
+        // reset(), which preserve securityContext and the circuit breaker while isProtocolSwitched
+        // is true. securityContext MUST be reset here to prevent security context leaks between
+        // pooled connections. Do not make these conditional.
+        this.isProtocolSwitched = false;
+        this.securityContext = DenyAllSecurityContext.INSTANCE;
+        this.resumeHandlerId = NO_RESUME_PROCESSOR;
+        if (httpCircuitBreaker != null) {
+            httpCircuitBreaker.clear();
+        }
     }
 
     @Override
     public void close() {
-        final int fd = getFd();
+        final long fd = getFd();
         LOG.debug().$("close [fd=").$(fd).I$();
+        decrementActiveConnections(fd);
         super.close();
         if (this.pendingRetry) {
             this.pendingRetry = false;
@@ -169,17 +288,28 @@ public class HttpConnectionContext extends IOContext<HttpConnectionContext> impl
         this.multipartContentHeaderParser.close();
         this.headerParser.close();
         this.localValueMap.close();
+        this.httpCircuitBreaker = Misc.free(httpCircuitBreaker);
+        this.httpSqlExecutionContext = Misc.free(httpSqlExecutionContext);
         this.recvBuffer = Unsafe.free(recvBuffer, recvBufferSize, MemoryTag.NATIVE_HTTP_CONN);
         this.responseSink.close();
         this.receivedBytes = 0;
         this.securityContext = DenyAllSecurityContext.INSTANCE;
+        this.sessionIdSink.clear();
         this.authenticator.close();
-        Misc.free(selectCache);
         LOG.debug().$("closed [fd=").$(fd).I$();
     }
 
+    public void drainRecvBuffer() {
+        try {
+            while (socket.recv(recvBuffer, recvBufferSize) > 0) {
+                // discard
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
     @Override
-    public void fail(HttpRequestProcessorSelector selector, HttpException e) throws PeerIsSlowToReadException, ServerDisconnectException, PeerDisconnectedException {
+    public void fail(HttpRequestProcessorSelector selector, HttpException e) throws PeerIsSlowToReadException, ServerDisconnectException {
         LOG.info().$("failed to retry query [fd=").$(getFd()).I$();
         HttpRequestProcessor processor = getHttpRequestProcessor(selector);
         failProcessor(processor, e, DISCONNECT_REASON_RETRY_FAILED);
@@ -198,8 +328,28 @@ public class HttpConnectionContext extends IOContext<HttpConnectionContext> impl
         return responseSink.getChunkedResponse();
     }
 
+    public NetworkSqlExecutionCircuitBreaker getCircuitBreaker() {
+        return httpCircuitBreaker;
+    }
+
     public HttpCookieHandler getCookieHandler() {
         return cookieHandler;
+    }
+
+    /**
+     * Lazily creates the per-connection fiber task. The task follows this context's
+     * pooled lifecycle: recycled together, reopened by the dispatch job when a new
+     * connection incarnation finds its gate terminal.
+     */
+    public HttpConnectionFiberTask getFiberTask(
+            IODispatcher<HttpConnectionContext> dispatcher,
+            HttpServer.HttpRequestProcessorSelectorFactory selectorFactory,
+            WaitProcessor rescheduleContext
+    ) {
+        if (fiberTask == null) {
+            fiberTask = new HttpConnectionFiberTask(this, dispatcher, selectorFactory, rescheduleContext);
+        }
+        return fiberTask;
     }
 
     public long getLastRequestBytesSent() {
@@ -219,8 +369,52 @@ public class HttpConnectionContext extends IOContext<HttpConnectionContext> impl
         return nCompletedRequests;
     }
 
+    public NetworkSqlExecutionCircuitBreaker getOrCreateCircuitBreaker(CairoEngine engine) {
+        if (httpCircuitBreaker == null) {
+            httpCircuitBreaker = new NetworkSqlExecutionCircuitBreaker(
+                    engine,
+                    engine.getConfiguration().getCircuitBreakerConfiguration()
+            );
+        }
+        if (SuspensionScope.isFiberMode()) {
+            SuspensionScope.enterTimerShards(engine.getTimerShards());
+            SuspensionScope.enterCancellationSource(httpCircuitBreaker);
+        }
+        return httpCircuitBreaker;
+    }
+
+    public SqlExecutionContextImpl getOrCreateSqlExecutionContext(CairoEngine engine, int workerCount) {
+        if (httpSqlExecutionContext == null) {
+            httpSqlExecutionContext = new SqlExecutionContextImpl(engine, workerCount);
+        }
+        return httpSqlExecutionContext;
+    }
+
+    public CharSequenceObjHashMap<CharSequence> getParsedCookiesMap() {
+        return parsedCookies;
+    }
+
     public HttpRawSocket getRawResponseSocket() {
         return responseSink.getRawSocket();
+    }
+
+    /**
+     * Returns the receive buffer address for protocol-switched connections.
+     */
+    public long getRecvBuffer() {
+        return recvBuffer;
+    }
+
+    /**
+     * Returns the receive buffer size for protocol-switched connections.
+     */
+    public int getRecvBufferSize() {
+        return recvBufferSize;
+    }
+
+    @SuppressWarnings("unused")
+    public RejectProcessor getRejectProcessor() {
+        return rejectProcessor;
     }
 
     public HttpRequestHeader getRequestHeader() {
@@ -239,34 +433,41 @@ public class HttpConnectionContext extends IOContext<HttpConnectionContext> impl
         return selectCache;
     }
 
-    @Override
-    public SuspendEvent getSuspendEvent() {
-        return suspendEvent;
+    public @NotNull StringSink getSessionIdSink() {
+        return sessionIdSink;
+    }
+
+    /**
+     * Returns the underlying socket for direct I/O after protocol switch (e.g., WebSocket).
+     */
+    public Socket getSocket() {
+        return socket;
+    }
+
+    public SqlExecutionContextImpl getSqlExecutionContext() {
+        return httpSqlExecutionContext;
     }
 
     public long getTotalBytesSent() {
         return totalBytesSent;
     }
 
+    public long getTotalReceived() {
+        return totalReceived;
+    }
+
     public boolean handleClientOperation(int operation, HttpRequestProcessorSelector selector, RescheduleContext rescheduleContext)
             throws HeartBeatException, PeerIsSlowToReadException, ServerDisconnectException, PeerIsSlowToWriteException {
-        boolean keepGoing;
-        switch (operation) {
-            case IOOperation.READ:
-                keepGoing = handleClientRecv(selector, rescheduleContext);
-                break;
-            case IOOperation.WRITE:
-                keepGoing = handleClientSend();
-                break;
-            case IOOperation.HEARTBEAT:
-                throw registerDispatcherHeartBeat();
-            default:
-                throw registerDispatcherDisconnect(DISCONNECT_REASON_UNKNOWN_OPERATION);
-        }
+        boolean keepGoing = switch (operation) {
+            case IOOperation.READ -> handleClientRecv(selector, rescheduleContext);
+            case IOOperation.WRITE -> handleClientSend(selector);
+            case IOOperation.HEARTBEAT -> throw registerDispatcherHeartBeat();
+            default -> throw registerDispatcherDisconnect(DISCONNECT_REASON_UNKNOWN_OPERATION);
+        };
 
         boolean useful = keepGoing;
         if (keepGoing) {
-            if (configuration.getServerKeepAlive()) {
+            if (keepConnectionAlive()) {
                 do {
                     keepGoing = handleClientRecv(selector, rescheduleContext);
                 } while (keepGoing);
@@ -278,75 +479,69 @@ public class HttpConnectionContext extends IOContext<HttpConnectionContext> impl
     }
 
     @Override
-    public void init() {
-        if (socket.supportsTls()) {
-            if (socket.startTlsSession(null) != 0) {
-                throw CairoException.nonCritical().put("failed to start TLS session");
-            }
-        }
-    }
-
-    @Override
     public boolean invalid() {
         return pendingRetry || receivedBytes > 0 || this.socket == null;
     }
 
     @Override
-    public HttpConnectionContext of(int fd, @NotNull IODispatcher<HttpConnectionContext> dispatcher) {
-        super.of(fd, dispatcher);
-        // The context is obtained from the pool, so we should initialize the memory.
-        if (recvBuffer == 0) {
-            recvBuffer = Unsafe.malloc(recvBufferSize, MemoryTag.NATIVE_HTTP_CONN);
+    public boolean isRetryCurrent(long taskIncarnation) {
+        if (taskIncarnation == 0) {
+            return true;
         }
-        responseSink.of(socket);
-        return this;
+        final HttpConnectionFiberTask task = fiberTask;
+        return task != null && task.isActive(taskIncarnation);
     }
 
-    public HttpRequestProcessor rejectRequest(int code, CharSequence userMessage) {
-        return rejectRequest(code, userMessage, null, null);
-    }
-
-    public HttpRequestProcessor rejectRequest(int code, byte authenticationType) {
-        LOG.error().$("rejecting request [code=").$(code).I$();
-        return rejectProcessor.rejectRequest(code, null, null, null, authenticationType);
-    }
-
-    public HttpRequestProcessor rejectRequest(int code, CharSequence userMessage, CharSequence cookieName, CharSequence cookieValue) {
-        LOG.error().$(userMessage).$(" [code=").$(code).I$();
-        return rejectProcessor.rejectRequest(code, userMessage, cookieName, cookieValue, AUTH_TYPE_NONE);
-    }
-
+    // called between requests on the same connections
     public void reset() {
         LOG.debug().$("reset [fd=").$(getFd()).$(']').$();
         this.totalBytesSent += responseSink.getTotalBytesSent();
         this.responseSink.clear();
         this.nCompletedRequests++;
-        this.resumeProcessor = null;
+        // Preserve resumeHandlerId for protocol-switched connections (e.g., WebSocket)
+        if (!isProtocolSwitched) {
+            this.resumeHandlerId = NO_RESUME_PROCESSOR;
+        }
         this.headerParser.clear();
         this.multipartContentParser.clear();
         this.multipartContentHeaderParser.clear();
         this.csPool.clear();
         this.localValueMap.clear();
+        // Preserve the breaker for protocol-switched connections (e.g., WebSocket); a parked
+        // credit-suspended egress stream still needs it. clear() resets it on pool return.
+        if (httpCircuitBreaker != null && !isProtocolSwitched) {
+            httpCircuitBreaker.clear();
+        }
         this.multipartParserState.multipartRetry = false;
         this.retryAttemptAttributes.waitStartTimestamp = 0;
         this.retryAttemptAttributes.lastRunTimestamp = 0;
         this.retryAttemptAttributes.attempt = 0;
         this.receivedBytes = 0;
         this.authenticationNanos = 0L;
-        this.securityContext = DenyAllSecurityContext.INSTANCE;
+        // Preserve securityContext for protocol-switched connections (e.g., WebSocket).
+        // The security context was configured during the initial HTTP request and should
+        // persist for the lifetime of the WebSocket connection.
+        //
+        // SECURITY: this conditional skip is safe ONLY because clear() unconditionally
+        // resets both isProtocolSwitched and securityContext when the context returns to
+        // the pool. The pool (WeakObjectPoolBase.push) always calls clear() before reuse.
+        // Do not add code paths that return a context to the pool without calling clear().
+        if (!isProtocolSwitched) {
+            this.securityContext = DenyAllSecurityContext.INSTANCE;
+        }
+        this.sessionIdSink.clear();
         this.authenticator.clear();
         this.totalReceived = 0;
         this.chunkedContentParser.clear();
         this.recvPos = recvBuffer;
         this.rejectProcessor.clear();
-        clearSuspendEvent();
     }
 
     public void resumeResponseSend() throws PeerIsSlowToReadException, PeerDisconnectedException {
         responseSink.resumeSend();
     }
 
-    public void scheduleRetry(HttpRequestProcessor processor, RescheduleContext rescheduleContext) throws PeerIsSlowToReadException, ServerDisconnectException, PeerDisconnectedException {
+    public void scheduleRetry(HttpRequestProcessor processor, RescheduleContext rescheduleContext) throws PeerIsSlowToReadException, ServerDisconnectException {
         try {
             pendingRetry = true;
             rescheduleContext.reschedule(this);
@@ -355,10 +550,30 @@ public class HttpConnectionContext extends IOContext<HttpConnectionContext> impl
         }
     }
 
-    public HttpResponseSink.SimpleResponseImpl simpleResponse() {
-        return responseSink.getSimple();
+    @TestOnly
+    public void setFiberTaskForTesting(HttpConnectionFiberTask fiberTask) {
+        if (this.fiberTask != null && this.fiberTask != fiberTask) {
+            throw new IllegalStateException("HTTP context already has a fiber task");
+        }
+        this.fiberTask = fiberTask;
     }
 
+    public HttpResponseSink.SimpleResponseImpl simpleResponse() {
+        return responseSink.simpleResponse();
+    }
+
+    /**
+     * Switches the connection to a different protocol (e.g., WebSocket).
+     * After calling this, normal HTTP parsing is bypassed and the processor
+     * handles raw socket I/O directly. The processor is resolved via
+     * {@code currentHandlerId} which was set during request routing.
+     */
+    public void switchProtocol() {
+        this.isProtocolSwitched = true;
+        this.resumeHandlerId = currentHandlerId;
+    }
+
+    @Override
     public boolean tryRerun(HttpRequestProcessorSelector selector, RescheduleContext rescheduleContext) throws PeerIsSlowToReadException, PeerIsSlowToWriteException, ServerDisconnectException {
         if (pendingRetry) {
             pendingRetry = false;
@@ -372,8 +587,7 @@ public class HttpConnectionContext extends IOContext<HttpConnectionContext> impl
                             multipartParserState.start,
                             multipartParserState.buf,
                             multipartParserState.bufRemaining,
-                            (HttpMultipartContentListener) processor,
-                            processor,
+                            (HttpMultipartContentProcessor) processor,
                             retryRescheduleContext
                     )) {
                         LOG.info().$("success retried multipart import [fd=").$(getFd()).I$();
@@ -391,16 +605,10 @@ public class HttpConnectionContext extends IOContext<HttpConnectionContext> impl
                 throw registerDispatcherDisconnect(DISCONNECT_REASON_PEER_DISCONNECT_AT_RERUN);
             } catch (PeerIsSlowToReadException e2) {
                 LOG.info().$("peer is slow on running the rerun [fd=").$(getFd())
-                        .$(", thread=").$(Thread.currentThread().getId()).I$();
+                        .$(", thread=").$(Thread.currentThread().threadId()).I$();
                 processor.parkRequest(this, false);
-                resumeProcessor = processor;
-                throw registerDispatcherWrite();
-            } catch (QueryPausedException e) {
-                LOG.info().$("partition is in cold storage, suspending query [fd=").$(getFd())
-                        .$(", thread=").$(Thread.currentThread().getId()).I$();
-                processor.parkRequest(this, true);
-                resumeProcessor = processor;
-                suspendEvent = e.getEvent();
+                resumeHandlerId = (processor instanceof RejectProcessor)
+                        ? HttpRequestProcessorSelector.REJECT_PROCESSOR_ID : currentHandlerId;
                 throw registerDispatcherWrite();
             } catch (ServerDisconnectException e) {
                 LOG.info().$("kicked out [fd=").$(getFd()).I$();
@@ -410,62 +618,64 @@ public class HttpConnectionContext extends IOContext<HttpConnectionContext> impl
         return true;
     }
 
+    boolean hasPendingRetry() {
+        return pendingRetry;
+    }
+
     @SuppressWarnings("StatementWithEmptyBody")
     private void busyRcvLoop(HttpRequestProcessorSelector selector, RescheduleContext rescheduleContext)
-            throws PeerDisconnectedException, PeerIsSlowToReadException, ServerDisconnectException, PeerIsSlowToWriteException {
+            throws PeerIsSlowToReadException, ServerDisconnectException, PeerIsSlowToWriteException {
         reset();
-        if (configuration.getServerKeepAlive()) {
+        if (keepConnectionAlive()) {
             while (handleClientRecv(selector, rescheduleContext)) ;
         } else {
             throw registerDispatcherDisconnect(DISCONNECT_REASON_KEEPALIVE_OFF);
         }
     }
 
-    private HttpRequestProcessor checkProcessorValidForRequest(
-            Utf8Sequence method,
-            HttpRequestProcessor processor,
-            boolean chunked,
-            boolean multipartRequest,
-            long contentLength,
-            boolean multipartProcessor
-    ) {
+    private HttpRequestProcessor checkConnectionLimit(HttpRequestProcessor processor) {
+        processorName = processor.getName();
+        final int connectionLimit = activeConnectionTracker.getLimit(processorName);
+        final long numOfConnections = activeConnectionTracker.inc(processorName);
+        connectionCounted = true;
 
-        if (processor.isErrorProcessor()) {
-            return processor;
+        if (connectionLimit != ActiveConnectionTracker.UNLIMITED) {
+            assert processorName != null;
+            if (numOfConnections > connectionLimit) {
+                rejectProcessor.getMessageSink()
+                        .put("exceeded connection limit [name=").put(processorName)
+                        .put(", numOfConnections=").put(numOfConnections)
+                        .put(", connectionLimit=").put(connectionLimit)
+                        .put(", fd=").put(getFd())
+                        .put(']');
+                decrementActiveConnections(getFd());
+                forceDisconnectOnComplete = true;
+                return rejectProcessor.withShutdownWrite().reject(HTTP_TOO_MANY_REQUESTS);
+            }
+            if (processor.reservedOneAdminConnection() && numOfConnections == connectionLimit && !securityContext.isSystemAdmin()) {
+                rejectProcessor.getMessageSink()
+                        .put("non-admin user reached connection limit [name=").put(processorName)
+                        .put(", numOfConnections=").put(numOfConnections)
+                        .put(", connectionLimit=").put(connectionLimit)
+                        .put(", fd=").put(getFd())
+                        .put(']');
+                decrementActiveConnections(getFd());
+                forceDisconnectOnComplete = true;
+                return rejectProcessor.withShutdownWrite().reject(HTTP_TOO_MANY_REQUESTS);
+            }
+            LOG.debug().$("counted connection [name=").$(processorName)
+                    .$(", numOfConnections=").$(numOfConnections)
+                    .$(", connectionLimit=").$(connectionLimit)
+                    .$(", fd=").$(getFd())
+                    .I$();
         }
-
-        if (Utf8s.equalsNcAscii("POST", method) || Utf8s.equalsNcAscii("PUT", method)) {
-            if (!multipartProcessor) {
-                if (multipartRequest) {
-                    return rejectRequest(HTTP_NOT_FOUND, "Method (multipart POST) not supported");
-                } else {
-                    return rejectRequest(HTTP_NOT_FOUND, "Method not supported");
-                }
-            }
-            if (chunked && contentLength > 0) {
-                return rejectRequest(HTTP_BAD_REQUEST, "Invalid chunked request; content-length specified");
-            }
-            if (!chunked && !multipartRequest && contentLength < 0) {
-                return rejectRequest(HTTP_BAD_REQUEST, "Content-length not specified for POST/PUT request");
-            }
-        } else if (Utf8s.equalsNcAscii("GET", method)) {
-            if (chunked || multipartRequest || contentLength > 0) {
-                return rejectRequest(HTTP_BAD_REQUEST, "GET request method cannot have content");
-            }
-            if (multipartProcessor) {
-                return rejectRequest(HTTP_NOT_FOUND, "Method GET not supported");
-            }
-        } else {
-            return rejectRequest(HTTP_BAD_REQUEST, "Method not supported");
-        }
-
         return processor;
     }
 
     private void completeRequest(
             HttpRequestProcessor processor,
             RescheduleContext rescheduleContext
-    ) throws PeerDisconnectedException, PeerIsSlowToReadException, ServerDisconnectException, QueryPausedException {
+    ) throws PeerDisconnectedException, PeerIsSlowToReadException, ServerDisconnectException {
         LOG.debug().$("complete [fd=").$(getFd()).I$();
         try {
             processor.onRequestComplete(this);
@@ -478,24 +688,63 @@ public class HttpConnectionContext extends IOContext<HttpConnectionContext> impl
 
     private boolean configureSecurityContext() {
         if (securityContext == DenyAllSecurityContext.INSTANCE) {
-            final long authenticationStart = configuration.getNanosecondClock().getTicks();
-            if (!authenticator.authenticate(headerParser)) {
+            final Clock clock = configuration.getHttpContextConfiguration().getNanosecondClock();
+            final long authenticationStart = clock.getTicks();
+
+            final CharSequence sessionId = cookieHandler.processSessionCookie(this);
+            HttpSessionStore.SessionInfo sessionInfo = null;
+            if (sessionId != null) {
+                sessionInfo = sessionStore.verifySessionId(sessionId, this);
+            }
+
+            final PrincipalContext principalContext;
+            if (authenticator.authenticate(headerParser)) {
+                principalContext = authenticator;
+            } else if (sessionInfo != null) {
+                principalContext = sessionInfo;
+            } else {
                 // authenticationNanos stays 0, when it fails this value is irrelevant
                 return false;
             }
-            securityContext = configuration.getFactoryProvider().getSecurityContextFactory().getInstance(
-                    authenticator.getPrincipal(),
-                    authenticator.getGroups(),
-                    authenticator.getAuthType(),
-                    SecurityContextFactory.HTTP
-            );
-            authenticationNanos = configuration.getNanosecondClock().getTicks() - authenticationStart;
+
+            // auth successful, create security context from auth info
+            final SecurityContextFactory scf = configuration.getFactoryProvider().getSecurityContextFactory();
+            securityContext = scf.getInstance(principalContext, SecurityContextFactory.HTTP);
+
+            if (configuration.getHttpContextConfiguration().areCookiesEnabled()) {
+                // the client can request a session by sending 'session=true',
+                // and close the session by sending 'session=false'
+                // we do not create a session for clients by default to avoid excessive session creating
+                // for clients which do not support/care about cookies, such as apps using the REST API
+                final DirectUtf8Sequence sessionParam = getRequestHeader().getUrlParam(URL_PARAM_SESSION);
+
+                // create session if
+                // - we do not have one yet and the client requested one with 'session=true' or
+                // - the client sent an expired/evicted session id or
+                // - changed credentials without sending logout
+                if (
+                        (Utf8s.equalsNcAscii(TRUE, sessionParam) && sessionId == null)
+                                || (sessionId != null && sessionInfo == null)
+                                || (sessionInfo != null && !Chars.equals(sessionInfo.getPrincipal(), securityContext.getSessionPrincipal()))
+                ) {
+                    sessionStore.createSession(authenticator, this);
+                } else if (Utf8s.equalsNcAscii(FALSE, sessionParam) && sessionInfo != null) {
+                    // close session if client requested it
+                    // note that this request is still going to be processed
+                    sessionStore.destroySession(sessionInfo.getSessionId(), this);
+                }
+            }
+            authenticationNanos = clock.getTicks() - authenticationStart;
         }
         return true;
     }
 
-    private boolean consumeChunked(HttpRequestProcessor processor, long headerEnd, long read, boolean newRequest) throws PeerIsSlowToReadException, ServerDisconnectException, PeerDisconnectedException, QueryPausedException, PeerIsSlowToWriteException {
-        HttpMultipartContentListener contentProcessor = (HttpMultipartContentListener) processor;
+    private boolean consumeChunked(
+            HttpPostPutProcessor processor,
+            long headerEnd,
+            long read,
+            boolean newRequest
+    ) throws PeerIsSlowToReadException, ServerDisconnectException, PeerDisconnectedException, PeerIsSlowToWriteException {
         if (!newRequest) {
             processor.resumeRecv(this);
         }
@@ -516,12 +765,12 @@ public class HttpConnectionContext extends IOContext<HttpConnectionContext> impl
             }
 
             if (read > 0) {
-                lo = chunkedContentParser.handleRecv(lo, hi, contentProcessor);
+                lo = chunkedContentParser.handleRecv(lo, hi, processor);
                 if (lo == Long.MAX_VALUE) {
                     // done
                     processor.onRequestComplete(this);
                     reset();
-                    if (configuration.getServerKeepAlive()) {
+                    if (keepConnectionAlive()) {
                         return true;
                     } else {
                         return disconnectHttp(processor, DISCONNECT_REASON_KEEPALIVE_OFF_RECV);
@@ -556,12 +805,11 @@ public class HttpConnectionContext extends IOContext<HttpConnectionContext> impl
     private boolean consumeContent(
             long contentLength,
             Socket socket,
-            HttpRequestProcessor processor,
+            HttpPostPutProcessor processor,
             long headerEnd,
             int read,
             boolean newRequest
-    ) throws PeerDisconnectedException, PeerIsSlowToReadException, ServerDisconnectException, QueryPausedException, PeerIsSlowToWriteException {
-        HttpMultipartContentListener contentProcessor = (HttpMultipartContentListener) processor;
+    ) throws PeerDisconnectedException, PeerIsSlowToReadException, ServerDisconnectException, PeerIsSlowToWriteException {
         if (!newRequest) {
             processor.resumeRecv(this);
         }
@@ -574,7 +822,7 @@ public class HttpConnectionContext extends IOContext<HttpConnectionContext> impl
                 lo = headerEnd;
                 newRequest = false;
             } else {
-                read = socket.recv(recvBuffer, recvBufferSize);
+                read = socket.recv(recvBuffer, recvBufferReadSize);
                 lo = recvBuffer;
             }
 
@@ -586,7 +834,7 @@ public class HttpConnectionContext extends IOContext<HttpConnectionContext> impl
                     return disconnectHttp(processor, DISCONNECT_REASON_KICKED_OUT_AT_EXTRA_BYTES);
                 }
 
-                contentProcessor.onChunk(lo, recvBuffer + read);
+                processor.onChunk(lo, recvBuffer + read);
                 totalReceived += read;
 
                 if (totalReceived == contentLength) {
@@ -605,16 +853,18 @@ public class HttpConnectionContext extends IOContext<HttpConnectionContext> impl
 
                     processor.onRequestComplete(this);
                     reset();
-                    if (configuration.getServerKeepAlive()) {
+                    if (keepConnectionAlive()) {
                         return true;
                     } else {
                         return disconnectHttp(processor, DISCONNECT_REASON_KEEPALIVE_OFF_RECV);
                     }
                 }
-            } else if (read == 0) {
+            }
+
+            if (read == 0 || read == forceFragmentationReceiveChunkSize) {
                 // Schedule for read
                 throw registerDispatcherRead();
-            } else {
+            } else if (read < 0) {
                 // client disconnected
                 return disconnectHttp(processor, DISCONNECT_REASON_KICKED_OUT_AT_RECV);
             }
@@ -623,12 +873,12 @@ public class HttpConnectionContext extends IOContext<HttpConnectionContext> impl
 
     private boolean consumeMultipart(
             Socket socket,
-            HttpRequestProcessor processor,
+            HttpMultipartContentProcessor processor,
             long headerEnd,
             int read,
             boolean newRequest,
             RescheduleContext rescheduleContext
-    ) throws PeerDisconnectedException, PeerIsSlowToReadException, ServerDisconnectException, QueryPausedException, PeerIsSlowToWriteException {
+    ) throws PeerDisconnectedException, PeerIsSlowToReadException, ServerDisconnectException, PeerIsSlowToWriteException {
         if (newRequest) {
             if (!headerParser.hasBoundary()) {
                 LOG.error().$("Bad request. Form data in multipart POST expected.").$(". Disconnecting [fd=").$(getFd()).I$();
@@ -640,7 +890,6 @@ public class HttpConnectionContext extends IOContext<HttpConnectionContext> impl
 
         processor.resumeRecv(this);
 
-        final HttpMultipartContentListener multipartListener = (HttpMultipartContentListener) processor;
         final long bufferEnd = recvBuffer + read;
 
         LOG.debug().$("multipart").$();
@@ -661,7 +910,7 @@ public class HttpConnectionContext extends IOContext<HttpConnectionContext> impl
             receivedBytes = 0;
         }
 
-        return continueConsumeMultipart(socket, start, buf, bufRemaining, multipartListener, processor, rescheduleContext);
+        return continueConsumeMultipart(socket, start, buf, bufRemaining, processor, rescheduleContext);
     }
 
     private boolean continueConsumeMultipart(
@@ -669,15 +918,14 @@ public class HttpConnectionContext extends IOContext<HttpConnectionContext> impl
             long start,
             long buf,
             int bufRemaining,
-            HttpMultipartContentListener multipartListener,
-            HttpRequestProcessor processor,
+            HttpMultipartContentProcessor processor,
             RescheduleContext rescheduleContext
-    ) throws PeerDisconnectedException, PeerIsSlowToReadException, ServerDisconnectException, QueryPausedException, PeerIsSlowToWriteException {
+    ) throws PeerDisconnectedException, PeerIsSlowToReadException, ServerDisconnectException, PeerIsSlowToWriteException {
         boolean keepGoing = false;
 
         if (buf > start) {
             try {
-                if (parseMultipartResult(start, buf, bufRemaining, multipartListener, processor, rescheduleContext)) {
+                if (parseMultipartResult(start, buf, bufRemaining, processor, rescheduleContext)) {
                     return true;
                 }
 
@@ -710,7 +958,7 @@ public class HttpConnectionContext extends IOContext<HttpConnectionContext> impl
                 // do we have anything in the buffer?
                 if (buf > start) {
                     try {
-                        if (parseMultipartResult(start, buf, bufRemaining, multipartListener, processor, rescheduleContext)) {
+                        if (parseMultipartResult(start, buf, bufRemaining, processor, rescheduleContext)) {
                             keepGoing = true;
                             break;
                         }
@@ -739,7 +987,7 @@ public class HttpConnectionContext extends IOContext<HttpConnectionContext> impl
             if (bufRemaining == 0) {
                 try {
                     if (buf - start > 1) {
-                        if (parseMultipartResult(start, buf, bufRemaining, multipartListener, processor, rescheduleContext)) {
+                        if (parseMultipartResult(start, buf, bufRemaining, processor, rescheduleContext)) {
                             keepGoing = true;
                             break;
                         }
@@ -766,6 +1014,18 @@ public class HttpConnectionContext extends IOContext<HttpConnectionContext> impl
         return keepGoing;
     }
 
+    private void decrementActiveConnections(long fd) {
+        if (processorName != null && connectionCounted) {
+            long activeConnections = activeConnectionTracker.dec(processorName);
+            LOG.debug().$("decrementing active connections [name=").$(processorName)
+                    .$(", activeConnections=").$(activeConnections)
+                    .$(", fd=").$(fd)
+                    .I$();
+            processorName = null;
+        }
+        connectionCounted = false;
+    }
+
     private boolean disconnectHttp(HttpRequestProcessor processor, int reason) throws ServerDisconnectException {
         processor.onConnectionClosed(this);
         reset();
@@ -785,7 +1045,7 @@ public class HttpConnectionContext extends IOContext<HttpConnectionContext> impl
         try {
             LOG.info()
                     .$("failed query result cannot be delivered. Kicked out [fd=").$(getFd())
-                    .$(", error=").$(e.getFlyweightMessage())
+                    .$(", error=").$safe(e.getFlyweightMessage())
                     .I$();
             processor.failRequest(this, e);
             throw registerDispatcherDisconnect(reason);
@@ -794,7 +1054,8 @@ public class HttpConnectionContext extends IOContext<HttpConnectionContext> impl
         } catch (PeerIsSlowToReadException peerIsSlowToReadException) {
             LOG.info().$("peer is slow to receive failed to retry response [fd=").$(getFd()).I$();
             processor.parkRequest(this, false);
-            resumeProcessor = processor;
+            resumeHandlerId = (processor instanceof RejectProcessor)
+                    ? HttpRequestProcessorSelector.REJECT_PROCESSOR_ID : currentHandlerId;
             canReset = false;
             throw registerDispatcherWrite();
         } finally {
@@ -805,27 +1066,28 @@ public class HttpConnectionContext extends IOContext<HttpConnectionContext> impl
     }
 
     private HttpRequestProcessor getHttpRequestProcessor(HttpRequestProcessorSelector selector) {
-        HttpRequestProcessor processor;
-        final Utf8Sequence url = headerParser.getUrl();
-        processor = selector.select(url);
-        if (processor == null) {
-            return selector.getDefaultProcessor();
-        }
-        return processor;
+        final HttpRequestProcessor processor = selector.select(headerParser);
+        this.currentHandlerId = selector.getLastSelectedHandlerId();
+        return requestValidator.validateRequestType(processor, rejectProcessor);
     }
 
     private boolean handleClientRecv(HttpRequestProcessorSelector selector, RescheduleContext rescheduleContext) throws PeerIsSlowToReadException, PeerIsSlowToWriteException, ServerDisconnectException {
+        // Handle protocol-switched connections (e.g., WebSocket)
+        if (isProtocolSwitched && resumeHandlerId != NO_RESUME_PROCESSOR) {
+            return handleProtocolSwitchedRecv(selector);
+        }
+
         boolean busyRecv = true;
         try {
-            // this is address of where header ended in our receive buffer
-            // we need to being processing request content starting from this address
+            // this is address of where header ended in our receiving buffer
+            // we need to process request content starting from this address
             long headerEnd = recvBuffer;
             int read = 0;
             final boolean newRequest = headerParser.isIncomplete();
             if (newRequest) {
                 while (headerParser.isIncomplete()) {
                     // read headers
-                    read = socket.recv(recvBuffer, recvBufferSize);
+                    read = socket.recv(recvBuffer, recvBufferReadSize);
                     LOG.debug().$("recv [fd=").$(getFd()).$(", count=").$(read).I$();
                     if (read < 0 && !headerParser.onRecvError(read)) {
                         LOG.debug()
@@ -844,33 +1106,40 @@ public class HttpConnectionContext extends IOContext<HttpConnectionContext> impl
                     dumpBuffer(recvBuffer, read);
                     headerEnd = headerParser.parse(recvBuffer, recvBuffer + read, true, false);
                 }
+                requestValidator.of(headerParser);
             }
 
-            final Utf8Sequence url = headerParser.getUrl();
-            if (url == null) {
-                throw HttpException.instance("missing URL");
-            }
+            requestValidator.validateRequestHeader(rejectProcessor);
             HttpRequestProcessor processor = rejectProcessor.isRequestBeingRejected() ? rejectProcessor : getHttpRequestProcessor(selector);
-            long contentLength = headerParser.getContentLength();
-            final boolean chunked = Utf8s.equalsNcAscii("chunked", headerParser.getHeader(HEADER_TRANSFER_ENCODING));
-            final boolean multipartRequest = Utf8s.equalsNcAscii("multipart/form-data", headerParser.getContentType())
-                    || Utf8s.equalsNcAscii("multipart/mixed", headerParser.getContentType());
-            final boolean multipartProcessor = processor instanceof HttpMultipartContentListener;
 
             DirectUtf8Sequence acceptEncoding = headerParser.getHeader(HEADER_CONTENT_ACCEPT_ENCODING);
-            if (configuration.allowDeflateBeforeSend() && acceptEncoding != null && Utf8s.containsAscii(acceptEncoding, "gzip")) {
-                responseSink.setDeflateBeforeSend(true);
+            if (configuration.getHttpContextConfiguration().allowDeflateBeforeSend()
+                    && acceptEncoding != null
+                    && Utf8s.containsAscii(acceptEncoding, "gzip")) {
+                // re-read send buffer size in case the config was reloaded
+                responseSink.setDeflateBeforeSend(true, configuration.getSendBufferSize());
             }
 
             try {
-                final byte requiredAuthType = processor.getRequiredAuthType();
                 if (newRequest) {
-                    if (processor.requiresAuthentication() && !configureSecurityContext()) {
-                        processor = rejectRequest(HTTP_UNAUTHORIZED, requiredAuthType);
+                    final boolean cookiesEnabled = configuration.getHttpContextConfiguration().areCookiesEnabled();
+                    if (cookiesEnabled) {
+                        if (!cookieHandler.parseCookies(this)) {
+                            processor = rejectProcessor;
+                        }
                     }
 
-                    if (configuration.areCookiesEnabled()) {
-                        if (!processor.processCookies(this, securityContext)) {
+                    try {
+                        if (processor.requiresAuthentication() && !configureSecurityContext()) {
+                            final byte requiredAuthType = processor.getRequiredAuthType();
+                            processor = rejectProcessor.withAuthenticationType(requiredAuthType).reject(HTTP_UNAUTHORIZED);
+                        }
+                    } catch (CairoException e) {
+                        processor = rejectProcessor.reject(HTTP_INTERNAL_ERROR, e.getFlyweightMessage());
+                    }
+
+                    if (cookiesEnabled) {
+                        if (!processor.processServiceAccountCookie(this, securityContext)) {
                             processor = rejectProcessor;
                         }
                     }
@@ -878,25 +1147,25 @@ public class HttpConnectionContext extends IOContext<HttpConnectionContext> impl
                     try {
                         securityContext.checkEntityEnabled();
                     } catch (CairoException e) {
-                        processor = rejectRequest(HTTP_FORBIDDEN, e.getFlyweightMessage());
+                        processor = rejectProcessor.reject(HTTP_FORBIDDEN, e.getFlyweightMessage());
                     }
                 }
 
-                processor = checkProcessorValidForRequest(
-                        headerParser.getMethod(),
-                        processor,
-                        chunked,
-                        multipartRequest,
-                        contentLength,
-                        multipartProcessor
-                );
+                if (!connectionCounted && !processor.ignoreConnectionLimitCheck()) {
+                    processor = checkConnectionLimit(processor);
+                }
 
-                if (chunked) {
-                    busyRecv = consumeChunked(processor, headerEnd, read, newRequest);
-                } else if (multipartRequest) {
-                    busyRecv = consumeMultipart(socket, processor, headerEnd, read, newRequest, rescheduleContext);
+                final long contentLength = headerParser.getContentLength();
+                final boolean chunked = HttpKeywords.isChunked(headerParser.getHeader(HEADER_TRANSFER_ENCODING));
+                final boolean multipartRequest = HttpKeywords.isContentTypeMultipartFormData(headerParser.getContentType())
+                        || HttpKeywords.isContentTypeMultipartMixed(headerParser.getContentType());
+
+                if (multipartRequest) {
+                    busyRecv = consumeMultipart(socket, (HttpMultipartContentProcessor) processor, headerEnd, read, newRequest, rescheduleContext);
+                } else if (chunked) {
+                    busyRecv = consumeChunked((HttpPostPutProcessor) processor, headerEnd, read, newRequest);
                 } else if (contentLength > 0) {
-                    busyRecv = consumeContent(contentLength, socket, processor, headerEnd, read, newRequest);
+                    busyRecv = consumeContent(contentLength, socket, (HttpPostPutProcessor) processor, headerEnd, read, newRequest);
                 } else {
                     // Do not expect any more bytes to be sent to us before
                     // we respond back to client. We will disconnect the client when
@@ -913,7 +1182,10 @@ public class HttpConnectionContext extends IOContext<HttpConnectionContext> impl
                         processor.onHeadersReady(this);
                         LOG.debug().$("good [fd=").$(getFd()).I$();
                         processor.onRequestComplete(this);
-                        resumeProcessor = null;
+                        // Don't clear resumeHandlerId for protocol-switched connections (e.g., WebSocket)
+                        if (!isProtocolSwitched) {
+                            resumeHandlerId = NO_RESUME_PROCESSOR;
+                        }
                         reset();
                     }
                 }
@@ -925,24 +1197,17 @@ public class HttpConnectionContext extends IOContext<HttpConnectionContext> impl
                 return disconnectHttp(processor, DISCONNECT_REASON_PEER_DISCONNECT_AT_RECV);
             } catch (PeerIsSlowToReadException e) {
                 LOG.debug().$("peer is slow reader [two]").$();
-                // it is important to assign resume processor before we fire
+                // it is important to assign resume handler ID before we fire
                 // event off to dispatcher
                 processor.parkRequest(this, false);
-                resumeProcessor = processor;
-                throw registerDispatcherWrite();
-            } catch (QueryPausedException e) {
-                LOG.debug().$("partition is in cold storage").$();
-                // it is important to assign resume processor before we fire
-                // event off to dispatcher
-                processor.parkRequest(this, true);
-                resumeProcessor = processor;
-                suspendEvent = e.getEvent();
+                resumeHandlerId = (processor instanceof RejectProcessor)
+                        ? HttpRequestProcessorSelector.REJECT_PROCESSOR_ID : currentHandlerId;
                 throw registerDispatcherWrite();
             }
         } catch (ServerDisconnectException | PeerIsSlowToReadException | PeerIsSlowToWriteException e) {
             throw e;
         } catch (HttpException e) {
-            LOG.error().$("http error [fd=").$(getFd()).$(", e=`").$(e.getFlyweightMessage()).$("`]").$();
+            LOG.error().$("http error [fd=").$(getFd()).$(", e=`").$safe(e.getFlyweightMessage()).$("`]").$();
             throw registerDispatcherDisconnect(DISCONNECT_REASON_PROTOCOL_VIOLATION);
         } catch (Throwable e) {
             LOG.error().$("internal error [fd=").$(getFd()).$(", e=`").$(e).$("`]").$();
@@ -951,25 +1216,34 @@ public class HttpConnectionContext extends IOContext<HttpConnectionContext> impl
         return busyRecv;
     }
 
-    private boolean handleClientSend() throws PeerIsSlowToReadException, ServerDisconnectException {
-        if (resumeProcessor != null) {
+    private boolean handleClientSend(HttpRequestProcessorSelector selector) throws PeerIsSlowToReadException, ServerDisconnectException {
+        if (resumeHandlerId != NO_RESUME_PROCESSOR) {
+            final HttpRequestProcessor proc = resolveResumeProcessor(selector);
             try {
-                resumeProcessor.resumeSend(this);
+                proc.resumeSend(this);
                 reset();
                 return true;
             } catch (PeerIsSlowToReadException ignore) {
-                resumeProcessor.parkRequest(this, false);
+                proc.parkRequest(this, false);
                 LOG.debug().$("peer is slow reader").$();
                 throw registerDispatcherWrite();
-            } catch (QueryPausedException e) {
-                resumeProcessor.parkRequest(this, true);
-                suspendEvent = e.getEvent();
-                LOG.debug().$("partition is in cold storage").$();
-                throw registerDispatcherWrite();
+                // resumeHandlerId stays set (re-park with same ID)
             } catch (PeerDisconnectedException ignore) {
+                // Protocol-switched connections (e.g. WebSocket) rely on
+                // onConnectionClosed to undo per-connection bookkeeping the
+                // processor set up at handshake time (gauges, security state,
+                // etc.). The receive path already calls it via
+                // handleProtocolSwitchedRecv; mirror that here so a disconnect
+                // detected on the send drain doesn't leak the hook.
+                if (isProtocolSwitched) {
+                    proc.onConnectionClosed(this);
+                }
                 throw registerDispatcherDisconnect(DISCONNECT_REASON_PEER_DISCONNECT_AT_SEND);
             } catch (ServerDisconnectException ignore) {
                 LOG.info().$("kicked out [fd=").$(getFd()).I$();
+                if (isProtocolSwitched) {
+                    proc.onConnectionClosed(this);
+                }
                 throw registerDispatcherDisconnect(DISCONNECT_REASON_KICKED_OUT_AT_SEND);
             }
         } else {
@@ -978,17 +1252,50 @@ public class HttpConnectionContext extends IOContext<HttpConnectionContext> impl
         return false;
     }
 
+    /**
+     * Handles receive for protocol-switched connections (e.g., WebSocket).
+     * Instead of parsing HTTP, delegates to the processor's resumeRecv.
+     */
+    private boolean handleProtocolSwitchedRecv(HttpRequestProcessorSelector selector) throws PeerIsSlowToWriteException, ServerDisconnectException, PeerIsSlowToReadException {
+        final HttpRequestProcessor processor = resolveResumeProcessor(selector);
+        try {
+            processor.resumeRecv(this);
+
+            // resumeRecv() returned normally -> the processor is ready to read from a websocket again.
+            // We don't return true, because that would make the infrastructure call us immediately again
+            // and we would monopolize the thread. Instead, we use PeerIsSlowToWriteException as a signal
+            // to be registered for reading. This gives the worker thread a chance to run other processors.
+            throw registerDispatcherRead();
+        } catch (PeerIsSlowToReadException | PeerIsSlowToWriteException e) {
+            // Need more data from/to peer
+            throw e;
+        } catch (ServerDisconnectException e) {
+            // Connection should be closed
+            LOG.info().$("protocol-switched connection closing [fd=").$(getFd()).I$();
+            processor.onConnectionClosed(this);
+            throw e;
+        } catch (Throwable e) {
+            // Any other error, close connection
+            LOG.error().$("error in protocol-switched recv [fd=").$(getFd()).$(", e=").$(e).I$();
+            processor.onConnectionClosed(this);
+            throw registerDispatcherDisconnect(DISCONNECT_REASON_SERVER_ERROR);
+        }
+    }
+
+    private boolean keepConnectionAlive() {
+        return !forceDisconnectOnComplete && configuration.getHttpContextConfiguration().getServerKeepAlive();
+    }
+
     private boolean parseMultipartResult(
             long start,
             long buf,
             int bufRemaining,
-            HttpMultipartContentListener multipartListener,
-            HttpRequestProcessor processor,
+            HttpMultipartContentProcessor processor,
             RescheduleContext rescheduleContext
-    ) throws PeerDisconnectedException, PeerIsSlowToReadException, ServerDisconnectException, QueryPausedException, TooFewBytesReceivedException {
+    ) throws PeerDisconnectedException, PeerIsSlowToReadException, ServerDisconnectException, TooFewBytesReceivedException {
         boolean parseResult;
         try {
-            parseResult = multipartContentParser.parse(start, buf, multipartListener);
+            parseResult = multipartContentParser.parse(start, buf, processor);
         } catch (RetryOperationException e) {
             this.multipartParserState.saveFdBufferPosition(multipartContentParser.getResumePtr(), buf, bufRemaining);
             throw e;
@@ -1005,6 +1312,14 @@ public class HttpConnectionContext extends IOContext<HttpConnectionContext> impl
         return false;
     }
 
+    private HttpRequestProcessor resolveResumeProcessor(HttpRequestProcessorSelector selector) {
+        if (resumeHandlerId == HttpRequestProcessorSelector.REJECT_PROCESSOR_ID) {
+            return rejectProcessor;
+        }
+        HttpRequestProcessor processor = selector.resolveProcessorById(resumeHandlerId, headerParser);
+        return processor != null ? processor : rejectProcessor;
+    }
+
     private void shiftReceiveBufferUnprocessedBytes(long start, int receivedBytes) {
         // Shift to start
         this.receivedBytes = receivedBytes;
@@ -1012,4 +1327,23 @@ public class HttpConnectionContext extends IOContext<HttpConnectionContext> impl
         LOG.debug().$("peer is slow, waiting for bigger part to parse [multipart]").$();
     }
 
+    @Override
+    protected void doInit() throws TlsSessionInitFailedException {
+        // the context is obtained from the pool, so we should initialize the memory
+        if (recvBuffer == 0) {
+            // re-read recv buffer size in case the config was reloaded
+            recvBufferSize = configuration.getRecvBufferSize();
+            recvBufferReadSize = Math.min(forceFragmentationReceiveChunkSize, recvBufferSize);
+            recvBuffer = Unsafe.malloc(recvBufferSize, MemoryTag.NATIVE_HTTP_CONN);
+        }
+        // re-read buffer sizes in case the config was reloaded
+        responseSink.of(socket, configuration.getSendBufferSize());
+        headerParser.reopen(configuration.getHttpContextConfiguration().getRequestHeaderBufferSize());
+        multipartContentHeaderParser.reopen(configuration.getHttpContextConfiguration().getMultipartHeaderBufferSize());
+
+        if (socket.supportsTls()) {
+            socket.startTlsSession(null);
+        }
+        connectionCounted = false;
+    }
 }

@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -26,19 +26,45 @@ package io.questdb.griffin.engine.functions.groupby;
 
 import io.questdb.cairo.ArrayColumnTypes;
 import io.questdb.cairo.ColumnType;
+import io.questdb.cairo.map.Map;
 import io.questdb.cairo.map.MapValue;
+import io.questdb.cairo.sql.PageFrameMemoryRecord;
 import io.questdb.cairo.sql.Record;
 import io.questdb.griffin.PlanSink;
 import io.questdb.griffin.engine.functions.GroupByFunction;
 import io.questdb.griffin.engine.functions.LongFunction;
+import io.questdb.griffin.engine.groupby.FlyweightPackedMapValue;
 import io.questdb.std.Numbers;
+import io.questdb.std.Unsafe;
 
 public class CountLongConstGroupByFunction extends LongFunction implements GroupByFunction {
     private int valueIndex;
 
     @Override
+    public void computeBatch(MapValue mapValue, long dataAddr, int rowCount, long startRowId) {
+        mapValue.addLong(valueIndex, rowCount);
+    }
+
+    @Override
     public void computeFirst(MapValue mapValue, Record record, long rowId) {
         mapValue.putLong(valueIndex, 1);
+    }
+
+    @Override
+    public void computeKeyedBatch(
+            PageFrameMemoryRecord record,
+            FlyweightPackedMapValue mapValue,
+            long baseValueAddr,
+            long batchAddr,
+            long rowCount,
+            long baseRowId
+    ) {
+        final long valueColumnOffset = mapValue.getOffset(valueIndex);
+        for (long i = 0; i < rowCount; i++) {
+            long encoded = Unsafe.getLong(batchAddr + (i << 3));
+            long addr = baseValueAddr + Map.decodeBatchOffset(encoded) + valueColumnOffset;
+            Unsafe.putLong(addr, Unsafe.getLong(addr) + 1);
+        }
     }
 
     @Override
@@ -47,8 +73,18 @@ public class CountLongConstGroupByFunction extends LongFunction implements Group
     }
 
     @Override
+    public int getComputeBatchArgType() {
+        return ColumnType.UNDEFINED;
+    }
+
+    @Override
     public long getLong(Record rec) {
         return rec.getLong(valueIndex);
+    }
+
+    @Override
+    public int getSampleByFlags() {
+        return GroupByFunction.SAMPLE_BY_FILL_ALL;
     }
 
     @Override
@@ -68,14 +104,21 @@ public class CountLongConstGroupByFunction extends LongFunction implements Group
     }
 
     @Override
-    public boolean isReadThreadSafe() {
+    public boolean isThreadSafe() {
         return true;
     }
 
     @Override
     public void merge(MapValue destValue, MapValue srcValue) {
-        long srcCount = srcValue.getLong(valueIndex);
-        destValue.addLong(valueIndex, srcCount);
+        final long srcCount = srcValue.getLong(valueIndex);
+        if (srcCount > 0) {
+            final long destCount = destValue.getLong(valueIndex);
+            if (destCount > 0) {
+                destValue.putLong(valueIndex, destCount + srcCount);
+            } else {
+                destValue.putLong(valueIndex, srcCount);
+            }
+        }
     }
 
     @Override
@@ -91,6 +134,11 @@ public class CountLongConstGroupByFunction extends LongFunction implements Group
     @Override
     public void setNull(MapValue mapValue) {
         mapValue.putLong(valueIndex, Numbers.LONG_NULL);
+    }
+
+    @Override
+    public boolean supportsBatchComputation() {
+        return true;
     }
 
     @Override

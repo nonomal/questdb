@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -34,9 +34,7 @@ import org.junit.Assert;
 import org.junit.Test;
 
 public class InsertNullTest extends AbstractCairoTest {
-
     private static final int NULL_INSERTS = 3;
-
     private static final String[][] TYPES = {
             // type name, null value
             {"boolean", "false"},
@@ -47,6 +45,7 @@ public class InsertNullTest extends AbstractCairoTest {
             {"long", "null"},
             {"date", ""},
             {"timestamp", ""},
+            {"timestamp_ns", ""},
             {"float", "null"},
             {"double", "null"},
             {"string", ""},
@@ -56,7 +55,13 @@ public class InsertNullTest extends AbstractCairoTest {
             {"geohash(5b)", ""},
             {"geohash(15b)", ""},
             {"geohash(31b)", ""},
-            {"geohash(60b)", ""}
+            {"geohash(60b)", ""},
+            {"decimal(2,0)", ""},
+            {"decimal(4,0)", ""},
+            {"decimal(8,0)", ""},
+            {"decimal(16,0)", ""},
+            {"decimal(32,0)", ""},
+            {"decimal(64,0)", ""}
     };
 
     @Test
@@ -67,17 +72,11 @@ public class InsertNullTest extends AbstractCairoTest {
             }
             try {
                 final String[] type = TYPES[i];
-                assertQuery(
-                        "value\n",
-                        "x",
-                        String.format("create table x (value %s)", type[0]),
-                        null,
-                        String.format("insert into x select null from long_sequence(%d)", NULL_INSERTS),
-                        expectedNullInserts("value\n", type[1], NULL_INSERTS, true),
-                        true,
-                        true,
-                        false
-                );
+                assertQuery("x")
+                        .ddl(String.format("create table x (value %s)", type[0]))
+                        .mutateWith(String.format("insert into x select null from long_sequence(%d)", NULL_INSERTS))
+                        .expectSize()
+                        .returns("value\n", expectedNullInserts("value\n", type[1], NULL_INSERTS, true));
             } finally {
                 tearDown();
             }
@@ -86,46 +85,22 @@ public class InsertNullTest extends AbstractCairoTest {
 
     @Test
     public void testInsertNullFromSelectOnDesignatedColumnMustFail() throws Exception {
-        assertMemoryLeak(() -> {
-            try {
-                assertQuery(
-                        "sym\ty\n",
-                        "xx",
-                        "create table xx (sym symbol, y timestamp) timestamp(y)",
-                        "y",
-                        "insert into xx select 'AA', null from long_sequence(1)",
-                        "y\n",
-                        true,
-                        false,
-                        false
-                );
-                Assert.fail();
-            } catch (CairoException expected) {
-                Assert.assertTrue(expected.getMessage().contains("timestamp before 1970-01-01 is not allowed"));
-            }
-        });
+        _testInsertNullFromSelectOnDesignatedColumnMustFail("timestamp");
+    }
+
+    @Test
+    public void testInsertNullFromSelectOnDesignatedNSColumnMustFail() throws Exception {
+        _testInsertNullFromSelectOnDesignatedColumnMustFail("timestamp_ns");
     }
 
     @Test
     public void testInsertNullFromValuesOnDesignatedColumnMustFail() throws Exception {
-        assertMemoryLeak(() -> {
-            try {
-                assertQuery(
-                        "sym\ty\n",
-                        "xx",
-                        "create table xx (sym symbol, y timestamp) timestamp(y)",
-                        "y",
-                        "insert into xx values('AA', null)",
-                        "y\n",
-                        true,
-                        false,
-                        false
-                );
-                Assert.fail();
-            } catch (SqlException expected) {
-                Assert.assertEquals("[0] designated timestamp column cannot be NULL", expected.getMessage());
-            }
-        });
+        _testInsertNullFromValuesOnDesignatedColumnMustFail("timestamp");
+    }
+
+    @Test
+    public void testInsertNullFromValuesOnDesignatedNSColumnMustFail() throws Exception {
+        _testInsertNullFromValuesOnDesignatedColumnMustFail("timestamp_ns");
     }
 
     @Test
@@ -136,17 +111,10 @@ public class InsertNullTest extends AbstractCairoTest {
             }
             try {
                 final String[] type = TYPES[i];
-                assertQuery(
-                        "value\n",
-                        "x where value = null",
-                        String.format("create table x (value %s)", type[0]),
-                        null,
-                        String.format("insert into x select null from long_sequence(%d)", NULL_INSERTS),
-                        expectedNullInserts("value\n", type[1], NULL_INSERTS, !isNotNullable(type[0])),
-                        !isNotNullable(type[0]),
-                        false,
-                        false
-                );
+                assertQuery("x where value = null")
+                        .ddl(String.format("create table x (value %s)", type[0]))
+                        .mutateWith(String.format("insert into x select null from long_sequence(%d)", NULL_INSERTS))
+                        .returns("value\n", expectedNullInserts("value\n", type[1], NULL_INSERTS, !isNotNullable(type[0])));
             } finally {
                 tearDown();
             }
@@ -161,17 +129,11 @@ public class InsertNullTest extends AbstractCairoTest {
             }
             try {
                 final String[] type = TYPES[i];
-                assertQuery(
-                        "value\n",
-                        "x where value is not null",
-                        String.format("create table x (value %s)", type[0]),
-                        null,
-                        String.format("insert into x select null from long_sequence(%d)", NULL_INSERTS),
-                        expectedNullInserts("value\n", type[1], NULL_INSERTS, isNotNullable(type[0])),
-                        true,
-                        isNotNullable(type[0]),
-                        false
-                );
+                assertQuery("x where value is not null")
+                        .ddl(String.format("create table x (value %s)", type[0]))
+                        .mutateWith(String.format("insert into x select null from long_sequence(%d)", NULL_INSERTS))
+                        .expectSize(isNotNullable(type[0]))
+                        .returns("value\n", expectedNullInserts("value\n", type[1], NULL_INSERTS, isNotNullable(type[0])));
             } finally {
                 tearDown();
             }
@@ -186,17 +148,10 @@ public class InsertNullTest extends AbstractCairoTest {
             }
             try {
                 final String[] type = TYPES[i];
-                assertQuery(
-                        "value\n",
-                        "x where value is null",
-                        String.format("create table x (value %s)", type[0]),
-                        null,
-                        String.format("insert into x select null from long_sequence(%d)", NULL_INSERTS),
-                        expectedNullInserts("value\n", type[1], NULL_INSERTS, !isNotNullable(type[0])),
-                        !isNotNullable(type[0]),
-                        false,
-                        false
-                );
+                assertQuery("x where value is null")
+                        .ddl(String.format("create table x (value %s)", type[0]))
+                        .mutateWith(String.format("insert into x select null from long_sequence(%d)", NULL_INSERTS))
+                        .returns("value\n", expectedNullInserts("value\n", type[1], NULL_INSERTS, !isNotNullable(type[0])));
             } finally {
                 tearDown();
             }
@@ -211,17 +166,11 @@ public class InsertNullTest extends AbstractCairoTest {
             }
             try {
                 final String[] type = TYPES[i];
-                assertQuery(
-                        "value\n",
-                        "x where value != null",
-                        String.format("create table x (value %s)", type[0]),
-                        null,
-                        String.format("insert into x select null from long_sequence(%d)", NULL_INSERTS),
-                        expectedNullInserts("value\n", type[1], NULL_INSERTS, isNotNullable(type[0])),
-                        true,
-                        isNotNullable(type[0]),
-                        false
-                );
+                assertQuery("x where value != null")
+                        .ddl(String.format("create table x (value %s)", type[0]))
+                        .mutateWith(String.format("insert into x select null from long_sequence(%d)", NULL_INSERTS))
+                        .expectSize(isNotNullable(type[0]))
+                        .returns("value\n", expectedNullInserts("value\n", type[1], NULL_INSERTS, isNotNullable(type[0])));
             } finally {
                 tearDown();
             }
@@ -232,6 +181,36 @@ public class InsertNullTest extends AbstractCairoTest {
         return Chars.equalsLowerCaseAscii(type, "short") ||
                 Chars.equalsLowerCaseAscii(type, "byte") ||
                 Chars.equalsLowerCaseAscii(type, "boolean");
+    }
+
+    private void _testInsertNullFromSelectOnDesignatedColumnMustFail(String timestampType) throws Exception {
+        assertMemoryLeak(() -> {
+            try {
+                assertQuery("xx")
+                        .ddl("create table xx (sym symbol, y #TIMESTAMP_TYPE) timestamp(y)".replace("#TIMESTAMP_TYPE", timestampType))
+                        .mutateWith("insert into xx select 'AA', null from long_sequence(1)")
+                        .timestamp("y")
+                        .returns("sym\ty\n", "y\n");
+                Assert.fail();
+            } catch (CairoException expected) {
+                Assert.assertTrue(expected.getMessage().contains("designated timestamp column cannot be NULL"));
+            }
+        });
+    }
+
+    private void _testInsertNullFromValuesOnDesignatedColumnMustFail(String timestamp) throws Exception {
+        assertMemoryLeak(() -> {
+            try {
+                assertQuery("xx")
+                        .ddl("create table xx (sym symbol, y #TIMESTAMP_TYPE) timestamp(y)".replace("#TIMESTAMP_TYPE", timestamp))
+                        .mutateWith("insert into xx values('AA', null)")
+                        .timestamp("y")
+                        .returns("sym\ty\n", "y\n");
+                Assert.fail();
+            } catch (SqlException expected) {
+                Assert.assertEquals("[28] designated timestamp column cannot be NULL", expected.getMessage());
+            }
+        });
     }
 
     static String expectedNullInserts(String header, String nullValue, int count, boolean expectsOutput) {

@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -46,7 +46,7 @@ public class CsvLexerBenchmark {
         long buf = Unsafe.malloc(BUF_SIZE, MemoryTag.NATIVE_DEFAULT);
         try {
             try (Path path = new Path().of(pathToCsv)) {
-                int fd = Files.openRO(path.$());
+                long fd = Files.openRO(path.$());
                 assert fd > 0;
                 AtomicInteger counter = new AtomicInteger();
 

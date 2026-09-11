@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -26,11 +26,21 @@ package io.questdb.cairo.pool;
 
 import io.questdb.cairo.CairoConfiguration;
 import io.questdb.cairo.CairoEngine;
-import io.questdb.cairo.GenericTableRecordMetadata;
+import io.questdb.cairo.GenericRecordMetadata;
+import io.questdb.cairo.TableColumnMetadata;
 import io.questdb.cairo.TableToken;
+import io.questdb.cairo.sql.TableRecordMetadata;
+import io.questdb.cairo.wal.seq.TableRecordMetadataSink;
 import io.questdb.cairo.wal.seq.TableSequencerAPI;
+import io.questdb.std.IntList;
+import io.questdb.std.Transient;
+import io.questdb.std.str.CharSink;
+import org.jetbrains.annotations.NotNull;
+import org.jetbrains.annotations.Nullable;
 
-public class SequencerMetadataPool extends AbstractMultiTenantPool<MetadataPoolTenant> {
+import java.util.Comparator;
+
+public class SequencerMetadataPool extends AbstractMultiTenantPool<SequencerMetadataPool.SequencerMetadataTenantImpl> {
     private final CairoEngine engine;
 
     public SequencerMetadataPool(CairoConfiguration configuration, CairoEngine engine) {
@@ -44,25 +54,40 @@ public class SequencerMetadataPool extends AbstractMultiTenantPool<MetadataPoolT
     }
 
     @Override
-    protected MetadataPoolTenant newTenant(TableToken tableToken, Entry<MetadataPoolTenant> entry, int index) {
-        return new SequencerMetadataTenantImpl(this, entry, index, tableToken, engine.getTableSequencerAPI());
+    protected SequencerMetadataTenantImpl newTenant(
+            TableToken tableToken,
+            Entry<SequencerMetadataTenantImpl> rootEntry,
+            Entry<SequencerMetadataTenantImpl> entry,
+            int index,
+            @Nullable ResourcePoolSupervisor<SequencerMetadataTenantImpl> supervisor
+    ) {
+        return new SequencerMetadataTenantImpl(this, rootEntry, entry, index, tableToken, engine.getTableSequencerAPI());
     }
 
-    private static class SequencerMetadataTenantImpl extends GenericTableRecordMetadata implements MetadataPoolTenant {
+    public static class SequencerMetadataTenantImpl extends GenericRecordMetadata implements TableRecordMetadata, TableRecordMetadataSink, PoolTenant<SequencerMetadataTenantImpl> {
+        private final Comparator<TableColumnMetadata> columnOrderComparator;
         private final int index;
+        private final AbstractMultiTenantPool.Entry<SequencerMetadataTenantImpl> rootEntry;
         private final TableSequencerAPI tableSequencerAPI;
-        private final TableToken tableToken;
-        private AbstractMultiTenantPool.Entry<MetadataPoolTenant> entry;
-        private AbstractMultiTenantPool<MetadataPoolTenant> pool;
+        private AbstractMultiTenantPool.Entry<SequencerMetadataTenantImpl> entry;
+        private long metadataVersion;
+        private AbstractMultiTenantPool<SequencerMetadataTenantImpl> pool;
+        private IntList readColumnOrder;
+        private int tableId;
+        private TableToken tableToken;
 
         public SequencerMetadataTenantImpl(
-                AbstractMultiTenantPool<MetadataPoolTenant> pool,
-                Entry<MetadataPoolTenant> entry,
+                AbstractMultiTenantPool<SequencerMetadataTenantImpl> pool,
+                Entry<SequencerMetadataTenantImpl> rootEntry,
+                Entry<SequencerMetadataTenantImpl> entry,
                 int index,
                 TableToken tableToken,
                 TableSequencerAPI tableSequencerAPI
         ) {
+            super();
+            columnOrderComparator = this::compareColumnOrder;
             this.pool = pool;
+            this.rootEntry = rootEntry;
             this.entry = entry;
             this.index = index;
             this.tableSequencerAPI = tableSequencerAPI;
@@ -71,17 +96,48 @@ public class SequencerMetadataPool extends AbstractMultiTenantPool<MetadataPoolT
         }
 
         @Override
-        public void close() {
-            if (pool != null && getEntry() != null) {
-                if (pool.returnToPool(this)) {
-                    return;
+        public void addColumn(
+                String columnName,
+                int columnType,
+                byte indexType,
+                int indexValueBlockCapacity,
+                boolean symbolTableStatic,
+                int writerIndex,
+                boolean isDedupKey,
+                boolean symbolIsCached,
+                int symbolCapacity,
+                @Transient IntList coveringColumnIndices
+        ) {
+            if (columnType > -1L) {
+                TableColumnMetadata columnMetadata = new TableColumnMetadata(
+                        columnName,
+                        columnType,
+                        indexType,
+                        indexValueBlockCapacity,
+                        symbolTableStatic,
+                        null,
+                        writerIndex,
+                        isDedupKey,
+                        0,
+                        symbolIsCached,
+                        symbolCapacity
+                );
+                if (coveringColumnIndices != null) {
+                    columnMetadata.setCoveringColumnIndices(new IntList(coveringColumnIndices));
                 }
+                add(columnMetadata);
             }
-            super.close();
         }
 
         @Override
-        public AbstractMultiTenantPool.Entry<MetadataPoolTenant> getEntry() {
+        public void close() {
+            if (pool != null && getEntry() != null) {
+                pool.returnToPool(this);
+            }
+        }
+
+        @Override
+        public AbstractMultiTenantPool.Entry<SequencerMetadataTenantImpl> getEntry() {
             return entry;
         }
 
@@ -91,18 +147,23 @@ public class SequencerMetadataPool extends AbstractMultiTenantPool<MetadataPoolT
         }
 
         @Override
-        public int getMaxUncommittedRows() {
-            throw new UnsupportedOperationException();
+        public long getMetadataVersion() {
+            return metadataVersion;
         }
 
         @Override
-        public long getO3MaxLag() {
-            throw new UnsupportedOperationException();
+        public AbstractMultiTenantPool.Entry<SequencerMetadataTenantImpl> getRootEntry() {
+            return rootEntry;
         }
 
         @Override
-        public int getPartitionBy() {
-            throw new UnsupportedOperationException();
+        public int getTableId() {
+            return tableId;
+        }
+
+        @Override
+        public TableToken getTableToken() {
+            return tableToken;
         }
 
         public void goodbye() {
@@ -112,17 +173,64 @@ public class SequencerMetadataPool extends AbstractMultiTenantPool<MetadataPoolT
 
         @Override
         public boolean isDedupKey(int columnIndex) {
-            throw new UnsupportedOperationException();
+            return false;
         }
 
         @Override
-        public boolean isSoftLink() {
-            throw new UnsupportedOperationException();
+        public boolean isWalEnabled() {
+            // this class is only used for WAL-enabled tables
+            return true;
         }
 
         @Override
-        public void refresh() {
+        public void of(
+                TableToken tableToken,
+                int tableId,
+                int timestampIndex,
+                int compressedTimestampIndex,
+                long structureVersion,
+                int columnCount,
+                @Transient @Nullable IntList readColumnOrder
+        ) {
+            this.tableToken = tableToken;
+            this.tableId = tableId;
+            this.timestampIndex = compressedTimestampIndex;
+            this.metadataVersion = structureVersion;
+
+            if (readColumnOrder != null) {
+                this.readColumnOrder = readColumnOrder;
+                columnMetadata.sort(columnOrderComparator);
+                this.readColumnOrder = null;
+
+                columnNameIndexMap.clear();
+                for (int i = 0; i < columnCount; i++) {
+                    TableColumnMetadata column = columnMetadata.getQuick(i);
+                    columnNameIndexMap.put(column.getColumnName(), i);
+                    if (column.getWriterIndex() == timestampIndex) {
+                        this.timestampIndex = i;
+                    }
+                }
+            }
+        }
+
+        @Override
+        public void refresh(@Nullable ResourcePoolSupervisor<SequencerMetadataTenantImpl> supervisor) {
             tableSequencerAPI.reloadMetadataConditionally(tableToken, getMetadataVersion(), this);
+        }
+
+        @Override
+        public void toSink(@NotNull CharSink<?> sink) {
+            sink.put("SequencerMetadataTenantImpl{index=").put(index).put(", tableToken=").put(tableToken).put('}');
+        }
+
+        public void updateTableToken(TableToken tableToken) {
+            this.tableToken = tableToken;
+        }
+
+        private int compareColumnOrder(TableColumnMetadata a, TableColumnMetadata b) {
+            int aOrder = readColumnOrder.getQuick(a.getWriterIndex());
+            int bOrder = readColumnOrder.getQuick(b.getWriterIndex());
+            return Integer.compare(aOrder, bOrder);
         }
     }
 }

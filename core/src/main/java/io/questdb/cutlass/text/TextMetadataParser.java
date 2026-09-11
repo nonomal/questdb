@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -33,10 +33,15 @@ import io.questdb.cutlass.text.types.TypeManager;
 import io.questdb.griffin.SqlKeywords;
 import io.questdb.log.Log;
 import io.questdb.log.LogFactory;
-import io.questdb.std.*;
+import io.questdb.std.CharSequenceIntHashMap;
+import io.questdb.std.MemoryTag;
+import io.questdb.std.Mutable;
+import io.questdb.std.ObjList;
+import io.questdb.std.ObjectPool;
+import io.questdb.std.Unsafe;
+import io.questdb.std.Vect;
 import io.questdb.std.datetime.DateLocale;
 import io.questdb.std.datetime.DateLocaleFactory;
-import io.questdb.std.datetime.microtime.TimestampFormatFactory;
 import io.questdb.std.datetime.millitime.DateFormatFactory;
 import io.questdb.std.str.AbstractCharSequence;
 
@@ -60,7 +65,6 @@ public class TextMetadataParser implements JsonParser, Mutable, Closeable {
     private final DateFormatFactory dateFormatFactory;
     private final DateLocale dateLocale;
     private final DateLocaleFactory dateLocaleFactory;
-    private final TimestampFormatFactory timestampFormatFactory;
     private final TypeManager typeManager;
     private long buf;
     private long bufCapacity = 0;
@@ -82,7 +86,6 @@ public class TextMetadataParser implements JsonParser, Mutable, Closeable {
         this.csPool = new ObjectPool<>(FloatingCharSequence::new, textConfiguration.getMetadataStringPoolCapacity());
         this.dateLocaleFactory = typeManager.getInputFormatConfiguration().getDateLocaleFactory();
         this.dateFormatFactory = typeManager.getInputFormatConfiguration().getDateFormatFactory();
-        this.timestampFormatFactory = typeManager.getInputFormatConfiguration().getTimestampFormatFactory();
         this.typeManager = typeManager;
         this.dateLocale = textConfiguration.getDefaultDateLocale();
     }
@@ -132,7 +135,7 @@ public class TextMetadataParser implements JsonParser, Mutable, Closeable {
             case JsonLexer.EVT_NAME:
                 this.propertyIndex = propertyNameMap.get(tag);
                 if (this.propertyIndex == -1) {
-                    LOG.info().$("unknown [table=").$(tableName).$(", tag=").$(tag).$(']').$();
+                    LOG.info().$("unknown [table=").$safe(tableName).$(", tag=").$safe(tag).$(']').$();
                 }
                 break;
             case JsonLexer.EVT_VALUE:
@@ -142,7 +145,7 @@ public class TextMetadataParser implements JsonParser, Mutable, Closeable {
                         break;
                     case P_TYPE:
                         type = ColumnType.typeOf(tag);
-                        if (type == -1) {
+                        if (type == -1 || isUnstorableDecimal(type)) {
                             throw JsonException.$(position, "Invalid type");
                         }
                         break;
@@ -160,7 +163,7 @@ public class TextMetadataParser implements JsonParser, Mutable, Closeable {
                         index = SqlKeywords.isTrueKeyword(tag);
                         break;
                     default:
-                        LOG.info().$("ignoring [table=").$(tableName).$(", value=").$(tag).$(']').$();
+                        LOG.info().$("ignoring [table=").$safe(tableName).$(", value=").$safe(tag).$(']').$();
                         break;
                 }
                 break;
@@ -185,9 +188,19 @@ public class TextMetadataParser implements JsonParser, Mutable, Closeable {
         }
     }
 
+    // The bare DECIMAL tag is a surrogate for function overload resolution and has no storage size.
+    // The type name table also holds scale > precision pairs, which the DDL parser rejects.
+    private static boolean isUnstorableDecimal(int type) {
+        final short tag = ColumnType.tagOf(type);
+        if (tag == ColumnType.DECIMAL) {
+            return true;
+        }
+        return ColumnType.isDecimalType(tag) && ColumnType.getDecimalScale(type) > ColumnType.getDecimalPrecision(type);
+    }
+
     private static void strcpyw(final CharSequence value, final int len, final long address) {
         for (int i = 0; i < len; i++) {
-            Unsafe.getUnsafe().putChar(address + ((long) i << 1), value.charAt(i));
+            Unsafe.putChar(address + ((long) i << 1), value.charAt(i));
         }
     }
 
@@ -252,10 +265,18 @@ public class TextMetadataParser implements JsonParser, Mutable, Closeable {
                 if (pattern == null) {
                     throw JsonException.$(0, "TIMESTAMP format pattern is required");
                 }
-                columnTypes.add(typeManager.nextTimestampAdapter(utf8, timestampFormatFactory.get(pattern), timestampLocale));
+                columnTypes.add(typeManager.nextTimestampAdapter(utf8, ColumnType.getTimestampDriver(type).getTimestampDateFormatFactory().get(pattern), timestampLocale, pattern.toString()));
                 break;
             case ColumnType.SYMBOL:
                 columnTypes.add(typeManager.nextSymbolAdapter(index));
+                break;
+            case ColumnType.DECIMAL8:
+            case ColumnType.DECIMAL16:
+            case ColumnType.DECIMAL32:
+            case ColumnType.DECIMAL64:
+            case ColumnType.DECIMAL128:
+            case ColumnType.DECIMAL256:
+                columnTypes.add(typeManager.nextDecimalAdapter(type));
                 break;
             default:
                 columnTypes.add(typeManager.getTypeAdapter(type));
@@ -276,7 +297,7 @@ public class TextMetadataParser implements JsonParser, Mutable, Closeable {
 
         @Override
         public char charAt(int index) {
-            return Unsafe.getUnsafe().getChar(buf + offset + index * 2L);
+            return Unsafe.getChar(buf + offset + index * 2L);
         }
 
         @Override

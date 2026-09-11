@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -26,13 +26,13 @@ package io.questdb.std;
 
 import io.questdb.std.str.CharSink;
 import io.questdb.std.str.Sinkable;
+import io.questdb.std.str.Utf8Sequence;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
 import java.util.Arrays;
 
 public class CharSequenceHashSet extends AbstractCharSequenceHashSet implements Sinkable {
-
     private static final int MIN_INITIAL_CAPACITY = 16;
     private final ObjList<CharSequence> list;
     private boolean hasNull = false;
@@ -51,7 +51,7 @@ public class CharSequenceHashSet extends AbstractCharSequenceHashSet implements 
         this(initialCapacity, 0.4);
     }
 
-    private CharSequenceHashSet(int initialCapacity, double loadFactor) {
+    public CharSequenceHashSet(int initialCapacity, double loadFactor) {
         super(initialCapacity, loadFactor);
         list = new ObjList<>(free);
         clear();
@@ -77,6 +77,36 @@ public class CharSequenceHashSet extends AbstractCharSequenceHashSet implements 
         return true;
     }
 
+    /**
+     * Adds a UTF-8 sequence to the hash set preserving key uniqueness.
+     * <p>
+     * For ASCII sequences, uses {@link Utf8Sequence#asAsciiCharSequence()} to avoid
+     * String allocation. For non-ASCII sequences, converts to String via {@code toString()}.
+     *
+     * @param seq the UTF-8 sequence to add (can be a flyweight object)
+     * @return false if the key is already in the set, true otherwise
+     */
+    public boolean add(@Nullable Utf8Sequence seq) {
+        if (seq == null) {
+            return addNull();
+        }
+
+        // Convert to String for storage and to compute UTF-16 compatible hash
+        CharSequence charSequence;
+        if (seq.isAscii()) {
+            charSequence = seq.asAsciiCharSequence();
+        } else {
+            charSequence = seq.toString();
+        }
+        int index = keyIndex(charSequence);
+        if (index < 0) {
+            return false;
+        }
+
+        addAt(index, charSequence);
+        return true;
+    }
+
     public final void addAll(@NotNull CharSequenceHashSet that) {
         for (int i = 0, k = that.size(); i < k; i++) {
             add(that.get(i));
@@ -87,6 +117,14 @@ public class CharSequenceHashSet extends AbstractCharSequenceHashSet implements 
         final String s = Chars.toString(key);
         keys[index] = s;
         list.add(s);
+        if (--free < 1) {
+            rehash();
+        }
+    }
+
+    public void addAtWithBorrowed(int index, @NotNull CharSequence key) {
+        keys[index] = key;
+        list.add(key);
         if (--free < 1) {
             rehash();
         }

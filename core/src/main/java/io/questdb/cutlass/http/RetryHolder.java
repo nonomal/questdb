@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,6 +24,24 @@
 
 package io.questdb.cutlass.http;
 
-class RetryHolder {
+import io.questdb.std.Mutable;
+
+class RetryHolder implements Mutable {
+    public long nextRunTimestamp;
     public Retry retry;
+    public long taskIncarnation;
+    RetryHolder nextFree;
+
+    @Override
+    public void clear() {
+        nextRunTimestamp = 0;
+        retry = null;
+        taskIncarnation = 0;
+    }
+
+    public void of(Retry retry, long taskIncarnation, long nextRunTimestamp) {
+        this.nextRunTimestamp = nextRunTimestamp;
+        this.retry = retry;
+        this.taskIncarnation = taskIncarnation;
+    }
 }

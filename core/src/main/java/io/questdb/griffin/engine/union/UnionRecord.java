@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,14 +24,34 @@
 
 package io.questdb.griffin.engine.union;
 
+import io.questdb.cairo.arr.ArrayView;
 import io.questdb.std.BinarySequence;
+import io.questdb.std.Decimal128;
+import io.questdb.std.Decimal256;
+import io.questdb.std.Interval;
 import io.questdb.std.Long256;
 import io.questdb.std.str.CharSink;
-import io.questdb.std.str.Utf16Sink;
 import io.questdb.std.str.Utf8Sequence;
-import io.questdb.std.str.Utf8Sink;
 
 public class UnionRecord extends AbstractUnionRecord {
+
+    @Override
+    public ArrayView getArray(int col, int columnType) {
+        if (useA) {
+            return recordA.getArray(col, columnType);
+        }
+        return recordB.getArray(col, columnType);
+    }
+
+    @Override
+    public int getArrayDimLen(int col, int columnType, int dim) {
+        return useA ? recordA.getArrayDimLen(col, columnType, dim) : recordB.getArrayDimLen(col, columnType, dim);
+    }
+
+    @Override
+    public double getArrayDouble1d2d(int col, int columnType, int idx0, int idx1) {
+        return useA ? recordA.getArrayDouble1d2d(col, columnType, idx0, idx1) : recordB.getArrayDouble1d2d(col, columnType, idx0, idx1);
+    }
 
     @Override
     public BinarySequence getBin(int col) {
@@ -79,6 +99,56 @@ public class UnionRecord extends AbstractUnionRecord {
             return recordA.getDate(col);
         }
         return recordB.getDate(col);
+    }
+
+    @Override
+    public void getDecimal128(int col, Decimal128 sink) {
+        if (useA) {
+            recordA.getDecimal128(col, sink);
+        } else {
+            recordB.getDecimal128(col, sink);
+        }
+    }
+
+    @Override
+    public short getDecimal16(int col) {
+        if (useA) {
+            return recordA.getDecimal16(col);
+        }
+        return recordB.getDecimal16(col);
+    }
+
+    @Override
+    public void getDecimal256(int col, Decimal256 sink) {
+        if (useA) {
+            recordA.getDecimal256(col, sink);
+        } else {
+            recordB.getDecimal256(col, sink);
+        }
+    }
+
+    @Override
+    public int getDecimal32(int col) {
+        if (useA) {
+            return recordA.getDecimal32(col);
+        }
+        return recordB.getDecimal32(col);
+    }
+
+    @Override
+    public long getDecimal64(int col) {
+        if (useA) {
+            return recordA.getDecimal64(col);
+        }
+        return recordB.getDecimal64(col);
+    }
+
+    @Override
+    public byte getDecimal8(int col) {
+        if (useA) {
+            return recordA.getDecimal8(col);
+        }
+        return recordB.getDecimal8(col);
     }
 
     @Override
@@ -148,6 +218,14 @@ public class UnionRecord extends AbstractUnionRecord {
     }
 
     @Override
+    public Interval getInterval(int col) {
+        if (useA) {
+            return recordA.getInterval(col);
+        }
+        return recordB.getInterval(col);
+    }
+
+    @Override
     public long getLong(int col) {
         if (useA) {
             return recordA.getLong(col);
@@ -205,15 +283,6 @@ public class UnionRecord extends AbstractUnionRecord {
     }
 
     @Override
-    public void getStr(int col, Utf16Sink utf16Sink) {
-        if (useA) {
-            recordA.getStr(col, utf16Sink);
-        } else {
-            recordB.getStr(col, utf16Sink);
-        }
-    }
-
-    @Override
     public CharSequence getStrA(int col) {
         if (useA) {
             return recordA.getStrA(col);
@@ -243,15 +312,6 @@ public class UnionRecord extends AbstractUnionRecord {
             return recordA.getTimestamp(col);
         }
         return recordB.getTimestamp(col);
-    }
-
-    @Override
-    public void getVarchar(int col, Utf8Sink utf8Sink) {
-        if (useA) {
-            recordA.getVarchar(col, utf8Sink);
-        } else {
-            recordB.getVarchar(col, utf8Sink);
-        }
     }
 
     @Override

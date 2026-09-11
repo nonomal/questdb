@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -124,7 +124,7 @@ public class HistogramLogReaderWriterTest {
     }
 
     @Test
-    public void jHiccupV0Log() throws Exception {
+    public void jHiccupV0Log() {
         InputStream readerStream = HistogramLogReaderWriterTest.class.getResourceAsStream("/hdr-histogram/jHiccup-2.0.1.logV0.hlog");
         HistogramLogReader reader = new HistogramLogReader(readerStream);
         int histogramCount = 0;
@@ -178,7 +178,7 @@ public class HistogramLogReaderWriterTest {
     }
 
     @Test
-    public void jHiccupV1Log() throws Exception {
+    public void jHiccupV1Log() {
         InputStream readerStream = HistogramLogReaderWriterTest.class.getResourceAsStream("/hdr-histogram/jHiccup-2.0.6.logV1.hlog");
         HistogramLogReader reader = new HistogramLogReader(readerStream);
         int histogramCount = 0;
@@ -232,7 +232,7 @@ public class HistogramLogReaderWriterTest {
     }
 
     @Test
-    public void jHiccupV2Log() throws Exception {
+    public void jHiccupV2Log() {
         InputStream readerStream = HistogramLogReaderWriterTest.class.getResourceAsStream("/hdr-histogram/jHiccup-2.0.7S.logV2.hlog");
 
         HistogramLogReader reader = new HistogramLogReader(readerStream);
@@ -287,7 +287,7 @@ public class HistogramLogReaderWriterTest {
     }
 
     @Test
-    public void taggedV2LogTest() throws Exception {
+    public void taggedV2LogTest() {
         InputStream readerStream = HistogramLogReaderWriterTest.class.getResourceAsStream("/hdr-histogram/tagged-Log.logV2.hlog");
 
         HistogramLogReader reader = new HistogramLogReader(readerStream);
@@ -312,7 +312,7 @@ public class HistogramLogReaderWriterTest {
     }
 
     @Test
-    public void ycsbV1Log() throws Exception {
+    public void ycsbV1Log() {
         InputStream readerStream = HistogramLogReaderWriterTest.class.getResourceAsStream("/hdr-histogram/ycsb.logV1.hlog");
         HistogramLogReader reader = new HistogramLogReader(readerStream);
         int histogramCount = 0;

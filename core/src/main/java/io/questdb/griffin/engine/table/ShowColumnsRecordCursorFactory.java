@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -23,25 +23,47 @@
  ******************************************************************************/
 package io.questdb.griffin.engine.table;
 
-import io.questdb.cairo.*;
+import io.questdb.cairo.AbstractRecordCursorFactory;
+import io.questdb.cairo.CairoColumn;
+import io.questdb.cairo.CairoEngine;
+import io.questdb.cairo.CairoException;
+import io.questdb.cairo.CairoTable;
+import io.questdb.cairo.ColumnType;
+import io.questdb.cairo.GenericRecordMetadata;
+import io.questdb.cairo.IndexType;
+import io.questdb.cairo.MetadataCacheReader;
+import io.questdb.cairo.TableColumnMetadata;
+import io.questdb.cairo.TableReader;
+import io.questdb.cairo.TableToken;
 import io.questdb.cairo.sql.NoRandomAccessRecordCursor;
 import io.questdb.cairo.sql.Record;
 import io.questdb.cairo.sql.RecordCursor;
 import io.questdb.cairo.sql.RecordMetadata;
+import io.questdb.cairo.sql.SqlExecutionCircuitBreaker;
+import io.questdb.cairo.sql.StaticSymbolTable;
 import io.questdb.griffin.PlanSink;
 import io.questdb.griffin.SqlExecutionContext;
-import io.questdb.std.Misc;
+import io.questdb.std.IntList;
+import io.questdb.std.Transient;
+import io.questdb.std.str.StringSink;
 import org.jetbrains.annotations.NotNull;
+import org.jetbrains.annotations.Nullable;
 
 public class ShowColumnsRecordCursorFactory extends AbstractRecordCursorFactory {
     public static final int N_NAME_COL = 0;
     public static final int N_TYPE_COL = N_NAME_COL + 1;
     private static final int N_INDEXED_COL = N_TYPE_COL + 1;
     private static final int N_INDEX_BLOCK_CAPACITY_COL = N_INDEXED_COL + 1;
+    // Ordinals 0..8 match the pre-posting-index layout. The two posting
+    // columns (indexType, indexInclude) are appended at the end so JDBC
+    // clients reading by column index do not break on upgrade.
     private static final int N_SYMBOL_CACHED_COL = N_INDEX_BLOCK_CAPACITY_COL + 1;
     private static final int N_SYMBOL_CAPACITY_COL = N_SYMBOL_CACHED_COL + 1;
-    private static final int N_DESIGNATED_COL = N_SYMBOL_CAPACITY_COL + 1;
+    private static final int N_SYMBOL_TABLE_SIZE_COL = N_SYMBOL_CAPACITY_COL + 1;
+    private static final int N_DESIGNATED_COL = N_SYMBOL_TABLE_SIZE_COL + 1;
     private static final int N_UPSERT_KEY_COL = N_DESIGNATED_COL + 1;
+    private static final int N_INDEX_TYPE_COL = N_UPSERT_KEY_COL + 1;
+    private static final int N_INDEX_INCLUDE_COL = N_INDEX_TYPE_COL + 1;
     private static final RecordMetadata METADATA;
     private final ShowColumnsCursor cursor = new ShowColumnsCursor();
     private final TableToken tableToken;
@@ -55,6 +77,7 @@ public class ShowColumnsRecordCursorFactory extends AbstractRecordCursorFactory 
 
     @Override
     public RecordCursor getCursor(SqlExecutionContext executionContext) {
+        executionContext.getCircuitBreaker().statefulThrowExceptionIfTrippedTimeThrottled();
         return cursor.of(executionContext, tableToken, tokenPosition);
     }
 
@@ -66,17 +89,23 @@ public class ShowColumnsRecordCursorFactory extends AbstractRecordCursorFactory 
     @Override
     public void toPlan(PlanSink sink) {
         sink.type("show_columns");
-        sink.meta("of").val(tableToken);
+        sink.meta("of").val(tableToken.getTableName());
     }
 
-    public static class ShowColumnsCursor implements NoRandomAccessRecordCursor {
+    private static class ShowColumnsCursor implements NoRandomAccessRecordCursor {
+        private final StringSink includeSink = new StringSink();
+        private final StringSink includeSinkB = new StringSink();
         private final ShowColumnsRecord record = new ShowColumnsRecord();
+        private final IntList staticSymbolTableSizes = new IntList();
+        private CairoColumn cairoColumn = new CairoColumn();
+        private CairoTable cairoTable;
+        private SqlExecutionCircuitBreaker circuitBreaker;
         private int columnIndex;
-        private TableReader reader;
 
         @Override
         public void close() {
-            reader = Misc.free(reader);
+            cairoTable = null;
+            cairoColumn = null;
         }
 
         @Override
@@ -86,27 +115,67 @@ public class ShowColumnsRecordCursorFactory extends AbstractRecordCursorFactory 
 
         @Override
         public boolean hasNext() {
-            columnIndex++;
-            if (columnIndex < reader.getMetadata().getColumnCount()) {
+            circuitBreaker.statefulThrowExceptionIfTripped();
+            if (columnIndex < cairoTable.getColumnCount() - 1) {
+                cairoColumn = cairoTable.getColumnQuiet(++columnIndex);
                 return true;
             }
-            columnIndex--;
             return false;
         }
 
-        public ShowColumnsCursor of(SqlExecutionContext executionContext, TableToken tableToken, int tokenPosition) {
-            try {
-                reader = executionContext.getReader(tableToken);
-            } catch (CairoException e) {
-                e.position(tokenPosition);
-                throw e;
+        public ShowColumnsCursor of(CairoTable cairoTable, @Transient @Nullable TableReader tableReader) {
+            this.cairoTable = cairoTable;
+            staticSymbolTableSizes.restoreInitialCapacity();
+            staticSymbolTableSizes.setAll(cairoTable.getColumnCount(), 0);
+            if (tableReader != null) {
+                for (int i = 0, n = cairoTable.getColumnCount(); i < n; i++) {
+                    final CairoColumn column = this.cairoTable.getColumnQuiet(i);
+                    if (column.isSymbolTableStatic()) {
+                        // there is a small chance that cairoTable and tableReader are out of sync with each other due to
+                        // a concurrent schema change, so we must double-check presence of the column in table metadata
+                        final int readerColumnIndex = tableReader.getMetadata().getColumnIndexQuiet(column.getName());
+                        if (readerColumnIndex != -1) {
+                            final StaticSymbolTable staticSymbolTable = tableReader.getSymbolTable(readerColumnIndex);
+                            if (staticSymbolTable != null) {
+                                staticSymbolTableSizes.setQuick(i, staticSymbolTable.getSymbolCount() + (staticSymbolTable.containsNullValue() ? 1 : 0));
+                            }
+                        }
+                    }
+                }
             }
             toTop();
             return this;
         }
 
-        public ShowColumnsCursor of(SqlExecutionContext executionContext, CharSequence tableName) {
-            return of(executionContext, executionContext.getTableTokenIfExists(tableName), -1);
+        public ShowColumnsCursor of(SqlExecutionContext executionContext, TableToken tableToken, int tokenPosition) {
+            this.circuitBreaker = executionContext.getCircuitBreaker();
+            final CairoEngine engine = executionContext.getCairoEngine();
+            // The token is resolved from the synchronously loaded registry, but the
+            // metadata cache is hydrated lazily; hydrate this table on demand so we do
+            // not report a registered-but-not-yet-cached table as non-existent during
+            // the startup hydration window (or before any catalogue query has warmed an
+            // embedded engine).
+            engine.getMetadataCache().hydrateTableOnDemand(tableToken);
+            try (MetadataCacheReader metadataRO = engine.getMetadataCache().readLock()) {
+                final CairoTable cairoTable = metadataRO.getTable(tableToken);
+                if (cairoTable != null) {
+                    // Plain VIEWs read through their base table and own no symbol maps, so they have
+                    // no reader to open. Live views are physical WAL-backed tables that do own their
+                    // symbol maps, so they take the reader path and report real symbol table sizes.
+                    if (tableToken.isView()) {
+                        return of(cairoTable, null);
+                    }
+                    try (TableReader tableReader = engine.getReader(tableToken)) {
+                        return of(cairoTable, tableReader);
+                    }
+                }
+            }
+            throw CairoException.tableDoesNotExist(tableToken.getTableName()).position(tokenPosition);
+        }
+
+        @Override
+        public long preComputedStateSize() {
+            return 0;
         }
 
         @Override
@@ -117,6 +186,7 @@ public class ShowColumnsRecordCursorFactory extends AbstractRecordCursorFactory 
         @Override
         public void toTop() {
             columnIndex = -1;
+            cairoColumn = null;
         }
 
         public class ShowColumnsRecord implements Record {
@@ -124,23 +194,16 @@ public class ShowColumnsRecordCursorFactory extends AbstractRecordCursorFactory 
             @Override
             public boolean getBool(int col) {
                 if (col == N_INDEXED_COL) {
-                    return reader.getMetadata().isColumnIndexed(columnIndex);
+                    return cairoColumn.isIndexed();
                 }
                 if (col == N_SYMBOL_CACHED_COL) {
-                    if (ColumnType.isSymbol(reader.getMetadata().getColumnType(columnIndex))) {
-                        return reader.getSymbolMapReader(columnIndex).isCached();
-                    } else {
-                        return false;
-                    }
+                    return cairoColumn.isSymbolCached();
                 }
                 if (col == N_DESIGNATED_COL) {
-                    return reader.getMetadata().getTimestampIndex() == columnIndex;
+                    return cairoColumn.isDesignated();
                 }
                 if (col == N_UPSERT_KEY_COL) {
-                    int timestampIndex = reader.getMetadata().getTimestampIndex();
-                    return reader.getMetadata().isDedupKey(columnIndex) && reader.getMetadata().isWalEnabled()
-                            && timestampIndex > -1
-                            && reader.getMetadata().isDedupKey(timestampIndex);
+                    return cairoColumn.isDedupKey();
                 }
                 throw new UnsupportedOperationException();
             }
@@ -148,14 +211,17 @@ public class ShowColumnsRecordCursorFactory extends AbstractRecordCursorFactory 
             @Override
             public int getInt(int col) {
                 if (col == N_INDEX_BLOCK_CAPACITY_COL) {
-                    return reader.getMetadata().getIndexValueBlockCapacity(columnIndex);
+                    return cairoColumn.getIndexBlockCapacity();
                 }
                 if (col == N_SYMBOL_CAPACITY_COL) {
-                    if (ColumnType.isSymbol(reader.getMetadata().getColumnType(columnIndex))) {
-                        return reader.getSymbolMapReader(columnIndex).getSymbolCapacity();
+                    if (ColumnType.isSymbol(cairoColumn.getType())) {
+                        return cairoColumn.getSymbolCapacity();
                     } else {
                         return 0;
                     }
+                }
+                if (col == N_SYMBOL_TABLE_SIZE_COL) {
+                    return staticSymbolTableSizes.getQuick(columnIndex);
                 }
                 throw new UnsupportedOperationException();
             }
@@ -164,16 +230,68 @@ public class ShowColumnsRecordCursorFactory extends AbstractRecordCursorFactory 
             @NotNull
             public CharSequence getStrA(int col) {
                 if (col == N_NAME_COL) {
-                    return reader.getMetadata().getColumnName(columnIndex);
+                    return cairoColumn.getName();
                 }
                 if (col == N_TYPE_COL) {
-                    return ColumnType.nameOf(reader.getMetadata().getColumnType(columnIndex));
+                    return ColumnType.nameOf(cairoColumn.getType());
+                }
+                if (col == N_INDEX_TYPE_COL) {
+                    return cairoColumn.isIndexed() ? IndexType.nameOf(cairoColumn.getIndexType()) : "";
+                }
+                if (col == N_INDEX_INCLUDE_COL) {
+                    IntList coveringCols = cairoColumn.getCoveringColumnIndices();
+                    if (coveringCols == null || coveringCols.size() == 0) {
+                        return "";
+                    }
+                    includeSink.clear();
+                    int emitted = 0;
+                    for (int i = 0, n = coveringCols.size(); i < n; i++) {
+                        // Skip tombstoned entries (dense -1 left after
+                        // DROP COLUMN). getColumnQuiet treats -1 as out
+                        // of bounds and would throw.
+                        int denseIdx = coveringCols.getQuick(i);
+                        if (denseIdx < 0) {
+                            continue;
+                        }
+                        CairoColumn covCol = cairoTable.getColumnQuiet(denseIdx);
+                        if (covCol != null) {
+                            if (emitted > 0) {
+                                includeSink.putAscii(',');
+                            }
+                            includeSink.put(covCol.getName());
+                            emitted++;
+                        }
+                    }
+                    return includeSink;
                 }
                 throw new UnsupportedOperationException();
             }
 
             @Override
             public CharSequence getStrB(int col) {
+                if (col == N_INDEX_INCLUDE_COL) {
+                    IntList coveringCols = cairoColumn.getCoveringColumnIndices();
+                    if (coveringCols == null || coveringCols.size() == 0) {
+                        return "";
+                    }
+                    includeSinkB.clear();
+                    int emitted = 0;
+                    for (int i = 0, n = coveringCols.size(); i < n; i++) {
+                        int denseIdx = coveringCols.getQuick(i);
+                        if (denseIdx < 0) {
+                            continue;
+                        }
+                        CairoColumn covCol = cairoTable.getColumnQuiet(denseIdx);
+                        if (covCol != null) {
+                            if (emitted > 0) {
+                                includeSinkB.putAscii(',');
+                            }
+                            includeSinkB.put(covCol.getName());
+                            emitted++;
+                        }
+                    }
+                    return includeSinkB;
+                }
                 return getStrA(col);
             }
 
@@ -192,8 +310,13 @@ public class ShowColumnsRecordCursorFactory extends AbstractRecordCursorFactory 
         metadata.add(new TableColumnMetadata("indexBlockCapacity", ColumnType.INT));
         metadata.add(new TableColumnMetadata("symbolCached", ColumnType.BOOLEAN));
         metadata.add(new TableColumnMetadata("symbolCapacity", ColumnType.INT));
+        metadata.add(new TableColumnMetadata("symbolTableSize", ColumnType.INT));
         metadata.add(new TableColumnMetadata("designated", ColumnType.BOOLEAN));
         metadata.add(new TableColumnMetadata("upsertKey", ColumnType.BOOLEAN));
+        // Posting-index columns appended at the end — keep JDBC ordinals
+        // 0..8 stable with pre-posting-index builds.
+        metadata.add(new TableColumnMetadata("indexType", ColumnType.STRING));
+        metadata.add(new TableColumnMetadata("indexInclude", ColumnType.STRING));
         METADATA = metadata;
     }
 }

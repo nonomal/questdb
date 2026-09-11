@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -35,20 +35,18 @@ public class NotMatchStrFunctionFactoryTest extends AbstractCairoTest {
     @Test
     public void testNullRegex() throws Exception {
         assertMemoryLeak(() -> {
-            ddl("create table x as (select rnd_str() name from long_sequence(2000))");
-            try {
-                assertExceptionNoLeakCheck("select * from x where name !~ null");
-            } catch (SqlException e) {
-                Assert.assertEquals(30, e.getPosition());
-                TestUtils.assertContains(e.getFlyweightMessage(), "NULL regex");
-            }
+            execute("create table x as (select rnd_str() name from long_sequence(2000))");
+            assertQuery("select * from x where name !~ null")
+                    .noLeakCheck()
+                    .expectSize()
+                    .returns("name\n");
         });
     }
 
     @Test
     public void testRegexSyntaxError() throws Exception {
         assertMemoryLeak(() -> {
-            ddl("create table x as (select rnd_str() name from long_sequence(2000))");
+            execute("create table x as (select rnd_str() name from long_sequence(2000))");
             try {
                 assertExceptionNoLeakCheck("select * from x where name !~ 'XJ**'");
             } catch (SqlException e) {
@@ -61,62 +59,63 @@ public class NotMatchStrFunctionFactoryTest extends AbstractCairoTest {
     @Test
     public void testSimple() throws Exception {
         assertMemoryLeak(() -> {
-            final String expected = "name\n" +
-                    "XYPO\n" +
-                    "XTP\n" +
-                    "PZP\n" +
-                    "WZOO\n" +
-                    "SYY\n" +
-                    "WVY\n" +
-                    "TRVYQ\n" +
-                    "RSX\n" +
-                    "YRZO\n" +
-                    "WRQ\n" +
-                    "QSW\n" +
-                    "PZWY\n" +
-                    "WOZZV\n" +
-                    "YRS\n" +
-                    "PQU\n" +
-                    "SUXQSWVR\n" +
-                    "ROVRQZV\n" +
-                    "WPSU\n" +
-                    "QPW\n" +
-                    "OQO\n" +
-                    "WZWX\n" +
-                    "PZPW\n" +
-                    "QZY\n" +
-                    "ZQR\n" +
-                    "ZPXR\n" +
-                    "TYVU\n" +
-                    "VOW\n" +
-                    "WYX\n" +
-                    "ZWTO\n" +
-                    "VTR\n" +
-                    "QXXY\n" +
-                    "UUWV\n" +
-                    "PYW\n" +
-                    "YOP\n" +
-                    "YVXZ\n" +
-                    "SYYQ\n" +
-                    "TVX\n" +
-                    "UQRVV\n" +
-                    "USUT\n" +
-                    "OQVS\n" +
-                    "SSSR\n" +
-                    "WZV\n" +
-                    "PZX\n" +
-                    "ZOYYO\n" +
-                    "SXY\n" +
-                    "XZU\n" +
-                    "YPX\n" +
-                    "ROU\n" +
-                    "OPY\n" +
-                    "YPR\n";
-            ddl("create table x as (select rnd_str() name from long_sequence(2000))");
-            assertSql(
-                    expected,
-                    "select * from x where name !~ '[ABCDEFGHIJKLMN]'"
-            );
+            final String expected = """
+                    name
+                    XYPO
+                    XTP
+                    PZP
+                    WZOO
+                    SYY
+                    WVY
+                    TRVYQ
+                    RSX
+                    YRZO
+                    WRQ
+                    QSW
+                    PZWY
+                    WOZZV
+                    YRS
+                    PQU
+                    SUXQSWVR
+                    ROVRQZV
+                    WPSU
+                    QPW
+                    OQO
+                    WZWX
+                    PZPW
+                    QZY
+                    ZQR
+                    ZPXR
+                    TYVU
+                    VOW
+                    WYX
+                    ZWTO
+                    VTR
+                    QXXY
+                    UUWV
+                    PYW
+                    YOP
+                    YVXZ
+                    SYYQ
+                    TVX
+                    UQRVV
+                    USUT
+                    OQVS
+                    SSSR
+                    WZV
+                    PZX
+                    ZOYYO
+                    SXY
+                    XZU
+                    YPX
+                    ROU
+                    OPY
+                    YPR
+                    """;
+            execute("create table x as (select rnd_str() name from long_sequence(2000))");
+            assertQuery("select * from x where name !~ '[ABCDEFGHIJKLMN]'")
+                    .noLeakCheck()
+                    .returns(expected);
         });
     }
 }

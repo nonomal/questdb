@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -118,13 +118,13 @@ public class LineTcpTypeConversionTest extends BaseLineTcpContextTest {
     @Test
     public void testConversionToFloat() throws Exception {
         testConversionToType("FLOAT", "testCol\ttime\n" +
-                "100.0000\t2016-06-13T17:43:50.100418Z\n" +
-                "-100.0000\t2016-06-13T17:43:50.100419Z\n" +
-                "123.0000\t2016-06-13T17:43:50.100421Z\n" +
-                "-54.0000\t2016-06-13T17:43:50.100422Z\n" +
-                "23.3000\t2016-06-13T17:43:50.100423Z\n" +
-                "1.0000\t2016-06-13T17:43:50.100424Z\n" +
-                "0.0000\t2016-06-13T17:43:50.100425Z\n"
+                "100.0\t2016-06-13T17:43:50.100418Z\n" +
+                "-100.0\t2016-06-13T17:43:50.100419Z\n" +
+                "123.0\t2016-06-13T17:43:50.100421Z\n" +
+                "-54.0\t2016-06-13T17:43:50.100422Z\n" +
+                "23.3\t2016-06-13T17:43:50.100423Z\n" +
+                "1.0\t2016-06-13T17:43:50.100424Z\n" +
+                "0.0\t2016-06-13T17:43:50.100425Z\n"
         );
     }
 
@@ -205,7 +205,7 @@ public class LineTcpTypeConversionTest extends BaseLineTcpContextTest {
                 "q\t2016-06-13T17:43:50.100402Z\n" +
                 (stringAsTagSupported
                         ? "\"questdbb\"\t2016-06-13T17:43:50.100403Z\n" +
-                        "\"q\"\t2016-06-13T17:43:50.100404Z\n"
+                          "\"q\"\t2016-06-13T17:43:50.100404Z\n"
                         : "") +
                 "100i\t2016-06-13T17:43:50.100405Z\n" +
                 "-100i\t2016-06-13T17:43:50.100406Z\n" +
@@ -265,7 +265,7 @@ public class LineTcpTypeConversionTest extends BaseLineTcpContextTest {
 
     private void testConversion(String table, String createTableCmd, String input, String expected) throws Exception {
         runInContext(() -> {
-            ddl(createTableCmd);
+            execute(createTableCmd);
             recvBuffer = input;
             do {
                 handleContextIO0();

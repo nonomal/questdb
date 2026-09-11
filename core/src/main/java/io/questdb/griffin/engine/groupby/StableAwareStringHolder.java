@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -26,7 +26,7 @@ package io.questdb.griffin.engine.groupby;
 
 import io.questdb.std.Unsafe;
 import io.questdb.std.str.AbstractCharSequence;
-import io.questdb.std.str.StableDirectString;
+import io.questdb.std.str.DirectString;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
@@ -39,11 +39,11 @@ import org.jetbrains.annotations.Nullable;
  * sequence itself.
  * <br>
  * The information about whether a stored sequence is direct or not is not stored in the header of the Holder. Instead, the
- * top bit of the pointer returned by {@link #ptr()} is used to store this information. This is done to save space in the
- * header and to avoid the need to store this information separately. Thus, the value returned by {@link #ptr()} cannot
+ * top bit of the pointer returned by {@link #colouredPtr()} is used to store this information. This is done to save space in the
+ * header and to avoid the need to store this information separately. Thus, the value returned by {@link #colouredPtr()} cannot
  * be used as a pointer directly and should be treated as an opaque value.
  * <p>
- * Uses provided {@link GroupByAllocatorImpl} to allocate the underlying buffer. Grows the buffer when needed.
+ * Uses provided {@link GroupByAllocator} to allocate the underlying buffer. Grows the buffer when needed.
  * <p>
  * Buffer layout is the following:
  * <pre>
@@ -66,11 +66,11 @@ public class StableAwareStringHolder implements CharSequence {
         if (direct) {
             // we could cache the direct pointer, but then we would need to invalidate it when the pointer changes
             // and we assume of() is called more frequently than charAt()
-            long directPtr = Unsafe.getUnsafe().getLong(ptr + HEADER_SIZE);
+            long directPtr = Unsafe.getLong(ptr + HEADER_SIZE);
             assert directPtr != 0;
-            return Unsafe.getUnsafe().getChar(directPtr + 2L * index);
+            return Unsafe.getChar(directPtr + 2L * index);
         } else {
-            return Unsafe.getUnsafe().getChar(ptr + HEADER_SIZE + 2L * index);
+            return Unsafe.getChar(ptr + HEADER_SIZE + 2L * index);
         }
     }
 
@@ -79,38 +79,40 @@ public class StableAwareStringHolder implements CharSequence {
         if (cs == null) {
             return;
         }
-        if (cs instanceof StableDirectString) {
-            direct = true;
-            StableDirectString sds = (StableDirectString) cs;
-            checkCapacity(4); // pointer is 8 bytes = 4 chars
-            Unsafe.getUnsafe().putLong(ptr + HEADER_SIZE, sds.ptr());
-            Unsafe.getUnsafe().putInt(ptr + LEN_OFFSET, cs.length());
-        } else {
-            int thatLen = cs.length();
-            checkCapacity(thatLen);
-            long lo = ptr + HEADER_SIZE;
-            for (int i = 0; i < thatLen; i++) {
-                Unsafe.getUnsafe().putChar(lo + 2L * i, cs.charAt(i));
+        if (cs instanceof DirectString ds) {
+            if (ds.isStable()) {
+                direct = true;
+                checkCapacity(4); // pointer is 8 bytes = 4 chars
+                Unsafe.putLong(ptr + HEADER_SIZE, ds.ptr());
+                Unsafe.putInt(ptr + LEN_OFFSET, cs.length());
+                return;
             }
-            Unsafe.getUnsafe().putInt(ptr + LEN_OFFSET, thatLen);
         }
+
+        int thatLen = cs.length();
+        checkCapacity(thatLen);
+        long lo = ptr + HEADER_SIZE;
+        for (int i = 0; i < thatLen; i++) {
+            Unsafe.putChar(lo + 2L * i, cs.charAt(i));
+        }
+        Unsafe.putInt(ptr + LEN_OFFSET, thatLen);
+    }
+
+    public long colouredPtr() {
+        return ptr | (direct ? 0x8000000000000000L : 0);
     }
 
     @Override
     public int length() {
-        return ptr != 0 ? Unsafe.getUnsafe().getInt(ptr + LEN_OFFSET) : 0;
+        return ptr != 0 ? Unsafe.getInt(ptr + LEN_OFFSET) : 0;
     }
 
-    public StableAwareStringHolder of(long ptr) {
+    public StableAwareStringHolder of(long colouredPtr) {
         // clear the top bit
-        this.ptr = ptr & 0x7FFFFFFFFFFFFFFFL;
+        this.ptr = colouredPtr & 0x7FFFFFFFFFFFFFFFL;
         // extract the top bit
-        this.direct = (ptr & 0x8000000000000000L) != 0;
+        this.direct = (colouredPtr & 0x8000000000000000L) != 0;
         return this;
-    }
-
-    public long ptr() {
-        return ptr | (direct ? 0x8000000000000000L : 0);
     }
 
     public void setAllocator(GroupByAllocator allocator) {
@@ -129,7 +131,7 @@ public class StableAwareStringHolder implements CharSequence {
     }
 
     private int capacity() {
-        return ptr != 0 ? Unsafe.getUnsafe().getInt(ptr) : 0;
+        return ptr != 0 ? Unsafe.getInt(ptr) : 0;
     }
 
     private void checkCapacity(int nChars) {
@@ -144,11 +146,11 @@ public class StableAwareStringHolder implements CharSequence {
         long newSize = ((long) newCapacity << 1) + HEADER_SIZE;
         if (ptr == 0) {
             ptr = allocator.malloc(newSize);
-            Unsafe.getUnsafe().putInt(ptr, newCapacity);
-            Unsafe.getUnsafe().putInt(ptr + LEN_OFFSET, 0);
+            Unsafe.putInt(ptr, newCapacity);
+            Unsafe.putInt(ptr + LEN_OFFSET, 0);
         } else {
             ptr = allocator.realloc(ptr, ((long) capacity << 1) + HEADER_SIZE, newSize);
-            Unsafe.getUnsafe().putInt(ptr, newCapacity);
+            Unsafe.putInt(ptr, newCapacity);
         }
 
         assert ptr != 0;
@@ -158,7 +160,7 @@ public class StableAwareStringHolder implements CharSequence {
 
     private void clear() {
         if (ptr != 0) {
-            Unsafe.getUnsafe().putInt(ptr + LEN_OFFSET, 0);
+            Unsafe.putInt(ptr + LEN_OFFSET, 0);
             direct = false;
         }
     }

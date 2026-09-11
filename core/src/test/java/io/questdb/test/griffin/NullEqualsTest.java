@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -32,33 +32,47 @@ public class NullEqualsTest extends AbstractCairoTest {
     @Test
     public void testDoubleNullsEquals() throws Exception {
         assertMemoryLeak(() -> {
-            ddl("create table x (a double, b double)");
-            insert("insert into x values(null, null)");
-            assertSql("a\tb\n", "select * from x where a <> b");
-            assertSql("a\tb\nnull\tnull\n", "select * from x where a = b");
+            execute("create table x (a double, b double)");
+            execute("insert into x values(null, null)");
+            assertQuery("select * from x where a <> b")
+                    .noLeakCheck()
+                    .returns("a\tb\n");
+            assertQuery("select * from x where a = b")
+                    .noLeakCheck()
+                    .returns("a\tb\nnull\tnull\n");
         });
     }
 
     @Test
     public void testFloatNullNotNullEquals() throws Exception {
         assertMemoryLeak(() -> {
-            ddl("create table x (a float, b float)");
-            insert("insert into x values(null, 1.0)");
-            insert("insert into x values(3.14, 1.0)");
-            assertSql("a\tb\n" +
-                    "null\t1.0000\n" +
-                    "3.1400\t1.0000\n", "select * from x where a <> b");
-            assertSql("a\tb\n", "select * from x where a = b");
+            execute("create table x (a float, b float)");
+            execute("insert into x values(null, 1.0)");
+            execute("insert into x values(3.14, 1.0)");
+            assertQuery("select * from x where a <> b")
+                    .noLeakCheck()
+                    .returns("""
+                            a\tb
+                            null\t1.0
+                            3.14\t1.0
+                            """);
+            assertQuery("select * from x where a = b")
+                    .noLeakCheck()
+                    .returns("a\tb\n");
         });
     }
 
     @Test
     public void testFloatNullsEquals() throws Exception {
         assertMemoryLeak(() -> {
-            ddl("create table x (a float, b float)");
-            insert("insert into x values(null, null)");
-            assertSql("a\tb\n", "select * from x where a <> b");
-            assertSql("a\tb\nnull\tnull\n", "select * from x where a = b");
+            execute("create table x (a float, b float)");
+            execute("insert into x values(null, null)");
+            assertQuery("select * from x where a <> b")
+                    .noLeakCheck()
+                    .returns("a\tb\n");
+            assertQuery("select * from x where a = b")
+                    .noLeakCheck()
+                    .returns("a\tb\nnull\tnull\n");
         });
     }
 }

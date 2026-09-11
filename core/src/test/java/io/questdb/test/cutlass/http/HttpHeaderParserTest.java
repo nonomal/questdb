@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,15 +24,20 @@
 
 package io.questdb.test.cutlass.http;
 
+import io.questdb.cairo.CairoException;
+import io.questdb.cutlass.http.HttpCookie;
 import io.questdb.cutlass.http.HttpException;
 import io.questdb.cutlass.http.HttpHeaderParser;
 import io.questdb.std.MemoryTag;
+import io.questdb.std.Misc;
 import io.questdb.std.ObjectPool;
 import io.questdb.std.Rnd;
 import io.questdb.std.Unsafe;
 import io.questdb.std.str.DirectUtf8String;
+import io.questdb.std.str.StringSink;
 import io.questdb.std.str.Utf8String;
 import io.questdb.test.tools.TestUtils;
+import org.jetbrains.annotations.NotNull;
 import org.junit.Assert;
 import org.junit.Rule;
 import org.junit.Test;
@@ -61,6 +66,247 @@ public class HttpHeaderParserTest {
             .build();
 
     @Test
+    public void testBoundaryAugmenterCloseResetsLimit() throws Exception {
+        // close() used to zero lo and _wptr but leave lim at its last grown value. The augmenter
+        // then claimed a block it no longer held: the next of() large enough to resize reallocated
+        // off a null pointer while booking only newLim - staleLim, so the counters were charged
+        // less than was allocated and close() over-freed by the difference. assertMemoryLeak
+        // observes exactly that imbalance.
+        TestUtils.assertMemoryLeak(() -> {
+            final StringSink grown = new StringSink();
+            for (int i = 0; i < 200; i++) {
+                grown.put('a');
+            }
+            // Longer than the block the first value grows into, so the follow-up of() resizes
+            // rather than taking the write-through-a-stale-limit path.
+            final StringSink larger = new StringSink();
+            for (int i = 0; i < 300; i++) {
+                larger.put('b');
+            }
+
+            try (HttpHeaderParser.BoundaryAugmenter augmenter = new HttpHeaderParser.BoundaryAugmenter()) {
+                TestUtils.assertEquals("\r\n--" + grown, augmenter.of(new Utf8String(grown)));
+                augmenter.close();
+                TestUtils.assertEquals("\r\n--" + larger, augmenter.of(new Utf8String(larger)));
+            }
+        });
+    }
+
+    @Test
+    public void testBoundaryAugmenterReopenAfterCloseRestoresLimit() throws Exception {
+        // close() zeroes lim, so reopen() has to commit a capacity back alongside the block it
+        // allocates, and that capacity is the one the augmenter grew to rather than INITIAL_CAPACITY.
+        // A multipart boundary is a property of the client, so it repeats on every request of a
+        // connection: sizing reopen() from the constant made the first of() after each pooled reuse
+        // realloc straight back up to the same size, a malloc plus a realloc per reuse for any
+        // boundary longer than 60 bytes. Growing past 64 first is what makes the assertion
+        // load-bearing - a boundary that always fitted the initial block leaves the remembered
+        // capacity at 64 either way, so both implementations ask for the same size.
+        //
+        // The second assertion covers the commit, which the first cannot see: drop `lim =
+        // reopenCapacity` and the malloc still runs, but lim stays 0 while lo holds a real block, so
+        // the of() below takes the resize path it should have skipped and reallocs against an oldSize
+        // of 0. The third covers close() leaving the remembered capacity alone, so a connection reused
+        // more than once does not fall back to 64 on the second round.
+        TestUtils.assertMemoryLeak(() -> {
+            // 200 chars + the 4-byte prefix rounds up to a 256-byte block, so lim ends up four
+            // times the initial capacity.
+            final StringSink grown = new StringSink();
+            for (int i = 0; i < 200; i++) {
+                grown.put('a');
+            }
+
+            try (HttpHeaderParser.BoundaryAugmenter augmenter = new HttpHeaderParser.BoundaryAugmenter()) {
+                TestUtils.assertEquals("\r\n--" + grown, augmenter.of(new Utf8String(grown)));
+                augmenter.close();
+
+                final long usedAfterClose = Unsafe.getMemUsedByTag(MemoryTag.NATIVE_HTTP_CONN);
+                augmenter.reopen();
+                Assert.assertEquals(
+                        "reopen() must restore the capacity the augmenter grew to",
+                        usedAfterClose + 256,
+                        Unsafe.getMemUsedByTag(MemoryTag.NATIVE_HTTP_CONN)
+                );
+
+                // The same boundary again, against a restored 256-byte limit: of() must find room and
+                // leave the block alone. A lim left at 0 makes the same call resize.
+                TestUtils.assertEquals("\r\n--" + grown, augmenter.of(new Utf8String(grown)));
+                Assert.assertEquals(
+                        "a boundary inside the restored capacity must not reallocate",
+                        usedAfterClose + 256,
+                        Unsafe.getMemUsedByTag(MemoryTag.NATIVE_HTTP_CONN)
+                );
+
+                augmenter.close();
+                augmenter.reopen();
+                Assert.assertEquals(
+                        "the remembered capacity must survive every close/reopen round",
+                        usedAfterClose + 256,
+                        Unsafe.getMemUsedByTag(MemoryTag.NATIVE_HTTP_CONN)
+                );
+            }
+        });
+    }
+
+    @Test
+    public void testBoundaryAugmenterReopenFailureKeepsSizeConsistent() throws Exception {
+        // reopen() used to commit lim before its malloc, the same ordering resize() was fixed for.
+        // Unsafe.malloc throws once the global RSS limit is breached, and the augmenter was then
+        // left claiming INITIAL_CAPACITY with no block behind it, breaking the lim == 0 <=> lo == 0
+        // invariant. The next of() large enough to resize reallocated off a null pointer while
+        // booking only newLim - 64, so the counters were charged less than was allocated and
+        // close() over-freed by the difference. assertMemoryLeak observes exactly that imbalance.
+        TestUtils.assertMemoryLeak(() -> {
+            try (HttpHeaderParser.BoundaryAugmenter augmenter = new HttpHeaderParser.BoundaryAugmenter()) {
+                augmenter.close();
+
+                final long savedLimit = Unsafe.getRssMemLimit();
+                try {
+                    // No headroom at all, so reopen()'s malloc cannot succeed.
+                    Unsafe.setRssMemLimit(Unsafe.getRssMemUsed());
+                    augmenter.reopen();
+                    Assert.fail("expected CairoException");
+                } catch (CairoException e) {
+                    TestUtils.assertContains(e.getFlyweightMessage(), "global RSS memory limit exceeded");
+                } finally {
+                    Unsafe.setRssMemLimit(savedLimit);
+                }
+
+                // Longer than INITIAL_CAPACITY, so this of() takes the resize path rather than the
+                // write-through-a-stale-limit one, and the realloc books the whole block.
+                final StringSink boundary = new StringSink();
+                for (int i = 0; i < 200; i++) {
+                    boundary.put('a');
+                }
+                TestUtils.assertEquals("\r\n--" + boundary, augmenter.of(new Utf8String(boundary)));
+            }
+        });
+    }
+
+    @Test
+    public void testBoundaryAugmenterResizeFailureKeepsSizeConsistent() throws Exception {
+        // A multipart boundary longer than 64 bytes is client-controlled and makes the augmenter
+        // grow. Unsafe.realloc throws once the global RSS limit is breached - which every standard
+        // deployment sets from ram.usage.limit.percent - and the augmenter used to commit the new
+        // size before the realloc returned. It was then holding the old, smaller block while
+        // claiming the larger size, so close() decremented the memory counters by more than was
+        // ever charged. assertMemoryLeak observes exactly that imbalance.
+        TestUtils.assertMemoryLeak(() -> {
+            final long usedBeforeOpen = Unsafe.getMemUsedByTag(MemoryTag.NATIVE_HTTP_CONN);
+            try (HttpHeaderParser.BoundaryAugmenter augmenter = new HttpHeaderParser.BoundaryAugmenter()) {
+                final StringSink boundary = new StringSink();
+                for (int i = 0; i < 200; i++) {
+                    boundary.put('a');
+                }
+
+                final long savedLimit = Unsafe.getRssMemLimit();
+                try {
+                    // No headroom at all, so the growing realloc cannot succeed.
+                    Unsafe.setRssMemLimit(Unsafe.getRssMemUsed());
+                    augmenter.of(new Utf8String(boundary));
+                    Assert.fail("expected CairoException");
+                } catch (CairoException e) {
+                    TestUtils.assertContains(e.getFlyweightMessage(), "global RSS memory limit exceeded");
+                } finally {
+                    Unsafe.setRssMemLimit(savedLimit);
+                }
+
+                // The augmenter still holds its original block, so a value that fits must round
+                // trip rather than run past the end of it.
+                TestUtils.assertEquals("\r\n--short", augmenter.of(new Utf8String("short")));
+
+                // close() frees lim bytes, so the stale size shows up as an over-free the moment
+                // the augmenter is released. Assert that directly instead of driving another of()
+                // large enough to expose the second consequence: under the old code that call
+                // skipped resize() and wrote ~150 bytes into the 64-byte block it really held,
+                // which corrupts the heap before any assertion gets to run.
+                augmenter.close();
+                Assert.assertEquals(
+                        "close() must free exactly the block the augmenter really holds",
+                        usedBeforeOpen,
+                        Unsafe.getMemUsedByTag(MemoryTag.NATIVE_HTTP_CONN)
+                );
+            }
+        });
+    }
+
+    @Test
+    public void testConstructorFailureFreesNativeAllocations() throws Exception {
+        // The constructor takes the sink and the boundary augmenter as its first two statements
+        // inside its try, then mallocs the header buffer. That malloc throws once the global RSS
+        // limit is breached, and nothing ever closes the half-built parser, so every block it took
+        // has to be released by the catch. Leave headroom for the first two and none for the buffer.
+        //
+        // Note what this cannot reach: only the header malloc and the augmenter's go through
+        // Unsafe.malloc and so see the RSS ceiling. DirectUtf8Sink allocates through the native
+        // implCreate, which bypasses checkAllocLimit entirely, so a throw from the sink is not
+        // reproducible here - which is why the constructor takes it first, leaving that one
+        // unreachable failure with nothing to roll back. Keeping both allocations inside the try -
+        // rather than in field initialisers, which run before the try is entered - is what covers
+        // this window; testConstructorFailureFreesTheSink covers the one in between.
+        TestUtils.assertMemoryLeak(() -> {
+            final int headerBufferSize = 1_048_576;
+            final ObjectPool<DirectUtf8String> csPool = new ObjectPool<>(DirectUtf8String.FACTORY, 8);
+            final long savedLimit = Unsafe.getRssMemLimit();
+            // Holds the parser on the path where the constructor unexpectedly succeeds. Dropping
+            // it there would leak a built parser and make the enclosing leak check fail on top of
+            // the Assert.fail below, burying the failure that matters.
+            HttpHeaderParser parser = null;
+            try {
+                Unsafe.setRssMemLimit(Unsafe.getRssMemUsed() + 4096);
+                parser = new HttpHeaderParser(headerBufferSize, csPool);
+                Assert.fail("expected CairoException");
+            } catch (CairoException e) {
+                TestUtils.assertContains(e.getFlyweightMessage(), "global RSS memory limit exceeded");
+                // Pin which allocation ran out of room. Without this the test passes vacuously if
+                // the headroom ever stops covering the first two allocations: the augmenter would
+                // throw first, the sink would never allocate, and nothing would leak either way.
+                TestUtils.assertContains(e.getFlyweightMessage(), "size=" + headerBufferSize);
+            } finally {
+                Unsafe.setRssMemLimit(savedLimit);
+                Misc.free(parser);
+            }
+        });
+    }
+
+    @Test
+    public void testConstructorFailureFreesTheSink() throws Exception {
+        // The constructor takes the sink first and the boundary augmenter second, so this covers the
+        // window the other constructor test cannot reach: the augmenter's malloc fails with the sink
+        // already built and nothing else acquired, and the catch has to hand the sink back on its
+        // own. DirectUtf8Sink's native implCreate bypasses Unsafe.checkAllocLimit but still books
+        // the block through recordMemAlloc, so the sink goes through under any ceiling and shifts
+        // usage before the augmenter's Unsafe.malloc is checked.
+        //
+        // The headroom is exactly the augmenter's 64 bytes, which is what makes the size assertion
+        // below pin the acquisition order rather than merely the amount. Sink first: the sink's
+        // booking pushes usage above the ceiling, so the augmenter's 64-byte malloc is refused. Swap
+        // the two statements back and the augmenter allocates into an untouched 64-byte headroom -
+        // checkAllocLimit refuses only usage + size > limit - and the throw moves to the header
+        // buffer, i.e. a different size. Without the headroom both orders report size=64 and a
+        // reorder would leave the sink with nothing to roll back and this test silently vacuous.
+        TestUtils.assertMemoryLeak(() -> {
+            final ObjectPool<DirectUtf8String> csPool = new ObjectPool<>(DirectUtf8String.FACTORY, 8);
+            final long savedLimit = Unsafe.getRssMemLimit();
+            // Holds the parser on the path where the constructor unexpectedly succeeds. Dropping it
+            // there would leak a built parser and make the enclosing leak check fail on top of the
+            // Assert.fail below, burying the failure that matters.
+            HttpHeaderParser parser = null;
+            try {
+                Unsafe.setRssMemLimit(Unsafe.getRssMemUsed() + 64);
+                parser = new HttpHeaderParser(1024, csPool);
+                Assert.fail("expected CairoException");
+            } catch (CairoException e) {
+                TestUtils.assertContains(e.getFlyweightMessage(), "global RSS memory limit exceeded");
+                TestUtils.assertContains(e.getFlyweightMessage(), "size=64");
+            } finally {
+                Unsafe.setRssMemLimit(savedLimit);
+                Misc.free(parser);
+            }
+        });
+    }
+
+    @Test
     public void testContentDisposition() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             String v = "Content-Disposition: form-data; name=\"hello\"\r\n" +
@@ -87,6 +333,118 @@ public class HttpHeaderParserTest {
                 TestUtils.assertEquals("hello", hp.getContentDispositionName());
                 TestUtils.assertEquals("xyz.dat", hp.getContentDispositionFilename());
                 TestUtils.assertEquals("form-data", hp.getContentDisposition());
+            } finally {
+                Unsafe.free(p, v.length(), MemoryTag.NATIVE_DEFAULT);
+            }
+        });
+    }
+
+    @Test
+    public void testContentDispositionQuotedFilenameWithSemicolon() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            String v = "Content-Disposition: form-data; name=\"data\"; filename=\"a;b.csv\"\r\n" +
+                    "\r\n";
+            long p = TestUtils.toMemory(v);
+            try (HttpHeaderParser hp = new HttpHeaderParser(1024, pool)) {
+                hp.parse(p, p + v.length(), false, false);
+                TestUtils.assertEquals("data", hp.getContentDispositionName());
+                TestUtils.assertEquals("a;b.csv", hp.getContentDispositionFilename());
+            } finally {
+                Unsafe.free(p, v.length(), MemoryTag.NATIVE_DEFAULT);
+            }
+        });
+    }
+
+    @Test
+    public void testContentDispositionQuotedFilenameWithEqualsAndSemicolon() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            String v = "Content-Disposition: form-data; name=\"data\"; filename=\"a=b;c.csv\"\r\n" +
+                    "\r\n";
+            long p = TestUtils.toMemory(v);
+            try (HttpHeaderParser hp = new HttpHeaderParser(1024, pool)) {
+                hp.parse(p, p + v.length(), false, false);
+                TestUtils.assertEquals("data", hp.getContentDispositionName());
+                TestUtils.assertEquals("a=b;c.csv", hp.getContentDispositionFilename());
+            } finally {
+                Unsafe.free(p, v.length(), MemoryTag.NATIVE_DEFAULT);
+            }
+        });
+    }
+
+    @Test
+    public void testContentDispositionQuotedFilenameWithSemicolonAndEscapedQuote() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            String v = "Content-Disposition: form-data; name=\"data\"; filename=\"a\\\";b.csv\"\r\n" +
+                    "\r\n";
+            long p = TestUtils.toMemory(v);
+            try (HttpHeaderParser hp = new HttpHeaderParser(1024, pool)) {
+                hp.parse(p, p + v.length(), false, false);
+                TestUtils.assertEquals("data", hp.getContentDispositionName());
+                TestUtils.assertEquals("a\\\";b.csv", hp.getContentDispositionFilename());
+            } finally {
+                Unsafe.free(p, v.length(), MemoryTag.NATIVE_DEFAULT);
+            }
+        });
+    }
+
+    @Test
+    public void testContentDispositionFilenameBeforeName() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            String v = "Content-Disposition: form-data; filename=\"x.csv\"; name=\"data\"\r\n" +
+                    "\r\n";
+            long p = TestUtils.toMemory(v);
+            try (HttpHeaderParser hp = new HttpHeaderParser(1024, pool)) {
+                hp.parse(p, p + v.length(), false, false);
+                TestUtils.assertEquals("data", hp.getContentDispositionName());
+                TestUtils.assertEquals("x.csv", hp.getContentDispositionFilename());
+            } finally {
+                Unsafe.free(p, v.length(), MemoryTag.NATIVE_DEFAULT);
+            }
+        });
+    }
+
+    @Test
+    public void testContentDispositionQuotedNameWithSemicolonBeforeFilename() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            String v = "Content-Disposition: form-data; name=\"da;ta\"; filename=\"x.csv\"\r\n" +
+                    "\r\n";
+            long p = TestUtils.toMemory(v);
+            try (HttpHeaderParser hp = new HttpHeaderParser(1024, pool)) {
+                hp.parse(p, p + v.length(), false, false);
+                TestUtils.assertEquals("da;ta", hp.getContentDispositionName());
+                TestUtils.assertEquals("x.csv", hp.getContentDispositionFilename());
+            } finally {
+                Unsafe.free(p, v.length(), MemoryTag.NATIVE_DEFAULT);
+            }
+        });
+    }
+
+    @Test
+    public void testContentDispositionUnknownParameterBeforeFilename() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            String v = "Content-Disposition: form-data; name=\"data\"; tag=xyz; filename=\"a;b.csv\"\r\n" +
+                    "\r\n";
+            long p = TestUtils.toMemory(v);
+            try (HttpHeaderParser hp = new HttpHeaderParser(1024, pool)) {
+                hp.parse(p, p + v.length(), false, false);
+                TestUtils.assertEquals("data", hp.getContentDispositionName());
+                TestUtils.assertEquals("a;b.csv", hp.getContentDispositionFilename());
+            } finally {
+                Unsafe.free(p, v.length(), MemoryTag.NATIVE_DEFAULT);
+            }
+        });
+    }
+
+    @Test
+    public void testContentDispositionUnquotedQuoteDoesNotHideFollowingFilename() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            String v = "Content-Disposition: form-data; name=abc\"; filename=\"x.csv\"\r\n" +
+                    "\r\n";
+            long p = TestUtils.toMemory(v);
+            try (HttpHeaderParser hp = new HttpHeaderParser(1024, pool)) {
+                hp.parse(p, p + v.length(), false, false);
+                TestUtils.assertEquals("abc\"", hp.getContentDispositionName());
+                TestUtils.assertEquals("x.csv", hp.getContentDispositionFilename());
             } finally {
                 Unsafe.free(p, v.length(), MemoryTag.NATIVE_DEFAULT);
             }
@@ -196,14 +554,7 @@ public class HttpHeaderParserTest {
         TestUtils.assertMemoryLeak(() -> {
             String v = "Content-Type: text/html; charset=utf-8\r\n" +
                     "\r\n";
-            long p = TestUtils.toMemory(v);
-            try (HttpHeaderParser hp = new HttpHeaderParser(1024, pool)) {
-                hp.parse(p, p + v.length(), false, false);
-                TestUtils.assertEquals("text/html", hp.getContentType());
-                TestUtils.assertEquals("utf-8", hp.getCharset());
-            } finally {
-                Unsafe.free(p, v.length(), MemoryTag.NATIVE_DEFAULT);
-            }
+            assertContentType(v, "text/html", "utf-8", null);
         });
     }
 
@@ -229,26 +580,43 @@ public class HttpHeaderParserTest {
     public void testContentTypeAndUnknown() {
         String v = "Content-Type: text/html; encoding=abc\r\n" +
                 "\r\n";
-        long p = TestUtils.toMemory(v);
-        try (HttpHeaderParser hp = new HttpHeaderParser(1024, pool)) {
-            hp.parse(p, p + v.length(), false, false);
-            TestUtils.assertEquals("text/html", hp.getContentType());
-        } finally {
-            Unsafe.free(p, v.length(), MemoryTag.NATIVE_DEFAULT);
-        }
+        assertContentType(v, "text/html", null, null);
     }
 
     @Test
     public void testContentTypeBoundaryAndUnknown() {
         String v = "Content-Type: text/html; boundary=----WebKitFormBoundaryQ3pdBTBXxEFUWDML; encoding=abc\r\n" +
                 "\r\n";
-        long p = TestUtils.toMemory(v);
+        assertContentType(v, "text/html", null, "\r\n------WebKitFormBoundaryQ3pdBTBXxEFUWDML");
+    }
+
+    @Test
+    public void testContentTypeBoundaryQuoted() {
+        String v = "Content-Type: multipart/mixed; boundary=\"gc0pJq0M:08jU5\\\"34c0p\"\r\n" +
+                "\r\n";
+        assertContentType(v, "multipart/mixed", null, "\r\n--gc0pJq0M:08jU5\"34c0p");
+    }
+
+    @Test
+    public void testContentTypeSemantics() {
+        assertContentType("Content-Type:   text/html \r\n\r\n", "text/html", null, null);
+        assertContentType("Content-Type:  text/html ; charset = utf-8\r\n\r\n", "text/html", "utf-8", null);
+        assertContentType("Content-Type: application/problem+json; charset = \"utf-8\" ; boundary = \"a;\\\"\\\\b\" \r\n\r\n", "application/problem+json", "utf-8", "\r\n--a;\"\\b");
+    }
+
+    private void assertContentType(@NotNull String header, @NotNull String expectedType, String expectedCharset, String expectedBoundary) {
+        long p = TestUtils.toMemory(header);
         try (HttpHeaderParser hp = new HttpHeaderParser(1024, pool)) {
-            hp.parse(p, p + v.length(), false, false);
-            TestUtils.assertEquals("text/html", hp.getContentType());
-            TestUtils.assertEquals("\r\n------WebKitFormBoundaryQ3pdBTBXxEFUWDML", hp.getBoundary());
+            hp.parse(p, p + header.length(), false, false);
+            TestUtils.assertEquals(expectedType, hp.getContentType());
+            if (expectedBoundary != null) {
+                TestUtils.assertEquals(expectedBoundary, hp.getBoundary());
+            }
+            if (expectedCharset != null) {
+                TestUtils.assertEquals(expectedCharset, hp.getCharset());
+            }
         } finally {
-            Unsafe.free(p, v.length(), MemoryTag.NATIVE_DEFAULT);
+            Unsafe.free(p, header.length(), MemoryTag.NATIVE_DEFAULT);
         }
     }
 
@@ -263,6 +631,407 @@ public class HttpHeaderParserTest {
         } finally {
             Unsafe.free(p, v.length(), MemoryTag.NATIVE_DEFAULT);
         }
+    }
+
+    @Test
+    public void testContentTypeReuseClearsCharset() {
+        try (HttpHeaderParser hp = new HttpHeaderParser(1024, pool)) {
+            parse(hp, "Content-Type: text/html; charset=utf-8\r\n\r\n", false, false);
+            TestUtils.assertEquals("utf-8", hp.getCharset());
+
+            hp.clear();
+            parse(hp, "Content-Type: text/plain\r\n\r\n", false, false);
+            TestUtils.assertEquals("text/plain", hp.getContentType());
+            Assert.assertNull(hp.getCharset());
+        }
+    }
+
+    @Test
+    public void testCookieError() {
+        assertMalformedCookieIgnored(
+                "Set-Cookie: =123; Domain=hello.com; Path=/; Secure; Partitioned; HttpOnly; Max-Age=1234545; SameSite=strict; Expires=Wed, 21 Oct 2015 07:28:00 GMT\r\n"
+        );
+
+        assertMalformedCookieIgnored(
+                "Set-Cookie: 123; Domain=hello.com; Path=/; Secure; Partitioned; HttpOnly; Max-Age=1234545; SameSite=strict; Expires=Wed, 21 Oct 2015 07:28:00 GMT\r\n"
+        );
+
+        assertMalformedCookieIgnored(
+                "Set-Cookie: ; Domain=hello.com; Path=/; Secure; Partitioned; HttpOnly; Max-Age=1234545; SameSite=strict; Expires=Wed, 21 Oct 2015 07:28:00 GMT\r\n"
+        );
+
+        assertMalformedCookieIgnored(
+                "Set-Cookie: HttpOnly; Max-Age=1234545; SameSite=strict; Expires=Wed, 21 Oct 2015 07:28:00 GMT\r\n"
+        );
+
+        assertMalformedCookieIgnored(
+                "Set-Cookie: =; Expires=Wed, 21 Oct 2015 07:28:00 GMT\r\n"
+        );
+
+        assertMalformedCookieIgnored(
+                "Set-Cookie: something\r\n"
+        );
+    }
+
+    @Test
+    public void testCookieIgnoresUnknownAttribute() {
+        StringSink sink = new StringSink();
+        // unknown attribute, boolean - starts with 'P' (along known alphabet)
+        assertCookies(
+                "[{cookieName=\"a\", value=\"b\", domain=\"hello.com\", path=\"/\", secure=true, httpOnly=true, partitioned=false, expires=1445412480000000, maxAge=1234545, sameSite=\"strict\"}]",
+                "Set-Cookie: a=b; Domain=hello.com; Path=/; Secure; Part?; HttpOnly; Max-Age=1234545; SameSite=strict; Expires=Wed, 21 Oct 2015 07:28:00 GMT\r\n",
+                sink
+        );
+
+        // Path missing '='
+        assertCookies(
+                "[{cookieName=\"a\", value=\"b\", domain=\"hello.com\", secure=false, httpOnly=false, partitioned=false, expires=1445412480000000, maxAge=1234545, sameSite=\"strict\"}]",
+                "Set-Cookie: a=b; Domain=hello.com; Path/; Max-Age=1234545; SameSite=strict; Expires=Wed, 21 Oct 2015 07:28:00 GMT\r\n",
+                sink
+        );
+
+        // another Path variation
+        assertCookies(
+                "[{cookieName=\"a\", value=\"b\", domain=\"hello.com\", secure=false, httpOnly=false, partitioned=false, expires=1445412480000000, maxAge=1234545, sameSite=\"strict\"}]",
+                "Set-Cookie: a=b; Domain=hello.com; Ph=/; Max-Age=1234545; SameSite=strict; Expires=Wed, 21 Oct 2015 07:28:00 GMT\r\n",
+                sink
+        );
+
+        // prefixed "Path" with alphabet
+        assertCookies(
+                "[{cookieName=\"a\", value=\"b\", domain=\"hello.com\", secure=true, httpOnly=true, partitioned=false, expires=1445412480000000, maxAge=1234545, sameSite=\"strict\"}]",
+                "Set-Cookie: a=b; Domain=hello.com; dPath=/; Secure; HttpOnly; Max-Age=1234545; SameSite=strict; Expires=Wed, 21 Oct 2015 07:28:00 GMT\r\n",
+                sink
+        );
+
+        // prefixed "Path" with non-alphabet
+        assertCookies(
+                "[{cookieName=\"a\", value=\"b\", domain=\"hello.com\", secure=true, httpOnly=true, partitioned=false, expires=1445412480000000, maxAge=1234545, sameSite=\"strict\"}]",
+                "Set-Cookie: a=b; Domain=hello.com; xPath=/; Secure; HttpOnly; Max-Age=1234545; SameSite=strict; Expires=Wed, 21 Oct 2015 07:28:00 GMT\r\n",
+                sink
+        );
+
+        // unknown attribute, boolean - starts with 'D'  (along known alphabet)
+        assertCookies(
+                "[{cookieName=\"a\", value=\"b\", path=\"/\", secure=true, httpOnly=true, partitioned=false, expires=1445412480000000, maxAge=1234545, sameSite=\"strict\"}]",
+                "Set-Cookie: a=b; Do4main=hello.com; Path=/; Secure; Part?; HttpOnly; Max-Age=1234545; SameSite=strict; Expires=Wed, 21 Oct 2015 07:28:00 GMT\r\n",
+                sink
+        );
+
+        // prefixed "Domain" with alphabet
+        assertCookies(
+                "[{cookieName=\"a\", value=\"b\", path=\"/\", secure=true, httpOnly=true, partitioned=false, expires=1445412480000000, maxAge=1234545, sameSite=\"strict\"}]",
+                "Set-Cookie: a=b; sDomain=hello.com; Path=/; Secure; Part?; HttpOnly; Max-Age=1234545; SameSite=strict; Expires=Wed, 21 Oct 2015 07:28:00 GMT\r\n",
+                sink
+        );
+
+        // prefixed "Domain" with nont-alphabet
+        assertCookies(
+                "[{cookieName=\"a\", value=\"b\", path=\"/\", secure=true, httpOnly=true, partitioned=false, expires=1445412480000000, maxAge=1234545, sameSite=\"strict\"}]",
+                "Set-Cookie: a=b; xDomain=hello.com; Path=/; Secure; Part?; HttpOnly; Max-Age=1234545; SameSite=strict; Expires=Wed, 21 Oct 2015 07:28:00 GMT\r\n",
+                sink
+        );
+
+        // unknown attribute, boolean - starts with 'S'  (along known alphabet)
+        assertCookies(
+                "[{cookieName=\"a\", value=\"b\", domain=\"hello.com\", path=\"/\", secure=false, httpOnly=true, partitioned=false, expires=1445412480000000, maxAge=1234545, sameSite=\"strict\"}]",
+                "Set-Cookie: a=b; Domain=hello.com; Path=/; Secre; HttpOnly; Max-Age=1234545; SameSite=strict; Expires=Wed, 21 Oct 2015 07:28:00 GMT\r\n",
+                sink
+        );
+
+        // SameSite is malformed
+        assertCookies(
+                "[{cookieName=\"a\", value=\"b\", secure=false, httpOnly=false, partitioned=false, expires=1445412480000000, maxAge=0}]",
+                "Set-Cookie: a=b; SameSitestrict; Expires=Wed, 21 Oct 2015 07:28:00 GMT\r\n",
+                sink
+        );
+
+        // SameSite is prefixed with alphabet
+        assertCookies(
+                "[{cookieName=\"a\", value=\"b\", secure=false, httpOnly=false, partitioned=false, expires=1445412480000000, maxAge=0}]",
+                "Set-Cookie: a=b; pSameSite=strict; Expires=Wed, 21 Oct 2015 07:28:00 GMT\r\n",
+                sink
+        );
+
+        // SameSite is prefixed with non-alphabet
+        assertCookies(
+                "[{cookieName=\"a\", value=\"b\", secure=false, httpOnly=false, partitioned=false, expires=1445412480000000, maxAge=0}]",
+                "Set-Cookie: a=b; xSameSite=strict; Expires=Wed, 21 Oct 2015 07:28:00 GMT\r\n",
+                sink
+        );
+
+        // another variation with S
+        assertCookies(
+                "[{cookieName=\"a\", value=\"b\", secure=false, httpOnly=false, partitioned=false, expires=1445412480000000, maxAge=0}]",
+                "Set-Cookie: a=b; Sam; Expires=Wed, 21 Oct 2015 07:28:00 GMT\r\n",
+                sink
+        );
+
+        // unknown attribute, boolean - starts with 'H'  (along known alphabet)
+        assertCookies(
+                "[{cookieName=\"a\", value=\"b\", domain=\"hello.com\", path=\"/\", secure=false, httpOnly=false, partitioned=false, expires=1445412480000000, maxAge=1234545, sameSite=\"strict\"}]",
+                "Set-Cookie: a=b; Domain=hello.com; Path=/; Htt; Max-Age=1234545; SameSite=strict; Expires=Wed, 21 Oct 2015 07:28:00 GMT\r\n",
+                sink
+        );
+
+        // prefixed HttpOnly with alphabet
+        assertCookies(
+                "[{cookieName=\"a\", value=\"b\", domain=\"hello.com\", path=\"/\", secure=false, httpOnly=false, partitioned=false, expires=1445412480000000, maxAge=1234545, sameSite=\"strict\"}]",
+                "Set-Cookie: a=b; Domain=hello.com; Path=/; dHttpOnly; Max-Age=1234545; SameSite=strict; Expires=Wed, 21 Oct 2015 07:28:00 GMT\r\n",
+                sink
+        );
+
+        // prefixed HttpOnly with non-alphabet
+        assertCookies(
+                "[{cookieName=\"a\", value=\"b\", domain=\"hello.com\", path=\"/\", secure=false, httpOnly=false, partitioned=false, expires=1445412480000000, maxAge=1234545, sameSite=\"strict\"}]",
+                "Set-Cookie: a=b; Domain=hello.com; Path=/; dHttpOnly; Max-Age=1234545; SameSite=strict; Expires=Wed, 21 Oct 2015 07:28:00 GMT\r\n",
+                sink
+        );
+
+        // unknown attribute, boolean - starts with 'M'  (along known alphabet)
+        assertCookies(
+                "[{cookieName=\"a\", value=\"b\", domain=\"hello.com\", secure=false, httpOnly=false, partitioned=false, expires=1445412480000000, maxAge=0, sameSite=\"strict\"}]",
+                "Set-Cookie: a=b; Domain=hello.com; Max=1234545; SameSite=strict; Expires=Wed, 21 Oct 2015 07:28:00 GMT\r\n",
+                sink
+        );
+
+        // Max-Age is invalid number
+        assertCookies(
+                "[{cookieName=\"a\", value=\"b\", domain=\"hello.com\", secure=false, httpOnly=false, partitioned=false, expires=1445412480000000, maxAge=0, sameSite=\"strict\"}]",
+                "Set-Cookie: a=b; Domain=hello.com; Max-Age=hello; SameSite=strict; Expires=Wed, 21 Oct 2015 07:28:00 GMT\r\n",
+                sink
+        );
+
+        // Max-Age is prefixed with alphabet
+        assertCookies(
+                "[{cookieName=\"a\", value=\"b\", domain=\"hello.com\", secure=false, httpOnly=false, partitioned=false, expires=1445412480000000, maxAge=0, sameSite=\"strict\"}]",
+                "Set-Cookie: a=b; Domain=hello.com; sMax-Age=10; SameSite=strict; Expires=Wed, 21 Oct 2015 07:28:00 GMT\r\n",
+                sink
+        );
+
+        // Max-Age is prefixed with non-alphabet
+        assertCookies(
+                "[{cookieName=\"a\", value=\"b\", domain=\"hello.com\", secure=false, httpOnly=false, partitioned=false, expires=1445412480000000, maxAge=0, sameSite=\"strict\"}]",
+                "Set-Cookie: a=b; Domain=hello.com; xMax-Age=10; SameSite=strict; Expires=Wed, 21 Oct 2015 07:28:00 GMT\r\n",
+                sink
+        );
+
+        // unknown attribute, boolean - starts with 'E' (along known alphabet)
+        assertCookies(
+                "[{cookieName=\"a\", value=\"b\", secure=false, httpOnly=false, partitioned=false, expires=-1, maxAge=0}]",
+                "Set-Cookie: a=b; ExpiresWed, 21 Oct 2015 07:28:00 GMT\r\n",
+                sink
+        );
+
+        // Expires is prefixed with alphabet
+        assertCookies(
+                "[{cookieName=\"a\", value=\"b\", secure=true, httpOnly=false, partitioned=false, expires=-1, maxAge=0}]",
+                "Set-Cookie: a=b; hExpires=Wed, 21 Oct 2015 07:28:00 GMT; secure\r\n",
+                sink
+        );
+
+        // Expires is prefixed with non-alphabet
+        assertCookies(
+                "[{cookieName=\"a\", value=\"b\", secure=true, httpOnly=false, partitioned=false, expires=-1, maxAge=0}]",
+                "Set-Cookie: a=b; xExpires=Wed, 21 Oct 2015 07:28:00 GMT; secure\r\n",
+                sink
+        );
+
+        // Expires is prefixed with non-alphabet
+        assertCookies(
+                "[{cookieName=\"a\", value=\"b\", secure=false, httpOnly=false, partitioned=true, expires=-1, maxAge=0}]",
+                "Set-Cookie: a=b; xExpires=Wed, 21 Oct 2015 07:28:00 GMT; partitioned\r\n",
+                sink
+        );
+
+        assertCookies(
+                "[{cookieName=\"a\", value=\"b\", secure=false, httpOnly=true, partitioned=false, expires=-1, maxAge=0}]",
+                "Set-Cookie: a=b; xExpires=Wed, 21 Oct 2015 07:28:00 GMT; httponly\r\n",
+                sink
+        );
+
+        // malformed date in "Expires" attribute
+        assertCookies(
+                "[{cookieName=\"a\", value=\"b\", secure=false, httpOnly=false, partitioned=false, expires=-1, maxAge=0}]",
+                "Set-Cookie: a=b; Expires=ok, 21 Oct 2015 07:28:00 GMT\r\n",
+                sink
+        );
+
+        // unknown attribute "ZT", boolean (unknown alphabet)
+        assertCookies(
+                "[{cookieName=\"a\", value=\"b\", secure=false, httpOnly=false, partitioned=false, expires=-1, maxAge=0}]",
+                "Set-Cookie: a=b; ZT\r\n",
+                sink
+        );
+
+        // unknown attribute "ZT with value
+        assertCookies(
+                "[{cookieName=\"a\", value=\"b\", secure=false, httpOnly=false, partitioned=false, expires=-1, maxAge=0}]",
+                "Set-Cookie: a=b; ZT=123\r\n",
+                sink
+        );
+
+        // no attributes
+        assertCookies(
+                "[{cookieName=\"a\", value=\"b\", secure=false, httpOnly=false, partitioned=false, expires=-1, maxAge=0}]",
+                "Set-Cookie: a=b\r\n",
+                sink
+        );
+    }
+
+    @Test
+    public void testCookiesNameHasKeywordSecure() {
+        String v = "GET /ok?x=a&y=b+c&z=123 HTTP/1.1\r\n" +
+                "Set-Cookie: Secure=123; Domain=hello.com; Path=/; Secure; Partitioned; HttpOnly; Max-Age=1234545; SameSite=strict; Expires=Wed, 21 Oct 2015 07:28:00 GMT\r\n" +
+                "\r\n";
+        long p = TestUtils.toMemory(v);
+        try (HttpHeaderParser hp = new HttpHeaderParser(1024, pool)) {
+            hp.parse(p, p + v.length(), true, false);
+            HttpCookie cookie = hp.getCookie(new Utf8String("Secure"));
+            Assert.assertNotNull(cookie);
+            TestUtils.assertEquals("123", cookie.value);
+            TestUtils.assertEquals("hello.com", cookie.domain);
+            TestUtils.assertEquals("/", cookie.path);
+            Assert.assertTrue(cookie.secure);
+            Assert.assertTrue(cookie.partitioned);
+            Assert.assertTrue(cookie.httpOnly);
+            Assert.assertEquals(1234545, cookie.maxAge);
+            TestUtils.assertEquals("strict", cookie.sameSite);
+            Assert.assertEquals(1445412480000000L, cookie.expires);
+
+        } finally {
+            Unsafe.free(p, v.length(), MemoryTag.NATIVE_DEFAULT);
+        }
+    }
+
+    @Test
+    public void testCookiesReuseClearsMappedCookies() {
+        final Utf8String cookieName = new Utf8String("id");
+
+        try (HttpHeaderParser hp = new HttpHeaderParser(1024, pool)) {
+            parse(
+                    hp,
+                    "GET /ok HTTP/1.1\r\n" +
+                            "Set-Cookie: id=123; Path=/\r\n" +
+                            "\r\n",
+                    true,
+                    false
+            );
+            Assert.assertNotNull(hp.getCookie(cookieName));
+
+            hp.clear();
+            parse(hp, "GET /ok HTTP/1.1\r\n\r\n", true, false);
+            Assert.assertNull(hp.getCookie(cookieName));
+        }
+    }
+
+    @Test
+    public void testCookiesUnrecognisedAttribute() {
+        // SameSite
+        assertCaseInsensitivity("GET /ok?x=a&y=b+c&z=123 HTTP/1.1\r\n" +
+                "Set-Cookie: _gh_sess=HSVQNiqqkeSqpG%2B7x9fBrnGqXk4nI%2BW2j9BITSM7WLy53vJNNeFqLpfiDH9TyA%2BUa%2FX3%2FrfzQgidqybd36Lh9wsADt3GQP2VQh7pBSAlsGicsqSe2oYK9%2F2y1K3L8gCiYDNtSNk4zdBsTYNLRG72D82X2JvK3ArL79zLkBg6qys45Fou39r33iNH9DxfCisqGS2zvDw0MiJ2H%2FzVD85GB7iXeuznThBI107uPHLJxzpgUAgqj4gLr8ocbDgkFeBuiiWHYRaT9b4wZmHIHMnDz%2BU0Pu45spvs6PLSvCoePzpIazmAqvVvvh5SQ1hqZuCn5ffl3x777xHiUU9z--akaypyDbIgToO26U--D%2BUL6IEkoc6dkRNuUkoosQ%3D%3D; Path=/; Secure; HttpOnly; saMesite=Lax\r\n" +
+                "\r\n");
+
+        // Secure
+        assertCaseInsensitivity("GET /ok?x=a&y=b+c&z=123 HTTP/1.1\r\n" +
+                "Set-Cookie: _gh_sess=HSVQNiqqkeSqpG%2B7x9fBrnGqXk4nI%2BW2j9BITSM7WLy53vJNNeFqLpfiDH9TyA%2BUa%2FX3%2FrfzQgidqybd36Lh9wsADt3GQP2VQh7pBSAlsGicsqSe2oYK9%2F2y1K3L8gCiYDNtSNk4zdBsTYNLRG72D82X2JvK3ArL79zLkBg6qys45Fou39r33iNH9DxfCisqGS2zvDw0MiJ2H%2FzVD85GB7iXeuznThBI107uPHLJxzpgUAgqj4gLr8ocbDgkFeBuiiWHYRaT9b4wZmHIHMnDz%2BU0Pu45spvs6PLSvCoePzpIazmAqvVvvh5SQ1hqZuCn5ffl3x777xHiUU9z--akaypyDbIgToO26U--D%2BUL6IEkoc6dkRNuUkoosQ%3D%3D; Path=/; secuRe; HttpOnly; SameSite=Lax\r\n" +
+                "\r\n");
+
+        // Path
+        assertCaseInsensitivity("GET /ok?x=a&y=b+c&z=123 HTTP/1.1\r\n" +
+                "Set-Cookie: _gh_sess=HSVQNiqqkeSqpG%2B7x9fBrnGqXk4nI%2BW2j9BITSM7WLy53vJNNeFqLpfiDH9TyA%2BUa%2FX3%2FrfzQgidqybd36Lh9wsADt3GQP2VQh7pBSAlsGicsqSe2oYK9%2F2y1K3L8gCiYDNtSNk4zdBsTYNLRG72D82X2JvK3ArL79zLkBg6qys45Fou39r33iNH9DxfCisqGS2zvDw0MiJ2H%2FzVD85GB7iXeuznThBI107uPHLJxzpgUAgqj4gLr8ocbDgkFeBuiiWHYRaT9b4wZmHIHMnDz%2BU0Pu45spvs6PLSvCoePzpIazmAqvVvvh5SQ1hqZuCn5ffl3x777xHiUU9z--akaypyDbIgToO26U--D%2BUL6IEkoc6dkRNuUkoosQ%3D%3D; PATH=/; secure; HttpOnly; SameSite=Lax\r\n" +
+                "\r\n");
+    }
+
+    @Test
+    public void testCookiesVanilla() {
+        assertCookieVanilla(
+                "GET /ok?x=a&y=b+c&z=123 HTTP/1.1\r\n" +
+                        "Set-Cookie: id=123; Domain=hello.com; Path=/; Secure; Partitioned; HttpOnly; Max-Age=1234545; SameSite=strict; Expires=Wed, 21 Oct 2015 07:28:00 GMT\r\n" +
+                        "\r\n"
+        );
+        // reorder the cookie attributes to make sure they don't affect each other
+        assertCookieVanilla(
+                "GET /ok?x=a&y=b+c&z=123 HTTP/1.1\r\n" +
+                        "Set-Cookie: id=123; Expires=Wed, 21 Oct 2015 07:28:00 GMT; Path=/; Secure; Partitioned; HttpOnly; Max-Age=1234545; SameSite=strict; Domain=hello.com\r\n" +
+                        "\r\n"
+        );
+    }
+
+    @Test
+    public void testCookiesWithTwoDigitYear() {
+        // HTTP 1.0 format with 2-digit year (e.g., Mon, 20-Oct-25 15:57:56 GMT)
+        String v = "GET /ok HTTP/1.1\r\n" +
+                "Set-Cookie: sessionid=abc123; Domain=example.com; Path=/; Expires=Mon, 20-Oct-25 15:57:56 GMT\r\n" +
+                "\r\n";
+        long p = TestUtils.toMemory(v);
+        try (HttpHeaderParser hp = new HttpHeaderParser(1024, pool)) {
+            hp.parse(p, p + v.length(), true, false);
+            HttpCookie cookie = hp.getCookie(new Utf8String("sessionid"));
+            Assert.assertNotNull(cookie);
+            TestUtils.assertEquals("abc123", cookie.value);
+            TestUtils.assertEquals("example.com", cookie.domain);
+            TestUtils.assertEquals("/", cookie.path);
+            Assert.assertEquals(1760975876000000L, cookie.expires);
+        } finally {
+            Unsafe.free(p, v.length(), MemoryTag.NATIVE_DEFAULT);
+        }
+    }
+
+    @Test
+    public void testCookiesWithAnsiCFormat() {
+        // ANSI C asctime format (e.g., Mon Oct 20 15:57:56 2025)
+        String v = "GET /ok HTTP/1.1\r\n" +
+                "Set-Cookie: token=xyz789; Domain=test.org; Path=/api; Expires=Sun Nov  6 08:49:37 1994\r\n" +
+                "\r\n";
+        long p = TestUtils.toMemory(v);
+        try (HttpHeaderParser hp = new HttpHeaderParser(1024, pool)) {
+            hp.parse(p, p + v.length(), true, false);
+            HttpCookie cookie = hp.getCookie(new Utf8String("token"));
+            Assert.assertNotNull(cookie);
+            TestUtils.assertEquals("xyz789", cookie.value);
+            TestUtils.assertEquals("test.org", cookie.domain);
+            TestUtils.assertEquals("/api", cookie.path);
+            Assert.assertEquals(784111777000000L, cookie.expires);
+        } finally {
+            Unsafe.free(p, v.length(), MemoryTag.NATIVE_DEFAULT);
+        }
+    }
+
+    @Test
+    public void testCookiesWithTheSameKeys() {
+        // reorder the cookie attributes to make sure they don't affect each other
+        assertPreferredCookie(
+                "GET /ok?x=a&y=b+c&z=123 HTTP/1.1\r\n" +
+                        "Set-Cookie: id=124; Expires=Wed, 21 Oct 2015 07:28:00 GMT; Path=/aaaa; Secure; Partitioned; HttpOnly; Max-Age=1234545; SameSite=strict; Domain=hello.com\r\n" +
+                        "Set-Cookie: id=123; Expires=Wed, 21 Oct 2015 07:28:00 GMT; Path=/; Secure; Partitioned; HttpOnly; Max-Age=1234545; SameSite=strict; Domain=hello.com\r\n" +
+                        "\r\n",
+                1445412480000000L
+        );
+
+        assertPreferredCookie(
+                "GET /ok?x=a&y=b+c&z=123 HTTP/1.1\r\n" +
+                        "Set-Cookie: id=123; Expires=Wed, 21 Oct 2015 07:28:00 GMT; Path=/; Secure; Partitioned; HttpOnly; Max-Age=1234545; SameSite=strict; Domain=hello.com\r\n" +
+                        "Set-Cookie: id=124; Expires=Wed, 21 Oct 2015 07:28:00 GMT; Path=/aaaa; Secure; Partitioned; HttpOnly; Max-Age=1234545; SameSite=strict; Domain=hello.com\r\n" +
+                        "\r\n",
+                1445412480000000L
+        );
+
+        assertPreferredCookie(
+                "GET /ok?x=a&y=b+c&z=123 HTTP/1.1\r\n" +
+                        "Set-Cookie: id=123; Expires=Wed, 21 Oct 2015 07:28:00 GMT; Path=/aaaa; Secure; Partitioned; HttpOnly; Max-Age=1234545; SameSite=strict; Domain=hello.com\r\n" +
+                        "Set-Cookie: id=124; Expires=Wed, 21 Oct 2017 07:28:00 GMT; Path=/aaaa; Secure; Partitioned; HttpOnly; Max-Age=1234545; SameSite=strict; Domain=hello.com\r\n" +
+                        "\r\n",
+                1508570880000000L
+        );
+
+        assertPreferredCookie(
+                "GET /ok?x=a&y=b+c&z=123 HTTP/1.1\r\n" +
+                        "Set-Cookie: id=124; Expires=Wed, 21 Oct 2017 07:28:00 GMT; Path=/aaaa; Secure; Partitioned; HttpOnly; Max-Age=1234545; SameSite=strict; Domain=hello.com\r\n" +
+                        "Set-Cookie: id=123; Expires=Wed, 21 Oct 2015 07:28:00 GMT; Path=/aaaa; Secure; Partitioned; HttpOnly; Max-Age=1234545; SameSite=strict; Domain=hello.com\r\n" +
+                        "\r\n",
+                1508570880000000L
+        );
     }
 
     @Test
@@ -331,7 +1100,6 @@ public class HttpHeaderParserTest {
         long p = TestUtils.toMemory(v);
         long s1 = System.currentTimeMillis();
         long s2 = System.nanoTime();
-        System.out.println("s1: " + s1 + "L; s2: " + s2 + "L;");
         Rnd rnd = new Rnd(s1, s2);
         int steps = rnd.nextInt(v.length()) + 1;
         int stepMax = rnd.nextInt(v.length() / steps + 1) + 1;
@@ -412,6 +1180,7 @@ public class HttpHeaderParserTest {
         try (HttpHeaderParser hp = new HttpHeaderParser(1024, pool)) {
             hp.parse(p, p + v.length(), true, false);
             TestUtils.assertEquals("/xyz", hp.getUrl());
+            Assert.assertNull(hp.getQuery());
         } finally {
             Unsafe.free(p, v.length(), MemoryTag.NATIVE_DEFAULT);
         }
@@ -419,12 +1188,14 @@ public class HttpHeaderParserTest {
 
     @Test
     public void testUrlParamSingleQuote() {
-        String v = "GET /ip?x=%27a%27&y==b HTTP/1.1";
+        String v = "GET /ip?x=%27a%27&y==b HTTP/1.1\r\n";
         long p = TestUtils.toMemory(v);
         try (HttpHeaderParser hp = new HttpHeaderParser(1024, pool)) {
             hp.parse(p, p + v.length(), true, false);
             TestUtils.assertEquals("'a'", hp.getUrlParam(new Utf8String("x")));
             TestUtils.assertEquals("b", hp.getUrlParam(new Utf8String("y")));
+            TestUtils.assertEquals("x=%27a%27&y==b", hp.getQuery());
+            TestUtils.assertEquals("GET /ip?x=%27a%27&y==b HTTP/1.1", hp.getMethodLine());
         } finally {
             Unsafe.free(p, v.length(), MemoryTag.NATIVE_DEFAULT);
         }
@@ -432,7 +1203,7 @@ public class HttpHeaderParserTest {
 
     @Test
     public void testUrlParamsDecode() {
-        String v = "GET /test?x=a&y=b+c%26&z=ab%20ba&w=2 HTTP/1.1";
+        String v = "GET /test?x=a&y=b+c%26&z=ab%20ba&w=2 HTTP/1.1\r\n";
         long p = TestUtils.toMemory(v);
         try (HttpHeaderParser hp = new HttpHeaderParser(1024, pool)) {
             hp.parse(p, p + v.length(), true, false);
@@ -440,6 +1211,7 @@ public class HttpHeaderParserTest {
             TestUtils.assertEquals("b c&", hp.getUrlParam(new Utf8String("y")));
             TestUtils.assertEquals("ab ba", hp.getUrlParam(new Utf8String("z")));
             TestUtils.assertEquals("2", hp.getUrlParam(new Utf8String("w")));
+            TestUtils.assertEquals("x=a&y=b+c%26&z=ab%20ba&w=2", hp.getQuery());
         } finally {
             Unsafe.free(p, v.length(), MemoryTag.NATIVE_DEFAULT);
         }
@@ -447,13 +1219,14 @@ public class HttpHeaderParserTest {
 
     @Test
     public void testUrlParamsDecodeSpace() {
-        String v = "GET /ok?x=a&y=b+c&z=123 HTTP/1.1";
+        String v = "GET /ok?x=a&y=b+c&z=123 HTTP/1.1\r\n";
         long p = TestUtils.toMemory(v);
         try (HttpHeaderParser hp = new HttpHeaderParser(1024, pool)) {
             hp.parse(p, p + v.length(), true, false);
             TestUtils.assertEquals("a", hp.getUrlParam(new Utf8String("x")));
             TestUtils.assertEquals("b c", hp.getUrlParam(new Utf8String("y")));
             TestUtils.assertEquals("123", hp.getUrlParam(new Utf8String("z")));
+            TestUtils.assertEquals("x=a&y=b+c&z=123", hp.getQuery());
         } finally {
             Unsafe.free(p, v.length(), MemoryTag.NATIVE_DEFAULT);
         }
@@ -461,12 +1234,13 @@ public class HttpHeaderParserTest {
 
     @Test
     public void testUrlParamsDecodeTrailingSpace() {
-        String v = "GET /xyz?x=a&y=b+c HTTP/1.1";
+        String v = "GET /xyz?x=a&y=b+c HTTP/1.1\r\n";
         long p = TestUtils.toMemory(v);
         try (HttpHeaderParser hp = new HttpHeaderParser(1024, pool)) {
             hp.parse(p, p + v.length(), true, false);
             TestUtils.assertEquals("a", hp.getUrlParam(new Utf8String("x")));
             TestUtils.assertEquals("b c", hp.getUrlParam(new Utf8String("y")));
+            TestUtils.assertEquals("x=a&y=b+c", hp.getQuery());
         } finally {
             Unsafe.free(p, v.length(), MemoryTag.NATIVE_DEFAULT);
         }
@@ -474,12 +1248,13 @@ public class HttpHeaderParserTest {
 
     @Test
     public void testUrlParamsDuplicateAmp() {
-        String v = "GET /query?x=a&&y==b HTTP/1.1";
+        String v = "GET /query?x=a&&y==b HTTP/1.1\r\n";
         long p = TestUtils.toMemory(v);
         try (HttpHeaderParser hp = new HttpHeaderParser(1024, pool)) {
             hp.parse(p, p + v.length(), true, false);
             TestUtils.assertEquals("a", hp.getUrlParam(new Utf8String("x")));
             TestUtils.assertEquals("b", hp.getUrlParam(new Utf8String("y")));
+            TestUtils.assertEquals("x=a&&y==b", hp.getQuery());
         } finally {
             Unsafe.free(p, v.length(), MemoryTag.NATIVE_DEFAULT);
         }
@@ -487,7 +1262,7 @@ public class HttpHeaderParserTest {
 
     @Test
     public void testUrlParamsSimple() {
-        String v = "GET /query?x=a&y=b HTTP/1.1";
+        String v = "GET /query?x=a&y=b HTTP/1.1\r\n";
         long p = TestUtils.toMemory(v);
         try (HttpHeaderParser hp = new HttpHeaderParser(1024, pool)) {
             hp.parse(p, p + v.length(), true, false);
@@ -500,7 +1275,7 @@ public class HttpHeaderParserTest {
 
     @Test
     public void testUrlParamsTrailingEmpty() {
-        String v = "GET /ip?x=a&y=b&z= HTTP/1.1";
+        String v = "GET /ip?x=a&y=b&z= HTTP/1.1\r\n";
         long p = TestUtils.toMemory(v);
         try (HttpHeaderParser hp = new HttpHeaderParser(1024, pool)) {
             hp.parse(p, p + v.length(), true, false);
@@ -514,7 +1289,7 @@ public class HttpHeaderParserTest {
 
     @Test
     public void testUrlParamsTrailingNull() {
-        String v = "GET /opi?x=a&y=b& HTTP/1.1";
+        String v = "GET /opi?x=a&y=b& HTTP/1.1\r\n";
         long p = TestUtils.toMemory(v);
         try (HttpHeaderParser hp = new HttpHeaderParser(1024, pool)) {
             hp.parse(p, p + v.length(), true, false);
@@ -538,11 +1313,115 @@ public class HttpHeaderParserTest {
         }
     }
 
+    private static void assertCaseInsensitivity(String request) {
+        long p = TestUtils.toMemory(request);
+        try (HttpHeaderParser hp = new HttpHeaderParser(1024, pool)) {
+            hp.parse(p, p + request.length(), true, false);
+            HttpCookie cookie = hp.getCookie(new Utf8String("_gh_sess"));
+            Assert.assertNotNull(cookie);
+            TestUtils.assertEquals("HSVQNiqqkeSqpG%2B7x9fBrnGqXk4nI%2BW2j9BITSM7WLy53vJNNeFqLpfiDH9TyA%2BUa%2FX3%2FrfzQgidqybd36Lh9wsADt3GQP2VQh7pBSAlsGicsqSe2oYK9%2F2y1K3L8gCiYDNtSNk4zdBsTYNLRG72D82X2JvK3ArL79zLkBg6qys45Fou39r33iNH9DxfCisqGS2zvDw0MiJ2H%2FzVD85GB7iXeuznThBI107uPHLJxzpgUAgqj4gLr8ocbDgkFeBuiiWHYRaT9b4wZmHIHMnDz%2BU0Pu45spvs6PLSvCoePzpIazmAqvVvvh5SQ1hqZuCn5ffl3x777xHiUU9z--akaypyDbIgToO26U--D%2BUL6IEkoc6dkRNuUkoosQ%3D%3D", cookie.value);
+            Assert.assertNull(cookie.domain);
+            TestUtils.assertEquals("/", cookie.path);
+            Assert.assertTrue(cookie.secure);
+            Assert.assertFalse(cookie.partitioned);
+            Assert.assertTrue(cookie.httpOnly);
+            Assert.assertEquals(0, cookie.maxAge);
+            TestUtils.assertEquals("Lax", cookie.sameSite);
+            Assert.assertEquals(-1, cookie.expires);
+
+        } finally {
+            Unsafe.free(p, request.length(), MemoryTag.NATIVE_DEFAULT);
+        }
+    }
+
+    private static void assertCookieVanilla(String v) {
+        long p = TestUtils.toMemory(v);
+        try (HttpHeaderParser hp = new HttpHeaderParser(1024, pool)) {
+            hp.parse(p, p + v.length(), true, false);
+            HttpCookie cookie = hp.getCookie(new Utf8String("id"));
+            Assert.assertNotNull(cookie);
+            TestUtils.assertEquals("123", cookie.value);
+            TestUtils.assertEquals("hello.com", cookie.domain);
+            TestUtils.assertEquals("/", cookie.path);
+            Assert.assertTrue(cookie.secure);
+            Assert.assertTrue(cookie.partitioned);
+            Assert.assertTrue(cookie.httpOnly);
+            Assert.assertEquals(1234545, cookie.maxAge);
+            TestUtils.assertEquals("strict", cookie.sameSite);
+            Assert.assertEquals(1445412480000000L, cookie.expires);
+
+        } finally {
+            Unsafe.free(p, v.length(), MemoryTag.NATIVE_DEFAULT);
+        }
+    }
+
+    private static void assertCookies(CharSequence expected, String response, StringSink sink) {
+        sink.clear();
+        response = "GET /ok?x=a&y=b+c&z=123 HTTP/1.1\r\n" + response + "\r\n";
+        long p = TestUtils.toMemory(response);
+        try (HttpHeaderParser hp = new HttpHeaderParser(1024, pool)) {
+            hp.parse(p, p + response.length(), true, false);
+            hp.getCookieList().toSink(sink);
+            TestUtils.assertEquals(expected, sink);
+        } finally {
+            Unsafe.free(p, response.length(), MemoryTag.NATIVE_DEFAULT);
+        }
+    }
+
+    private static void assertMalformedCookieIgnored(String malformedCookie) {
+        String v = "GET /ok?x=a&y=b+c&z=123 HTTP/1.1\r\n" +
+                "Set-Cookie: a=123; Domain=hello.com; Path=/; Secure; Partitioned; HttpOnly; Max-Age=1234545; SameSite=strict; Expires=Wed, 21 Oct 2015 07:28:00 GMT\r\n" +
+                malformedCookie +
+                "Set-Cookie: b=123; Domain=hello.com; Path=/; Secure; Partitioned; HttpOnly; Max-Age=1234545; SameSite=strict; Expires=Wed, 21 Oct 2015 07:28:00 GMT\r\n" +
+                "\r\n";
+        long p = TestUtils.toMemory(v);
+        try (HttpHeaderParser hp = new HttpHeaderParser(1024, pool)) {
+            hp.parse(p, p + v.length(), true, false);
+            Assert.assertEquals(2, hp.getCookieList().size());
+            Assert.assertNotNull(hp.getCookie(new Utf8String("a")));
+            Assert.assertNotNull(hp.getCookie(new Utf8String("b")));
+            Assert.assertEquals(1, hp.getIgnoredCookieCount());
+        } finally {
+            Unsafe.free(p, v.length(), MemoryTag.NATIVE_DEFAULT);
+        }
+    }
+
+    private static void assertPreferredCookie(String v, long expiresTimestamp) {
+        long p = TestUtils.toMemory(v);
+        try (HttpHeaderParser hp = new HttpHeaderParser(1024, pool)) {
+            hp.parse(p, p + v.length(), true, false);
+            HttpCookie cookie = hp.getCookie(new Utf8String("id"));
+            Assert.assertNotNull(cookie);
+            TestUtils.assertEquals("124", cookie.value);
+            TestUtils.assertEquals("hello.com", cookie.domain);
+            TestUtils.assertEquals("/aaaa", cookie.path);
+            Assert.assertTrue(cookie.secure);
+            Assert.assertTrue(cookie.partitioned);
+            Assert.assertTrue(cookie.httpOnly);
+            Assert.assertEquals(1234545, cookie.maxAge);
+            TestUtils.assertEquals("strict", cookie.sameSite);
+            Assert.assertEquals(expiresTimestamp, cookie.expires);
+
+        } finally {
+            Unsafe.free(p, v.length(), MemoryTag.NATIVE_DEFAULT);
+        }
+    }
+
+    private static void parse(HttpHeaderParser hp, String headers, boolean request, boolean protocol) {
+        long p = TestUtils.toMemory(headers);
+        try {
+            hp.parse(p, p + headers.length(), request, protocol);
+        } finally {
+            Unsafe.free(p, headers.length(), MemoryTag.NATIVE_DEFAULT);
+        }
+    }
+
     private void assertHeaders(HttpHeaderParser hp) {
         Assert.assertFalse(hp.isIncomplete());
         TestUtils.assertEquals("GET", hp.getMethod());
         TestUtils.assertEquals("/status", hp.getUrl());
-        TestUtils.assertEquals("GET /status?x=1&a=&b&c&d=x HTTP/1.1", hp.getMethodLine());
+        TestUtils.assertEquals("GET /status?x=1&a=%26b&c&d=x HTTP/1.1", hp.getMethodLine());
+        TestUtils.assertEquals("x=1&a=%26b&c&d=x", hp.getQuery());
         Assert.assertEquals(9, hp.size());
         TestUtils.assertEquals("localhost:9000", hp.getHeader(new Utf8String("Host")));
         TestUtils.assertEquals("keep-alive", hp.getHeader(new Utf8String("Connection")));

@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -31,11 +31,10 @@ import io.questdb.griffin.SqlException;
 import io.questdb.griffin.SqlExecutionContext;
 import io.questdb.griffin.SqlExecutionContextImpl;
 import io.questdb.mp.WorkerPool;
-import io.questdb.std.str.StringSink;
-import io.questdb.test.tools.TestUtils;
+import io.questdb.std.FilesFacade;
+import io.questdb.std.str.Path;
 
 public class TestServerMain extends ServerMain {
-    private final StringSink sink = new StringSink();
     private SqlExecutionContext sqlExecutionContext;
 
     public TestServerMain(String... args) {
@@ -52,7 +51,7 @@ public class TestServerMain extends ServerMain {
             protected void setupWalApplyJob(
                     WorkerPool workerPool,
                     CairoEngine engine,
-                    int sharedWorkerCount
+                    int sharedQueryWorkerCount
             ) {
             }
         };
@@ -60,17 +59,20 @@ public class TestServerMain extends ServerMain {
 
     public void assertSql(String sql, String expected) {
         try {
-            if (sqlExecutionContext == null) {
-                sqlExecutionContext = new SqlExecutionContextImpl(getEngine(), 1).with(
-                        getEngine().getConfiguration().getFactoryProvider().getSecurityContextFactory().getRootContext(),
-                        null,
-                        null,
-                        -1,
-                        null
-                );
-            }
-            TestUtils.assertSql(getEngine(), sqlExecutionContext, sql, sink, expected);
+            new QueryAssertion(getEngine(), getSqlExecutionContext(), () -> {
+            }, sql)
+                    .noLeakCheck()
+                    .returnsOnce(expected);
         } catch (SqlException e) {
+            // A transient compile failure (e.g. the table is not yet visible) becomes an
+            // AssertionError so callers polling via TestUtils.assertEventually(...) -- which retries
+            // only on AssertionError -- keep retrying until ingestion lands.
+            throw new AssertionError(e);
+        } catch (RuntimeException e) {
+            // Let runtime exceptions such as CairoException propagate unchanged, so callers that
+            // assert on a specific failure type (e.g. a corrupted-index CairoException) still catch it.
+            throw e;
+        } catch (Exception e) {
             throw new AssertionError(e);
         }
     }
@@ -78,12 +80,55 @@ public class TestServerMain extends ServerMain {
     public void compile(String sql) {
         try {
             if (sqlExecutionContext == null) {
-                getEngine().compile(sql);
+                getEngine().execute(sql);
             } else {
-                getEngine().compile(sql, sqlExecutionContext);
+                getEngine().execute(sql, sqlExecutionContext);
             }
         } catch (SqlException e) {
             throw new AssertionError(e);
+        }
+    }
+
+    public void execute(String sql) {
+        try {
+            ensureContext();
+            getEngine().execute(sql, sqlExecutionContext);
+        } catch (SqlException e) {
+            throw new AssertionError(e);
+        }
+    }
+
+    public SqlExecutionContext getSqlExecutionContext() {
+        ensureContext();
+        return sqlExecutionContext;
+    }
+
+    public void reset() {
+        // Drop all tables
+        CairoEngine engine = this.getEngine();
+        engine.releaseInactive();
+        engine.clear();
+        engine.closeNameRegistry();
+        FilesFacade ff = engine.getConfiguration().getFilesFacade();
+        try (Path p = new Path()) {
+            p.of(engine.getConfiguration().getDbRoot());
+            ff.mkdir(p.$(), engine.getConfiguration().getMkDirMode());
+        }
+        engine.getTableIdGenerator().open();
+        engine.resetNameRegistryMemory();
+        resetQueryCache();
+        engine.setUp();
+    }
+
+    private void ensureContext() {
+        if (sqlExecutionContext == null) {
+            sqlExecutionContext = new SqlExecutionContextImpl(getEngine(), 1).with(
+                    getEngine().getConfiguration().getFactoryProvider().getSecurityContextFactory().getRootContext(),
+                    null,
+                    null,
+                    -1,
+                    null
+            );
         }
     }
 }

@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -26,11 +26,12 @@ package org.questdb;
 
 import io.questdb.cairo.CairoConfiguration;
 import io.questdb.cairo.CairoException;
-import io.questdb.cutlass.line.LineChannel;
-import io.questdb.cutlass.line.LineTcpSender;
-import io.questdb.cutlass.line.tcp.PlainTcpLineChannel;
+import io.questdb.client.cutlass.line.AbstractLineTcpSender;
+import io.questdb.client.cutlass.line.LineChannel;
+import io.questdb.client.cutlass.line.LineTcpSenderV2;
+import io.questdb.client.cutlass.line.tcp.PlainTcpLineChannel;
+import io.questdb.client.network.NetworkFacadeImpl;
 import io.questdb.network.Net;
-import io.questdb.network.NetworkFacadeImpl;
 import io.questdb.std.FilesFacade;
 import io.questdb.std.FilesFacadeImpl;
 import io.questdb.std.Misc;
@@ -52,13 +53,13 @@ public class LineTCPSenderMainVarLenStrings {
         long start = System.nanoTime();
         FilesFacade ff = new FilesFacadeImpl();
         try (Path path = new Path()) {
-            int logFd = -1;
+            long logFd = -1;
             if (args.length == 1) {
                 path.put(args[0]);
                 logFd = ff.openRW(path.$(), CairoConfiguration.O_NONE);
             }
             PlainTcpLineChannel tcpLineChannel = new PlainTcpLineChannel(NetworkFacadeImpl.INSTANCE, Net.parseIPv4(hostIPv4), port, bufferCapacity * 2);
-            try (LineTcpSender sender = new LineTcpSender(new LoggingLineChannel(tcpLineChannel, logFd, ff), bufferCapacity)) {
+            try (AbstractLineTcpSender sender = new LineTcpSenderV2(new LoggingLineChannel(tcpLineChannel, logFd, ff), bufferCapacity, 127)) {
                 for (int i = 0; i < count; i++) {
                     sender.metric("md_msgs");
                     sender
@@ -97,11 +98,11 @@ public class LineTCPSenderMainVarLenStrings {
 
     private static class LoggingLineChannel implements LineChannel {
         private final FilesFacade ff;
-        private final int outFileFd;
+        private final long outFileFd;
         private LineChannel delegate;
         private long fileOffset = 0;
 
-        private LoggingLineChannel(LineChannel delegate, int outFileFd, FilesFacade ff) {
+        private LoggingLineChannel(LineChannel delegate, long outFileFd, FilesFacade ff) {
             this.delegate = delegate;
             this.outFileFd = outFileFd;
             this.ff = ff;

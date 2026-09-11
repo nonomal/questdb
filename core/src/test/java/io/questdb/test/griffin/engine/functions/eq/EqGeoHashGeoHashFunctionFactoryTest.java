@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -54,10 +54,11 @@ public class EqGeoHashGeoHashFunctionFactoryTest extends AbstractCairoTest {
 
     @Test
     public void testCastGeoHashToNullEqNull() throws Exception {
-        assertMemoryLeak(() -> assertSql(
-                "column\n" +
-                        "true\n", "select cast(null as geohash(1c)) = null"
-        ));
+        assertMemoryLeak(() -> assertQuery("select cast(null as geohash(1c)) = null")
+                .noLeakCheck()
+                .expectSize()
+                .returns("column\n" +
+                        "true\n"));
     }
 
     @Test
@@ -93,14 +94,14 @@ public class EqGeoHashGeoHashFunctionFactoryTest extends AbstractCairoTest {
     @Test
     public void testConstHalfConst1() throws Exception {
         assertMemoryLeak(() -> {
-            ddl("create table geohash as (" +
+            execute("create table geohash as (" +
                     "select " +
                     "    cast('sp052w92p1' as GeOhAsH(50b)) geohash from long_sequence(1)" +
                     ")");
-            assertSql(
-                    "geohash\n" +
-                            "sp052w92p1\n", "geohash where cast('sp052w92p1p' as gEoHaSh(10c)) = geohash"
-            );
+            assertQuery("geohash where cast('sp052w92p1p' as gEoHaSh(10c)) = geohash")
+                    .noLeakCheck()
+                    .returns("geohash\n" +
+                            "sp052w92p1\n");
         });
     }
 
@@ -126,30 +127,32 @@ public class EqGeoHashGeoHashFunctionFactoryTest extends AbstractCairoTest {
     @Test
     public void testEq() throws Exception {
         assertMemoryLeak(() -> {
-            ddl("create table x as (" +
+            execute("create table x as (" +
                     " select" +
                     " rnd_geohash(11) a," +
                     " rnd_geohash(11) b" +
                     " from long_sequence(5000)" +
                     ")");
-            assertSql(
-                    "a\tb\n" +
-                            "11010001011\t11010001011\n", "x where a = b"
-            );
+            assertQuery("x where a = b")
+                    .noLeakCheck()
+                    .returns("a\tb\n" +
+                            "11010001011\t11010001011\n");
         });
     }
 
     @Test
     public void testNotEq() throws Exception {
         assertMemoryLeak(() -> {
-            ddl("create table x as (" +
+            execute("create table x as (" +
                     " select" +
                     " rnd_geohash(11) a," +
                     " rnd_geohash(13) b" +
                     " from long_sequence(8)" +
                     ")");
-            assertSql(
-                    "a\tb\n" +
+            assertQuery("x where a != b")
+                    .noLeakCheck()
+                    .expectSize()
+                    .returns("a\tb\n" +
                             "01001110110\t0010000110110\n" +
                             "10001101001\t1111101110110\n" +
                             "10000101010\t1110010000001\n" +
@@ -157,8 +160,7 @@ public class EqGeoHashGeoHashFunctionFactoryTest extends AbstractCairoTest {
                             "10011100111\t0011100001011\n" +
                             "01110110001\t1011000100110\n" +
                             "11010111111\t1000110001001\n" +
-                            "10010110001\t0101011010111\n", "x where a != b"
-            );
+                            "10010110001\t0101011010111\n");
         });
     }
 
@@ -235,15 +237,15 @@ public class EqGeoHashGeoHashFunctionFactoryTest extends AbstractCairoTest {
     @Test
     public void testNull9() throws Exception {
         assertMemoryLeak(() -> {
-            ddl("create table geohash as (" +
+            execute("create table geohash as (" +
                     "select " +
                     "    cast(null as GeOhAsH(50b)) as geohash1, " +
                     "    cast('sp052w92' as GeOhAsH(2c)) as geohash2 " +
                     "from long_sequence(1)" +
                     ")");
-            assertSql(
-                    "geohash1\tgeohash2\n", "geohash where geohash1 = geohash2"
-            );
+            assertQuery("geohash where geohash1 = geohash2")
+                    .noLeakCheck()
+                    .returns("geohash1\tgeohash2\n");
         });
     }
 
@@ -331,7 +333,7 @@ public class EqGeoHashGeoHashFunctionFactoryTest extends AbstractCairoTest {
                     }
 
                     @Override
-                    public boolean isReadThreadSafe() {
+                    public boolean isThreadSafe() {
                         return true;
                     }
                 };
@@ -343,7 +345,7 @@ public class EqGeoHashGeoHashFunctionFactoryTest extends AbstractCairoTest {
                     }
 
                     @Override
-                    public boolean isReadThreadSafe() {
+                    public boolean isThreadSafe() {
                         return true;
                     }
                 };
@@ -355,7 +357,7 @@ public class EqGeoHashGeoHashFunctionFactoryTest extends AbstractCairoTest {
                     }
 
                     @Override
-                    public boolean isReadThreadSafe() {
+                    public boolean isThreadSafe() {
                         return true;
                     }
                 };
@@ -368,7 +370,7 @@ public class EqGeoHashGeoHashFunctionFactoryTest extends AbstractCairoTest {
                     }
 
                     @Override
-                    public boolean isReadThreadSafe() {
+                    public boolean isThreadSafe() {
                         return true;
                     }
                 };

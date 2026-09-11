@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,22 +24,122 @@
 
 package io.questdb.test.griffin;
 
+import io.questdb.cairo.CairoError;
 import io.questdb.griffin.SqlException;
+import io.questdb.std.FilesFacade;
+import io.questdb.std.LongHashSet;
+import io.questdb.std.str.LPSZ;
+import io.questdb.std.str.Utf8s;
 import io.questdb.test.AbstractCairoTest;
+import io.questdb.test.std.TestFilesFacadeImpl;
+import org.junit.Assert;
 import org.junit.Test;
 
+import java.io.File;
+import java.util.concurrent.atomic.AtomicBoolean;
+
 public class CreateTableAsSelectTest extends AbstractCairoTest {
+
+    @Test
+    public void testCreateAsSelectAndLikeIsInvalid() throws Exception {
+        assertMemoryLeak(() -> {
+            createSrcTable();
+
+            assertQuery("create table dest as (select * from src) like src")
+                    .fails(41, "unexpected token [like]");
+        });
+    }
+
+    @Test
+    public void testCreateAsSelectDoesNotPropagateParquetConfig() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("CREATE TABLE src (ts TIMESTAMP, v LONG PARQUET(delta_binary_packed, zstd(3))) TIMESTAMP(ts) PARTITION BY DAY;");
+            execute("INSERT INTO src VALUES('2024-01-01', 42);");
+            execute("CREATE TABLE dest AS (SELECT * FROM src) TIMESTAMP(ts) PARTITION BY DAY;");
+
+            // CTAS derives columns from SELECT metadata, which does not carry
+            // per-column parquet encoding config from the source table.
+            assertQuery("SHOW CREATE TABLE dest")
+                    .noLeakCheck()
+                    .noRandomAccess()
+                    .returns("""
+                            ddl
+                            CREATE TABLE 'dest' (\s
+                            \tts TIMESTAMP,
+                            \tv LONG
+                            ) timestamp(ts) PARTITION BY DAY BYPASS WAL;
+                            """);
+        });
+    }
+
+    @Test
+    public void testCreateAsSelectNonCairoExceptionCleansUpTable() throws Exception {
+        final LongHashSet destTableColumnFds = new LongHashSet();
+        final AtomicBoolean failed = new AtomicBoolean(false);
+
+        FilesFacade ff = new TestFilesFacadeImpl() {
+            @Override
+            public boolean close(long fd) {
+                destTableColumnFds.remove(fd);
+                return super.close(fd);
+            }
+
+            @Override
+            public long mmap(long fd, long len, long offset, int flags, int memoryTag) {
+                if (destTableColumnFds.contains(fd) && failed.compareAndSet(false, true)) {
+                    throw new CairoError("simulated mmap error");
+                }
+                return super.mmap(fd, len, offset, flags, memoryTag);
+            }
+
+            @Override
+            public long openRW(LPSZ name, int opts) {
+                long fd = super.openRW(name, opts);
+                if (Utf8s.containsAscii(name, File.separator + "dest") && Utf8s.endsWithAscii(name, ".d")) {
+                    destTableColumnFds.add(fd);
+                }
+                return fd;
+            }
+        };
+
+        assertMemoryLeak(ff, () -> {
+            createSrcTable();
+            try {
+                execute("create table dest as (select * from src)");
+            } catch (CairoError e) {
+                Assert.assertTrue(e.getMessage().contains("simulated mmap error"));
+            }
+
+            Assert.assertNull("dest table should have been cleaned up", engine.getTableTokenIfExists("dest"));
+        });
+    }
+
+    @Test
+    public void testCreateAsSelectParquetConfig() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("create table src (ts timestamp, v long PARQUET(DELTA_BINARY_PACKED, zstd(3))) timestamp(ts) partition by day;");
+            execute("create table dest (like src)");
+
+            assertQuery("SHOW CREATE TABLE dest")
+                    .noLeakCheck()
+                    .noRandomAccess()
+                    .returns("""
+                            ddl
+                            CREATE TABLE 'dest' (\s
+                            \tts TIMESTAMP,
+                            \tv LONG PARQUET(delta_binary_packed, zstd(3))
+                            ) timestamp(ts) PARTITION BY DAY BYPASS WAL;
+                            """);
+        });
+    }
 
     @Test
     public void testCreateNonPartitionedTableAsSelectTimestampDescOrder() throws Exception {
         assertMemoryLeak(() -> {
             createSrcTable();
 
-            assertException(
-                    "create table dest as (select * from src where v % 2 = 0 order by ts desc) timestamp(ts);",
-                    13,
-                    "cannot insert rows out of order to non-partitioned table."
-            );
+            assertQuery("create table dest as (select * from src where v % 2 = 0 order by ts desc) timestamp(ts);")
+                    .fails(13, "cannot insert rows out of order to non-partitioned table.");
         });
     }
 
@@ -107,20 +207,19 @@ public class CreateTableAsSelectTest extends AbstractCairoTest {
         assertMemoryLeak(() -> {
             createSrcTable();
 
-            ddl("create table dest as (select * from src where v % 2 = 0 " + orderByClause + ") timestamp(ts) partition by day;");
+            execute("create table dest as (select * from src where v % 2 = 0 " + orderByClause + ") timestamp(ts) partition by day;");
 
-            String expected = "ts\tv\n" +
-                    "1970-01-01T00:00:00.000000Z\t0\n" +
-                    "1970-01-01T00:00:00.020000Z\t2\n" +
-                    "1970-01-01T00:00:00.040000Z\t4\n";
+            String expected = """
+                    ts\tv
+                    1970-01-01T00:00:00.000000Z\t0
+                    1970-01-01T00:00:00.020000Z\t2
+                    1970-01-01T00:00:00.040000Z\t4
+                    """;
 
-            assertQuery(
-                    expected,
-                    "dest",
-                    "ts",
-                    true,
-                    true
-            );
+            assertQuery("dest")
+                    .timestamp("ts")
+                    .expectSize()
+                    .returns(expected);
         });
     }
 
@@ -141,20 +240,19 @@ public class CreateTableAsSelectTest extends AbstractCairoTest {
             sql += " table dest as ";
 
             sql += "(select * from src where v % 2 = 0 " + orderByClause + ") timestamp(ts) partition by day;";
-            ddl(sql);
+            execute(sql);
 
-            String expected = "ts\tv\n" +
-                    "1970-01-01T00:00:00.000000Z\t0\n" +
-                    "1970-01-01T00:00:00.020000Z\t2\n" +
-                    "1970-01-01T00:00:00.040000Z\t4\n";
+            String expected = """
+                    ts\tv
+                    1970-01-01T00:00:00.000000Z\t0
+                    1970-01-01T00:00:00.020000Z\t2
+                    1970-01-01T00:00:00.040000Z\t4
+                    """;
 
-            assertQuery(
-                    expected,
-                    "dest",
-                    "ts",
-                    true,
-                    true
-            );
+            assertQuery("dest")
+                    .timestamp("ts")
+                    .expectSize()
+                    .returns(expected);
         });
     }
 
@@ -166,29 +264,28 @@ public class CreateTableAsSelectTest extends AbstractCairoTest {
 
 
             sql += "(select * from src where v % 2 = 0 " + orderByClause + ") timestamp(ts) partition by day;";
-            ddl(sql);
+            execute(sql);
 
-            String expected = "ts\tv\n" +
-                    "1970-01-01T00:00:00.000000Z\t0\n" +
-                    "1970-01-01T00:00:00.020000Z\t2\n" +
-                    "1970-01-01T00:00:00.040000Z\t4\n";
+            String expected = """
+                    ts\tv
+                    1970-01-01T00:00:00.000000Z\t0
+                    1970-01-01T00:00:00.020000Z\t2
+                    1970-01-01T00:00:00.040000Z\t4
+                    """;
 
-            assertQuery(
-                    expected,
-                    "dest",
-                    "ts",
-                    true,
-                    true
-            );
+            assertQuery("dest")
+                    .timestamp("ts")
+                    .expectSize()
+                    .returns(expected);
         });
     }
 
     private void createSrcTable() throws SqlException {
-        ddl("create table src (ts timestamp, v long) timestamp(ts) partition by day;");
-        insert("insert into src values (0, 0);");
-        insert("insert into src values (10000, 1);");
-        insert("insert into src values (20000, 2);");
-        insert("insert into src values (30000, 3);");
-        insert("insert into src values (40000, 4);");
+        execute("create table src (ts timestamp, v long) timestamp(ts) partition by day;");
+        execute("insert into src values (0, 0);");
+        execute("insert into src values (10000, 1);");
+        execute("insert into src values (20000, 2);");
+        execute("insert into src values (30000, 3);");
+        execute("insert into src values (40000, 4);");
     }
 }

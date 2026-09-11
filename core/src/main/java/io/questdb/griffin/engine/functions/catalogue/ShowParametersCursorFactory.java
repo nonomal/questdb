@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -30,8 +30,11 @@ import io.questdb.cairo.AbstractRecordCursorFactory;
 import io.questdb.cairo.ColumnType;
 import io.questdb.cairo.GenericRecordMetadata;
 import io.questdb.cairo.TableColumnMetadata;
+import io.questdb.cairo.TableUtils;
+import io.questdb.cairo.sql.NoRandomAccessRecordCursor;
 import io.questdb.cairo.sql.Record;
 import io.questdb.cairo.sql.RecordCursor;
+import io.questdb.cairo.sql.SqlExecutionCircuitBreaker;
 import io.questdb.griffin.PlanSink;
 import io.questdb.griffin.SqlExecutionContext;
 import io.questdb.std.ObjObjHashMap;
@@ -40,7 +43,6 @@ import org.jetbrains.annotations.NotNull;
 import java.util.Iterator;
 
 public class ShowParametersCursorFactory extends AbstractRecordCursorFactory {
-
     private static final GenericRecordMetadata METADATA = new GenericRecordMetadata();
     private final ShowParametersRecordCursor cursor = new ShowParametersRecordCursor();
 
@@ -50,7 +52,8 @@ public class ShowParametersCursorFactory extends AbstractRecordCursorFactory {
 
     @Override
     public RecordCursor getCursor(SqlExecutionContext executionContext) {
-        return cursor.of(executionContext.getCairoEngine().getConfiguration().getAllPairs());
+        executionContext.getCircuitBreaker().statefulThrowExceptionIfTrippedTimeThrottled();
+        return cursor.of(executionContext.getCircuitBreaker(), executionContext.getCairoEngine().getConfiguration().getAllPairs());
     }
 
     @Override
@@ -77,46 +80,40 @@ public class ShowParametersCursorFactory extends AbstractRecordCursorFactory {
         }
     }
 
-    private static class ShowParametersRecordCursor implements RecordCursor {
+    private static class ShowParametersRecordCursor implements NoRandomAccessRecordCursor {
         private ObjObjHashMap<ConfigPropertyKey, ConfigPropertyValue> allPairs;
+        private SqlExecutionCircuitBreaker circuitBreaker;
         private ObjObjHashMap.Entry<ConfigPropertyKey, ConfigPropertyValue> entry;
         private final Record record = new Record() {
             @Override
-            public CharSequence getStrA(int col) {
-                switch (col) {
-                    case 0:
-                        return entry.key.getPropertyPath();
-                    case 1:
-                        return entry.key.getEnvVarName();
-                    case 2:
-                        if (entry.key.isSensitive()) {
-                            return "****";
-                        }
-                        return entry.value.getValue();
-                    case 3:
-                        switch (entry.value.getValueSource()) {
-                            case ConfigPropertyValue.VALUE_SOURCE_DEFAULT:
-                                return "default";
-                            case ConfigPropertyValue.VALUE_SOURCE_CONF:
-                                return "conf";
-                            default:
-                                return "env";
-                        }
-                    default:
-                        return null;
-                }
+            public boolean getBool(int col) {
+                return switch (col) {
+                    case 4 -> entry.key.isSensitive();
+                    case 5 -> entry.value.isDynamic();
+                    default -> false;
+                };
             }
 
             @Override
-            public boolean getBool(int col) {
-                switch (col) {
-                    case 4:
-                        return entry.key.isSensitive();
-                    case 5:
-                        return entry.value.isDynamic();
-                    default:
-                        return false;
-                }
+            public CharSequence getStrA(int col) {
+                return switch (col) {
+                    case 0 -> entry.key.getPropertyPath();
+                    case 1 -> entry.key.getEnvVarName();
+                    case 2 -> {
+                        if (entry.key.isSensitive()) {
+                            yield "****";
+                        }
+                        yield entry.value.getValue();
+                    }
+                    case 3 -> switch (entry.value.getValueSource()) {
+                        case ConfigPropertyValue.VALUE_SOURCE_DEFAULT -> "default";
+                        case ConfigPropertyValue.VALUE_SOURCE_CONF -> "conf";
+                        case ConfigPropertyValue.VALUE_SOURCE_ENV -> "env";
+                        case ConfigPropertyValue.VALUE_SOURCE_FILE -> "file";
+                        default -> "unknown";
+                    };
+                    default -> null;
+                };
             }
 
             @Override
@@ -126,8 +123,7 @@ public class ShowParametersCursorFactory extends AbstractRecordCursorFactory {
 
             @Override
             public int getStrLen(int col) {
-                CharSequence s = getStrA(col);
-                return s != null ? s.length() : -1;
+                return TableUtils.lengthOf(getStrA(col));
             }
         };
         @NotNull
@@ -145,12 +141,8 @@ public class ShowParametersCursorFactory extends AbstractRecordCursorFactory {
         }
 
         @Override
-        public Record getRecordB() {
-            throw new UnsupportedOperationException();
-        }
-
-        @Override
         public boolean hasNext() {
+            circuitBreaker.statefulThrowExceptionIfTripped();
             if (iterator.hasNext()) {
                 entry = iterator.next();
                 return true;
@@ -159,8 +151,8 @@ public class ShowParametersCursorFactory extends AbstractRecordCursorFactory {
         }
 
         @Override
-        public void recordAt(Record record, long atRowId) {
-            throw new UnsupportedOperationException();
+        public long preComputedStateSize() {
+            return 0;
         }
 
         @Override
@@ -174,7 +166,8 @@ public class ShowParametersCursorFactory extends AbstractRecordCursorFactory {
             entry = null;
         }
 
-        private ShowParametersRecordCursor of(ObjObjHashMap<ConfigPropertyKey, ConfigPropertyValue> allPairs) {
+        private ShowParametersRecordCursor of(SqlExecutionCircuitBreaker circuitBreaker, ObjObjHashMap<ConfigPropertyKey, ConfigPropertyValue> allPairs) {
+            this.circuitBreaker = circuitBreaker;
             this.allPairs = allPairs;
             toTop();
             return this;
@@ -187,6 +180,6 @@ public class ShowParametersCursorFactory extends AbstractRecordCursorFactory {
         METADATA.add(new TableColumnMetadata("value", ColumnType.STRING));
         METADATA.add(new TableColumnMetadata("value_source", ColumnType.STRING));
         METADATA.add(new TableColumnMetadata("sensitive", ColumnType.BOOLEAN));
-        METADATA.add(new TableColumnMetadata("dynamic", ColumnType.BOOLEAN));
+        METADATA.add(new TableColumnMetadata("reloadable", ColumnType.BOOLEAN));
     }
 }

@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -40,7 +40,6 @@ class SampleByFillNoneRecordCursor extends AbstractVirtualRecordSampleByCursor {
     private final RecordSink keyMapSink;
     private final Map map;
     private final RecordCursor mapCursor;
-    private boolean isHasNextPending;
     private boolean isMapBuildPending;
     private boolean isOpen;
     private long rowId;
@@ -53,29 +52,41 @@ class SampleByFillNoneRecordCursor extends AbstractVirtualRecordSampleByCursor {
             GroupByFunctionsUpdater groupByFunctionsUpdater,
             ObjList<Function> recordFunctions,
             int timestampIndex, // index of timestamp column in base cursor
+            int timestampType,
             TimestampSampler timestampSampler,
             Function timezoneNameFunc,
             int timezoneNameFuncPos,
             Function offsetFunc,
-            int offsetFuncPos
+            int offsetFuncPos,
+            Function sampleFromFunc,
+            int sampleFromFuncPos,
+            Function sampleToFunc,
+            int sampleToFuncPos
     ) {
         super(
                 configuration,
                 recordFunctions,
                 timestampIndex,
+                timestampType,
                 timestampSampler,
                 groupByFunctions,
                 groupByFunctionsUpdater,
                 timezoneNameFunc,
                 timezoneNameFuncPos,
                 offsetFunc,
-                offsetFuncPos
+                offsetFuncPos,
+                sampleFromFunc,
+                sampleFromFuncPos,
+                sampleToFunc,
+                sampleToFuncPos
         );
         this.map = map;
         this.keyMapSink = keyMapSink;
         record.of(map.getRecord());
         mapCursor = map.getCursor();
-        isOpen = true;
+        // Lazy map (openOnInit=false): start closed so of() allocates the backing
+        // under the bound MemoryTracker on the first cursor.
+        isOpen = false;
     }
 
     @Override
@@ -106,13 +117,13 @@ class SampleByFillNoneRecordCursor extends AbstractVirtualRecordSampleByCursor {
 
     @Override
     public void of(RecordCursor base, SqlExecutionContext executionContext) throws SqlException {
+        // isOpen before super.of() so an of() breach frees the base cursor via close().
+        isOpen = true;
         super.of(base, executionContext);
-        if (!isOpen) {
-            isOpen = true;
-            map.reopen();
-        }
+        // Bind+reopen the map as super.of() does the allocator; reopen() is idempotent.
+        map.setMemoryTracker(executionContext.getMemoryTracker());
+        map.reopen();
         rowId = 0;
-        isHasNextPending = false;
         isMapBuildPending = true;
     }
 
@@ -120,7 +131,6 @@ class SampleByFillNoneRecordCursor extends AbstractVirtualRecordSampleByCursor {
     public void toTop() {
         super.toTop();
         rowId = 0;
-        isHasNextPending = false;
         isMapBuildPending = true;
     }
 
@@ -132,41 +142,34 @@ class SampleByFillNoneRecordCursor extends AbstractVirtualRecordSampleByCursor {
         }
 
         final long next = timestampSampler.nextTimestamp(localEpoch);
-        boolean baseHasNext = true;
-        while (baseHasNext) {
-            if (!isHasNextPending) {
-                long timestamp = getBaseRecordTimestamp();
-                if (timestamp < next) {
-                    circuitBreaker.statefulThrowExceptionIfTripped();
+        do {
+            long timestamp = getBaseRecordTimestamp();
+            if (timestamp < next) {
+                circuitBreaker.statefulThrowExceptionIfTripped();
 
-                    adjustDstInFlight(timestamp - tzOffset);
-                    final MapKey key = map.withKey();
-                    keyMapSink.copy(baseRecord, key);
-                    MapValue value = key.createValue();
-                    if (value.isNew()) {
-                        groupByFunctionsUpdater.updateNew(value, baseRecord, rowId++);
-                    } else {
-                        groupByFunctionsUpdater.updateExisting(value, baseRecord, rowId++);
-                    }
+                adjustDstInFlight(timestamp - tzOffset);
+                final MapKey key = map.withKey();
+                keyMapSink.copy(baseRecord, key);
+                MapValue value = key.createValue();
+                if (value.isNew()) {
+                    groupByFunctionsUpdater.updateNew(value, baseRecord, rowId++);
                 } else {
-                    // map value is conditional and only required when clock goes back
-                    // we override base method for when this happens
-                    // see: updateValueWhenClockMovesBack()
-                    timestamp = adjustDst(timestamp, null, next);
-                    if (timestamp != Long.MIN_VALUE) {
-                        nextSamplePeriod(timestamp);
-                        // reset map iterator
-                        map.getCursor();
-                        isMapBuildPending = true;
-                        return;
-                    }
+                    groupByFunctionsUpdater.updateExisting(value, baseRecord, rowId++);
+                }
+            } else {
+                // map value is conditional and only required when clock goes back
+                // we override base method for when this happens
+                // see: updateValueWhenClockMovesBack()
+                timestamp = adjustDst(timestamp, null, next);
+                if (timestamp != Long.MIN_VALUE) {
+                    nextSamplePeriod(timestamp);
+                    // reset map iterator
+                    map.getCursor();
+                    isMapBuildPending = true;
+                    return;
                 }
             }
-
-            isHasNextPending = true;
-            baseHasNext = baseCursor.hasNext();
-            isHasNextPending = false;
-        }
+        } while (baseCursor.hasNext());
 
         // we ran out of data, make sure hasNext() returns false at the next
         // opportunity, after we stream map that is.

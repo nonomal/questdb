@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2023 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -39,11 +39,11 @@ import org.jetbrains.annotations.Nullable;
  * sequence itself.
  * <br>
  * The information about whether a stored sequence is direct or not is not stored in the header of the Holder. Instead, the
- * top bit of the pointer returned by {@link #ptr()} is used to store this information. This is done to save space in the
- * header and to avoid the need to store this information separately. Thus, the value returned by {@link #ptr()} cannot
+ * top bit of the pointer returned by {@link #colouredPtr()} is used to store this information. This is done to save space in the
+ * header and to avoid the need to store this information separately. Thus, the value returned by {@link #colouredPtr()} cannot
  * be used as a pointer directly and should be treated as an opaque value.
  * <p>
- * Uses provided {@link GroupByAllocatorImpl} to allocate the underlying buffer. Grows the buffer when needed.
+ * Uses provided {@link GroupByAllocator} to allocate the underlying buffer. Grows the buffer when needed.
  * <p>
  * Buffer layout is the following:
  * <pre>
@@ -77,11 +77,11 @@ public class StableAwareUtf8StringHolder implements Utf8Sequence {
         if (direct) {
             // we could cache the direct pointer, but then we would need to invalidate it when the pointer changes
             // and we assume of() is called more frequently than charAt()
-            long directPtr = Unsafe.getUnsafe().getLong(ptr + HEADER_SIZE);
+            long directPtr = Unsafe.getLong(ptr + HEADER_SIZE);
             assert directPtr != 0;
-            return Unsafe.getUnsafe().getByte(directPtr + index);
+            return Unsafe.getByte(directPtr + index);
         } else {
-            return Unsafe.getUnsafe().getByte(ptr + HEADER_SIZE + index);
+            return Unsafe.getByte(ptr + HEADER_SIZE + index);
         }
     }
 
@@ -93,34 +93,39 @@ public class StableAwareUtf8StringHolder implements Utf8Sequence {
         if (us.isStable()) {
             direct = true;
             checkCapacity(8); // pointer is 8 bytes
-            Unsafe.getUnsafe().putLong(ptr + HEADER_SIZE, us.ptr());
-            Unsafe.getUnsafe().putInt(ptr + SIZE_OFFSET, us.size());
-            Unsafe.getUnsafe().putBoolean(null, ptr + IS_ASCII_OFFSET, us.isAscii());
+            Unsafe.putLong(ptr + HEADER_SIZE, us.ptr());
+            Unsafe.putInt(ptr + SIZE_OFFSET, us.size());
+            Unsafe.putBoolean(null, ptr + IS_ASCII_OFFSET, us.isAscii());
         } else {
             int thatSize = us.size();
             checkCapacity(thatSize);
             long lo = ptr + HEADER_SIZE;
             us.writeTo(lo, 0, thatSize);
-            Unsafe.getUnsafe().putInt(ptr + SIZE_OFFSET, thatSize);
-            Unsafe.getUnsafe().putBoolean(null, ptr + IS_ASCII_OFFSET, us.isAscii());
+            Unsafe.putInt(ptr + SIZE_OFFSET, thatSize);
+            Unsafe.putBoolean(null, ptr + IS_ASCII_OFFSET, us.isAscii());
         }
+    }
+
+    public long colouredPtr() {
+        return ptr | (direct ? 0x8000000000000000L : 0);
     }
 
     @Override
     public boolean isAscii() {
-        return ptr == 0 || Unsafe.getUnsafe().getBoolean(null, ptr + IS_ASCII_OFFSET);
+        return ptr == 0 || Unsafe.getBoolean(null, ptr + IS_ASCII_OFFSET);
     }
 
-    public StableAwareUtf8StringHolder of(long ptr) {
+    public StableAwareUtf8StringHolder of(long colouredPtr) {
         // clear the top bit
-        this.ptr = ptr & 0x7FFFFFFFFFFFFFFFL;
+        this.ptr = colouredPtr & 0x7FFFFFFFFFFFFFFFL;
         // extract the top bit
-        this.direct = (ptr & 0x8000000000000000L) != 0;
+        this.direct = (colouredPtr & 0x8000000000000000L) != 0;
         return this;
     }
 
+    @Override
     public long ptr() {
-        return ptr | (direct ? 0x8000000000000000L : 0);
+        return ptr;
     }
 
     public void setAllocator(GroupByAllocator allocator) {
@@ -129,11 +134,11 @@ public class StableAwareUtf8StringHolder implements Utf8Sequence {
 
     @Override
     public int size() {
-        return ptr != 0 ? Unsafe.getUnsafe().getInt(ptr + SIZE_OFFSET) : 0;
+        return ptr != 0 ? Unsafe.getInt(ptr + SIZE_OFFSET) : 0;
     }
 
     private int capacity() {
-        return ptr != 0 ? Unsafe.getUnsafe().getInt(ptr) : 0;
+        return ptr != 0 ? Unsafe.getInt(ptr) : 0;
     }
 
     private void checkCapacity(int bytes) {
@@ -150,12 +155,12 @@ public class StableAwareUtf8StringHolder implements Utf8Sequence {
         long newSize = newCapacity + HEADER_SIZE;
         if (ptr == 0) {
             ptr = allocator.malloc(newSize);
-            Unsafe.getUnsafe().putInt(ptr, newCapacity);
-            Unsafe.getUnsafe().putInt(ptr + SIZE_OFFSET, 0);
-            Unsafe.getUnsafe().putBoolean(null, ptr + IS_ASCII_OFFSET, true);
+            Unsafe.putInt(ptr, newCapacity);
+            Unsafe.putInt(ptr + SIZE_OFFSET, 0);
+            Unsafe.putBoolean(null, ptr + IS_ASCII_OFFSET, true);
         } else {
             ptr = allocator.realloc(ptr, capacity + HEADER_SIZE, newSize);
-            Unsafe.getUnsafe().putInt(ptr, newCapacity);
+            Unsafe.putInt(ptr, newCapacity);
         }
 
         assert ptr != 0;
@@ -165,8 +170,8 @@ public class StableAwareUtf8StringHolder implements Utf8Sequence {
 
     private void clear() {
         if (ptr != 0) {
-            Unsafe.getUnsafe().putInt(ptr + SIZE_OFFSET, 0);
-            Unsafe.getUnsafe().putBoolean(null, ptr + IS_ASCII_OFFSET, true);
+            Unsafe.putInt(ptr + SIZE_OFFSET, 0);
+            Unsafe.putBoolean(null, ptr + IS_ASCII_OFFSET, true);
             direct = false;
         }
     }

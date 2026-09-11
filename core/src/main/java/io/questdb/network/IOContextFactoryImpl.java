@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -28,20 +28,19 @@ import io.questdb.cairo.CairoException;
 import io.questdb.mp.EagerThreadSetup;
 import io.questdb.std.Misc;
 import io.questdb.std.ObjectFactory;
-import io.questdb.std.ThreadLocal;
+import io.questdb.std.CarrierLocal;
 import io.questdb.std.WeakMutableObjectPool;
-import org.jetbrains.annotations.NotNull;
 
 import java.io.Closeable;
 
 public class IOContextFactoryImpl<C extends IOContext<C>> implements IOContextFactory<C>, Closeable, EagerThreadSetup {
 
-    private final ThreadLocal<WeakMutableObjectPool<C>> contextPool;
+    private final CarrierLocal<WeakMutableObjectPool<C>> contextPool;
     private volatile boolean closed = false;
 
     public IOContextFactoryImpl(ObjectFactory<C> factory, int poolSize) {
         // todo: this is very slow, refactor
-        this.contextPool = new ThreadLocal<>(() -> new WeakMutableObjectPool<>(factory, poolSize));
+        this.contextPool = new CarrierLocal<>(() -> new WeakMutableObjectPool<>(factory, poolSize));
     }
 
     @Override
@@ -59,15 +58,14 @@ public class IOContextFactoryImpl<C extends IOContext<C>> implements IOContextFa
     }
 
     public void freeThreadLocal() {
-        // helper call, it will free only thread-local instance and not others
-        Misc.free(contextPool);
+        contextPool.removeAndFree();
     }
 
-    public C newInstance(int fd, @NotNull IODispatcher<C> dispatcher) {
+    public C newInstance(long fd) {
         WeakMutableObjectPool<C> pool = contextPool.get();
         C context = pool.pop();
         try {
-            return context.of(fd, dispatcher);
+            return context.of(fd);
         } catch (CairoException e) {
             if (e.isCritical()) {
                 context.close();

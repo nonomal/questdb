@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -33,6 +33,7 @@ import io.questdb.griffin.engine.functions.constants.StrConstant;
 import io.questdb.griffin.engine.functions.constants.VarcharConstant;
 import io.questdb.std.IntList;
 import io.questdb.std.IntObjHashMap;
+import io.questdb.std.Misc;
 import io.questdb.std.ObjList;
 
 import static io.questdb.cairo.ColumnType.*;
@@ -60,9 +61,27 @@ public class TypeOfFunctionFactory implements FunctionFactory {
             if (argType == UNDEFINED) {
                 throw SqlException.$(position, "bind variables are not supported");
             }
-            return isNull(argType) ? NULL : TYPE_NAMES.get(argType);
+            final Function result;
+            if (isNull(argType)) {
+                result = NULL;
+            } else if (isDecimal(argType)) {
+                // there are thousands of DECIMAL(p,s) types, resolve the name on demand
+                result = new StrConstant(nameOf(argType));
+            } else {
+                result = TYPE_NAMES.get(argType);
+            }
+            if (result != null) {
+                // the returned constant keeps no argument, so this branch owns it
+                Misc.free(arg);
+            }
+            return result;
         }
         throw SqlException.$(position, "exactly one argument expected");
+    }
+
+    @Override
+    public int resolvePreferredVariadicType(int sqlPos, int argPos, ObjList<Function> args) throws SqlException {
+        throw SqlException.$(sqlPos, "bind variables are not supported");
     }
 
     static {
@@ -73,7 +92,8 @@ public class TypeOfFunctionFactory implements FunctionFactory {
         TYPE_NAMES.put(INT, new StrConstant(nameOf(INT)));
         TYPE_NAMES.put(LONG, new StrConstant(nameOf(LONG)));
         TYPE_NAMES.put(DATE, new StrConstant(nameOf(DATE)));
-        TYPE_NAMES.put(TIMESTAMP, new StrConstant(nameOf(TIMESTAMP)));
+        TYPE_NAMES.put(TIMESTAMP_MICRO, new StrConstant(nameOf(TIMESTAMP_MICRO)));
+        TYPE_NAMES.put(TIMESTAMP_NANO, new StrConstant(nameOf(TIMESTAMP_NANO)));
         TYPE_NAMES.put(FLOAT, new StrConstant(nameOf(FLOAT)));
         TYPE_NAMES.put(DOUBLE, new StrConstant(nameOf(DOUBLE)));
         TYPE_NAMES.put(STRING, new StrConstant(nameOf(STRING)));
@@ -97,5 +117,8 @@ public class TypeOfFunctionFactory implements FunctionFactory {
 
         TYPE_NAMES.put(IPv4, new StrConstant(nameOf(IPv4)));
         TYPE_NAMES.put(VARCHAR, new VarcharConstant(nameOf(VARCHAR)));
+        TYPE_NAMES.put(INTERVAL_RAW, new StrConstant(nameOf(INTERVAL)));
+        TYPE_NAMES.put(INTERVAL_TIMESTAMP_MICRO, new StrConstant(nameOf(INTERVAL)));
+        TYPE_NAMES.put(INTERVAL_TIMESTAMP_NANO, new StrConstant(nameOf(INTERVAL)));
     }
 }

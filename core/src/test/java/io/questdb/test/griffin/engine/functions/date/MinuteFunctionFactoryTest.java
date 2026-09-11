@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -30,40 +30,48 @@ import org.junit.Test;
 public class MinuteFunctionFactoryTest extends AbstractCairoTest {
     @Test
     public void testNull() throws Exception {
-        assertQuery(
-                "minute\n" +
-                        "null\n",
-                "select minute(null)",
-                null,
-                null,
-                true,
-                true
-        );
+        assertQuery("select minute(null)")
+                .ddl(null)
+                .expectSize()
+                .returns("""
+                        minute
+                        null
+                        """);
     }
 
     @Test
     public void testPreEpoch() throws Exception {
-        assertQuery(
-                "minute\n" +
-                        "11\n",
-                "select minute('1901-07-11T22:11:21.555998Z'::timestamp)",
-                null,
-                null,
-                true,
-                true
-        );
+        assertQuery("select minute('1901-07-11T22:11:21.555998Z'::timestamp)")
+                .ddl(null)
+                .expectSize()
+                .returns("""
+                        minute
+                        11
+                        """);
+        assertQuery("select minute('1901-07-11T22:11:21.555998123Z'::timestamp_ns)")
+                .ddl(null)
+                .expectSize()
+                .returns("""
+                        minute
+                        11
+                        """);
     }
 
     @Test
     public void testVanilla() throws Exception {
-        assertQuery(
-                "minute\n" +
-                        "8\n",
-                "select minute('1997-04-11T22:08:30.555555Z'::timestamp)",
-                null,
-                null,
-                true,
-                true
-        );
+        assertQuery("select minute('1997-04-11T22:08:30.555555Z'::timestamp)")
+                .ddl(null)
+                .expectSize()
+                .returns("""
+                        minute
+                        8
+                        """);
+        assertQuery("select minute('1997-04-11T22:08:30.555555123Z'::timestamp_ns)")
+                .ddl(null)
+                .expectSize()
+                .returns("""
+                        minute
+                        8
+                        """);
     }
 }

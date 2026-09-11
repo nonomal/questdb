@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -26,7 +26,6 @@ package io.questdb.cairo.wal;
 
 import io.questdb.cairo.sql.Record;
 import io.questdb.cairo.sql.RecordCursor;
-import io.questdb.std.Misc;
 
 public class WalDataCursor implements RecordCursor {
     private final WalDataRecord recordA = new WalDataRecord();
@@ -35,7 +34,7 @@ public class WalDataCursor implements RecordCursor {
 
     @Override
     public void close() {
-        reader = Misc.free(reader);
+        // No-op: the WalReader owns this cursor and is responsible for its lifecycle.
     }
 
     @Override
@@ -58,13 +57,16 @@ public class WalDataCursor implements RecordCursor {
     }
 
     public void of(WalReader reader) {
-        close();
-
         this.reader = reader;
         recordA.of(reader);
 
         final long segmentSize = reader.openSegment();
         maxRecordIndex = segmentSize - 1;
+    }
+
+    @Override
+    public long preComputedStateSize() {
+        return 0;
     }
 
     @Override

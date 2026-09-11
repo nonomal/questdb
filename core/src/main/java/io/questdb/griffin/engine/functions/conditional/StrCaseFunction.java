@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -28,8 +28,8 @@ import io.questdb.cairo.sql.Function;
 import io.questdb.cairo.sql.Record;
 import io.questdb.griffin.engine.functions.StrFunction;
 import io.questdb.std.ObjList;
-import io.questdb.std.str.Utf16Sink;
 
+@SuppressWarnings("resource")
 class StrCaseFunction extends StrFunction implements CaseFunction {
     private final ObjList<Function> args;
     private final CaseFunctionPicker picker;
@@ -40,13 +40,8 @@ class StrCaseFunction extends StrFunction implements CaseFunction {
     }
 
     @Override
-    public ObjList<Function> getArgs() {
+    public ObjList<Function> args() {
         return args;
-    }
-
-    @Override
-    public void getStr(Record rec, Utf16Sink utf16Sink) {
-        picker.pick(rec).getStr(rec, utf16Sink);
     }
 
     @Override

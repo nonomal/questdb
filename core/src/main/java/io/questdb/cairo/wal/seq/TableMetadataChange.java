@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -27,7 +27,21 @@ package io.questdb.cairo.wal.seq;
 import io.questdb.cairo.AlterTableContextException;
 import io.questdb.cairo.wal.MetadataService;
 
-@FunctionalInterface
 public interface TableMetadataChange {
+
     long apply(MetadataService svc, boolean contextAllowsAnyStructureChanges) throws AlterTableContextException;
+
+    /**
+     * Should return a non-null string in case when the operation on the base table leaves dependent mat views in invalid state.
+     */
+    default String matViewInvalidationReason() {
+        return null;
+    }
+
+    /**
+     * Returns true if the operation should trigger the re-compilation of dependent views.
+     */
+    default boolean shouldCompileDependentViews() {
+        return false;
+    }
 }

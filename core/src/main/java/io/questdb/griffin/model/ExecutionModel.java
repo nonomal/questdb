@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,19 +24,29 @@
 
 package io.questdb.griffin.model;
 
+import org.jetbrains.annotations.Nullable;
+
 public interface ExecutionModel {
-    int COPY = 5;
-    int CREATE_TABLE = 2;
-    int EXPLAIN = 7;
-    int INSERT = 4;
-    int MAX = EXPLAIN + 1;
-    int QUERY = 1;
-    int RENAME_TABLE = 3;
-    int UPDATE = 6;
+    int QUERY = 1;                          // 1
+    int CREATE_TABLE = QUERY + 1;           // 2
+    int RENAME_TABLE = CREATE_TABLE + 1;    // 3
+    int INSERT = RENAME_TABLE + 1;          // 4
+    int COPY = INSERT + 1;                  // 5
+    int UPDATE = COPY + 1;                  // 6
+    int EXPLAIN = UPDATE + 1;               // 7
+    int CREATE_MAT_VIEW = EXPLAIN + 1;      // 8
+    int CREATE_VIEW = CREATE_MAT_VIEW + 1;  // 9
+    int COMPILE_VIEW = CREATE_VIEW + 1;     // 10
+    int CREATE_LIVE_VIEW = COMPILE_VIEW + 1; // 11
+    int MAX = CREATE_LIVE_VIEW + 1;
 
     int getModelType();
 
-    default QueryModel getQueryModel() {
+    default IQueryModel getQueryModel() {
+        return null;
+    }
+
+    default @Nullable CharSequence getSelectText() {
         return null;
     }
 
@@ -63,6 +73,10 @@ public interface ExecutionModel {
             typeNameMap[ExecutionModel.COPY] = "Copy";
             typeNameMap[ExecutionModel.UPDATE] = "Update";
             typeNameMap[ExecutionModel.EXPLAIN] = "Explain";
+            typeNameMap[ExecutionModel.CREATE_MAT_VIEW] = "Create materialized";
+            typeNameMap[ExecutionModel.CREATE_VIEW] = "Create view";
+            typeNameMap[ExecutionModel.COMPILE_VIEW] = "Compile view";
+            typeNameMap[ExecutionModel.CREATE_LIVE_VIEW] = "Create live view";
         }
     }
 }

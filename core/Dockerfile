@@ -1,28 +1,82 @@
-FROM debian:bookworm
+FROM debian:bookworm AS builder
+
 ARG tag_name
+ARG GRAAL_JDK_VERSION=25.0.2
+ARG TARGETARCH
 
-ENV GOSU_VERSION=1.14
-ENV JDK_VERSION=17.0.11.9-1
+ENV GOSU_VERSION=1.19-go1.25.14
+ENV DEBIAN_FRONTEND=noninteractive
 
+# 1) Base tools + Maven
+# `git` is required by buildnumber-maven-plugin (core/pom.xml) at build time
+# to embed the HEAD revision; keep it installed even though the sources now
+# come from the build context rather than a `git clone`.
 RUN apt-get update \
-  && apt-get install --no-install-recommends git curl wget gnupg2 ca-certificates lsb-release software-properties-common unzip -y
+    && apt-get install --no-install-recommends -y \
+       git curl wget gnupg2 ca-certificates lsb-release software-properties-common unzip maven \
+    && rm -rf /var/lib/apt/lists/*
 
-RUN wget -O - https://apt.corretto.aws/corretto.key | gpg --dearmor -o /usr/share/keyrings/corretto-keyring.gpg && \
-    echo "deb [signed-by=/usr/share/keyrings/corretto-keyring.gpg] https://apt.corretto.aws stable main" | tee /etc/apt/sources.list.d/corretto.list && \
-    apt-get update && \
-    apt-get install --no-install-recommends -y java-17-amazon-corretto-jdk=1:${JDK_VERSION} && \
-    apt-get -y install maven
+# 2) Download GraalVM CE archive + SHA256, arch-aware
+RUN set -eux; \
+    : "${TARGETARCH:=amd64}"; \
+    case "$TARGETARCH" in \
+      amd64) ARCH_SUFFIX="linux-x64" ;; \
+      arm64) ARCH_SUFFIX="linux-aarch64" ;; \
+      *) echo "Unsupported TARGETARCH: $TARGETARCH" >&2; exit 1 ;; \
+    esac; \
+    echo "Building for TARGETARCH=${TARGETARCH}, using GraalVM suffix ${ARCH_SUFFIX}"; \
+    TAG="jdk-${GRAAL_JDK_VERSION}"; \
+    FILENAME="graalvm-community-jdk-${GRAAL_JDK_VERSION}_${ARCH_SUFFIX}_bin.tar.gz"; \
+    BASE_URL="https://github.com/graalvm/graalvm-ce-builds/releases/download/${TAG}"; \
+    mkdir -p /tmp/graalvm; \
+    cd /tmp/graalvm; \
+    curl -L -o "${FILENAME}" "${BASE_URL}/${FILENAME}"; \
+    curl -L -o "${FILENAME}.sha256" "${BASE_URL}/${FILENAME}.sha256"
 
-ENV JAVA_HOME=/usr/lib/jvm/java-17-amazon-corretto
-WORKDIR /build
+# 3) Verify SHA256 and install GraalVM CE
+RUN set -eux; \
+    : "${TARGETARCH:=amd64}"; \
+    case "$TARGETARCH" in \
+      amd64) ARCH_SUFFIX="linux-x64" ;; \
+      arm64) ARCH_SUFFIX="linux-aarch64" ;; \
+      *) echo "Unsupported TARGETARCH: $TARGETARCH" >&2; exit 1 ;; \
+    esac; \
+    cd /tmp/graalvm; \
+    FILENAME="graalvm-community-jdk-${GRAAL_JDK_VERSION}_${ARCH_SUFFIX}_bin.tar.gz"; \
+    # .sha256 contains only the hash, so wrap it with filename for sha256sum -c
+    HASH="$(cut -d ' ' -f1 "${FILENAME}.sha256")"; \
+    echo "${HASH}  ${FILENAME}" | sha256sum -c -; \
+    INSTALL_DIR="/usr/lib/jvm/graalvm-community-jdk-${GRAAL_JDK_VERSION}"; \
+    mkdir -p "${INSTALL_DIR}"; \
+    tar -xzf "${FILENAME}" -C "${INSTALL_DIR}" --strip-components=1; \
+    rm -rf /tmp/graalvm
+
+ENV JAVA_HOME=/usr/lib/jvm/graalvm-community-jdk-${GRAAL_JDK_VERSION}
+ENV PATH="${JAVA_HOME}/bin:${PATH}"
 
 RUN echo tag_name ${tag_name:-master}
 
-RUN git clone --depth=1 --progress --branch "${tag_name:-master}" --verbose https://github.com/questdb/questdb.git
-
 WORKDIR /build/questdb
 
-RUN mvn clean package -Djdk.lang.Process.launchMechanism=vfork -Dmaven.resolver.transport=wagon -Dmaven.wagon.httpconnectionManager.ttlSeconds=30 -DskipTests -P build-web-console,build-binaries
+COPY . .
+
+# Auto-detect how the java-questdb-client dependency must be resolved.
+# If core/pom.xml references a -SNAPSHOT client version, that artifact is not
+# published to Maven Central, so we build it from the bundled java-questdb-client
+# submodule by enabling the `local-client` Maven profile. For a released client
+# version we resolve it from Maven Central (no extra profile).
+# NOTE: for the SNAPSHOT path the submodule must be present in the build context
+# (the docker-release pipeline checks it out via `submodules: true`) and its
+# version must match questdb.client.version.
+RUN set -eux; \
+    CLIENT_VERSION="$(sed -n 's/.*<questdb.client.version>\(.*\)<\/questdb.client.version>.*/\1/p' core/pom.xml | head -1)"; \
+    echo "questdb.client.version=${CLIENT_VERSION}"; \
+    CLIENT_PROFILE=""; \
+    case "${CLIENT_VERSION}" in \
+      *-SNAPSHOT) echo "SNAPSHOT client detected, activating local-client profile"; CLIENT_PROFILE=",local-client" ;; \
+      *) echo "Release client detected, resolving from Maven Central" ;; \
+    esac; \
+    mvn clean package -Djdk.lang.Process.launchMechanism=vfork -Dmaven.resolver.transport=wagon -Dmaven.wagon.httpconnectionManager.ttlSeconds=30 -DskipTests -P "build-web-console,build-binaries${CLIENT_PROFILE}"
 
 WORKDIR /build/questdb/core/target
 
@@ -31,30 +85,84 @@ RUN tar xvfz questdb-*-rt-*.tar.gz
 RUN rm questdb-*-rt-*.tar.gz
 
 RUN dpkgArch="$(dpkg --print-architecture | awk -F- '{ print $NF }')"; \
-    wget -O gosu "https://github.com/tianon/gosu/releases/download/$GOSU_VERSION/gosu-$dpkgArch" && \
-    wget -O gosu.asc "https://github.com/tianon/gosu/releases/download/$GOSU_VERSION/gosu-$dpkgArch.asc" && \
-    export GNUPGHOME="$(mktemp -d)" && \
-    gpg --batch --keyserver hkps://keys.openpgp.org --recv-keys B42F6819007F00F88E364FD4036A9C25BF357DD4 && \
-    gpg --batch --verify gosu.asc gosu && \
-    gpgconf --kill all && \
-    rm -rf "$GNUPGHOME" gosu.asc && \
+    wget -O "gosu-$dpkgArch" "https://github.com/questdb/gosu/releases/download/$GOSU_VERSION/gosu-$dpkgArch" && \
+    wget -O SHA256SUMS "https://github.com/questdb/gosu/releases/download/$GOSU_VERSION/SHA256SUMS" && \
+    grep "gosu-$dpkgArch\$" SHA256SUMS | sha256sum -c - && \
+    rm SHA256SUMS && \
+    mv "gosu-$dpkgArch" gosu && \
     chmod +x gosu && \
     ./gosu --version && \
     ./gosu nobody true
 
-FROM debian:bookworm-slim
+##############################################################################
+######################### Build for RedHat OpenShift #########################
+##############################################################################
+
+FROM registry.access.redhat.com/ubi10/ubi-minimal AS rhel
+ARG tag_name
 
 WORKDIR /app
 
-COPY --from=0 /build/questdb/core/target/questdb-*-rt-* .
-COPY --from=0 /build/questdb/core/target/gosu /usr/local/bin/gosu
+COPY --from=builder /build/questdb/core/target/questdb-*-rt-* .
 
-COPY docker-entrypoint.sh /docker-entrypoint.sh
+COPY core/docker-entrypoint.sh /docker-entrypoint.sh
+RUN chmod +x /docker-entrypoint.sh
+
+# Add license information
+RUN mkdir /licenses
+COPY core/LICENSE.txt /licenses
+
+LABEL name=QuestDB \
+    vendor=QuestDB \
+    summary="Provides the latest release of QuestDB" \
+    description="QuestDB is an open source time-series database for fast ingest and SQL queries" \
+    version=${tag_name:-master} \
+    release=${tag_name:-master} \
+    maintainer=QuestDB \
+    url="https://github.com/questdb/questdb"
+
+# Create questdb user and group
+RUN microdnf install -y shadow-utils util-linux grep && \
+    groupadd -g 10001 questdb && \
+    useradd -u 10001 -g 10001 -d /var/lib/questdb -M -s /sbin/nologin questdb && \
+    microdnf remove -y shadow-utils && \
+    microdnf clean all && \
+    mkdir -p /var/lib/questdb && \
+    chown -R questdb:questdb /var/lib/questdb
+
+USER questdb
+
+WORKDIR /var/lib/questdb
+
+# Make port 9000 available to the world outside this container
+EXPOSE 9000/tcp
+EXPOSE 8812/tcp
+EXPOSE 9009/tcp
+
+ENV DO_CHOWN="false"
+ENTRYPOINT ["/docker-entrypoint.sh"]
+
+##############################################################################
+########################## General-use Docker build ##########################
+##############################################################################
+
+FROM quay.io/fedora/fedora-minimal:44 AS questdb
+ARG tag_name
+
+WORKDIR /app
+
+COPY --from=builder /build/questdb/core/target/questdb-*-rt-* .
+COPY --from=builder /build/questdb/core/target/gosu /usr/local/bin/gosu
+
+COPY core/docker-entrypoint.sh /docker-entrypoint.sh
 RUN chmod +x /docker-entrypoint.sh
 
 # Create questdb user and group
-RUN groupadd -g 10001 questdb && \
+RUN microdnf install -y shadow-utils util-linux grep && \
+    groupadd -g 10001 questdb && \
     useradd -u 10001 -g 10001 -d /var/lib/questdb -M -s /sbin/nologin questdb && \
+    microdnf remove -y shadow-utils && \
+    microdnf clean all && \
     mkdir -p /var/lib/questdb && \
     chown -R questdb:questdb /var/lib/questdb
 

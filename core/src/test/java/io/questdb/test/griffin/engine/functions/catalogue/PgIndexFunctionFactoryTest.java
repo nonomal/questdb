@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -31,25 +31,17 @@ public class PgIndexFunctionFactoryTest extends AbstractCairoTest {
 
     @Test
     public void testPgIndexFunc() throws Exception {
-        assertQuery(
-                "indexrelid\tindrelid\tindnatts\tindnkeyatts\tindisunique\tindnullsnotdistinct\tindisprimary\tindisexclusion\tindimmediate\tindisclustered\tindisvalid\tindcheckxmin\tindisready\tindislive\tindisreplident\tindkey\tindcollation\tindclass\tindoption\tindexprs\tindpred\n",
-                "pg_index;",
-                "create table x(a int)",
-                null,
-                false,
-                true
-        );
+        assertQuery("pg_index;")
+                .ddl("create table x(a int)")
+                .expectSize()
+                .returns("indexrelid\tindrelid\tindnatts\tindnkeyatts\tindisunique\tindnullsnotdistinct\tindisprimary\tindisexclusion\tindimmediate\tindisclustered\tindisvalid\tindcheckxmin\tindisready\tindislive\tindisreplident\tindkey\tindcollation\tindclass\tindoption\tindexprs\tindpred\n");
     }
 
     @Test
     public void testPrefixedPgIndexFunc() throws Exception {
-        assertQuery(
-                "indexrelid\tindrelid\tindnatts\tindnkeyatts\tindisunique\tindnullsnotdistinct\tindisprimary\tindisexclusion\tindimmediate\tindisclustered\tindisvalid\tindcheckxmin\tindisready\tindislive\tindisreplident\tindkey\tindcollation\tindclass\tindoption\tindexprs\tindpred\n",
-                "pg_catalog.pg_index;",
-                "create table x(a int)",
-                null,
-                false,
-                true
-        );
+        assertQuery("pg_catalog.pg_index;")
+                .ddl("create table x(a int)")
+                .expectSize()
+                .returns("indexrelid\tindrelid\tindnatts\tindnkeyatts\tindisunique\tindnullsnotdistinct\tindisprimary\tindisexclusion\tindimmediate\tindisclustered\tindisvalid\tindcheckxmin\tindisready\tindislive\tindisreplident\tindkey\tindcollation\tindclass\tindoption\tindexprs\tindpred\n");
     }
 }

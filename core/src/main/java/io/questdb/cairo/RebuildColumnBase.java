@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -25,6 +25,8 @@
 package io.questdb.cairo;
 
 import io.questdb.cairo.sql.RecordMetadata;
+import io.questdb.log.Log;
+import io.questdb.log.LogFactory;
 import io.questdb.std.FilesFacade;
 import io.questdb.std.MemoryTag;
 import io.questdb.std.Misc;
@@ -41,15 +43,23 @@ import static io.questdb.cairo.TableUtils.TXN_FILE_NAME;
 import static io.questdb.cairo.TableUtils.lockName;
 
 public abstract class RebuildColumnBase implements Closeable, Mutable {
+    private static final Log LOG = LogFactory.getLog(RebuildColumnBase.class);
     static final int REBUILD_ALL_COLUMNS = -1;
     protected final CairoConfiguration configuration;
     protected final String unsupportedTableMessage = "Table does not have any indexes";
     private final MillisecondClock clock;
     private final StringSink tempStringSink = new StringSink();
+    // The committed table _txn the rebuild is operating against. Set by
+    // reindex callers that have a TxReader handy (reindexAfterUpdate gets it
+    // from tableWriter; reindex0 reads it from the .txn file). Concrete
+    // doReindex implementations use this to tag PostingIndexWriter chain
+    // entries with txnAtSeal=currentTableTxn so a future recovery walk does
+    // not mis-classify the rebuilt index as abandoned.
+    protected long currentTableTxn = -1L;
     protected Path path = new Path(255, MemoryTag.NATIVE_SQL_COMPILER);
     protected int rootLen;
     protected String unsupportedColumnMessage = "Wrong column type";
-    private int lockFd;
+    private long lockFd;
 
     public RebuildColumnBase(CairoConfiguration configuration) {
         this.configuration = configuration;
@@ -84,17 +94,12 @@ public abstract class RebuildColumnBase implements Closeable, Mutable {
         reindex(configuration.getFilesFacade(), partitionName, columnName);
     }
 
-    public void reindex(
-            FilesFacade ff,
-            @Nullable CharSequence partitionName,
-            @Nullable CharSequence columnName
-    ) {
+    public void reindex(FilesFacade ff, @Nullable CharSequence partitionName, @Nullable CharSequence columnName) {
         try {
             lock(ff);
             path.concat(TableUtils.COLUMN_VERSION_FILE_NAME);
             try (ColumnVersionReader columnVersionReader = new ColumnVersionReader().ofRO(ff, path.$())) {
-                final long deadline = clock.getTicks() + configuration.getSpinLockTimeout();
-                columnVersionReader.readSafe(clock, deadline);
+                columnVersionReader.readSafe(clock, configuration.getSpinLockTimeout());
                 path.trimTo(rootLen);
                 reindex0(ff, columnVersionReader, partitionName, columnName);
             }
@@ -104,7 +109,12 @@ public abstract class RebuildColumnBase implements Closeable, Mutable {
         }
     }
 
-    public void reindexAfterUpdate(FilesFacade ff, long partitionTimestamp, CharSequence columnName, TableWriter tableWriter) {
+    public void reindexAfterUpdate(
+            FilesFacade ff,
+            long partitionTimestamp,
+            CharSequence columnName,
+            TableWriter tableWriter
+    ) {
         TxReader txReader = tableWriter.getTxReader();
         int partitionIndex = txReader.getPartitionIndex(partitionTimestamp);
         assert partitionIndex > -1L;
@@ -119,10 +129,11 @@ public abstract class RebuildColumnBase implements Closeable, Mutable {
                 : txReader.getPartitionSize(partitionIndex);
 
         long partitionNameTxn = txReader.getPartitionNameTxn(partitionIndex);
+        currentTableTxn = txReader.getTxn();
 
         doReindex(
                 ff,
-                tableWriter.getColumnVersionReader(),
+                tableWriter.columnVersionReader(),
                 // this may not be needed, because table writer's column index is the same
                 // as metadata writers' index.
                 columnIndex,
@@ -130,8 +141,12 @@ public abstract class RebuildColumnBase implements Closeable, Mutable {
                 partitionNameTxn,
                 partitionSize,
                 partitionTimestamp,
+                tableWriter.getMetadata().getTimestampType(),
                 tableWriter.getPartitionBy(),
-                indexValueBlockCapacity
+                indexValueBlockCapacity,
+                metadata.getColumnIndexType(columnIndex),
+                metadata,
+                columnIndex
         );
     }
 
@@ -165,8 +180,12 @@ public abstract class RebuildColumnBase implements Closeable, Mutable {
                 partitionNameTxn,
                 partitionSize,
                 partitionTimestamp,
+                metadata.getTimestampType(),
                 partitionBy,
-                metadata.getIndexValueBlockCapacity(columnIndex)
+                metadata.getIndexValueBlockCapacity(columnIndex),
+                metadata.getColumnIndexType(columnIndex),
+                metadata,
+                columnIndex
         );
     }
 
@@ -179,7 +198,7 @@ public abstract class RebuildColumnBase implements Closeable, Mutable {
         }
 
         if (this.lockFd == -1) {
-            throw CairoException.nonCritical().put("Cannot lock table: ").put(path.$());
+            throw CairoException.nonCritical().put("cannot lock table: ").put(path.$());
         }
     }
 
@@ -192,7 +211,7 @@ public abstract class RebuildColumnBase implements Closeable, Mutable {
     ) {
         path.trimTo(rootLen).concat(TableUtils.META_FILE_NAME);
         try (TableReaderMetadata metadata = new TableReaderMetadata(configuration)) {
-            metadata.load(path.$());
+            metadata.loadMetadata(path.$());
             // Resolve column id if the column name specified
             final int columnIndex;
             if (columnName != null) {
@@ -204,16 +223,23 @@ public abstract class RebuildColumnBase implements Closeable, Mutable {
             path.trimTo(rootLen);
             final int partitionBy = metadata.getPartitionBy();
 
-            try (TxReader txReader = new TxReader(ff).ofRO(path.concat(TXN_FILE_NAME).$(), partitionBy)) {
+            try (TxReader txReader = new TxReader(ff).ofRO(path.concat(TXN_FILE_NAME).$(), metadata.getTimestampType(), partitionBy)) {
                 txReader.unsafeLoadAll();
+                currentTableTxn = txReader.getTxn();
                 path.trimTo(rootLen);
 
                 if (PartitionBy.isPartitioned(partitionBy)) {
                     // Resolve partition timestamp if partition name specified
                     if (partitionName != null) {
-                        final long partitionTimestamp = PartitionBy.parsePartitionDirName(partitionName, partitionBy);
+                        final long partitionTimestamp = PartitionBy.parsePartitionDirName(partitionName, metadata.getTimestampType(), partitionBy);
                         int partitionIndex = txReader.findAttachedPartitionIndexByLoTimestamp(partitionTimestamp);
                         if (partitionIndex > -1L) {
+                            if (txReader.isPartitionParquet(partitionIndex)) {
+                                // No local .d to rebuild from (folded into the parquet); reject
+                                // rather than wipe an index we cannot recreate.
+                                throw CairoException.nonCritical()
+                                        .put("cannot reindex parquet partition [partition=").put(partitionName).put(']');
+                            }
                             reindexPartition(
                                     ff,
                                     metadata,
@@ -227,6 +253,14 @@ public abstract class RebuildColumnBase implements Closeable, Mutable {
                         }
                     } else {
                         for (int partitionIndex = txReader.getPartitionCount() - 1; partitionIndex > -1; partitionIndex--) {
+                            if (txReader.isPartitionParquet(partitionIndex)) {
+                                // No local .d to rebuild from; skip so the existing index survives and
+                                // the native partitions still get reindexed.
+                                LOG.info().$("skipping parquet partition during reindex, index left intact [path=").$(path)
+                                        .$(", ts=").$ts(ColumnType.getTimestampDriver(metadata.getTimestampType()), txReader.getPartitionTimestampByIndex(partitionIndex))
+                                        .I$();
+                                continue;
+                            }
                             reindexPartition(
                                     ff,
                                     metadata,
@@ -354,8 +388,16 @@ public abstract class RebuildColumnBase implements Closeable, Mutable {
             long partitionNameTxn,
             long partitionSize,
             long partitionTimestamp,
+            int timestampType,
             int partitionBy,
-            int indexValueBlockCapacity
+            int indexValueBlockCapacity,
+            byte indexType,
+            // The metadata reference and the column's dense index are
+            // required for POSTING covering rebuilds: the seal needs to
+            // look up covering column names/types from metadata. They are
+            // ignored by indexers that don't support covering.
+            RecordMetadata metadata,
+            int columnIndex
     );
 
     protected abstract boolean isSupportedColumn(RecordMetadata metadata, int columnIndex);

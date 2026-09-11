@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -31,27 +31,23 @@ public class PgGetSIExprFunctionFactoryTest extends AbstractCairoTest {
 
     @Test
     public void testPgGetSIExprFunc() throws Exception {
-        assertQuery(
-                "pg_get_expr\n" +
-                        "\n",
-                "select pg_get_expr('abc', 42);",
-                null,
-                null,
-                true,
-                true
-        );
+        assertQuery("select pg_get_expr('abc', 42);")
+                .ddl(null)
+                .expectSize()
+                .returns("""
+                        pg_get_expr
+                        
+                        """);
     }
 
     @Test
     public void testPrefixedPgGetSIExprFunc() throws Exception {
-        assertQuery(
-                "pg_get_expr\n" +
-                        "\n",
-                "select pg_catalog.pg_get_expr('abc', 42);",
-                null,
-                null,
-                true,
-                true
-        );
+        assertQuery("select pg_catalog.pg_get_expr('abc', 42);")
+                .ddl(null)
+                .expectSize()
+                .returns("""
+                        pg_get_expr
+                        
+                        """);
     }
 }

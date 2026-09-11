@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,11 +24,16 @@
 
 package io.questdb.test.griffin;
 
-import io.questdb.cairo.*;
+import io.questdb.cairo.FullPartitionFrameCursorFactory;
+import io.questdb.cairo.GenericRecordMetadata;
+import io.questdb.cairo.TableReader;
+import io.questdb.cairo.TableReaderMetadata;
+import io.questdb.cairo.TableWriter;
+import io.questdb.cairo.sql.PartitionFrameCursorFactory;
 import io.questdb.cairo.sql.RecordCursor;
 import io.questdb.cairo.sql.RecordCursorFactory;
-import io.questdb.griffin.engine.table.DataFrameRecordCursorFactory;
-import io.questdb.griffin.engine.table.DataFrameRowCursorFactory;
+import io.questdb.griffin.engine.table.PageFrameRecordCursorFactory;
+import io.questdb.griffin.engine.table.PageFrameRowCursorFactory;
 import io.questdb.std.IntList;
 import io.questdb.test.AbstractCairoTest;
 import org.junit.Assert;
@@ -56,7 +61,9 @@ public class OrderByAscRowSkippingTest extends AbstractCairoTest {
         assertMemoryLeak(() -> {
             prepare2partitionsTable();
 
-            assertQuery("l\n1\n2\n3\n", "select l from tab order by ts limit 3");
+            assertQuery("select l from tab order by ts limit 3")
+                    .expectSize()
+                    .returns("l\n1\n2\n3\n");
         });
     }
 
@@ -65,7 +72,7 @@ public class OrderByAscRowSkippingTest extends AbstractCairoTest {
         assertMemoryLeak(() -> {
             prepare2partitionsTable();
 
-            assertQuery("l\n", "select l from tab order by ts limit 8,8");
+            assertEmpty("select l from tab order by ts limit 8,8");
         });
     }
 
@@ -73,8 +80,9 @@ public class OrderByAscRowSkippingTest extends AbstractCairoTest {
     public void test2partitionsSelectLastN() throws Exception {
         assertMemoryLeak(() -> {
             prepare2partitionsTable();
-
-            assertQuery("l\n8\n9\n10\n", "select l from tab order by ts limit -3", true);
+            assertQuery("select l from tab order by ts limit -3")
+                    .expectSize()
+                    .returns("l\n8\n9\n10\n");
         });
     }
 
@@ -83,7 +91,7 @@ public class OrderByAscRowSkippingTest extends AbstractCairoTest {
         assertMemoryLeak(() -> {
             prepare2partitionsTable();
 
-            assertQuery("l\n", "select l from tab order by ts limit -8,-8");
+            assertEmpty("select l from tab order by ts limit -8,-8");
         });
     }
 
@@ -92,7 +100,9 @@ public class OrderByAscRowSkippingTest extends AbstractCairoTest {
         assertMemoryLeak(() -> {
             prepare2partitionsTable();
 
-            assertQuery("l\n5\n6\n", "select l from tab order by ts limit 4,-4");
+            assertQuery("select l from tab order by ts limit 4,-4")
+                    .expectSize()
+                    .returns("l\n5\n6\n");
         });
     }
 
@@ -101,7 +111,9 @@ public class OrderByAscRowSkippingTest extends AbstractCairoTest {
         assertMemoryLeak(() -> {
             prepare2partitionsTable();
 
-            assertQuery("l\n3\n4\n5\n", "select l from tab order by ts limit -8,-5");
+            assertQuery("select l from tab order by ts limit -8,-5")
+                    .expectSize()
+                    .returns("l\n3\n4\n5\n");
         });
     }
 
@@ -110,7 +122,9 @@ public class OrderByAscRowSkippingTest extends AbstractCairoTest {
         assertMemoryLeak(() -> {
             prepare2partitionsTable();
 
-            assertQuery("l\n6\n7\n8\n", "select l from tab order by ts limit 5,8");
+            assertQuery("select l from tab order by ts limit 5,8")
+                    .expectSize()
+                    .returns("l\n6\n7\n8\n");
         });
     }
 
@@ -119,7 +133,7 @@ public class OrderByAscRowSkippingTest extends AbstractCairoTest {
         assertMemoryLeak(() -> {
             prepare2partitionsTable();
 
-            assertQuery("l\n", "select l from tab order by ts limit -11,-15");
+            assertEmpty("select l from tab order by ts limit -11,-15");
         });
     }
 
@@ -128,7 +142,7 @@ public class OrderByAscRowSkippingTest extends AbstractCairoTest {
         assertMemoryLeak(() -> {
             prepare2partitionsTable();
 
-            assertQuery("l\n", "select l from tab order by ts limit 11,12");
+            assertEmpty("select l from tab order by ts limit 11,12");
         });
     }
 
@@ -137,7 +151,9 @@ public class OrderByAscRowSkippingTest extends AbstractCairoTest {
         assertMemoryLeak(() -> {
             prepare2partitionsTable();
 
-            assertQuery("l\n9\n10\n", "select l from tab order by ts limit 8,12");
+            assertQuery("select l from tab order by ts limit 8,12")
+                    .expectSize()
+                    .returns("l\n9\n10\n");
         });
     }
 
@@ -146,7 +162,9 @@ public class OrderByAscRowSkippingTest extends AbstractCairoTest {
         assertMemoryLeak(() -> {
             prepare2partitionsTable();
 
-            assertQuery("l\n1\n2\n", "select l from tab order by ts limit -12,-8");
+            assertQuery("select l from tab order by ts limit -12,-8")
+                    .expectSize()
+                    .returns("l\n1\n2\n");
         });
     }
 
@@ -156,7 +174,7 @@ public class OrderByAscRowSkippingTest extends AbstractCairoTest {
         assertMemoryLeak(() -> {
             createEmptyTable();
 
-            assertQuery("l\n", "select l from tab order by ts");
+            assertEmpty("select l from tab order by ts");
         });
     }
 
@@ -165,7 +183,7 @@ public class OrderByAscRowSkippingTest extends AbstractCairoTest {
         assertMemoryLeak(() -> {
             createEmptyTable();
 
-            assertQuery("l\n", "select l from tab order by ts limit 3");
+            assertEmpty("select l from tab order by ts limit 3");
         });
     }
 
@@ -174,7 +192,7 @@ public class OrderByAscRowSkippingTest extends AbstractCairoTest {
         assertMemoryLeak(() -> {
             createEmptyTable();
 
-            assertQuery("l\n", "select l from tab order by ts limit 8,8");
+            assertEmpty("select l from tab order by ts limit 8,8");
         });
     }
 
@@ -183,7 +201,7 @@ public class OrderByAscRowSkippingTest extends AbstractCairoTest {
         assertMemoryLeak(() -> {
             createEmptyTable();
 
-            assertQuery("l\n", "select l from tab order by ts limit -3");
+            assertEmpty("select l from tab order by ts limit -3");
         });
     }
 
@@ -192,7 +210,7 @@ public class OrderByAscRowSkippingTest extends AbstractCairoTest {
         assertMemoryLeak(() -> {
             createEmptyTable();
 
-            assertQuery("l\n", "select l from tab order by ts limit -8,-8");
+            assertEmpty("select l from tab order by ts limit -8,-8");
         });
     }
 
@@ -201,7 +219,7 @@ public class OrderByAscRowSkippingTest extends AbstractCairoTest {
         assertMemoryLeak(() -> {
             createEmptyTable();
 
-            assertQuery("l\n", "select l from tab order by ts limit 4,-4");
+            assertEmpty("select l from tab order by ts limit 4,-4");
         });
     }
 
@@ -210,7 +228,7 @@ public class OrderByAscRowSkippingTest extends AbstractCairoTest {
         assertMemoryLeak(() -> {
             createEmptyTable();
 
-            assertQuery("l\n", "select l from tab order by ts limit -8,-5");
+            assertEmpty("select l from tab order by ts limit -8,-5");
         });
     }
 
@@ -219,7 +237,7 @@ public class OrderByAscRowSkippingTest extends AbstractCairoTest {
         assertMemoryLeak(() -> {
             createEmptyTable();
 
-            assertQuery("l\n", "select l from tab order by ts limit 5,8");
+            assertEmpty("select l from tab order by ts limit 5,8");
         });
     }
 
@@ -228,7 +246,7 @@ public class OrderByAscRowSkippingTest extends AbstractCairoTest {
         assertMemoryLeak(() -> {
             createEmptyTable();
 
-            assertQuery("l\n", "select l from tab order by ts limit -11,-15");
+            assertEmpty("select l from tab order by ts limit -11,-15");
         });
     }
 
@@ -237,7 +255,7 @@ public class OrderByAscRowSkippingTest extends AbstractCairoTest {
         assertMemoryLeak(() -> {
             createEmptyTable();
 
-            assertQuery("l\n", "select l from tab order by ts limit 11,12");
+            assertEmpty("select l from tab order by ts limit 11,12");
         });
     }
 
@@ -246,7 +264,7 @@ public class OrderByAscRowSkippingTest extends AbstractCairoTest {
         assertMemoryLeak(() -> {
             createEmptyTable();
 
-            assertQuery("l\n", "select l from tab order by ts limit 8,12");
+            assertEmpty("select l from tab order by ts limit 8,12");
         });
     }
 
@@ -255,7 +273,7 @@ public class OrderByAscRowSkippingTest extends AbstractCairoTest {
         assertMemoryLeak(() -> {
             createEmptyTable();
 
-            assertQuery("l\n", "select l from tab order by ts limit -8,-12");
+            assertEmpty("select l from tab order by ts limit -8,-12");
         });
     }
 
@@ -283,7 +301,7 @@ public class OrderByAscRowSkippingTest extends AbstractCairoTest {
         assertMemoryLeak(() -> {
             prepareNoDesignatedTsTable();
 
-            assertQuery("l\n", "select l from tab order by ts limit 8,8");
+            assertEmpty("select l from tab order by ts limit 8,8");
         });
     }
 
@@ -301,7 +319,7 @@ public class OrderByAscRowSkippingTest extends AbstractCairoTest {
         assertMemoryLeak(() -> {
             prepareNoDesignatedTsTable();
 
-            assertQuery("l\n", "select l from tab order by ts limit -8,-8");
+            assertEmpty("select l from tab order by ts limit -8,-8");
         });
     }
 
@@ -310,7 +328,9 @@ public class OrderByAscRowSkippingTest extends AbstractCairoTest {
         assertMemoryLeak(() -> {
             prepareNoDesignatedTsTable();
 
-            assertQuery("l\n5\n6\n", "select l from tab order by ts limit 4,-4");
+            assertQuery("select l from tab order by ts limit 4,-4")
+                    .expectSize()
+                    .returns("l\n5\n6\n");
         });
     }
 
@@ -337,7 +357,7 @@ public class OrderByAscRowSkippingTest extends AbstractCairoTest {
         assertMemoryLeak(() -> {
             prepareNoDesignatedTsTable();
 
-            assertQuery("l\n", "select l from tab order by ts limit -11,-15");
+            assertEmpty("select l from tab order by ts limit -11,-15");
         });
     }
 
@@ -346,7 +366,7 @@ public class OrderByAscRowSkippingTest extends AbstractCairoTest {
         assertMemoryLeak(() -> {
             prepareNoDesignatedTsTable();
 
-            assertQuery("l\n", "select l from tab order by ts limit 11,12");
+            assertEmpty("select l from tab order by ts limit 11,12");
         });
     }
 
@@ -392,7 +412,7 @@ public class OrderByAscRowSkippingTest extends AbstractCairoTest {
         assertMemoryLeak(() -> {
             prepareNoDesignatedTsTableWithDuplicates();
 
-            assertQuery("l\n", "select l from tab order by ts limit 8,8");
+            assertEmpty("select l from tab order by ts limit 8,8");
         });
     }
 
@@ -410,7 +430,7 @@ public class OrderByAscRowSkippingTest extends AbstractCairoTest {
         assertMemoryLeak(() -> {
             prepareNoDesignatedTsTableWithDuplicates();
 
-            assertQuery("l\n", "select l from tab order by ts limit -8,-8");
+            assertEmpty("select l from tab order by ts limit -8,-8");
         });
     }
 
@@ -419,7 +439,9 @@ public class OrderByAscRowSkippingTest extends AbstractCairoTest {
         assertMemoryLeak(() -> {
             prepareNoDesignatedTsTableWithDuplicates();
 
-            assertQuery("l\n5\n6\n", "select l from tab order by ts limit 9,-9");
+            assertQuery("select l from tab order by ts limit 9,-9")
+                    .expectSize()
+                    .returns("l\n5\n6\n");
         });
     }
 
@@ -446,7 +468,7 @@ public class OrderByAscRowSkippingTest extends AbstractCairoTest {
         assertMemoryLeak(() -> {
             prepareNoDesignatedTsTableWithDuplicates();
 
-            assertQuery("l\n", "select l from tab order by ts limit -25,-21");
+            assertEmpty("select l from tab order by ts limit -25,-21");
         });
     }
 
@@ -455,7 +477,7 @@ public class OrderByAscRowSkippingTest extends AbstractCairoTest {
         assertMemoryLeak(() -> {
             prepareNoDesignatedTsTableWithDuplicates();
 
-            assertQuery("l\n", "select l from tab order by ts limit 21,22");
+            assertEmpty("select l from tab order by ts limit 21,22");
         });
     }
 
@@ -492,7 +514,9 @@ public class OrderByAscRowSkippingTest extends AbstractCairoTest {
         assertMemoryLeak(() -> {
             prepareNormalTable();
 
-            assertQuery("l\n1\n2\n3\n", "select l from tab order by ts limit 3");
+            assertQuery("select l from tab order by ts limit 3")
+                    .expectSize()
+                    .returns("l\n1\n2\n3\n");
         });
     }
 
@@ -501,7 +525,7 @@ public class OrderByAscRowSkippingTest extends AbstractCairoTest {
         assertMemoryLeak(() -> {
             prepareNormalTable();
 
-            assertQuery("l\n", "select l from tab order by ts limit 8,8");
+            assertEmpty("select l from tab order by ts limit 8,8");
         });
     }
 
@@ -510,7 +534,9 @@ public class OrderByAscRowSkippingTest extends AbstractCairoTest {
         assertMemoryLeak(() -> {
             prepareNormalTable();
 
-            assertQuery("l\n8\n9\n10\n", "select l from tab order by ts limit -3", true);
+            assertQuery("select l from tab order by ts limit -3")
+                    .expectSize()
+                    .returns("l\n8\n9\n10\n");
         });
     }
 
@@ -519,7 +545,9 @@ public class OrderByAscRowSkippingTest extends AbstractCairoTest {
         assertMemoryLeak(() -> {
             prepareNormalTable();
 
-            assertQuery("l\n", "select l from tab order by ts limit -8,-8");
+            assertQuery("select l from tab order by ts limit -8,-8")
+                    .expectSize()
+                    .returns("l\n");
         });
     }
 
@@ -528,7 +556,9 @@ public class OrderByAscRowSkippingTest extends AbstractCairoTest {
         assertMemoryLeak(() -> {
             prepareNormalTable();
 
-            assertQuery("l\n5\n6\n", "select l from tab order by ts limit 4,-4");
+            assertQuery("select l from tab order by ts limit 4,-4")
+                    .expectSize()
+                    .returns("l\n5\n6\n");
         });
     }
 
@@ -537,7 +567,9 @@ public class OrderByAscRowSkippingTest extends AbstractCairoTest {
         assertMemoryLeak(() -> {
             prepareNormalTable();
 
-            assertQuery("l\n3\n4\n5\n", "select l from tab order by ts limit -8,-5");
+            assertQuery("select l from tab order by ts limit -8,-5")
+                    .expectSize()
+                    .returns("l\n3\n4\n5\n");
         });
     }
 
@@ -546,7 +578,9 @@ public class OrderByAscRowSkippingTest extends AbstractCairoTest {
         assertMemoryLeak(() -> {
             prepareNormalTable();
 
-            assertQuery("l\n6\n7\n8\n", "select l from tab order by ts limit 5,8");
+            assertQuery("select l from tab order by ts limit 5,8")
+                    .expectSize()
+                    .returns("l\n6\n7\n8\n");
         });
     }
 
@@ -555,7 +589,9 @@ public class OrderByAscRowSkippingTest extends AbstractCairoTest {
         assertMemoryLeak(() -> {
             prepareNormalTable();
 
-            assertQuery("l\n", "select l from tab order by ts limit -11,-15");
+            assertQuery("select l from tab order by ts limit -11,-15")
+                    .expectSize()
+                    .returns("l\n");
         });
     }
 
@@ -564,7 +600,9 @@ public class OrderByAscRowSkippingTest extends AbstractCairoTest {
         assertMemoryLeak(() -> {
             prepareNormalTable();
 
-            assertQuery("l\n", "select l from tab order by ts limit 11,12");
+            assertQuery("select l from tab order by ts limit 11,12")
+                    .expectSize()
+                    .returns("l\n");
         });
     }
 
@@ -573,7 +611,9 @@ public class OrderByAscRowSkippingTest extends AbstractCairoTest {
         assertMemoryLeak(() -> {
             prepareNormalTable();
 
-            assertQuery("l\n9\n10\n", "select l from tab order by ts limit 8,12");
+            assertQuery("select l from tab order by ts limit 8,12")
+                    .expectSize()
+                    .returns("l\n9\n10\n");
         });
     }
 
@@ -582,7 +622,18 @@ public class OrderByAscRowSkippingTest extends AbstractCairoTest {
         assertMemoryLeak(() -> {
             prepareNormalTable();
 
-            assertQuery("l\n1\n2\n", "select l from tab order by ts limit -12,-8");
+            assertQuery("select l from tab order by ts limit -12,-8")
+                    .expectSize()
+                    .returns("l\n1\n2\n");
+        });
+    }
+
+    @Test
+    public void testNormalTableSelectWithLimitOffset() throws Exception {
+        assertMemoryLeak(() -> {
+            prepareNormalTable();
+            assertQuery("select l from tab where l > 5 order by ts limit 2, 10")
+                    .returns("l\n8\n9\n10\n");
         });
     }
 
@@ -601,7 +652,9 @@ public class OrderByAscRowSkippingTest extends AbstractCairoTest {
         assertMemoryLeak(() -> {
             preparePartitionPerRowTable();
 
-            assertQuery("l\n1\n2\n3\n", "select l from tab order by ts limit 3");
+            assertQuery("select l from tab order by ts limit 3")
+                    .expectSize()
+                    .returns("l\n1\n2\n3\n");
         });
     }
 
@@ -610,7 +663,7 @@ public class OrderByAscRowSkippingTest extends AbstractCairoTest {
         assertMemoryLeak(() -> {
             preparePartitionPerRowTable();
 
-            assertQuery("l\n", "select l from tab order by ts limit 8,8");
+            assertEmpty("select l from tab order by ts limit 8,8");
         });
     }
 
@@ -619,7 +672,9 @@ public class OrderByAscRowSkippingTest extends AbstractCairoTest {
         assertMemoryLeak(() -> {
             preparePartitionPerRowTable();
 
-            assertQuery("l\n8\n9\n10\n", "select l from tab order by ts limit -3", true);
+            assertQuery("select l from tab order by ts limit -3")
+                    .expectSize()
+                    .returns("l\n8\n9\n10\n");
         });
     }
 
@@ -628,7 +683,9 @@ public class OrderByAscRowSkippingTest extends AbstractCairoTest {
         assertMemoryLeak(() -> {
             preparePartitionPerRowTable();
 
-            assertQuery("l\n", "select l from tab order by ts limit -8,-8");
+            assertQuery("select l from tab order by ts limit -8,-8")
+                    .expectSize()
+                    .returns("l\n");
         });
     }
 
@@ -637,7 +694,9 @@ public class OrderByAscRowSkippingTest extends AbstractCairoTest {
         assertMemoryLeak(() -> {
             preparePartitionPerRowTable();
 
-            assertQuery("l\n5\n6\n", "select l from tab order by ts limit 4,-4");
+            assertQuery("select l from tab order by ts limit 4,-4")
+                    .expectSize()
+                    .returns("l\n5\n6\n");
         });
     }
 
@@ -646,7 +705,9 @@ public class OrderByAscRowSkippingTest extends AbstractCairoTest {
         assertMemoryLeak(() -> {
             preparePartitionPerRowTable();
 
-            assertQuery("l\n3\n4\n5\n", "select l from tab order by ts limit -8,-5");
+            assertQuery("select l from tab order by ts limit -8,-5")
+                    .expectSize()
+                    .returns("l\n3\n4\n5\n");
         });
     }
 
@@ -655,7 +716,9 @@ public class OrderByAscRowSkippingTest extends AbstractCairoTest {
         assertMemoryLeak(() -> {
             preparePartitionPerRowTable();
 
-            assertQuery("l\n6\n7\n8\n", "select l from tab order by ts limit 5,8");
+            assertQuery("select l from tab order by ts limit 5,8")
+                    .expectSize()
+                    .returns("l\n6\n7\n8\n");
         });
     }
 
@@ -664,7 +727,7 @@ public class OrderByAscRowSkippingTest extends AbstractCairoTest {
         assertMemoryLeak(() -> {
             preparePartitionPerRowTable();
 
-            assertQuery("l\n", "select l from tab order by ts limit 11,12");
+            assertEmpty("select l from tab order by ts limit 11,12");
         });
     }
 
@@ -673,7 +736,9 @@ public class OrderByAscRowSkippingTest extends AbstractCairoTest {
         assertMemoryLeak(() -> {
             preparePartitionPerRowTable();
 
-            assertQuery("l\n9\n10\n", "select l from tab order by ts limit 8,12");
+            assertQuery("select l from tab order by ts limit 8,12")
+                    .expectSize()
+                    .returns("l\n9\n10\n");
         });
     }
 
@@ -682,7 +747,9 @@ public class OrderByAscRowSkippingTest extends AbstractCairoTest {
         assertMemoryLeak(() -> {
             preparePartitionPerRowTable();
 
-            assertQuery("l\n1\n2\n", "select l from tab order by ts limit -12,-8");
+            assertQuery("select l from tab order by ts limit -12,-8")
+                    .expectSize()
+                    .returns("l\n1\n2\n");
         });
     }
 
@@ -718,7 +785,6 @@ public class OrderByAscRowSkippingTest extends AbstractCairoTest {
     public void testPartitionPerRow_select_last_N_ordered_by_nonTs_column() throws Exception {
         assertMemoryLeak(() -> {
             preparePartitionPerRowTable();
-
             assertQueryExpectSize("l\n8\n9\n10\n", "select l from tab order by l asc limit -3");
         });
     }
@@ -728,11 +794,11 @@ public class OrderByAscRowSkippingTest extends AbstractCairoTest {
         assertMemoryLeak(() -> {
             preparePartitionPerRowTable();
 
-            assertQuery("l\n", "select l from tab order by ts limit -11,-15");
+            assertEmpty("select l from tab order by ts limit -11,-15");
         });
     }
 
-    // tests "partitionIndex == partitionCount - 1" conditional in FullFwdDataFrameCursor.skipTo()
+    // tests "partitionIndex == partitionCount - 1" conditional in FullFwdPartitionFrameCursor.skipTo()
     @Test
     public void testSkipBeyondEndOfNonEmptyTableReturnsNoRows() throws Exception {
         assertMemoryLeak(() -> {
@@ -746,7 +812,7 @@ public class OrderByAscRowSkippingTest extends AbstractCairoTest {
                 RecordCursor.Counter counter = new RecordCursor.Counter();
                 counter.set(11);
 
-                cursor.skipRows(counter);
+                cursor.skipRows(counter, RecordCursor.UNBOUNDED_ROW_COUNT);
 
                 Assert.assertTrue(counter.get() > 0);
                 Assert.assertFalse(cursor.hasNext());
@@ -775,7 +841,7 @@ public class OrderByAscRowSkippingTest extends AbstractCairoTest {
                 ) {
                     RecordCursor.Counter counter = new RecordCursor.Counter();
                     counter.set(1);
-                    cursor.skipRows(counter);
+                    cursor.skipRows(counter, RecordCursor.UNBOUNDED_ROW_COUNT);
 
                     Assert.assertEquals(1, counter.get());
                     Assert.assertFalse(cursor.hasNext());
@@ -786,7 +852,7 @@ public class OrderByAscRowSkippingTest extends AbstractCairoTest {
         });
     }
 
-    // tests "partitionCount < 1" conditional in FullFwdDataFrameCursor.skipTo()
+    // tests "partitionCount < 1" conditional in FullFwdPartitionFrameCursor.skipTo()
     @Test
     public void testSkipOverEmptyTableWithNoPartitionsReturnsNoRows() throws Exception {
         assertMemoryLeak(() -> {
@@ -799,7 +865,7 @@ public class OrderByAscRowSkippingTest extends AbstractCairoTest {
             ) {
                 RecordCursor.Counter counter = new RecordCursor.Counter();
                 counter.set(1);
-                cursor.skipRows(counter);
+                cursor.skipRows(counter, RecordCursor.UNBOUNDED_ROW_COUNT);
 
                 Assert.assertEquals(1, counter.get());
                 Assert.assertFalse(cursor.hasNext());
@@ -807,26 +873,19 @@ public class OrderByAscRowSkippingTest extends AbstractCairoTest {
         });
     }
 
-    private void assertQuery(String expected, String query) throws Exception {
-        assertQueryNoLeakCheck(
-                expected,
-                query,
-                null,
-                null,
-                true,
-                false
-        );
+    private void assertEmpty(String query) throws Exception {
+        assertQuery(query)
+                .noLeakCheck()
+                .ddl(null)
+                .returns("l\n");
     }
 
     private void assertQueryExpectSize(String expected, String query) throws Exception {
-        assertQueryNoLeakCheck(
-                expected,
-                query,
-                null,
-                null,
-                true,
-                true
-        );
+        assertQuery(query)
+                .noLeakCheck()
+                .ddl(null)
+                .expectSize()
+                .returns(expected);
     }
 
     private void createEmptyTable() throws Exception {
@@ -853,17 +912,18 @@ public class OrderByAscRowSkippingTest extends AbstractCairoTest {
         columnSizes.add(3);
         columnSizes.add(3);
 
-        return new DataFrameRecordCursorFactory(
+        return new PageFrameRecordCursorFactory(
                 engine.getConfiguration(),
                 metadata,
-                new FullFwdDataFrameCursorFactory(metadata.getTableToken(), reader.getMetadataVersion(), GenericRecordMetadata.copyOf(metadata)),
-                new DataFrameRowCursorFactory(),
+                new FullPartitionFrameCursorFactory(metadata.getTableToken(), reader.getMetadataVersion(), GenericRecordMetadata.copyOf(metadata), PartitionFrameCursorFactory.ORDER_ASC, null, 0, false),
+                new PageFrameRowCursorFactory(PartitionFrameCursorFactory.ORDER_ASC),
                 false,
                 null,
                 true,
                 columnIndexes,
                 columnSizes,
-                true
+                true,
+                false
         );
     }
 
@@ -925,7 +985,7 @@ public class OrderByAscRowSkippingTest extends AbstractCairoTest {
 
     private void runQueries(String... queries) throws Exception {
         for (String query : queries) {
-            compile(query);
+            execute(query);
         }
     }
 }

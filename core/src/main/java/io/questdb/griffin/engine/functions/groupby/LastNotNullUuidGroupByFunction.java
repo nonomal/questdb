@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -38,7 +38,9 @@ public class LastNotNullUuidGroupByFunction extends FirstUuidGroupByFunction {
     @Override
     public void computeNext(MapValue mapValue, Record record, long rowId) {
         if (!Uuid.isNull(arg.getLong128Lo(record), arg.getLong128Hi(record))) {
-            computeFirst(mapValue, record, rowId);
+            if (Uuid.isNull(mapValue.getLong128Lo(valueIndex + 1), mapValue.getLong128Hi(valueIndex + 1)) || rowId > mapValue.getLong(valueIndex)) {
+                computeFirst(mapValue, record, rowId);
+            }
         }
     }
 
@@ -56,7 +58,7 @@ public class LastNotNullUuidGroupByFunction extends FirstUuidGroupByFunction {
         }
         long srcRowId = srcValue.getLong(valueIndex);
         long destRowId = destValue.getLong(valueIndex);
-        if (srcRowId > destRowId) {
+        if (srcRowId > destRowId || Uuid.isNull(destValue.getLong128Lo(valueIndex + 1), destValue.getLong128Hi(valueIndex + 1))) {
             destValue.putLong(valueIndex, srcRowId);
             destValue.putLong128(valueIndex + 1, srcValLo, srcValHi);
         }

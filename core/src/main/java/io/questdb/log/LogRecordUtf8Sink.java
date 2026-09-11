@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -27,7 +27,15 @@ package io.questdb.log;
 import io.questdb.std.Misc;
 import io.questdb.std.Mutable;
 import io.questdb.std.Unsafe;
-import io.questdb.std.str.*;
+import io.questdb.std.str.AsciiCharSequence;
+import io.questdb.std.str.CharSink;
+import io.questdb.std.str.CharSinkEncoding;
+import io.questdb.std.str.DirectUtf8Sequence;
+import io.questdb.std.str.Sinkable;
+import io.questdb.std.str.Utf16Sink;
+import io.questdb.std.str.Utf8Sequence;
+import io.questdb.std.str.Utf8Sink;
+import io.questdb.std.str.Utf8s;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
@@ -41,6 +49,7 @@ public class LogRecordUtf8Sink implements Utf8Sink, DirectUtf8Sequence, Sinkable
     protected long _wptr;
     private boolean done = false;
     private int level;
+    private int[] ryuE10;
 
     public LogRecordUtf8Sink(long address, long addressSize) {
         this.address = _wptr = address;
@@ -54,7 +63,7 @@ public class LogRecordUtf8Sink implements Utf8Sink, DirectUtf8Sequence, Sinkable
 
     @Override
     public byte byteAt(int index) {
-        return Unsafe.getUnsafe().getByte(address + index);
+        return Unsafe.getByte(address + index);
     }
 
     @Override
@@ -108,7 +117,7 @@ public class LogRecordUtf8Sink implements Utf8Sink, DirectUtf8Sequence, Sinkable
     public Utf8Sink put(byte b) {
         final long left = lim - _wptr - EOL_LENGTH;
         if (left >= 4) { // 4 is the maximum byte length for a UTF-8 character.
-            Unsafe.getUnsafe().putByte(_wptr++, b);
+            Unsafe.putByte(_wptr++, b);
             return this;
         }
 
@@ -140,7 +149,7 @@ public class LogRecordUtf8Sink implements Utf8Sink, DirectUtf8Sequence, Sinkable
         }
 
         if (left >= needed) {
-            Unsafe.getUnsafe().putByte(_wptr++, b);
+            Unsafe.putByte(_wptr++, b);
         } else {
             done = true;
         }
@@ -164,7 +173,7 @@ public class LogRecordUtf8Sink implements Utf8Sink, DirectUtf8Sequence, Sinkable
         final long size = hi - lo;
         if (rem >= size) {
             // Common case where the buffer fits the available space.
-            Unsafe.getUnsafe().copyMemory(lo, _wptr, size);
+            Unsafe.copyMemory(lo, _wptr, size);
             _wptr += size;
             return this;
         }
@@ -175,16 +184,24 @@ public class LogRecordUtf8Sink implements Utf8Sink, DirectUtf8Sequence, Sinkable
         // NOTE: The computed length may be negative.
         long safeLen = rem - 4;
         if (safeLen > 0) {
-            Unsafe.getUnsafe().copyMemory(lo, _wptr, safeLen);
+            Unsafe.copyMemory(lo, _wptr, safeLen);
             _wptr += safeLen;
         }
 
         safeLen = Math.max(0, safeLen);
         for (long i = safeLen; i < rem; i++) {
             // Copying the final few bytes one at a time ensures we don't write any partial codepoints.
-            put(Unsafe.getUnsafe().getByte(lo + i));
+            put(Unsafe.getByte(lo + i));
         }
         return this;
+    }
+
+    @Override
+    public int[] ryuScratch() {
+        if (ryuE10 == null) {
+            ryuE10 = new int[1];
+        }
+        return ryuE10;
     }
 
     public void setLevel(int level) {
@@ -255,7 +272,7 @@ public class LogRecordUtf8Sink implements Utf8Sink, DirectUtf8Sequence, Sinkable
 
                 lookback:
                 for (; ptr >= boundary; --ptr) {
-                    final byte prev = Unsafe.getUnsafe().getByte(ptr);
+                    final byte prev = Unsafe.getByte(ptr);
                     multibyteLength = utf8ByteClass(prev);
                     switch (multibyteLength) {
                         case UTF8_BYTE_CLASS_BAD:

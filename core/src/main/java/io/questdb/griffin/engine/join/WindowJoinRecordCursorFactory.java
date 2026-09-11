@@ -1,0 +1,707 @@
+/*+*****************************************************************************
+ *     ___                  _   ____  ____
+ *    / _ \ _   _  ___  ___| |_|  _ \| __ )
+ *   | | | | | | |/ _ \/ __| __| | | |  _ \
+ *   | |_| | |_| |  __/\__ \ |_| |_| | |_) |
+ *    \__\_\\__,_|\___||___/\__|____/|____/
+ *
+ *  Copyright (c) 2014-2019 Appsicle
+ *  Copyright (c) 2019-2026 QuestDB
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *
+ *  http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ *
+ ******************************************************************************/
+
+package io.questdb.griffin.engine.join;
+
+import io.questdb.cairo.AbstractRecordCursorFactory;
+import io.questdb.cairo.ArrayColumnTypes;
+import io.questdb.cairo.CairoConfiguration;
+import io.questdb.cairo.CairoException;
+import io.questdb.cairo.ColumnType;
+import io.questdb.cairo.TimestampDriver;
+import io.questdb.cairo.sql.Function;
+import io.questdb.cairo.sql.NoRandomAccessRecordCursor;
+import io.questdb.cairo.sql.ParquetDecodeHint;
+import io.questdb.cairo.sql.Record;
+import io.questdb.cairo.sql.RecordCursor;
+import io.questdb.cairo.sql.RecordCursorFactory;
+import io.questdb.cairo.sql.RecordMetadata;
+import io.questdb.cairo.sql.SqlExecutionCircuitBreaker;
+import io.questdb.cairo.sql.SymbolTable;
+import io.questdb.cairo.sql.TimeFrameCursor;
+import io.questdb.cairo.sql.VirtualRecord;
+import io.questdb.griffin.PlanSink;
+import io.questdb.griffin.SqlException;
+import io.questdb.griffin.SqlExecutionContext;
+import io.questdb.griffin.engine.functions.GroupByFunction;
+import io.questdb.griffin.engine.functions.SymbolFunction;
+import io.questdb.griffin.engine.groupby.GroupByAllocator;
+import io.questdb.griffin.engine.groupby.GroupByAllocatorFactory;
+import io.questdb.griffin.engine.groupby.GroupByFunctionsUpdater;
+import io.questdb.griffin.engine.groupby.GroupByFunctionsUpdaterFactory;
+import io.questdb.griffin.engine.groupby.GroupByUtils;
+import io.questdb.griffin.engine.groupby.SimpleMapValue;
+import io.questdb.griffin.engine.table.SelectedRecord;
+import io.questdb.std.BytecodeAssembler;
+import io.questdb.std.IntList;
+import io.questdb.std.Misc;
+import io.questdb.std.ObjList;
+import io.questdb.std.Rows;
+import io.questdb.std.Transient;
+import org.jetbrains.annotations.NotNull;
+import org.jetbrains.annotations.Nullable;
+
+import static io.questdb.griffin.engine.join.AbstractAsOfJoinFastRecordCursor.scaleTimestamp;
+import static io.questdb.griffin.engine.join.AsyncWindowJoinRecordCursorFactory.addSaturating;
+import static io.questdb.griffin.engine.join.AsyncWindowJoinRecordCursorFactory.computeEffectiveBound;
+import static io.questdb.griffin.engine.join.AsyncWindowJoinRecordCursorFactory.findPrevailingForMasterRow;
+import static io.questdb.griffin.engine.join.AsyncWindowJoinRecordCursorFactory.subtractSaturating;
+
+/**
+ * Single-threaded WINDOW JOIN factory for general join conditions.
+ * <p>
+ * The master cursor drives the iteration. For every master row the slave cursor is traversed only
+ * within the timestamp window {@code [masterTs - windowLo, masterTs + windowHi]}, with timestamps
+ * scaled to nanoseconds when master and slave use different units. Matching slave rows are passed
+ * through an optional post-join filter and accumulated by the supplied {@link GroupByFunction}s
+ * into a {@link SimpleMapValue} that is exposed as a synthetic slave record via {@link OuterJoinRecord}.
+ *
+ * @see AsyncWindowJoinRecordCursorFactory for the multi-threaded variant
+ */
+public class WindowJoinRecordCursorFactory extends AbstractRecordCursorFactory {
+    private final int hiSign;
+    private final char hiTimeUnit;
+    private final boolean includePrevailing;
+    private final int loSign;
+    private final char loTimeUnit;
+    private final @Nullable TimestampDriver timestampDriver;
+    private final long windowHi;
+    private final long windowLo;
+    private WindowJoinRecordCursor cursor;
+    private ObjList<GroupByFunction> groupByFunctions;
+    private Function joinFilter;
+    private JoinRecordMetadata joinMetadata;
+    private RecordCursorFactory masterFactory;
+    private RecordCursorFactory slaveFactory;
+    private SimpleMapValue value;
+    private @Nullable Function windowHiFunc;
+    private @Nullable Function windowLoFunc;
+
+    public WindowJoinRecordCursorFactory(
+            @Transient @NotNull BytecodeAssembler asm,
+            CairoConfiguration configuration,
+            @NotNull RecordMetadata metadata,
+            @NotNull JoinRecordMetadata joinMetadata,
+            @NotNull RecordCursorFactory masterFactory,
+            @NotNull RecordCursorFactory slaveFactory,
+            boolean includePrevailing,
+            @Nullable IntList columnIndex,
+            long windowLo,
+            long windowHi,
+            @Nullable Function windowLoFunc,
+            @Nullable Function windowHiFunc,
+            int loSign,
+            int hiSign,
+            char loTimeUnit,
+            char hiTimeUnit,
+            @Nullable TimestampDriver timestampDriver,
+            @NotNull ObjList<GroupByFunction> groupByFunctions,
+            @NotNull ArrayColumnTypes columnTypes,
+            @Nullable Function joinFilter
+    ) {
+        super(metadata);
+        try {
+            this.masterFactory = masterFactory;
+            this.slaveFactory = slaveFactory;
+            this.joinMetadata = joinMetadata;
+            this.joinFilter = joinFilter;
+            this.groupByFunctions = groupByFunctions;
+            this.windowLo = windowLo;
+            this.windowHi = windowHi;
+            this.windowLoFunc = windowLoFunc;
+            this.windowHiFunc = windowHiFunc;
+            // Adopted here, before the first statement that can throw: the cursor only clears this
+            // list (Mutable.clear(), not close()), so _close() is its sole release point and the
+            // generator has already nulled its own reference. GroupByFunctionsUpdaterFactory below
+            // can throw, and so can the assert.
+            this.groupByFunctions = groupByFunctions;
+            // Checked after the adopting assignments above, not at the top of the constructor: the
+            // generator transfers ownership of the filter and the window functions before it calls
+            // this, and the catch below frees the FIELDS, so an -ea failure any earlier leaks them.
+            assert slaveFactory.supportsTimeFrameCursor();
+            this.loSign = loSign;
+            this.hiSign = hiSign;
+            this.loTimeUnit = loTimeUnit;
+            this.hiTimeUnit = hiTimeUnit;
+            this.timestampDriver = timestampDriver;
+            this.includePrevailing = includePrevailing;
+            this.value = new SimpleMapValue(columnTypes.getColumnCount());
+            final int columnSplit = masterFactory.getMetadata().getColumnCount();
+            final RecordMetadata masterMetadata = masterFactory.getMetadata();
+            final RecordMetadata slaveMetadata = slaveFactory.getMetadata();
+            final GroupByFunctionsUpdater groupByFunctionsUpdater = GroupByFunctionsUpdaterFactory.getInstance(asm, groupByFunctions);
+            if (includePrevailing && joinFilter != null) {
+                this.cursor = new WindowJoinWithPrevailingAndJoinFilterRecordCursor(
+                        configuration,
+                        columnIndex,
+                        columnSplit,
+                        masterMetadata.getTimestampIndex(),
+                        slaveMetadata.getTimestampIndex(),
+                        masterMetadata.getTimestampType(),
+                        slaveMetadata.getTimestampType(),
+                        groupByFunctions,
+                        groupByFunctionsUpdater,
+                        value
+                );
+            } else {
+                this.cursor = new WindowJoinRecordCursor(
+                        configuration,
+                        columnIndex,
+                        columnSplit,
+                        masterMetadata.getTimestampIndex(),
+                        slaveMetadata.getTimestampIndex(),
+                        masterMetadata.getTimestampType(),
+                        slaveMetadata.getTimestampType(),
+                        groupByFunctions,
+                        groupByFunctionsUpdater,
+                        value
+                );
+            }
+        } catch (Throwable th) {
+            releaseAdoptedStateOnConstructorFailure();
+            throw th;
+        }
+    }
+
+    @Override
+    public boolean followedOrderByAdvice() {
+        return masterFactory.followedOrderByAdvice();
+    }
+
+    @Override
+    public RecordCursor getCursor(SqlExecutionContext executionContext) throws SqlException {
+        RecordCursor masterCursor = masterFactory.getCursor(executionContext);
+        TimeFrameCursor slaveCursor = null;
+        try {
+            slaveCursor = slaveFactory.getTimeFrameCursor(executionContext);
+            slaveCursor.setParquetDecodeHint(ParquetDecodeHint.SCATTERED);
+            cursor.of(masterCursor, slaveCursor, executionContext);
+        } catch (Throwable ex) {
+            Misc.free(masterCursor);
+            Misc.free(slaveCursor);
+            // of() binds the per-query tracker and reopens the allocator before it can throw;
+            // close() frees it under that tracker and resets isOpen so the factory stays reusable.
+            Misc.free(cursor);
+            throw ex;
+        }
+        return cursor;
+    }
+
+    @Override
+    public int getScanDirection() {
+        return masterFactory.getScanDirection();
+    }
+
+    @Override
+    public boolean recordCursorSupportsRandomAccess() {
+        return false;
+    }
+
+    @Override
+    public void toPlan(PlanSink sink) {
+        sink.type("Window Join");
+
+        sink.attr("window lo");
+        if (windowLoFunc != null) {
+            sink.val("dynamic");
+        } else if (windowLo == 0) {
+            sink.val("current row");
+        } else if (windowLo < 0) {
+            sink.val(Math.abs(windowLo)).val(" following");
+        } else {
+            sink.val(windowLo).val(" preceding");
+        }
+        sink.val(includePrevailing ? " (include prevailing)" : " (exclude prevailing)");
+
+        sink.attr("window hi");
+        if (windowHiFunc != null) {
+            sink.val("dynamic");
+        } else if (windowHi == 0) {
+            sink.val("current row");
+        } else if (windowHi < 0) {
+            sink.val(Math.abs(windowHi)).val(" preceding");
+        } else {
+            sink.val(windowHi).val(" following");
+        }
+
+        if (joinFilter != null) {
+            sink.setMetadata(joinMetadata);
+            sink.attr("join filter").val(joinFilter);
+            sink.setMetadata(null);
+        }
+        sink.child(masterFactory);
+        sink.child(slaveFactory);
+    }
+
+    // A join reads externally if either input does. getBaseFactory() cannot express this because it
+    // returns a single child, so the two-child propagation is explicit here, mirroring
+    // AbstractJoinRecordCursorFactory. Guards against a null child during teardown.
+    @Override
+    public boolean usesExternalDataSource() {
+        final RecordCursorFactory masterFactory = this.masterFactory;
+        if (masterFactory != null && masterFactory.usesExternalDataSource()) {
+            return true;
+        }
+        final RecordCursorFactory slaveFactory = this.slaveFactory;
+        return slaveFactory != null && slaveFactory.usesExternalDataSource();
+    }
+
+    @Override
+    protected void _close() {
+        final RecordMetadata metadata = detachMetadata();
+        final WindowJoinRecordCursor cursor = this.cursor;
+        this.cursor = null;
+        final ObjList<GroupByFunction> groupByFunctions = this.groupByFunctions;
+        this.groupByFunctions = null;
+        final Function joinFilter = this.joinFilter;
+        this.joinFilter = null;
+        final JoinRecordMetadata joinMetadata = this.joinMetadata;
+        this.joinMetadata = null;
+        final RecordCursorFactory masterFactory = this.masterFactory;
+        this.masterFactory = null;
+        final RecordCursorFactory slaveFactory = this.slaveFactory;
+        this.slaveFactory = null;
+        final SimpleMapValue value = this.value;
+        this.value = null;
+        final Function windowHiFunc = this.windowHiFunc;
+        this.windowHiFunc = null;
+        final Function windowLoFunc = this.windowLoFunc;
+        this.windowLoFunc = null;
+
+        Throwable failure = Misc.freeIfCloseableBestEffort(null, metadata);
+        failure = Misc.freeBestEffort(failure, masterFactory);
+        if (slaveFactory != masterFactory) {
+            failure = Misc.freeBestEffort(failure, slaveFactory);
+        }
+        failure = Misc.freeBestEffort(failure, cursor);
+        failure = Misc.freeObjListBestEffort(failure, groupByFunctions);
+        failure = Misc.freeBestEffort(failure, joinFilter);
+        if (joinMetadata != metadata) {
+            failure = Misc.freeBestEffort(failure, joinMetadata);
+        }
+        failure = Misc.freeBestEffort(failure, value);
+        if (windowHiFunc != joinFilter) {
+            failure = Misc.freeBestEffort(failure, windowHiFunc);
+        }
+        if (windowLoFunc != joinFilter && windowLoFunc != windowHiFunc) {
+            failure = Misc.freeBestEffort(failure, windowLoFunc);
+        }
+        // Last, defensively. The cursor's close() runs Misc.clearObjList(groupByFunctions), and
+        // clear() touches the very native buffers close() releases (StringDistinctAggGroupByFunction
+        // resets its sink capacity, which reallocs). Callers close the cursor before the factory and
+        // that close() is isOpen-guarded, so today the clear cannot follow the free -- ordering the
+        // free after the cursor keeps it that way if a caller ever closes the factory first.
+        failure = Misc.freeObjListBestEffort(failure, groupByFunctions);
+        CairoException.rethrowCleanupFailure(failure);
+    }
+
+    /**
+     * Releases what THIS constructor adopted, and only that.
+     * <p>
+     * The base factories and the join metadata belong to {@code SqlCodeGenerator} until the
+     * constructor returns - the contract the async siblings already honour, and the one the
+     * generator's own catch implements (it frees master, slave and the join metadata itself).
+     * Calling {@link #close()} here instead released them a second time. That is a no-op for an
+     * {@link io.questdb.cairo.AbstractRecordCursorFactory}, whose {@code close()} is flag-guarded,
+     * but not for a factory implementing {@code RecordCursorFactory} directly: for instance
+     * {@code CoveringIndexRecordCursorFactory.close()} frees its partition-frame factory and its
+     * functions unguarded, so a master of that shape was double freed. {@link JoinRecordMetadata}
+     * is reference counted, so the second close drove its count below zero as well.
+     * <p>
+     * Nulling the three fields before {@code close()} keeps the release of the adopted handles -
+     * the join filter, the window bound functions, the group-by functions, the cursor and the map
+     * value - in one place.
+     */
+    private void releaseAdoptedStateOnConstructorFailure() {
+        masterFactory = null;
+        slaveFactory = null;
+        joinMetadata = null;
+        close();
+    }
+
+    private class WindowJoinRecordCursor implements NoRandomAccessRecordCursor {
+        protected final GroupByFunctionsUpdater groupByFunctionsUpdater;
+        protected final JoinRecord internalJoinRecord;
+        protected final int masterTimestampIndex;
+        protected final long masterTimestampScale;
+        protected final WindowJoinTimeFrameHelper slaveTimeFrameHelper;
+        protected final int slaveTimestampIndex;
+        protected final long slaveTimestampScale;
+        protected final SimpleMapValue value;
+        private final GroupByAllocator allocator;
+        private final int columnSplit;
+        private final @Nullable IntList crossIndex;
+        private final ObjList<GroupByFunction> groupByFunctions;
+        private final VirtualRecord groupByRecord;
+        private final JoinRecord joinRecord;
+        private final JoinSymbolTableSource joinSymbolTableSource;
+        private final Record record;
+        protected SqlExecutionCircuitBreaker circuitBreaker;
+        protected RecordCursor masterCursor;
+        protected Record masterRecord;
+        private boolean isOpen;
+        private TimeFrameCursor slaveCursor;
+
+        public WindowJoinRecordCursor(
+                CairoConfiguration configuration,
+                @Nullable IntList columnIndex,
+                int columnSplit,
+                int masterTimestampIndex,
+                int slaveTimestampIndex,
+                int masterTimestampType,
+                int slaveTimestampType,
+                @NotNull ObjList<GroupByFunction> groupByFunctions,
+                @NotNull GroupByFunctionsUpdater groupByFunctionsUpdater,
+                @NotNull SimpleMapValue value
+        ) {
+            this.crossIndex = columnIndex;
+            this.columnSplit = columnSplit;
+            this.groupByFunctions = groupByFunctions;
+            this.allocator = GroupByAllocatorFactory.createAllocator(configuration, false);
+            GroupByUtils.setAllocator(groupByFunctions, allocator);
+            this.groupByFunctionsUpdater = groupByFunctionsUpdater;
+            this.value = value;
+            this.masterTimestampIndex = masterTimestampIndex;
+            this.slaveTimestampIndex = slaveTimestampIndex;
+            isOpen = false;
+            if (masterTimestampType == slaveTimestampType) {
+                masterTimestampScale = slaveTimestampScale = 1L;
+            } else {
+                masterTimestampScale = ColumnType.getTimestampDriver(masterTimestampType).toNanosScale();
+                slaveTimestampScale = ColumnType.getTimestampDriver(slaveTimestampType).toNanosScale();
+            }
+            this.slaveTimeFrameHelper = new WindowJoinTimeFrameHelper(configuration.getSqlAsOfJoinLookAhead(), slaveTimestampScale);
+            this.joinSymbolTableSource = new JoinSymbolTableSource(columnSplit);
+
+            this.internalJoinRecord = new JoinRecord(columnSplit);
+            this.groupByRecord = new VirtualRecord(groupByFunctions);
+            groupByRecord.of(value);
+            this.joinRecord = new JoinRecord(columnSplit);
+            if (columnIndex != null) {
+                SelectedRecord sr = new SelectedRecord(columnIndex);
+                sr.of(joinRecord);
+                this.record = sr;
+            } else {
+                this.record = joinRecord;
+            }
+        }
+
+        @Override
+        public void calculateSize(SqlExecutionCircuitBreaker circuitBreaker, Counter counter) {
+            masterCursor.calculateSize(circuitBreaker, counter);
+        }
+
+        @Override
+        public void close() {
+            if (isOpen) {
+                isOpen = false;
+                Misc.free(allocator);
+                Misc.clearObjList(groupByFunctions);
+                masterCursor = Misc.free(masterCursor);
+                slaveCursor = Misc.free(slaveCursor);
+            }
+        }
+
+        @Override
+        public Record getRecord() {
+            return record;
+        }
+
+        @Override
+        public SymbolTable getSymbolTable(int columnIndex) {
+            if (crossIndex != null) {
+                columnIndex = crossIndex.getQuick(columnIndex);
+            }
+            if (columnIndex < columnSplit) {
+                return masterCursor.getSymbolTable(columnIndex);
+            }
+            return (SymbolTable) groupByFunctions.getQuick(columnIndex - columnSplit);
+        }
+
+        @Override
+        public boolean hasNext() {
+            if (!masterCursor.hasNext()) {
+                return false;
+            }
+
+            // We build the timestamp interval over which we will aggregate the matching slave rows [slaveTimestampLo; slaveTimestampHi]
+            long masterTimestamp = masterRecord.getTimestamp(masterTimestampIndex);
+            long effectiveLo = computeEffectiveBound(windowLoFunc, windowLo, masterRecord, loSign, loTimeUnit, timestampDriver);
+            long effectiveHi = computeEffectiveBound(windowHiFunc, windowHi, masterRecord, hiSign, hiTimeUnit, timestampDriver);
+
+            groupByFunctionsUpdater.updateEmpty(value);
+            value.setNew(true);
+
+            if (effectiveLo == Long.MIN_VALUE || effectiveHi == Long.MIN_VALUE) {
+                return true;
+            }
+
+            long slaveTimestampLo = scaleTimestamp(subtractSaturating(masterTimestamp, effectiveLo), masterTimestampScale);
+            long slaveTimestampHi = scaleTimestamp(addSaturating(masterTimestamp, effectiveHi), masterTimestampScale);
+
+            long slaveRowIndex;
+            if (includePrevailing) {
+                slaveRowIndex = slaveTimeFrameHelper.findRowLoWithPrevailing(slaveTimestampLo, slaveTimestampHi);
+            } else {
+                slaveRowIndex = slaveTimeFrameHelper.findRowLo(slaveTimestampLo, slaveTimestampHi);
+            }
+            if (slaveRowIndex == Long.MIN_VALUE) {
+                return true;
+            }
+
+            final Record slaveRecord = slaveTimeFrameHelper.getRecord();
+            long baseSlaveRowId = Rows.toRowID(slaveTimeFrameHelper.getTimeFrameIndex(), 0);
+            for (; ; ) {
+                circuitBreaker.statefulThrowExceptionIfTripped();
+                slaveTimeFrameHelper.recordAtRowIndex(slaveRowIndex);
+                final long slaveTimestamp = scaleTimestamp(slaveRecord.getTimestamp(slaveTimestampIndex), slaveTimestampScale);
+                if (slaveTimestamp > slaveTimestampHi) {
+                    break;
+                }
+
+                if (joinFilter == null || joinFilter.getBool(internalJoinRecord)) {
+                    if (value.isNew()) {
+                        groupByFunctionsUpdater.updateNew(value, internalJoinRecord, baseSlaveRowId + slaveRowIndex);
+                        value.setNew(false);
+                    } else {
+                        groupByFunctionsUpdater.updateExisting(value, internalJoinRecord, baseSlaveRowId + slaveRowIndex);
+                    }
+                }
+
+                if (++slaveRowIndex >= slaveTimeFrameHelper.getTimeFrameRowHi()) {
+                    if (!slaveTimeFrameHelper.nextFrame(slaveTimestampHi)) {
+                        break;
+                    }
+                    slaveRowIndex = slaveTimeFrameHelper.getTimeFrameRowLo();
+                    baseSlaveRowId = Rows.toRowID(slaveTimeFrameHelper.getTimeFrameIndex(), 0);
+                    // don't forget to switch the record to the new frame
+                    slaveTimeFrameHelper.recordAt(baseSlaveRowId);
+                }
+            }
+
+            return true;
+        }
+
+        @Override
+        public SymbolTable newSymbolTable(int columnIndex) {
+            if (crossIndex != null) {
+                columnIndex = crossIndex.getQuick(columnIndex);
+            }
+            if (columnIndex < columnSplit) {
+                return masterCursor.newSymbolTable(columnIndex);
+            }
+            return ((SymbolFunction) groupByFunctions.getQuick(columnIndex - columnSplit)).newSymbolTable();
+        }
+
+        @Override
+        public long preComputedStateSize() {
+            return masterCursor.preComputedStateSize();
+        }
+
+        @Override
+        public long size() {
+            return masterCursor.size();
+        }
+
+        @Override
+        public void toTop() {
+            masterCursor.toTop();
+            slaveTimeFrameHelper.toTop();
+            GroupByUtils.toTop(groupByFunctions);
+            allocator.clear();
+        }
+
+        void of(RecordCursor masterCursor, TimeFrameCursor slaveCursor, SqlExecutionContext sqlExecutionContext) throws SqlException {
+            if (!isOpen) {
+                isOpen = true;
+                allocator.setMemoryTracker(sqlExecutionContext.getMemoryTracker());
+                allocator.reopen();
+            }
+            this.masterRecord = masterCursor.getRecord();
+            joinRecord.of(masterRecord, groupByRecord);
+            slaveTimeFrameHelper.of(slaveCursor);
+            internalJoinRecord.of(masterRecord, slaveTimeFrameHelper.getRecord());
+            joinSymbolTableSource.of(masterCursor, slaveTimeFrameHelper.getSymbolTableSource());
+            if (joinFilter != null) {
+                joinFilter.init(joinSymbolTableSource, sqlExecutionContext);
+            }
+            if (windowLoFunc != null) {
+                windowLoFunc.init(joinSymbolTableSource, sqlExecutionContext);
+            }
+            if (windowHiFunc != null) {
+                windowHiFunc.init(joinSymbolTableSource, sqlExecutionContext);
+            }
+            Function.init(groupByFunctions, joinSymbolTableSource, sqlExecutionContext, null);
+            circuitBreaker = sqlExecutionContext.getCircuitBreaker();
+
+            // Adopt master/slave last so an init() throw above can't double-free them via the getCursor() catch.
+            this.masterCursor = masterCursor;
+            this.slaveCursor = slaveCursor;
+        }
+    }
+
+    private class WindowJoinWithPrevailingAndJoinFilterRecordCursor extends WindowJoinRecordCursor {
+
+        public WindowJoinWithPrevailingAndJoinFilterRecordCursor(
+                CairoConfiguration configuration,
+                @Nullable IntList columnIndex,
+                int columnSplit,
+                int masterTimestampIndex,
+                int slaveTimestampIndex,
+                int masterTimestampType,
+                int slaveTimestampType,
+                @NotNull ObjList<GroupByFunction> groupByFunctions,
+                @NotNull GroupByFunctionsUpdater groupByFunctionsUpdater,
+                @NotNull SimpleMapValue value
+        ) {
+            super(
+                    configuration,
+                    columnIndex,
+                    columnSplit,
+                    masterTimestampIndex,
+                    slaveTimestampIndex,
+                    masterTimestampType,
+                    slaveTimestampType,
+                    groupByFunctions,
+                    groupByFunctionsUpdater,
+                    value
+            );
+        }
+
+        @Override
+        public boolean hasNext() {
+            if (!masterCursor.hasNext()) {
+                return false;
+            }
+
+            // We build the timestamp interval over which we will aggregate the matching slave rows [slaveTimestampLo; slaveTimestampHi]
+            long masterTimestamp = masterRecord.getTimestamp(masterTimestampIndex);
+            long effectiveLo = computeEffectiveBound(windowLoFunc, windowLo, masterRecord, loSign, loTimeUnit, timestampDriver);
+            long effectiveHi = computeEffectiveBound(windowHiFunc, windowHi, masterRecord, hiSign, hiTimeUnit, timestampDriver);
+
+            groupByFunctionsUpdater.updateEmpty(value);
+            value.setNew(true);
+
+            if (effectiveLo == Long.MIN_VALUE || effectiveHi == Long.MIN_VALUE) {
+                return true;
+            }
+
+            long slaveTimestampLo = scaleTimestamp(subtractSaturating(masterTimestamp, effectiveLo), masterTimestampScale);
+            long slaveTimestampHi = scaleTimestamp(addSaturating(masterTimestamp, effectiveHi), masterTimestampScale);
+
+            long slaveRowIndex = slaveTimeFrameHelper.findRowLo(slaveTimestampLo, slaveTimestampHi, true);
+            final int prevailingFrameIndex = slaveTimeFrameHelper.getPrevailingFrameIndex();
+            final long prevailingRowIndex = slaveTimeFrameHelper.getPrevailingRowIndex();
+            if (slaveRowIndex == Long.MIN_VALUE) {
+                findPrevailingForMasterRow(
+                        slaveTimeFrameHelper,
+                        prevailingFrameIndex,
+                        prevailingRowIndex,
+                        joinFilter,
+                        internalJoinRecord,
+                        groupByFunctionsUpdater,
+                        value
+                );
+                return true;
+            }
+
+            final Record slaveRecord = slaveTimeFrameHelper.getRecord();
+            long baseSlaveRowId = Rows.toRowID(slaveTimeFrameHelper.getTimeFrameIndex(), 0);
+
+            // First, check if one of the first rows matching the join filter is also at the slaveTimestampLo timestamp.
+            // If so, we don't need to do backward scan to find the prevailing row.
+            boolean needToFindPrevailing = true;
+            for (; ; ) {
+                circuitBreaker.statefulThrowExceptionIfTripped();
+                if (slaveRowIndex >= slaveTimeFrameHelper.getTimeFrameRowHi()) {
+                    if (!slaveTimeFrameHelper.nextFrame(slaveTimestampHi)) {
+                        break;
+                    }
+                    slaveRowIndex = slaveTimeFrameHelper.getTimeFrameRowLo();
+                    baseSlaveRowId = Rows.toRowID(slaveTimeFrameHelper.getTimeFrameIndex(), 0);
+                    // don't forget to switch the record to the new frame
+                    slaveTimeFrameHelper.recordAt(baseSlaveRowId);
+                }
+                slaveTimeFrameHelper.recordAtRowIndex(slaveRowIndex);
+                final long slaveTimestamp = scaleTimestamp(slaveRecord.getTimestamp(slaveTimestampIndex), slaveTimestampScale);
+                if (slaveTimestamp > slaveTimestampLo) {
+                    break;
+                }
+
+                slaveRowIndex++;
+                if (joinFilter.getBool(internalJoinRecord)) {
+                    // - 1 is here to compensate the above increment.
+                    groupByFunctionsUpdater.updateNew(value, internalJoinRecord, baseSlaveRowId + slaveRowIndex - 1);
+                    value.setNew(false);
+                    needToFindPrevailing = false;
+                    break;
+                }
+            }
+
+            // Do a backward scan to find the prevailing row.
+            if (needToFindPrevailing) {
+                findPrevailingForMasterRow(
+                        slaveTimeFrameHelper,
+                        prevailingFrameIndex,
+                        prevailingRowIndex,
+                        joinFilter,
+                        internalJoinRecord,
+                        groupByFunctionsUpdater,
+                        value
+                );
+            }
+
+            // Aggregate the rows within the time window.
+            for (; ; ) {
+                circuitBreaker.statefulThrowExceptionIfTripped();
+                if (slaveRowIndex >= slaveTimeFrameHelper.getTimeFrameRowHi()) {
+                    if (!slaveTimeFrameHelper.nextFrame(slaveTimestampHi)) {
+                        break;
+                    }
+                    slaveRowIndex = slaveTimeFrameHelper.getTimeFrameRowLo();
+                    baseSlaveRowId = Rows.toRowID(slaveTimeFrameHelper.getTimeFrameIndex(), 0);
+                    // don't forget to switch the record to the new frame
+                    slaveTimeFrameHelper.recordAt(baseSlaveRowId);
+                }
+                slaveTimeFrameHelper.recordAtRowIndex(slaveRowIndex);
+                final long slaveTimestamp = scaleTimestamp(slaveRecord.getTimestamp(slaveTimestampIndex), slaveTimestampScale);
+                if (slaveTimestamp > slaveTimestampHi) {
+                    break;
+                }
+
+                if (joinFilter.getBool(internalJoinRecord)) {
+                    if (value.isNew()) {
+                        groupByFunctionsUpdater.updateNew(value, internalJoinRecord, baseSlaveRowId + slaveRowIndex);
+                        value.setNew(false);
+                    } else {
+                        groupByFunctionsUpdater.updateExisting(value, internalJoinRecord, baseSlaveRowId + slaveRowIndex);
+                    }
+                }
+                slaveRowIndex++;
+            }
+
+            return true;
+        }
+    }
+}

@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -72,6 +72,7 @@ public class BytecodeAssembler {
     private static final int lstore_1 = 0x40;
     private static final int lstore_2 = 0x41;
     private static final int lstore_3 = 0x42;
+    private static final int new_ = 0xbb;
     private static final int sipush = 0x11;
     private final ObjIntHashMap<Class<?>> classCache = new ObjIntHashMap<>();
     private final Utf8Appender utf8Appender = new Utf8Appender();
@@ -83,6 +84,7 @@ public class BytecodeAssembler {
     private int defaultConstructorDescIndex;
     private int defaultConstructorMethodIndex;
     private int defaultConstructorNameIndex;
+    private int defaultConstructorSigIndex;
     private Class<?> host;
     private int objectClassIndex;
     private int poolCount;
@@ -122,6 +124,7 @@ public class BytecodeAssembler {
         putShort(0x8F);
     }
 
+    @SuppressWarnings("unused")
     public void dcmpg() {
         putByte(0x98);
     }
@@ -148,8 +151,7 @@ public class BytecodeAssembler {
         startMethod(defaultConstructorNameIndex, defaultConstructorDescIndex, 1, 1);
         // code
         aload(0);
-        putByte(invokespecial);
-        putShort(superIndex);
+        invokespecial(superIndex);
         return_();
         endMethodCode();
         // exceptions
@@ -176,7 +178,7 @@ public class BytecodeAssembler {
             buf.limit(l);
             buf.position(p);
         } catch (Exception e) {
-            e.printStackTrace();
+            e.printStackTrace(System.err);
         }
     }
 
@@ -187,6 +189,10 @@ public class BytecodeAssembler {
     @SuppressWarnings("unused")
     public void dup2() {
         putByte(0x5c);
+    }
+
+    public void dup_x2() {
+        putByte(0x5b);
     }
 
     public void endMethod() {
@@ -237,8 +243,38 @@ public class BytecodeAssembler {
         return codeStart;
     }
 
+    public int getDefaultConstructorDescIndex() {
+        return defaultConstructorDescIndex;
+    }
+
+    public int getDefaultConstructorNameIndex() {
+        return defaultConstructorNameIndex;
+    }
+
+    public int getDefaultConstructorSigIndex() {
+        return defaultConstructorSigIndex;
+    }
+
+    /**
+     * Returns the size of the current method's bytecode in bytes.
+     * This is the value that matters for JVM's HugeMethodLimit (default 8000).
+     * Call this after endMethodCode() to get the final size.
+     */
+    public int getMethodCodeSize() {
+        return position() - codeStart;
+    }
+
+    public int getObjectInitMethodIndex() {
+        return defaultConstructorMethodIndex;
+    }
+
     public int getPoolCount() {
         return poolCount;
+    }
+
+    public void getStatic(int index) {
+        putByte(178);
+        putShort(index);
     }
 
     public void getfield(int index) {
@@ -365,6 +401,11 @@ public class BytecodeAssembler {
         putShort(index);
     }
 
+    public void invokespecial(int index) {
+        putByte(invokespecial);
+        putShort(index);
+    }
+
     public void irem() {
         putByte(0x70);
     }
@@ -428,12 +469,10 @@ public class BytecodeAssembler {
         putByte(0x69);
     }
 
-    @SuppressWarnings("unchecked")
-    @Nullable
-    public <T> Class<T> loadClass(Class<?> host) {
-        byte[] b = new byte[position()];
-        System.arraycopy(buf.array(), 0, b, 0, b.length);
-        return (Class<T>) Unsafe.defineAnonymousClass(host, b);
+    public <T> Class<T> loadClass() {
+        Class<T> x = loadClass(host);
+        assert x != null;
+        return x;
     }
 
     public void lreturn() {
@@ -457,6 +496,11 @@ public class BytecodeAssembler {
             LOG.critical().$("could not create an instance of ").$(host.getName()).$(", cause: ").$(e).$();
             throw BytecodeException.INSTANCE;
         }
+    }
+
+    public void new_(int classIndex) {
+        putByte(new_);
+        putShort(classIndex);
     }
 
     public int poolClass(int classIndex) {
@@ -673,7 +717,7 @@ public class BytecodeAssembler {
 
         // add standard stuff
         objectClassIndex = poolClass(Object.class);
-        defaultConstructorMethodIndex = poolMethod(objectClassIndex, poolNameAndType(
+        defaultConstructorMethodIndex = poolMethod(objectClassIndex, defaultConstructorSigIndex = poolNameAndType(
                         defaultConstructorNameIndex = poolUtf8("<init>"),
                         defaultConstructorDescIndex = poolUtf8("()V")
                 )
@@ -684,6 +728,33 @@ public class BytecodeAssembler {
     public void startMethod(int nameIndex, int descriptorIndex, int maxStack, int maxLocal) {
         // access flags
         putShort(ACC_PUBLIC);
+        // name index
+        putShort(nameIndex);
+        // descriptor index
+        putShort(descriptorIndex);
+        // attribute count
+        putShort(1);
+
+        // code
+        putShort(codeAttributeIndex);
+
+        // attribute len
+        putInt(0);
+        // come back to this later
+        this.codeAttributeStart = position();
+        // max stack
+        putShort(maxStack);
+        // max locals
+        putShort(maxLocal);
+
+        // code len
+        putInt(0);
+        this.codeStart = position();
+    }
+
+    public void startPrivateMethod(int nameIndex, int descriptorIndex, int maxStack, int maxLocal) {
+        // access flags
+        putShort(ACC_PRIVATE);
         // name index
         putShort(nameIndex);
         // descriptor index
@@ -753,6 +824,14 @@ public class BytecodeAssembler {
         return pos;
     }
 
+    @SuppressWarnings("unchecked")
+    @Nullable
+    private <T> Class<T> loadClass(Class<?> host) {
+        byte[] b = new byte[position()];
+        System.arraycopy(buf.array(), 0, b, 0, b.length);
+        return (Class<T>) Unsafe.defineAnonymousClass(host, b);
+    }
+
     private void optimisedIO(int code0, int code1, int code2, int code3, int code, int value) {
         switch (value) {
             case 0:
@@ -808,6 +887,7 @@ public class BytecodeAssembler {
 
     public class Utf8Appender implements Utf8Sink {
         private int lenpos;
+        private int[] ryuE10;
         private int utf8len = 0;
 
         public int $() {
@@ -868,9 +948,17 @@ public class BytecodeAssembler {
         public Utf8Appender putNonAscii(long lo, long hi) {
             Bytes.checkedLoHiSize(lo, hi, BytecodeAssembler.this.position());
             for (long p = lo; p < hi; p++) {
-                BytecodeAssembler.this.putByte(Unsafe.getUnsafe().getByte(p));
+                BytecodeAssembler.this.putByte(Unsafe.getByte(p));
             }
             return this;
+        }
+
+        @Override
+        public int[] ryuScratch() {
+            if (ryuE10 == null) {
+                ryuE10 = new int[1];
+            }
+            return ryuE10;
         }
     }
 }

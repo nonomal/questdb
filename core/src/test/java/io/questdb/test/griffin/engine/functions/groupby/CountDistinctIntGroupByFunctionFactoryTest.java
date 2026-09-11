@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -31,193 +31,277 @@ public class CountDistinctIntGroupByFunctionFactoryTest extends AbstractCairoTes
 
     @Test
     public void testConstant() throws Exception {
-        assertQuery(
-                "a\tcount_distinct\n" +
-                        "a\t1\n" +
-                        "b\t1\n" +
-                        "c\t1\n",
-                "select a, count_distinct(42) from x order by a",
-                "create table x as (select * from (select rnd_symbol('a','b','c') a from long_sequence(20)))",
-                null,
-                true,
-                true
-        );
+        String expected = """
+                a\tcount_distinct
+                a\t1
+                b\t1
+                c\t1
+                """;
+
+        assertQuery("select a, count_distinct(42) from x order by a")
+                .ddl("create table x as (select * from (select rnd_symbol('a','b','c') a from long_sequence(20)))")
+                .expectSize()
+                .returns(expected);
+
+        assertQuery("select a, count(distinct 42) from x order by a")
+                .expectSize()
+                .returns(expected);
     }
 
     @Test
     public void testConstantDefaultHashSetNoEntryValue() throws Exception {
-        assertQuery(
-                "count_distinct\n" +
-                        "1\n",
-                "select count_distinct(l) from x",
-                "create table x as (select -1::int as l from long_sequence(10))",
-                null,
-                false,
-                true
-        );
+        String expected = """
+                count_distinct
+                1
+                """;
+        assertQuery("select count_distinct(l) from x")
+                .ddl("create table x as (select -1::int as l from long_sequence(10))")
+                .noRandomAccess()
+                .expectSize()
+                .returns(expected);
+
+        assertQuery("select count(distinct l) from x")
+                .noRandomAccess()
+                .expectSize()
+                .returns(expected);
+    }
+
+    @Test
+    public void testCountDistinctMultipleColNotSupported() throws Exception {
+        assertQuery("select count(distinct(x::varchar, x+1::varchar)) from long_sequence(1)")
+                .fails(46, "count distinct aggregation supports a single column only");
+
+        assertQuery("select count(distinct(x::varchar, foo(bar))) from long_sequence(1)")
+                .fails(42, "count distinct aggregation supports a single column only");
     }
 
     @Test
     public void testExpression() throws Exception {
         assertMemoryLeak(() -> {
-            final String expected = "a\tcount_distinct\n" +
-                    "a\t5\n" +
-                    "b\t4\n" +
-                    "c\t4\n";
-            assertQueryNoLeakCheck(
-                    expected,
-                    "select a, count_distinct(s * 42) from x order by a",
-                    "create table x as (select * from (select rnd_symbol('a','b','c') a, rnd_int(1, 8, 0) s from long_sequence(20)))",
-                    null,
-                    true,
-                    true
-            );
+            final String expected = """
+                    a\tcount_distinct
+                    a\t5
+                    b\t4
+                    c\t4
+                    """;
+            assertQuery("select a, count_distinct(s * 42) from x order by a")
+                    .noLeakCheck()
+                    .ddl("create table x as (select * from (select rnd_symbol('a','b','c') a, rnd_int(1, 8, 0) s from long_sequence(20)))")
+                    .expectSize()
+                    .returns(expected);
+            assertQuery("select a, count(distinct s * 42) from x order by a")
+                    .noLeakCheck()
+                    .expectSize()
+                    .returns(expected);
+
             // multiplication shouldn't affect the number of distinct values,
             // so the result should stay the same
-            assertSql(expected, "select a, count_distinct(s) from x order by a");
+            assertQuery("select a, count_distinct(s) from x order by a")
+                    .noLeakCheck()
+                    .expectSize()
+                    .returns(expected);
+            assertQuery("select a, count(distinct s) from x order by a")
+                    .noLeakCheck()
+                    .expectSize()
+                    .returns(expected);
+
         });
     }
 
     @Test
     public void testGroupKeyed() throws Exception {
-        assertQuery(
-                "a\tcount_distinct\n" +
-                        "a\t2\n" +
-                        "b\t1\n" +
-                        "c\t2\n" +
-                        "d\t4\n" +
-                        "e\t4\n" +
-                        "f\t4\n",
-                "select a, count_distinct(s) from x order by a",
-                "create table x as (select * from (select rnd_symbol('a','b','c','d','e','f') a, rnd_int(0, 16, 0) s, timestamp_sequence(0, 100000) ts from long_sequence(20)) timestamp(ts))",
-                null,
-                true,
-                true
-        );
+        String expected = """
+                a\tcount_distinct
+                a\t2
+                b\t1
+                c\t2
+                d\t4
+                e\t4
+                f\t4
+                """;
+
+        assertQuery("select a, count_distinct(s) from x order by a")
+                .ddl("create table x as (select * from (select rnd_symbol('a','b','c','d','e','f') a, rnd_int(0, 16, 0) s, timestamp_sequence(0, 100000) ts from long_sequence(20)) timestamp(ts))")
+                .expectSize()
+                .returns(expected);
+
+        assertQuery("select a, count(distinct s) from x order by a")
+                .expectSize()
+                .returns(expected);
     }
 
     @Test
     public void testGroupNotKeyed() throws Exception {
-        assertQuery(
-                "count_distinct\n" +
-                        "6\n",
-                "select count_distinct(s) from x",
-                "create table x as (select * from (select rnd_int(1, 6, 0) s, timestamp_sequence(0, 100000) ts from long_sequence(100)) timestamp(ts))",
-                null,
-                false,
-                true
-        );
+        String expected = """
+                count_distinct
+                6
+                """;
+
+        assertQuery("select count_distinct(s) from x")
+                .ddl("create table x as (select * from (select rnd_int(1, 6, 0) s, timestamp_sequence(0, 100000) ts from long_sequence(100)) timestamp(ts))")
+                .noRandomAccess()
+                .expectSize()
+                .returns(expected);
+
+        assertQuery("select count(distinct s) from x")
+                .noRandomAccess()
+                .expectSize()
+                .returns(expected);
     }
 
     @Test
     public void testGroupNotKeyedWithNulls() throws Exception {
         assertMemoryLeak(() -> {
-            String expected = "count_distinct\n" +
-                    "6\n";
-            assertQueryNoLeakCheck(
-                    expected,
-                    "select count_distinct(s) from x",
-                    "create table x as (select * from (select rnd_int(1, 6, 0) s, timestamp_sequence(10, 100000) ts from long_sequence(100)) timestamp(ts)) timestamp(ts) PARTITION BY YEAR",
-                    null,
-                    false,
-                    true
-            );
+            String expected = """
+                    count_distinct
+                    6
+                    """;
+            assertQuery("select count_distinct(s) from x")
+                    .noLeakCheck()
+                    .ddl("create table x as (select * from (select rnd_int(1, 6, 0) s, timestamp_sequence(10, 100000) ts from long_sequence(100)) timestamp(ts)) timestamp(ts) PARTITION BY YEAR")
+                    .noRandomAccess()
+                    .expectSize()
+                    .returns(expected);
+            assertQuery("select count(distinct s) from x")
+                    .noLeakCheck()
+                    .noRandomAccess()
+                    .expectSize()
+                    .returns(expected);
 
-            insert("insert into x values(cast(null as INT), '2021-05-21')");
-            insert("insert into x values(cast(null as INT), '1970-01-01')");
-            assertSql(expected, "select count_distinct(s) from x");
+            execute("insert into x values(cast(null as INT), '2021-05-21')");
+            execute("insert into x values(cast(null as INT), '1970-01-01')");
+            assertQuery("select count_distinct(s) from x")
+                    .noLeakCheck()
+                    .noRandomAccess()
+                    .expectSize()
+                    .returns(expected);
+            assertQuery("select count(distinct s) from x")
+                    .noLeakCheck()
+                    .noRandomAccess()
+                    .expectSize()
+                    .returns(expected);
         });
     }
 
     @Test
     public void testNullConstant() throws Exception {
-        assertQuery(
-                "a\tcount_distinct\n" +
-                        "a\t0\n" +
-                        "b\t0\n" +
-                        "c\t0\n",
-                "select a, count_distinct(cast(null as INT)) from x order by a",
-                "create table x as (select * from (select rnd_symbol('a','b','c') a from long_sequence(20)))",
-                null,
-                true,
-                true
-        );
+        String expected = """
+                a\tcount_distinct
+                a\t0
+                b\t0
+                c\t0
+                """;
+        assertQuery("select a, count_distinct(cast(null as INT)) from x order by a")
+                .ddl("create table x as (select * from (select rnd_symbol('a','b','c') a from long_sequence(20)))")
+                .expectSize()
+                .returns(expected);
+
+        assertQuery("select a, count(distinct cast(null as INT)) from x order by a")
+                .expectSize()
+                .returns(expected);
     }
 
     @Test
     public void testSampleFillLinear() throws Exception {
-        assertQuery(
-                "ts\tcount_distinct\n" +
-                        "1970-01-01T00:00:00.000000Z\t8\n" +
-                        "1970-01-01T00:00:01.000000Z\t9\n" +
-                        "1970-01-01T00:00:02.000000Z\t9\n" +
-                        "1970-01-01T00:00:03.000000Z\t9\n" +
-                        "1970-01-01T00:00:04.000000Z\t8\n" +
-                        "1970-01-01T00:00:05.000000Z\t9\n" +
-                        "1970-01-01T00:00:06.000000Z\t10\n" +
-                        "1970-01-01T00:00:07.000000Z\t7\n" +
-                        "1970-01-01T00:00:08.000000Z\t8\n" +
-                        "1970-01-01T00:00:09.000000Z\t7\n",
-                "select ts, count_distinct(s) from x sample by 1s fill(linear)",
-                "create table x as (select * from (select rnd_int(0, 16, 0) s, timestamp_sequence(0, 100000) ts from long_sequence(100)) timestamp(ts))",
-                "ts",
-                true,
-                true
-        );
+        String expected = """
+                ts\tcount_distinct
+                1970-01-01T00:00:00.000000Z\t8
+                1970-01-01T00:00:01.000000Z\t9
+                1970-01-01T00:00:02.000000Z\t9
+                1970-01-01T00:00:03.000000Z\t9
+                1970-01-01T00:00:04.000000Z\t8
+                1970-01-01T00:00:05.000000Z\t9
+                1970-01-01T00:00:06.000000Z\t10
+                1970-01-01T00:00:07.000000Z\t7
+                1970-01-01T00:00:08.000000Z\t8
+                1970-01-01T00:00:09.000000Z\t7
+                """;
+        assertQuery("select ts, count_distinct(s) from x sample by 1s fill(linear)")
+                .ddl("create table x as (select * from (select rnd_int(0, 16, 0) s, timestamp_sequence(0, 100000) ts from long_sequence(100)) timestamp(ts))")
+                .timestamp("ts")
+                .expectSize()
+                .returns(expected);
+        assertQuery("select ts, count(distinct s) from x sample by 1s fill(linear)")
+                .timestamp("ts")
+                .expectSize()
+                .returns(expected);
     }
 
     @Test
     public void testSampleFillNone() throws Exception {
-        assertMemoryLeak(() -> assertSql(
-                "ts\tcount_distinct\n" +
-                        "1970-01-01T00:00:00.050000Z\t8\n" +
-                        "1970-01-01T00:00:02.050000Z\t8\n",
-                "with x as (select * from (select rnd_int(1, 8, 0) s, timestamp_sequence(50000, 100000L/4) ts from long_sequence(150)) timestamp(ts))\n" +
-                        "select ts, count_distinct(s) from x sample by 2s align to first observation"
-        ));
+        assertMemoryLeak(() -> {
+            String expected = """
+                    ts\tcount_distinct
+                    1970-01-01T00:00:00.050000Z\t8
+                    1970-01-01T00:00:02.050000Z\t8
+                    """;
+            // returnsOnce(): the query evaluates rnd_*() inline, so its values differ across the
+            // re-reads returns() performs; the single cursor pass keeps the result stable.
+            assertQuery("with x as (select * from (select rnd_int(1, 8, 0) s, timestamp_sequence(50000, 100000L/4) ts from long_sequence(150)) timestamp(ts))\n" +
+                    "select ts, count_distinct(s) from x sample by 2s align to first observation")
+                    .noLeakCheck()
+                    .returnsOnce(expected);
+
+            // returnsOnce(): the query evaluates rnd_*() inline, so its values differ across the
+            // re-reads returns() performs; the single cursor pass keeps the result stable.
+            assertQuery("with x as (select * from (select rnd_int(1, 8, 0) s, timestamp_sequence(50000, 100000L/4) ts from long_sequence(150)) timestamp(ts))\n" +
+                    "select ts, count(distinct s) from x sample by 2s align to first observation")
+                    .noLeakCheck()
+                    .returnsOnce(expected);
+        });
     }
 
     @Test
     public void testSampleFillValue() throws Exception {
-        assertQuery(
-                "ts\tcount_distinct\n" +
-                        "1970-01-01T00:00:00.000000Z\t8\n" +
-                        "1970-01-01T00:00:01.000000Z\t6\n" +
-                        "1970-01-01T00:00:02.000000Z\t7\n" +
-                        "1970-01-01T00:00:03.000000Z\t8\n" +
-                        "1970-01-01T00:00:04.000000Z\t6\n" +
-                        "1970-01-01T00:00:05.000000Z\t7\n" +
-                        "1970-01-01T00:00:06.000000Z\t7\n" +
-                        "1970-01-01T00:00:07.000000Z\t6\n" +
-                        "1970-01-01T00:00:08.000000Z\t7\n" +
-                        "1970-01-01T00:00:09.000000Z\t5\n",
-                "select ts, count_distinct(s) from x sample by 1s fill(99)",
-                "create table x as (select * from (select rnd_int(0, 8, 0) s, timestamp_sequence(0, 100000) ts from long_sequence(100)) timestamp(ts))",
-                "ts",
-                false
-        );
+        String expected = """
+                ts\tcount_distinct
+                1970-01-01T00:00:00.000000Z\t8
+                1970-01-01T00:00:01.000000Z\t6
+                1970-01-01T00:00:02.000000Z\t7
+                1970-01-01T00:00:03.000000Z\t8
+                1970-01-01T00:00:04.000000Z\t6
+                1970-01-01T00:00:05.000000Z\t7
+                1970-01-01T00:00:06.000000Z\t7
+                1970-01-01T00:00:07.000000Z\t6
+                1970-01-01T00:00:08.000000Z\t7
+                1970-01-01T00:00:09.000000Z\t5
+                """;
+        assertQuery("select ts, count_distinct(s) from x sample by 1s fill(99)")
+                .ddl("create table x as (select * from (select rnd_int(0, 8, 0) s, timestamp_sequence(0, 100000) ts from long_sequence(100)) timestamp(ts))")
+                .timestamp("ts")
+                .noRandomAccess()
+                .returns(expected);
+        assertQuery("select ts, count(distinct s) from x sample by 1s fill(99)")
+                .timestamp("ts")
+                .noRandomAccess()
+                .returns(expected);
     }
 
     @Test
     public void testSampleKeyed() throws Exception {
-        assertQuery(
-                "a\tcount_distinct\tts\n" +
-                        "a\t5\t1970-01-01T00:00:00.000000Z\n" +
-                        "f\t8\t1970-01-01T00:00:00.000000Z\n" +
-                        "c\t9\t1970-01-01T00:00:00.000000Z\n" +
-                        "e\t6\t1970-01-01T00:00:00.000000Z\n" +
-                        "d\t7\t1970-01-01T00:00:00.000000Z\n" +
-                        "b\t5\t1970-01-01T00:00:00.000000Z\n" +
-                        "b\t6\t1970-01-01T00:00:05.000000Z\n" +
-                        "c\t5\t1970-01-01T00:00:05.000000Z\n" +
-                        "f\t6\t1970-01-01T00:00:05.000000Z\n" +
-                        "e\t8\t1970-01-01T00:00:05.000000Z\n" +
-                        "d\t7\t1970-01-01T00:00:05.000000Z\n" +
-                        "a\t4\t1970-01-01T00:00:05.000000Z\n",
-                "select a, count_distinct(s), ts from x sample by 5s align to first observation",
-                "create table x as (select * from (select rnd_symbol('a','b','c','d','e','f') a, rnd_int(0, 12, 0) s, timestamp_sequence(0, 100000) ts from long_sequence(100)) timestamp(ts))",
-                "ts",
-                false
-        );
+        String expected = """
+                a\tcount_distinct\tts
+                a\t5\t1970-01-01T00:00:00.000000Z
+                f\t8\t1970-01-01T00:00:00.000000Z
+                c\t9\t1970-01-01T00:00:00.000000Z
+                e\t6\t1970-01-01T00:00:00.000000Z
+                d\t7\t1970-01-01T00:00:00.000000Z
+                b\t5\t1970-01-01T00:00:00.000000Z
+                b\t6\t1970-01-01T00:00:05.000000Z
+                c\t5\t1970-01-01T00:00:05.000000Z
+                f\t6\t1970-01-01T00:00:05.000000Z
+                e\t8\t1970-01-01T00:00:05.000000Z
+                d\t7\t1970-01-01T00:00:05.000000Z
+                a\t4\t1970-01-01T00:00:05.000000Z
+                """;
+        assertQuery("select a, count_distinct(s), ts from x sample by 5s align to first observation")
+                .ddl("create table x as (select * from (select rnd_symbol('a','b','c','d','e','f') a, rnd_int(0, 12, 0) s, timestamp_sequence(0, 100000) ts from long_sequence(100)) timestamp(ts))")
+                .timestamp("ts")
+                .noRandomAccess()
+                .returns(expected);
+        assertQuery("select a, count(distinct s), ts from x sample by 5s align to first observation")
+                .timestamp("ts")
+                .noRandomAccess()
+                .returns(expected);
     }
 }

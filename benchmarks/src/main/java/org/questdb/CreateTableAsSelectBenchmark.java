@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,12 +24,22 @@
 
 package org.questdb;
 
-import io.questdb.cairo.*;
+import io.questdb.cairo.CairoConfiguration;
+import io.questdb.cairo.CairoEngine;
+import io.questdb.cairo.DefaultCairoConfiguration;
 import io.questdb.griffin.SqlCompilerImpl;
 import io.questdb.griffin.SqlException;
 import io.questdb.griffin.SqlExecutionContext;
 import io.questdb.griffin.SqlExecutionContextImpl;
-import org.openjdk.jmh.annotations.*;
+import org.openjdk.jmh.annotations.Benchmark;
+import org.openjdk.jmh.annotations.BenchmarkMode;
+import org.openjdk.jmh.annotations.Level;
+import org.openjdk.jmh.annotations.Mode;
+import org.openjdk.jmh.annotations.OutputTimeUnit;
+import org.openjdk.jmh.annotations.Param;
+import org.openjdk.jmh.annotations.Scope;
+import org.openjdk.jmh.annotations.State;
+import org.openjdk.jmh.annotations.TearDown;
 import org.openjdk.jmh.runner.Runner;
 import org.openjdk.jmh.runner.RunnerException;
 import org.openjdk.jmh.runner.options.Options;
@@ -41,18 +51,11 @@ import java.util.concurrent.TimeUnit;
 @BenchmarkMode(Mode.AverageTime)
 @OutputTimeUnit(TimeUnit.MICROSECONDS)
 public class CreateTableAsSelectBenchmark {
-
-    // Should be set close enough to the cairo.max.uncommitted.rows default value.
-    private static final int ROWS_PER_ITERATION = 1;
     private final CairoConfiguration configuration = new DefaultCairoConfiguration(".");
-
-    //@Param({"10000", "1000000", "100000000", "1000000000"})
-    @Param({"1000000000"})
-    public String size;
-
-
     @Param({"8192", "16384", "32786", "131072"})
     public String batchSize;
+    @Param({"10000", "1000000", "100000000", "1000000000"})
+    public String size;
 
     public static void main(String[] args) throws RunnerException {
         Options opt = new OptionsBuilder()
@@ -73,12 +76,12 @@ public class CreateTableAsSelectBenchmark {
         executeDdl("drop table test1", configuration);
     }
 
-//    @Benchmark
-//    @BenchmarkMode(Mode.AverageTime)
-//    public void testCreateAsSelectAtomic() {
-//        executeDdl("create atomic table if not exists test1 as ( select x::long as l, x::timestamp as ts from long_sequence(" + size + ") as x ) timestamp(ts) partition by none bypass wal", configuration);
-//        executeDdl("select count(*) from test1", configuration);
-//    }
+    @Benchmark
+    @BenchmarkMode(Mode.AverageTime)
+    public void testCreateAsSelectAtomic() {
+        executeDdl("create atomic table if not exists test1 as ( select x::long as l, x::timestamp as ts from long_sequence(" + size + ") as x ) timestamp(ts) partition by none bypass wal", configuration);
+        executeDdl("select count(*) from test1", configuration);
+    }
 
     @Benchmark
     @BenchmarkMode(Mode.AverageTime)

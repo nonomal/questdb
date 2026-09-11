@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -75,21 +75,13 @@ public class CastCharToSymbolFunctionFactory implements FunctionFactory {
             if (value == 0) {
                 return null;
             }
-
-            final int keyIndex = symbolTableShortcut.keyIndex(value);
-            if (keyIndex < 0) {
-                return symbols.getQuick(symbolTableShortcut.valueAt(keyIndex));
-            }
-
-            symbolTableShortcut.putAt(keyIndex, value, next++);
-            final String str = Chars.toString(value);
-            symbols.add(str);
-            return str;
+            return getSymbol0(value);
         }
 
         @Override
-        protected AbstractCastToSymbolFunction newFunc() {
-            return new Func(arg);
+        protected String symbolOf(int key) {
+            // The shortcut keys on the code point, so render the character it stands for.
+            return Chars.toString((char) key);
         }
     }
 }

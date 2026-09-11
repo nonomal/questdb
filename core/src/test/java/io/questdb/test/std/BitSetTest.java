@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -34,8 +34,8 @@ public class BitSetTest {
     @Test
     public void testGetAndSet() {
         final int N = 1000;
+        final Rnd rnd = new Rnd();
         BitSet set = new BitSet();
-        Rnd rnd = new Rnd();
 
         Assert.assertTrue(set.capacity() > 0);
 
@@ -45,14 +45,12 @@ public class BitSetTest {
         Assert.assertTrue(set.capacity() >= N);
 
         rnd.reset();
-
         for (int i = 0; i < N; i++) {
             Assert.assertFalse(set.getAndSet(i));
             Assert.assertTrue(set.get(i));
         }
 
         rnd.reset();
-
         for (int i = 0; i < N; i++) {
             Assert.assertTrue(set.getAndSet(i));
             Assert.assertTrue(set.get(i));
@@ -60,11 +58,37 @@ public class BitSetTest {
     }
 
     @Test
+    public void testResetCapacity() {
+        final int N = 1000;
+        final int max = 1_000_000;
+        final Rnd rnd = new Rnd();
+        BitSet set = new BitSet();
+
+        final long initialCapacity = set.capacity();
+        Assert.assertTrue(set.capacity() > 0);
+
+        for (int i = 0; i < N; i++) {
+            int idx = rnd.nextInt(max);
+            Assert.assertFalse(set.get(idx));
+            set.set(idx);
+        }
+        Assert.assertTrue(set.capacity() >= N);
+
+        set.resetCapacity();
+        Assert.assertEquals(initialCapacity, set.capacity());
+
+        rnd.reset();
+        for (int i = 0; i < N; i++) {
+            Assert.assertFalse(set.get(rnd.nextInt(max)));
+        }
+    }
+
+    @Test
     public void testSmoke() {
         final int N = 1000;
         final int max = 1_000_000;
+        final Rnd rnd = new Rnd();
         BitSet set = new BitSet();
-        Rnd rnd = new Rnd();
 
         Assert.assertTrue(set.capacity() > 0);
 
@@ -74,13 +98,11 @@ public class BitSetTest {
         Assert.assertTrue(set.capacity() >= N);
 
         rnd.reset();
-
         for (int i = 0; i < N; i++) {
             set.set(rnd.nextInt(max));
         }
 
         rnd.reset();
-
         for (int i = 0; i < N; i++) {
             Assert.assertTrue(set.get(rnd.nextInt(max)));
         }
@@ -88,7 +110,6 @@ public class BitSetTest {
         set.clear();
 
         rnd.reset();
-
         for (int i = 0; i < N; i++) {
             Assert.assertFalse(set.get(rnd.nextInt(max)));
         }

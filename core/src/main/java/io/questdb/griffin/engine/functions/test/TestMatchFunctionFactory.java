@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -47,13 +47,17 @@ public class TestMatchFunctionFactory implements FunctionFactory {
     public static boolean assertAPI(SqlExecutionContext executionContext) {
         return openCounter.get() > 0 && openCounter.get() >= closeCount.get() && topCounter.get() > 0
                 // consider both single-threaded and parallel filter cases
-                && (closeCount.get() == 1 || closeCount.get() == executionContext.getWorkerCount() + 1);
+                && (closeCount.get() == 1 || closeCount.get() == executionContext.getSharedQueryWorkerCount() + 1);
     }
 
     public static void clear() {
         openCounter.set(0);
         topCounter.set(0);
         closeCount.set(0);
+    }
+
+    public static int getOpenCounter() {
+        return openCounter.get();
     }
 
     public static boolean isClosed() {

@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -69,17 +69,17 @@ public class EngineMigration {
         long mem = Unsafe.malloc(tempMemSize, MemoryTag.NATIVE_MIG);
 
         try (
-                MemoryARW virtualMem = Vm.getARWInstance(ff.getPageSize(), Integer.MAX_VALUE, MemoryTag.NATIVE_MIG_MMAP);
+                MemoryARW virtualMem = Vm.getCARWInstance(ff.getPageSize(), Integer.MAX_VALUE, MemoryTag.NATIVE_MIG_MMAP);
                 Path path = new Path();
-                MemoryMARW rwMemory = Vm.getMARWInstance()
+                MemoryMARW rwMemory = Vm.getCMARWInstance()
         ) {
             MigrationContext context = new MigrationContext(engine, mem, tempMemSize, virtualMem, rwMemory);
-            path.of(configuration.getRoot());
+            path.of(configuration.getDbRoot());
 
             // check if all tables have been upgraded already
             path.concat(TableUtils.UPGRADE_FILE_NAME);
             final boolean existed = !force && ff.exists(path.$());
-            int upgradeFd = openFileRWOrFail(ff, path.$(), configuration.getWriterFileOpenOpts());
+            long upgradeFd = openFileRWOrFail(ff, path.$(), configuration.getWriterFileOpenOpts());
             LOG.debug()
                     .$("open [fd=").$(upgradeFd)
                     .$(", path=").$(path)
@@ -156,7 +156,7 @@ public class EngineMigration {
 
     private static void upgradeTables(MigrationContext context, int latestTableVersion, int latestMigrationVersion) {
         final FilesFacade ff = context.getFf();
-        final CharSequence root = context.getConfiguration().getRoot();
+        final CharSequence root = context.getConfiguration().getDbRoot();
         long mem = context.getTempMemory(8);
 
         try (Path path = new Path(); Path copyPath = new Path()) {
@@ -171,7 +171,7 @@ public class EngineMigration {
                     final int tablePlen = path.size();
 
                     if (ff.exists(path.concat(TableUtils.META_FILE_NAME).$())) {
-                        final int fdMeta = openFileRWOrFail(ff, path.$(), context.getConfiguration().getWriterFileOpenOpts());
+                        final long fdMeta = openFileRWOrFail(ff, path.$(), context.getConfiguration().getWriterFileOpenOpts());
                         try {
                             int currentTableVersion = TableUtils.readIntOrFail(ff, fdMeta, META_OFFSET_VERSION, mem, path);
                             if (currentTableVersion < latestMigrationVersion) {
@@ -267,6 +267,6 @@ public class EngineMigration {
         MIGRATIONS.put(424, Mig609::migrate);
         MIGRATIONS.put(425, Mig614::migrate);
         MIGRATIONS.put(426, Mig620::migrate);
-        MIGRATIONS.put(427, Mig702::migrate);
+        MIGRATIONS.put(429, Mig941::migrate);
     }
 }

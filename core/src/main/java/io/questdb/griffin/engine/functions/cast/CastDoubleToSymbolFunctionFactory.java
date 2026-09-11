@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -52,24 +52,22 @@ public class CastDoubleToSymbolFunctionFactory implements FunctionFactory {
         final Function arg = args.getQuick(0);
         if (arg.isConstant()) {
             final StringSink sink = Misc.getThreadLocalSink();
-            sink.put(arg.getDouble(null), configuration.getDoubleToStrCastScale());
+            sink.put(arg.getDouble(null));
             return SymbolConstant.newInstance(sink);
         }
-        return new Func(arg, configuration.getDoubleToStrCastScale());
+        return new Func(arg);
     }
 
     private static class Func extends SymbolFunction implements UnaryFunction {
         private final Function arg;
-        private final int scale;
         private final StringSink sink = new StringSink();
         private final LongIntHashMap symbolTableShortcut = new LongIntHashMap();
         private final ObjList<String> symbols = new ObjList<>();
         private int next = 1;
 
-        public Func(Function arg, int scale) {
+        public Func(Function arg) {
             this.arg = arg;
             symbols.add(null);
-            this.scale = scale;
         }
 
         @Override
@@ -92,7 +90,7 @@ public class CastDoubleToSymbolFunctionFactory implements FunctionFactory {
 
             symbolTableShortcut.putAt(keyIndex, key, next);
             sink.clear();
-            sink.put(value, scale);
+            sink.put(value);
             symbols.add(Chars.toString(sink));
             return next++ - 1;
         }
@@ -112,9 +110,9 @@ public class CastDoubleToSymbolFunctionFactory implements FunctionFactory {
 
             symbolTableShortcut.putAt(keyIndex, key, next++);
             sink.clear();
-            sink.put(value, scale);
+            sink.put(value);
             final String str = Chars.toString(sink);
-            symbols.add(Chars.toString(sink));
+            symbols.add(str);
             return str;
         }
 
@@ -138,13 +136,21 @@ public class CastDoubleToSymbolFunctionFactory implements FunctionFactory {
         }
 
         @Override
+        public boolean isThreadSafe() {
+            return false;
+        }
+
+        @Override
         public @Nullable SymbolTable newSymbolTable() {
-            Func copy = new Func(arg, scale);
-            copy.symbolTableShortcut.putAll(this.symbolTableShortcut);
-            copy.symbols.clear();
-            copy.symbols.addAll(this.symbols);
-            copy.next = this.next;
-            return copy;
+            return new CastToSymbolTable(symbols);
+        }
+
+        @Override
+        public boolean supportsKeyValueAccess() {
+            // getInt() mints a key with one probe on the decoded scalar, never by hashing the row's
+            // text, and valueOf() resolves it by indexing symbols. A key consumer such as QWP egress
+            // should therefore encode each distinct value once instead of re-encoding it per row.
+            return true;
         }
 
         @Override

@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -35,7 +35,6 @@ public class CharSequenceLongHashMapTest {
 
     @Test
     public void testAll() {
-
         Rnd rnd = new Rnd();
         // populate map
         CharSequenceLongHashMap map = new CharSequenceLongHashMap();
@@ -89,10 +88,8 @@ public class CharSequenceLongHashMapTest {
                 Assert.assertTrue(map.excludes(cs));
             } else {
                 Assert.assertFalse(map.excludes(cs));
-
                 int index = map.keyIndex(cs);
                 Assert.assertEquals(value, map.valueAt(index));
-
                 // update value
                 map.putAt(index, cs, rnd3.nextLong());
             }
@@ -107,15 +104,15 @@ public class CharSequenceLongHashMapTest {
             CharSequence cs = rnd.nextChars(15);
             rnd.nextLong();
             if (rnd2.nextPositiveInt() % 16 != 0) {
-                map.increment(cs);
+                map.inc(cs);
                 int index = map.keyIndex(cs);
                 Assert.assertTrue(index < 0);
                 Assert.assertEquals(rnd3.nextLong() + 1, map.valueAt(index));
             } else {
-                map.increment(cs);
+                map.inc(cs);
                 int index = map.keyIndex(cs);
                 Assert.assertTrue(index < 0);
-                Assert.assertEquals(0, map.valueAt(index));
+                Assert.assertEquals(1, map.valueAt(index));
             }
         }
 
@@ -138,7 +135,7 @@ public class CharSequenceLongHashMapTest {
             } else {
                 int index = map2.keyIndex(cs);
                 Assert.assertTrue(index < 0);
-                Assert.assertEquals(0, map2.valueAt(index));
+                Assert.assertEquals(1, map2.valueAt(index));
             }
         }
 
@@ -191,6 +188,23 @@ public class CharSequenceLongHashMapTest {
     }
 
     @Test
+    public void testContains() {
+        CharSequenceLongHashMap map = new CharSequenceLongHashMap();
+        Rnd rnd = new Rnd();
+        final int N = 1000;
+
+        for (int i = 0; i < N; i++) {
+            String s = rnd.nextString(10).substring(1, 9);
+            map.put(s, i);
+        }
+
+        final ObjList<CharSequence> keys = map.keys();
+        for (int i = 0; i < keys.size(); i++) {
+            Assert.assertTrue(map.contains(keys.get(i)));
+        }
+    }
+
+    @Test
     public void testPartialLookup() {
         CharSequenceLongHashMap map = new CharSequenceLongHashMap();
         Rnd rnd = new Rnd();
@@ -213,23 +227,6 @@ public class CharSequenceLongHashMapTest {
         for (int i = 0; i < N; i++) {
             CharSequence cs = rnd.nextString(10);
             Assert.assertFalse(map.excludes(cs, 1, 9));
-        }
-    }
-
-    @Test
-    public void testContains() {
-        CharSequenceLongHashMap map = new CharSequenceLongHashMap();
-        Rnd rnd = new Rnd();
-        final int N = 1000;
-
-        for (int i = 0; i < N; i++) {
-            String s = rnd.nextString(10).substring(1, 9);
-            map.put(s, i);
-        }
-
-        final ObjList<CharSequence> keys = map.keys();
-        for (int i = 0; i < keys.size(); i++) {
-            Assert.assertTrue(map.contains(keys.get(i)));
         }
     }
 }

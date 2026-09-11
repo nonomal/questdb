@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -105,6 +105,11 @@ public class InVarcharFunctionFactory implements FunctionFactory {
         return new RuntimeConstFunc(new ObjList<>(args), positions);
     }
 
+    @Override
+    public boolean variadicTypeSupportUndefinedBindVariables(ObjList<Function> args) {
+        return args.size() > 2;
+    }
+
     private static void parseToVarchar(ObjList<Function> args, IntList argPositions, Utf8SequenceHashSet set) throws SqlException {
         set.clear();
         final int n = args.size();
@@ -118,7 +123,8 @@ public class InVarcharFunctionFactory implements FunctionFactory {
                     set.add(Utf8s.toUtf8String(func.getVarcharA(null)));
                     break;
                 case ColumnType.CHAR:
-                    set.add(new Utf8String(func.getChar(null)));
+                    char c = func.getChar(null);
+                    set.add(c != 0 ? new Utf8String(c) : null);
                     break;
                 default:
                     throw SqlException.position(argPositions.getQuick(i)).put("cannot compare VARCHAR with type ").put(ColumnType.nameOf(func.getType()));
@@ -163,7 +169,7 @@ public class InVarcharFunctionFactory implements FunctionFactory {
         }
 
         @Override
-        public ObjList<Function> getArgs() {
+        public ObjList<Function> args() {
             return args;
         }
 

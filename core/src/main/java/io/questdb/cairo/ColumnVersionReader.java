@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -30,9 +30,17 @@ import io.questdb.cairo.vm.api.MemoryR;
 import io.questdb.cairo.vm.api.MemoryW;
 import io.questdb.log.Log;
 import io.questdb.log.LogFactory;
-import io.questdb.std.*;
+import io.questdb.std.FilesFacade;
+import io.questdb.std.LongList;
+import io.questdb.std.MemoryTag;
+import io.questdb.std.Mutable;
+import io.questdb.std.Numbers;
+import io.questdb.std.Os;
+import io.questdb.std.Unsafe;
+import io.questdb.std.Vect;
 import io.questdb.std.datetime.millitime.MillisecondClock;
 import io.questdb.std.str.LPSZ;
+import io.questdb.std.str.StringSink;
 
 import java.io.Closeable;
 
@@ -51,6 +59,7 @@ public class ColumnVersionReader implements Closeable, Mutable {
     public static final int OFFSET_OFFSET_B_64 = OFFSET_SIZE_A_64 + 8;
     public static final int OFFSET_SIZE_B_64 = OFFSET_OFFSET_B_64 + 8;
     public static final int HEADER_SIZE = OFFSET_SIZE_B_64 + 8;
+    public static final long SYMBOL_TABLE_VERSION_PARTITION = COL_TOP_DEFAULT_PARTITION + 1;
     static final int TIMESTAMP_ADDED_PARTITION_OFFSET = COLUMN_TOP_OFFSET;
     private final static Log LOG = LogFactory.getLog(ColumnVersionReader.class);
     protected final LongList cachedColumnVersionList = new LongList();
@@ -63,6 +72,8 @@ public class ColumnVersionReader implements Closeable, Mutable {
         if (ownMem) {
             mem.close();
         }
+        cachedColumnVersionList.clear();
+        version = -1;
     }
 
     @Override
@@ -171,7 +182,7 @@ public class ColumnVersionReader implements Closeable, Mutable {
 
     public long getMaxPartitionVersion(long partitionTimestamp) {
         long maxVersion = -1;
-        int index = cachedColumnVersionList.binarySearchBlock(BLOCK_SIZE_MSB, partitionTimestamp, BinarySearch.SCAN_UP);
+        int index = cachedColumnVersionList.binarySearchBlock(BLOCK_SIZE_MSB, partitionTimestamp, Vect.BIN_SEARCH_SCAN_UP);
         if (index > -1) {
             final int sz = cachedColumnVersionList.size();
             for (; index < sz && cachedColumnVersionList.getQuick(index) == partitionTimestamp; index += BLOCK_SIZE) {
@@ -187,7 +198,7 @@ public class ColumnVersionReader implements Closeable, Mutable {
     }
 
     public int getRecordIndex(long partitionTimestamp, int columnIndex) {
-        int index = cachedColumnVersionList.binarySearchBlock(BLOCK_SIZE_MSB, partitionTimestamp, BinarySearch.SCAN_UP);
+        int index = cachedColumnVersionList.binarySearchBlock(BLOCK_SIZE_MSB, partitionTimestamp, Vect.BIN_SEARCH_SCAN_UP);
         if (index > -1) {
             final int sz = cachedColumnVersionList.size();
             for (; index < sz && cachedColumnVersionList.getQuick(index) == partitionTimestamp; index += BLOCK_SIZE) {
@@ -207,6 +218,22 @@ public class ColumnVersionReader implements Closeable, Mutable {
             }
         }
         return -1;
+    }
+
+    /**
+     * Symbol table files name txn - this is name suffix used to version the file group.
+     * Whenever symbol table capacity changes, its version is increased. Separate column version
+     * entry is used to store this version. Thus, decoupled from version of the columns.
+     * <p>
+     * Separate column version is optional however, when it is not present, this method will fall back to
+     * {@link #getDefaultColumnNameTxn}.
+     *
+     * @param columnIndex symbol column index
+     * @return version suffix
+     */
+    public long getSymbolTableNameTxn(int columnIndex) {
+        int index = getRecordIndex(SYMBOL_TABLE_VERSION_PARTITION, columnIndex);
+        return index > -1 ? getColumnNameTxnByIndex(index) : getDefaultColumnNameTxn(columnIndex);
     }
 
     public long getVersion() {
@@ -232,47 +259,69 @@ public class ColumnVersionReader implements Closeable, Mutable {
         version = -1;
     }
 
+    /**
+     * Copies column versions from the given reader.
+     */
+    public void readFrom(ColumnVersionReader columnVersionReader) {
+        this.version = columnVersionReader.version;
+        cachedColumnVersionList.clear();
+        cachedColumnVersionList.addAll(columnVersionReader.cachedColumnVersionList);
+    }
+
+    /**
+     * Spins until the file reads consistently, or until {@code spinLockTimeout} milliseconds
+     * have passed since the call. The timeout is a duration measured from here - not an
+     * absolute deadline; a caller that hands over {@code clock.getTicks() + timeout} instead
+     * buys a budget of roughly the current epoch, which no spin can ever exhaust.
+     */
     public void readSafe(MillisecondClock microsecondClock, long spinLockTimeout) {
         final long tick = microsecondClock.getTicks();
         while (true) {
-            long version = unsafeGetVersion();
-            if (version == this.version) {
+            if (readSafe()) {
                 return;
-            }
-            Unsafe.getUnsafe().loadFence();
-
-            final long offset;
-            final long size;
-
-            final boolean areaA = (version & 1L) == 0;
-            if (areaA) {
-                offset = mem.getLong(OFFSET_OFFSET_A_64);
-                size = mem.getLong(OFFSET_SIZE_A_64);
-            } else {
-                offset = mem.getLong(OFFSET_OFFSET_B_64);
-                size = mem.getLong(OFFSET_SIZE_B_64);
-            }
-
-            Unsafe.getUnsafe().loadFence();
-            if (version == unsafeGetVersion()) {
-                mem.resize(offset + size);
-                readUnsafe(offset, size, cachedColumnVersionList, mem);
-
-                Unsafe.getUnsafe().loadFence();
-                if (version == unsafeGetVersion()) {
-                    this.version = version;
-                    LOG.debug().$("read clean version ").$(version).$(", offset ").$(offset).$(", size ").$(size).$();
-                    return;
-                }
             }
 
             if (microsecondClock.getTicks() - tick > spinLockTimeout) {
-                LOG.error().$("Column Version read timeout [timeout=").$(spinLockTimeout).utf8("ms]").$();
+                LOG.error().$("Column Version read timeout [timeout=").$(spinLockTimeout).$("ms]").$();
                 throw CairoException.critical(0).put("Column Version read timeout");
             }
             Os.pause();
             LOG.debug().$("read dirty version ").$(version).$(", retrying").$();
         }
+    }
+
+    public boolean readSafe() {
+        long version = unsafeGetVersion();
+        if (version == this.version) {
+            return true;
+        }
+        Unsafe.loadFence();
+
+        final long offset;
+        final long size;
+
+        final boolean areaA = (version & 1L) == 0;
+        if (areaA) {
+            offset = mem.getLong(OFFSET_OFFSET_A_64);
+            size = mem.getLong(OFFSET_SIZE_A_64);
+        } else {
+            offset = mem.getLong(OFFSET_OFFSET_B_64);
+            size = mem.getLong(OFFSET_SIZE_B_64);
+        }
+
+        Unsafe.loadFence();
+        if (version == unsafeGetVersion()) {
+            mem.resize(offset + size);
+            readUnsafe(offset, size, cachedColumnVersionList, mem);
+
+            Unsafe.loadFence();
+            if (version == unsafeGetVersion()) {
+                this.version = version;
+                LOG.debug().$("read clean version ").$(version).$(", offset ").$(offset).$(", size ").$(size).$();
+                return true;
+            }
+        }
+        return false;
     }
 
     public long readUnsafe() {
@@ -284,6 +333,40 @@ public class ColumnVersionReader implements Closeable, Mutable {
         mem.resize(offset + size);
         readUnsafe(offset, size, cachedColumnVersionList, mem);
         return version;
+    }
+
+    @Override
+    public String toString() {
+        // Used for debugging, don't use Misc.getThreadLocalSink() to not mess with other debugging values
+        StringSink sink = new StringSink();
+        sink.put("{[");
+        for (int i = 0; i < cachedColumnVersionList.size(); i += BLOCK_SIZE) {
+            long timestamp = cachedColumnVersionList.getQuick(i);
+            int columnIndex = (int) cachedColumnVersionList.getQuick(i + COLUMN_INDEX_OFFSET);
+            long columnNameTxn = cachedColumnVersionList.getQuick(i + COLUMN_NAME_TXN_OFFSET);
+            long columnTop = cachedColumnVersionList.getQuick(i + COLUMN_TOP_OFFSET);
+
+            if (i > 0) {
+                sink.put(",");
+            }
+            sink.put("\n{columnIndex: ").put(columnIndex).put(", ");
+            if (timestamp == COL_TOP_DEFAULT_PARTITION) {
+                sink.putAscii("defaultNameTxn: ").put(columnNameTxn).putAscii(", ");
+                sink.putAscii("addedPartition: ");
+                sink.put(columnTop);
+            } else if (timestamp == SYMBOL_TABLE_VERSION_PARTITION) {
+                sink.putAscii("symbolTableTxn: ").put(columnNameTxn);
+            } else {
+                sink.putAscii("nameTxn: ").put(columnNameTxn).putAscii(", ");
+                sink.putAscii("partition: ");
+                sink.put(timestamp);
+                sink.putAscii(", ");
+                sink.putAscii("columnTop: ").put(columnTop);
+            }
+            sink.putAscii('}');
+        }
+        sink.putAscii("\n]}");
+        return sink.toString();
     }
 
     private static void readUnsafe(long offset, long areaSize, LongList cachedList, MemoryR mem) {

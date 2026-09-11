@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -31,36 +31,28 @@ import io.questdb.test.griffin.engine.AbstractFunctionFactoryTest;
 import org.junit.Test;
 
 public class SpreadFunctionFactoryTest extends AbstractFunctionFactoryTest {
-    @Test
-    public void testMidPrice() throws Exception {
-        assertQuery("spread\n0.0\n", "select spread(2.0, 2.0)");
-        assertQuery("spread\n2.0\n", "select spread(1.0, 3.0)");
-        assertQuery("spread\n4.0\n", "select spread(0.0, 4.0)");
-        assertQuery("spread\n1.0\n", "select spread(1.0, 2.0)");
-        assertQuery("spread\n0.25\n", "select spread(1.5, 1.75)");
-        assertQuery("spread\n0.1100000000000001\n", "select spread(1.5, 1.61)");
-        assertQuery("spread\n0.0\n", "select spread(0.0,0.0)");
-        assertQuery("spread\n2.0\n", "select spread(-1.0,1.0)");
-        assertQuery("spread\n1.0\n", "select spread(-1.0,0.0)");
-        assertQuery("spread\n1.0\n", "select spread(-2.0,-1.0)");
-        assertQuery("spread\n1.1111090000000001\n", "select spread(-2.22222,-1.111111)");
-    }
-
-    @Test
-    public void testNonFiniteNumber() throws Exception {
-        final String expected = "spread\nnull\n";
-        assertQuery(expected, "select spread(NULL, 1.0)");
-        assertQuery(expected, "select spread(1.0, NULL)");
-        assertQuery(expected, "select spread(NULL, NULL)");
-    }
 
     @Test
     public void testNullBehavior() throws Exception {
         final String expected = "spread\nnull\n";
-        assertQuery(expected, "select spread(NULL, 1.0)");
-        assertQuery(expected, "select spread(1.0, NULL)");
-        assertQuery(expected, "select spread(NULL, NULL)");
+        assertQuery("select spread(NULL, 1.0)").expectSize().returns(expected);
+        assertQuery("select spread(1.0, NULL)").expectSize().returns(expected);
+        assertQuery("select spread(NULL, NULL)").expectSize().returns(expected);
+    }
 
+    @Test
+    public void testSpread() throws Exception {
+        assertQuery("select spread(2.0, 2.0)").expectSize().returns("spread\n0.0\n");
+        assertQuery("select spread(1.0, 3.0)").expectSize().returns("spread\n2.0\n");
+        assertQuery("select spread(0.0, 4.0)").expectSize().returns("spread\n4.0\n");
+        assertQuery("select spread(1.0, 2.0)").expectSize().returns("spread\n1.0\n");
+        assertQuery("select spread(1.5, 1.75)").expectSize().returns("spread\n0.25\n");
+        assertQuery("select spread(1.5, 1.61)").expectSize().returns("spread\n0.1100000000000001\n");
+        assertQuery("select spread(0.0,0.0)").expectSize().returns("spread\n0.0\n");
+        assertQuery("select spread(-1.0,1.0)").expectSize().returns("spread\n2.0\n");
+        assertQuery("select spread(-1.0,0.0)").expectSize().returns("spread\n1.0\n");
+        assertQuery("select spread(-2.0,-1.0)").expectSize().returns("spread\n1.0\n");
+        assertQuery("select spread(-2.22222,-1.111111)").expectSize().returns("spread\n1.1111090000000001\n");
     }
 
     @Override

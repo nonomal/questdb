@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -30,6 +30,7 @@ import io.questdb.griffin.SqlCompiler;
 import io.questdb.griffin.engine.groupby.SampleByFillNoneRecordCursorFactory;
 import io.questdb.griffin.engine.groupby.SampleByFillNullRecordCursorFactory;
 import io.questdb.griffin.engine.groupby.SampleByFillPrevRecordCursorFactory;
+import io.questdb.griffin.engine.groupby.SampleByFillRecordCursorFactory;
 import io.questdb.griffin.engine.groupby.SampleByFillValueRecordCursorFactory;
 import io.questdb.griffin.engine.table.SelectedRecordCursorFactory;
 import io.questdb.std.Unsafe;
@@ -45,7 +46,7 @@ public class RecordCursorMemoryUsageTest extends AbstractCairoTest {
     @Test
     public void testAsOfJoinRecordCursorReleasesMemoryOnClose() throws Exception {
         assertMemoryLeak(() -> {
-            ddl("create table tab as (select" +
+            execute("create table tab as (select" +
                     " rnd_symbol(20,4,4,20000) sym1," +
                     " rnd_double(2) d," +
                     " timestamp_sequence(0, 1000000000) ts" +
@@ -85,7 +86,7 @@ public class RecordCursorMemoryUsageTest extends AbstractCairoTest {
 
     @Test
     public void testSampleByFillNullRecordCursorReleasesMemoryOnCloseCalendar() throws Exception { //prev / value
-        testSampleByCursorReleasesMemoryOnClose("FILL(null)", SampleByFillNullRecordCursorFactory.class, "CALENDAR");
+        testSampleByCursorReleasesMemoryOnClose("FILL(null)", SampleByFillRecordCursorFactory.class, "CALENDAR");
     }
 
     @Test
@@ -95,7 +96,7 @@ public class RecordCursorMemoryUsageTest extends AbstractCairoTest {
 
     @Test
     public void testSampleByFillPrevRecordCursorReleasesMemoryOnCloseCalendar() throws Exception {
-        testSampleByCursorReleasesMemoryOnClose("FILL(prev)", SampleByFillPrevRecordCursorFactory.class, "CALENDAR");
+        testSampleByCursorReleasesMemoryOnClose("FILL(prev)", SampleByFillRecordCursorFactory.class, "CALENDAR");
     }
 
     @Test
@@ -105,7 +106,7 @@ public class RecordCursorMemoryUsageTest extends AbstractCairoTest {
 
     @Test
     public void testSampleByFillValueRecordCursorReleasesMemoryOnCloseCalendar() throws Exception { //prev / value
-        testSampleByCursorReleasesMemoryOnClose("FILL(10)", SampleByFillValueRecordCursorFactory.class, "CALENDAR");
+        testSampleByCursorReleasesMemoryOnClose("FILL(10)", SampleByFillRecordCursorFactory.class, "CALENDAR");
     }
 
     @Test
@@ -115,14 +116,35 @@ public class RecordCursorMemoryUsageTest extends AbstractCairoTest {
 
     private void testSampleByCursorReleasesMemoryOnClose(String fill, Class<?> expectedFactoryClass, String alignment) throws Exception {
         assertMemoryLeak(() -> {
-            compile("create table tab as (select" +
+            execute("create table tab as (select" +
                     " rnd_symbol(20,4,4,20000) sym1," +
                     " rnd_double(2) d," +
                     " timestamp_sequence(0, 1000000000) ts" +
                     " from long_sequence(10000)) timestamp(ts)");
 
             try (RecordCursorFactory factory = select("select sym1, sum(d) from tab SAMPLE BY 1d " + fill + " ALIGN TO " + alignment)) {
-                Assert.assertSame(expectedFactoryClass, factory.getBaseFactory().getClass());
+                // Walk the base-factory chain so the CALENDAR FILL tests can
+                // assert SampleByFillRecordCursorFactory (which lives below an
+                // outer SelectedRecordCursorFactory wrap on the fast path)
+                // while the FIRST OBSERVATION tests still match their
+                // top-level legacy factory on the first step of the chain.
+                RecordCursorFactory cur = factory.getBaseFactory();
+                boolean isExpectedClassFound = false;
+                while (cur != null) {
+                    if (expectedFactoryClass.isInstance(cur)) {
+                        isExpectedClassFound = true;
+                        break;
+                    }
+                    RecordCursorFactory next = cur.getBaseFactory();
+                    if (next == cur) {
+                        break;
+                    }
+                    cur = next;
+                }
+                Assert.assertTrue(
+                        "expected factory class " + expectedFactoryClass.getSimpleName() + " not found in base chain of " + factory.getClass().getSimpleName(),
+                        isExpectedClassFound
+                );
 
                 long freeDuring;
                 long memDuring;

@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -27,27 +27,124 @@ package io.questdb.griffin;
 import io.questdb.cairo.CairoConfiguration;
 import io.questdb.cairo.ColumnType;
 import io.questdb.cairo.ImplicitCastException;
-import io.questdb.cairo.sql.*;
+import io.questdb.cairo.MillisTimestampDriver;
+import io.questdb.cairo.arr.ArrayView;
+import io.questdb.cairo.arr.FunctionArray;
+import io.questdb.cairo.sql.BindVariableService;
+import io.questdb.cairo.sql.Function;
+import io.questdb.cairo.sql.RecordCursorFactory;
+import io.questdb.cairo.sql.RecordMetadata;
 import io.questdb.griffin.engine.functions.CursorFunction;
 import io.questdb.griffin.engine.functions.GroupByFunction;
+import io.questdb.griffin.engine.functions.RuntimeConstFunction;
+import io.questdb.griffin.engine.functions.ScalarSubQueryBoundRefFunction;
 import io.questdb.griffin.engine.functions.bind.IndexedParameterLinkFunction;
 import io.questdb.griffin.engine.functions.bind.NamedParameterLinkFunction;
-import io.questdb.griffin.engine.functions.cast.*;
-import io.questdb.griffin.engine.functions.columns.*;
-import io.questdb.griffin.engine.functions.constants.*;
+import io.questdb.griffin.engine.functions.bool.BooleanSubQueryFunction;
+import io.questdb.griffin.engine.functions.cast.CastByteToDecimalFunctionFactory;
+import io.questdb.griffin.engine.functions.cast.CastCharToSymbolFunctionFactory;
+import io.questdb.griffin.engine.functions.cast.CastGeoHashToGeoHashFunctionFactory;
+import io.questdb.griffin.engine.functions.cast.CastIPv4ToStrFunctionFactory;
+import io.questdb.griffin.engine.functions.cast.CastIPv4ToVarcharFunctionFactory;
+import io.questdb.griffin.engine.functions.cast.CastIntToDecimalFunctionFactory;
+import io.questdb.griffin.engine.functions.cast.CastIntervalToStrFunctionFactory;
+import io.questdb.griffin.engine.functions.cast.CastLongToDecimalFunctionFactory;
+import io.questdb.griffin.engine.functions.cast.CastShortToDecimalFunctionFactory;
+import io.questdb.griffin.engine.functions.cast.CastStrToDecimalFunctionFactory;
+import io.questdb.griffin.engine.functions.cast.CastStrToDoubleArrayFunctionFactory;
+import io.questdb.griffin.engine.functions.cast.CastStrToGeoHashFunctionFactory;
+import io.questdb.griffin.engine.functions.cast.CastStrToTimestampFunctionFactory;
+import io.questdb.griffin.engine.functions.cast.CastStrToUuidFunctionFactory;
+import io.questdb.griffin.engine.functions.cast.CastUuidToStrFunctionFactory;
+import io.questdb.griffin.engine.functions.cast.CastUuidToVarcharFunctionFactory;
+import io.questdb.griffin.engine.functions.cast.CastVarcharToDecimalFunctionFactory;
+import io.questdb.griffin.engine.functions.cast.CastVarcharToGeoHashFunctionFactory;
+import io.questdb.griffin.engine.functions.cast.CastVarcharToTimestampFunctionFactory;
+import io.questdb.griffin.engine.functions.cast.CastVarcharToUuidFunctionFactory;
+import io.questdb.griffin.engine.functions.columns.ArrayColumn;
+import io.questdb.griffin.engine.functions.columns.BinColumn;
+import io.questdb.griffin.engine.functions.columns.BooleanColumn;
+import io.questdb.griffin.engine.functions.columns.ByteColumn;
+import io.questdb.griffin.engine.functions.columns.CharColumn;
+import io.questdb.griffin.engine.functions.columns.DateColumn;
+import io.questdb.griffin.engine.functions.columns.DecimalColumn;
+import io.questdb.griffin.engine.functions.columns.DoubleColumn;
+import io.questdb.griffin.engine.functions.columns.FloatColumn;
+import io.questdb.griffin.engine.functions.columns.GeoByteColumn;
+import io.questdb.griffin.engine.functions.columns.GeoIntColumn;
+import io.questdb.griffin.engine.functions.columns.GeoLongColumn;
+import io.questdb.griffin.engine.functions.columns.GeoShortColumn;
+import io.questdb.griffin.engine.functions.columns.IPv4Column;
+import io.questdb.griffin.engine.functions.columns.IntColumn;
+import io.questdb.griffin.engine.functions.columns.IntervalColumn;
+import io.questdb.griffin.engine.functions.columns.Long128Column;
+import io.questdb.griffin.engine.functions.columns.Long256Column;
+import io.questdb.griffin.engine.functions.columns.LongColumn;
+import io.questdb.griffin.engine.functions.columns.RecordColumn;
+import io.questdb.griffin.engine.functions.columns.ShortColumn;
+import io.questdb.griffin.engine.functions.columns.StrColumn;
+import io.questdb.griffin.engine.functions.columns.SymbolColumn;
+import io.questdb.griffin.engine.functions.columns.TimestampColumn;
+import io.questdb.griffin.engine.functions.columns.UuidColumn;
+import io.questdb.griffin.engine.functions.columns.VarcharColumn;
+import io.questdb.griffin.engine.functions.constants.ArrayConstant;
+import io.questdb.griffin.engine.functions.constants.BooleanConstant;
+import io.questdb.griffin.engine.functions.constants.ByteConstant;
+import io.questdb.griffin.engine.functions.constants.CharConstant;
+import io.questdb.griffin.engine.functions.constants.CharTypeConstant;
+import io.questdb.griffin.engine.functions.constants.ConstantFunction;
+import io.questdb.griffin.engine.functions.constants.Constants;
+import io.questdb.griffin.engine.functions.constants.DateConstant;
+import io.questdb.griffin.engine.functions.constants.Decimal128Constant;
+import io.questdb.griffin.engine.functions.constants.Decimal16Constant;
+import io.questdb.griffin.engine.functions.constants.Decimal256Constant;
+import io.questdb.griffin.engine.functions.constants.Decimal32Constant;
+import io.questdb.griffin.engine.functions.constants.Decimal64Constant;
+import io.questdb.griffin.engine.functions.constants.Decimal8Constant;
+import io.questdb.griffin.engine.functions.constants.DecimalTypeConstant;
+import io.questdb.griffin.engine.functions.constants.DoubleConstant;
+import io.questdb.griffin.engine.functions.constants.FloatConstant;
+import io.questdb.griffin.engine.functions.constants.GeoByteConstant;
+import io.questdb.griffin.engine.functions.constants.GeoHashTypeConstant;
+import io.questdb.griffin.engine.functions.constants.GeoIntConstant;
+import io.questdb.griffin.engine.functions.constants.GeoLongConstant;
+import io.questdb.griffin.engine.functions.constants.GeoShortConstant;
+import io.questdb.griffin.engine.functions.constants.IPv4Constant;
+import io.questdb.griffin.engine.functions.constants.IntConstant;
+import io.questdb.griffin.engine.functions.constants.Long256Constant;
+import io.questdb.griffin.engine.functions.constants.LongConstant;
+import io.questdb.griffin.engine.functions.constants.NullConstant;
+import io.questdb.griffin.engine.functions.constants.ShortConstant;
+import io.questdb.griffin.engine.functions.constants.StrConstant;
+import io.questdb.griffin.engine.functions.constants.SymbolConstant;
+import io.questdb.griffin.engine.functions.constants.TimestampConstant;
+import io.questdb.griffin.engine.functions.constants.UuidConstant;
+import io.questdb.griffin.engine.functions.constants.VarcharConstant;
 import io.questdb.griffin.model.ExpressionNode;
-import io.questdb.griffin.model.IntervalUtils;
+import io.questdb.griffin.model.ScalarSubQueryCompileCache;
+import io.questdb.griffin.model.ScalarTimestampBoundHolder;
 import io.questdb.log.Log;
 import io.questdb.log.LogFactory;
-import io.questdb.std.*;
-import io.questdb.std.datetime.millitime.DateFormatUtils;
+import io.questdb.std.Chars;
+import io.questdb.std.Decimal128;
+import io.questdb.std.Decimal256;
+import io.questdb.std.Decimals;
+import io.questdb.std.GenericLexer;
+import io.questdb.std.IntList;
+import io.questdb.std.IntStack;
+import io.questdb.std.Long256Impl;
+import io.questdb.std.Misc;
+import io.questdb.std.Mutable;
+import io.questdb.std.Numbers;
+import io.questdb.std.NumericException;
+import io.questdb.std.ObjList;
+import io.questdb.std.Transient;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
 import java.util.ArrayDeque;
 
-import static io.questdb.griffin.SqlKeywords.isNullKeyword;
-import static io.questdb.griffin.SqlKeywords.startsWithGeoHashKeyword;
+import static io.questdb.griffin.SqlKeywords.*;
 
 public class FunctionParser implements PostOrderTreeTraversalAlgo.Visitor, Mutable {
     private static final Log LOG = LogFactory.getLog(FunctionParser.class);
@@ -57,6 +154,7 @@ public class FunctionParser implements PostOrderTreeTraversalAlgo.Visitor, Mutab
     private static final int MATCH_NO_MATCH = 0;
     private static final int MATCH_PARTIAL_MATCH = 2;
     private final CairoConfiguration configuration;
+    private final SqlExecutionRequirements executionRequirements = new SqlExecutionRequirements();
     private final FunctionFactoryCache functionFactoryCache;
     private final ArrayDeque<Function> functionStack = new ArrayDeque<>();
     private final Long256Impl long256Sink = new Long256Impl();
@@ -66,6 +164,9 @@ public class FunctionParser implements PostOrderTreeTraversalAlgo.Visitor, Mutab
     private final IntStack positionStack = new IntStack();
     private final PostOrderTreeTraversalAlgo traverseAlgo = new PostOrderTreeTraversalAlgo();
     private final IntList undefinedVariables = new IntList();
+    private boolean cursorFunctionInstantiated;
+    private int executionRequirementPosition = -1;
+    private String lastFunctionFactorySignature;
     private RecordMetadata metadata;
     private SqlCodeGenerator sqlCodeGenerator;
     private SqlExecutionContext sqlExecutionContext;
@@ -76,105 +177,96 @@ public class FunctionParser implements PostOrderTreeTraversalAlgo.Visitor, Mutab
     }
 
     @NotNull
-    public static ScalarFunction createColumn(
+    public static Function createColumn(
             int position,
             CharSequence name,
             RecordMetadata metadata
     ) throws SqlException {
-        final int index = metadata.getColumnIndexQuiet(name);
+        final int index = SqlUtil.getColumnIndexQuiet(metadata, name);
 
         if (index == -1) {
             throw SqlException.invalidColumn(position, name);
         }
 
         int columnType = metadata.getColumnType(index);
-        switch (ColumnType.tagOf(columnType)) {
-            case ColumnType.BOOLEAN:
-                return BooleanColumn.newInstance(index);
-            case ColumnType.BYTE:
-                return ByteColumn.newInstance(index);
-            case ColumnType.SHORT:
-                return ShortColumn.newInstance(index);
-            case ColumnType.CHAR:
-                return CharColumn.newInstance(index);
-            case ColumnType.INT:
-                return IntColumn.newInstance(index);
-            case ColumnType.LONG:
-                return LongColumn.newInstance(index);
-            case ColumnType.FLOAT:
-                return FloatColumn.newInstance(index);
-            case ColumnType.DOUBLE:
-                return DoubleColumn.newInstance(index);
-            case ColumnType.STRING:
+        return switch (ColumnType.tagOf(columnType)) {
+            case ColumnType.BOOLEAN -> BooleanColumn.newInstance(index);
+            case ColumnType.BYTE -> ByteColumn.newInstance(index);
+            case ColumnType.SHORT -> ShortColumn.newInstance(index);
+            case ColumnType.CHAR -> new CharColumn(index);
+            case ColumnType.INT -> IntColumn.newInstance(index);
+            case ColumnType.LONG -> LongColumn.newInstance(index);
+            case ColumnType.FLOAT -> FloatColumn.newInstance(index);
+            case ColumnType.DOUBLE -> DoubleColumn.newInstance(index);
+            case ColumnType.STRING ->
                 // we cannot use a pooled StrColumn instance, because it is not thread-safe
-                return new StrColumn(index);
-            case ColumnType.VARCHAR:
+                    new StrColumn(index);
+            case ColumnType.VARCHAR, ColumnType.VARCHAR_SLICE ->
                 // we cannot use a pooled VarcharColumn instance, because it is not thread-safe
-                return new VarcharColumn(index);
-            case ColumnType.SYMBOL:
-                return new SymbolColumn(index, metadata.isSymbolTableStatic(index));
-            case ColumnType.BINARY:
-                return BinColumn.newInstance(index);
-            case ColumnType.DATE:
-                return DateColumn.newInstance(index);
-            case ColumnType.TIMESTAMP:
-                return TimestampColumn.newInstance(index);
-            case ColumnType.RECORD:
-                return new RecordColumn(index, metadata.getMetadata(index));
-            case ColumnType.GEOBYTE:
-                return GeoByteColumn.newInstance(index, columnType);
-            case ColumnType.GEOSHORT:
-                return GeoShortColumn.newInstance(index, columnType);
-            case ColumnType.GEOINT:
-                return GeoIntColumn.newInstance(index, columnType);
-            case ColumnType.GEOLONG:
-                return GeoLongColumn.newInstance(index, columnType);
-            case ColumnType.NULL:
-                return NullConstant.NULL;
-            case ColumnType.LONG256:
-                return Long256Column.newInstance(index);
-            case ColumnType.LONG128:
-                return Long128Column.newInstance(index);
-            case ColumnType.UUID:
-                return UuidColumn.newInstance(index);
-            case ColumnType.IPv4:
-                return IPv4Column.newInstance(index);
-            default:
-                throw SqlException.position(position)
-                        .put("unsupported column type ")
-                        .put(ColumnType.nameOf(columnType));
-        }
+                    new VarcharColumn(index);
+            case ColumnType.SYMBOL -> new SymbolColumn(index, metadata.isSymbolTableStatic(index));
+            case ColumnType.BINARY -> BinColumn.newInstance(index);
+            case ColumnType.DATE -> DateColumn.newInstance(index);
+            case ColumnType.TIMESTAMP -> TimestampColumn.newInstance(index, columnType);
+            case ColumnType.RECORD -> new RecordColumn(index, metadata.getMetadata(index));
+            case ColumnType.GEOBYTE -> GeoByteColumn.newInstance(index, columnType);
+            case ColumnType.GEOSHORT -> GeoShortColumn.newInstance(index, columnType);
+            case ColumnType.GEOINT -> GeoIntColumn.newInstance(index, columnType);
+            case ColumnType.GEOLONG -> GeoLongColumn.newInstance(index, columnType);
+            case ColumnType.NULL -> NullConstant.NULL;
+            case ColumnType.LONG256 -> Long256Column.newInstance(index);
+            case ColumnType.LONG128 -> Long128Column.newInstance(index);
+            case ColumnType.UUID -> UuidColumn.newInstance(index);
+            case ColumnType.IPv4 -> IPv4Column.newInstance(index);
+            case ColumnType.INTERVAL -> IntervalColumn.newInstance(index, columnType);
+            case ColumnType.ARRAY -> new ArrayColumn(index, columnType);
+            case ColumnType.DECIMAL8, ColumnType.DECIMAL16, ColumnType.DECIMAL32, ColumnType.DECIMAL64,
+                 ColumnType.DECIMAL128, ColumnType.DECIMAL256 -> new DecimalColumn(index, columnType);
+            default -> throw SqlException.position(position)
+                    .put("unsupported column type ")
+                    .put(ColumnType.nameOf(columnType));
+        };
     }
 
     @Override
     public void clear() {
+        this.executionRequirements.clear();
+        this.executionRequirementPosition = -1;
         this.positionStack.clear();
         this.functionStack.clear();
+        this.lastFunctionFactorySignature = null;
         this.sqlExecutionContext = null;
+        this.cursorFunctionInstantiated = false;
+    }
+
+    /**
+     * Signature of the factory that produced the most recent top-level parsed
+     * function. Consumed immediately by the SQL code generator for checkpoint
+     * identity, so the selected overload is not inferred from a runtime class.
+     */
+    public String getLastFunctionFactorySignature() {
+        return lastFunctionFactorySignature;
     }
 
     public Function createBindVariable(SqlExecutionContext sqlExecutionContext, int position, CharSequence name, int expressionType) throws SqlException {
         this.sqlExecutionContext = sqlExecutionContext;
         if (name != null) {
-            if (name.length() > 0) {
+            if (!name.isEmpty()) {
                 if (expressionType != ExpressionNode.BIND_VARIABLE) {
                     return new StrConstant(name);
                 }
-                switch (name.charAt(0)) {
-                    case ':':
-                        return createNamedParameter(position, name);
-                    case '$':
-                        return parseIndexedParameter(position, name);
-                    default:
-                        return new StrConstant(name);
-                }
+                return switch (name.charAt(0)) {
+                    case ':' -> createNamedParameter(position, name);
+                    case '$' -> parseIndexedParameter(position, name);
+                    default -> new StrConstant(name);
+                };
             } else return StrConstant.EMPTY;
         }
         return NullConstant.NULL;
     }
 
     public Function createImplicitCast(int position, Function function, int toType) throws SqlException {
-        Function cast = createImplicitCastOrNull(position, function, toType);
+        final Function cast = createImplicitCastOrNull(position, function, toType);
         if (cast != null && cast.isConstant()) {
             Function constant = functionToConstant(cast);
             // incoming function is now converted to a constant and can be closed here
@@ -199,8 +291,46 @@ public class FunctionParser implements PostOrderTreeTraversalAlgo.Visitor, Mutab
         return false;
     }
 
+    public SqlExecutionRequirements getExecutionRequirements() {
+        return executionRequirements;
+    }
+
     public FunctionFactoryCache getFunctionFactoryCache() {
         return functionFactoryCache;
+    }
+
+    /**
+     * Whether a function factory has produced a CURSOR-typed function since the last
+     * {@link #resetCursorFunctionInstantiated()}. The flag is raised on the <em>instantiated</em>
+     * function rather than on the factory or the name, because the same name can be either: the
+     * {@code sleep} factory yields a cursor in one signature and a plain boolean in another, and only
+     * the boolean one is legal in a WAL {@code UPDATE}. It is also raised wherever the function
+     * stands - a FROM source, a projected column or a predicate operand all reach
+     * {@code checkAndCreateFunction} - which is what makes the WAL {@code UPDATE} check that reads it
+     * position-independent.
+     * <p>
+     * A sub-query written as {@code (SELECT ...)} does not raise it: that is an
+     * {@link ExpressionNode#QUERY} node, not a factory call, and the tables it names are visible in
+     * the model tree and checked there.
+     *
+     * @see SqlCompilerImpl#generateUpdate
+     * @see #markCursorFunctionInstantiated()
+     */
+    public boolean isCursorFunctionInstantiated() {
+        return cursorFunctionInstantiated;
+    }
+
+    /**
+     * Raises the same flag {@link #isCursorFunctionInstantiated()} reports for a cursor the compiler
+     * builds without going through a function factory. {@code SHOW} is the case that exists:
+     * {@code SqlOptimiser#parseFunctionAndEnumerateColumns} constructs the factory for it directly
+     * and hands it to {@code IQueryModel#setTableNameFunction}, so nothing here would ever see it.
+     * The invariant the flag stands for is "the compiler materialised a cursor for this statement",
+     * not "a function factory was called", and this keeps the two construction paths on the same
+     * side of it.
+     */
+    public void markCursorFunctionInstantiated() {
+        cursorFunctionInstantiated = true;
     }
 
     /**
@@ -236,18 +366,23 @@ public class FunctionParser implements PostOrderTreeTraversalAlgo.Visitor, Mutab
             SqlExecutionContext executionContext
     ) throws SqlException {
         this.sqlExecutionContext = executionContext;
+        this.lastFunctionFactorySignature = null;
 
         if (this.metadata != null) {
             metadataStack.push(this.metadata);
         }
         try {
             this.metadata = metadata;
+            if (node != null) {
+                node.reassociateConstants(configuration.getCairoSqlLegacyOperatorPrecedence());
+            }
             try {
                 traverseAlgo.traverse(node, this);
             } catch (Exception e) {
-                // release parsed functions
+                // Release parsed functions best-effort: keep closing the rest even if one close()
+                // throws, and fold close failures into e as suppressed instead of masking it.
                 for (int i = functionStack.size(); i > 0; i--) {
-                    Misc.free(functionStack.poll());
+                    Misc.free(functionStack.poll(), e);
                 }
                 positionStack.clear();
                 throw e;
@@ -256,7 +391,7 @@ public class FunctionParser implements PostOrderTreeTraversalAlgo.Visitor, Mutab
             final Function function = functionStack.poll();
             positionStack.pop();
             assert positionStack.size() == functionStack.size();
-            if (function != null && function.isConstant() && (function instanceof ScalarFunction)) {
+            if (function != null && function.isConstant() && function.extendedOps() == null) {
                 return functionToConstant(function);
             }
             return function;
@@ -267,6 +402,10 @@ public class FunctionParser implements PostOrderTreeTraversalAlgo.Visitor, Mutab
                 this.metadata = metadataStack.poll();
             }
         }
+    }
+
+    public void resetCursorFunctionInstantiated() {
+        cursorFunctionInstantiated = false;
     }
 
     public void setSqlCodeGenerator(SqlCodeGenerator sqlCodeGenerator) {
@@ -303,16 +442,53 @@ public class FunctionParser implements PostOrderTreeTraversalAlgo.Visitor, Mutab
             mutableArgs.setPos(argCount);
             mutableArgPositions.clear();
             mutableArgPositions.setPos(argCount);
+            // The function about to be created is runtime constant iff every arg is constant or
+            // runtime constant and at least one is runtime constant (mirrors the function base
+            // classes). Used below to fold runtime-constant subtrees at boundaries only.
+            boolean allConstOrRuntimeConst = true;
+            boolean anyRuntimeConst = false;
             for (int n = 0; n < argCount; n++) {
-                final Function arg = functionStack.poll();
+                Function arg = functionStack.poll();
                 final int pos = positionStack.pop();
+
+                try {
+                    if (arg != null && arg.isConstant() && arg.extendedOps() == null && !(arg instanceof TypeConstant)) {
+                        arg = functionToConstant(arg);
+                    }
+                } catch (Throwable th) {
+                    // these args were already popped from functionStack.
+                    // Best-effort cleanup: fold any close() failure into th as suppressed instead
+                    // of masking it, and keep closing later args even if one close() throws.
+                    Misc.freeObjList(mutableArgs, th);
+                    throw th;
+                }
 
                 mutableArgs.setQuick(n, arg);
                 mutableArgPositions.setQuick(n, pos);
 
                 if (arg instanceof GroupByFunction) {
-                    Misc.freeObjList(mutableArgs);
-                    throw SqlException.position(pos).put("Aggregate function cannot be passed as an argument");
+                    final SqlException ex = SqlException.position(pos).put("Aggregate function cannot be passed as an argument");
+                    Misc.freeObjList(mutableArgs, ex);
+                    throw ex;
+                }
+
+                final boolean argRuntimeConst = arg != null && arg.isRuntimeConstant();
+                if (arg == null || (!argRuntimeConst && !arg.isConstant())) {
+                    allConstOrRuntimeConst = false;
+                } else if (argRuntimeConst) {
+                    // a function is never both constant and runtime constant (see Function.isRuntimeConstant)
+                    anyRuntimeConst = true;
+                }
+            }
+            // At a boundary (the new function is not runtime constant), each runtime-constant arg is
+            // a maximal runtime-constant subtree: wrap it so it evaluates once per cursor, not per
+            // row. Skipped when the parent is runtime constant, so only the topmost node is wrapped.
+            if (!(allConstOrRuntimeConst && anyRuntimeConst)) {
+                for (int n = 0; n < argCount; n++) {
+                    final Function arg = mutableArgs.getQuick(n);
+                    if (RuntimeConstFunction.isFoldable(arg)) {
+                        mutableArgs.setQuick(n, RuntimeConstFunction.newInstance(arg));
+                    }
                 }
             }
             functionStack.push(createFunction(node, mutableArgs, mutableArgPositions));
@@ -320,47 +496,173 @@ public class FunctionParser implements PostOrderTreeTraversalAlgo.Visitor, Mutab
         positionStack.push(node.position);
     }
 
-    private static SqlException invalidArgument(ExpressionNode node, ObjList<Function> args, FunctionFactoryDescriptor descriptor) {
+    int enterExecutionRequirementPosition(int position) {
+        final int previousPosition = executionRequirementPosition;
+        if (previousPosition < 0) {
+            executionRequirementPosition = position;
+        }
+        return previousPosition;
+    }
+
+    void restoreExecutionRequirementPosition(int position) {
+        executionRequirementPosition = position;
+    }
+
+    private static int countWindowOverloads(ObjList<FunctionFactoryDescriptor> overload) {
+        int count = 0;
+        for (int i = 0, n = overload.size(); i < n; i++) {
+            if (overload.getQuick(i).getFactory().isWindow()) {
+                count++;
+            }
+        }
+        return count;
+    }
+
+    private static void handleExpectedAndActual(@Transient IntList argPositions, SqlException ex, int i, int expectedType, int actualType) {
+        ex.put(" expected: ").put(ColumnType.nameOf(expectedType));
+        if (expectedType == actualType) {
+            ex.put(" constant");
+        }
+        ex.put(", actual: ").put(ColumnType.nameOf(actualType));
+        ex.setPosition(argPositions.getQuick(i));
+    }
+
+    private static SqlException invalidArgument(
+            ExpressionNode node,
+            @Nullable ObjList<Function> args,
+            @Transient IntList argPositions,
+            FunctionFactoryDescriptor descriptor
+    ) {
         SqlException ex = SqlException.position(node.position);
-        ex.put("unexpected argument for function: ");
-        ex.put(node.token);
-        ex.put(". expected args: ");
-        ex.put('(');
         if (descriptor != null) {
+            if (args != null) {
+                if (args.size() != descriptor.getSigArgCount()) {
+                    ex.put("wrong number of arguments for function `").put(node.token)
+                            .put("`; expected: ").put(descriptor.getSigArgCount())
+                            .put(", provided: ").put(args.size());
+                } else if (args.size() == 2) {
+                    // Binary operator; we have overloads we could not use because argument types
+                    // do not match somewhere. Throw type-specific exception, pointing out expression,
+                    // which type does not match the operator's descriptor.
+                    // This is typically works for boolean operators, such as "and" and "or" when
+                    // their arguments are not boolean.
+                    ex.put("expression type mismatch,");
+                    for (int i = 0, n = descriptor.getSigArgCount(); i < n; i++) {
+                        final int typeWithFlags = descriptor.getArgTypeWithFlags(i);
+                        final int expectedType = FunctionFactoryDescriptor.toTypeTag(typeWithFlags);
+                        final int actualType = args.getQuick(i).getType();
+                        final boolean expectedConstant = FunctionFactoryDescriptor.isConstant(typeWithFlags);
+                        final boolean actualConstant = args.getQuick(i).isConstant();
+
+                        if (FunctionFactoryDescriptor.isArray(typeWithFlags)) {
+                            // we expect arg to be a compatible array
+                            if (ColumnType.isArray(actualType) && expectedType == ColumnType.decodeArrayElementType(actualType) && (!expectedConstant || actualConstant)) {
+                                continue;
+                            }
+                            ex.put(" expected: ").put(ColumnType.nameOf(expectedType)).put("[]");
+                            if (ColumnType.isArray(actualType) && expectedType == ColumnType.decodeArrayElementType(actualType)) {
+                                ex.put(" constant");
+                            }
+                            ex.put(", actual: ").put(ColumnType.nameOf(actualType));
+                            ex.setPosition(argPositions.getQuick(i));
+                            break;
+                        } else {
+                            if (expectedType != actualType || (expectedConstant && !actualConstant)) {
+                                handleExpectedAndActual(argPositions, ex, i, expectedType, actualType);
+                                break;
+                            }
+                        }
+                    }
+                } else {
+                    ex.put("argument type mismatch for function `").put(node.token).put('`');
+                    for (int i = 0, n = descriptor.getSigArgCount(); i < n; i++) {
+                        final int typeWithFlags = descriptor.getArgTypeWithFlags(i);
+                        final int expectedType = FunctionFactoryDescriptor.toTypeTag(typeWithFlags);
+                        final boolean expectedConstant = FunctionFactoryDescriptor.isConstant(typeWithFlags);
+                        final int actualType = args.getQuick(i).getType();
+                        final boolean actualConstant = args.getQuick(i).isConstant();
+
+                        if (expectedType != actualType || (expectedConstant && !actualConstant)) {
+                            ex.put(" at #").put(i + 1);
+                            handleExpectedAndActual(argPositions, ex, i, expectedType, actualType);
+                        }
+                    }
+                }
+                Misc.freeObjList(args, ex);
+                return ex;
+            }
+
+            ex.put("function `");
+            ex.put(node.token);
+            ex.put("` requires arguments: ");
+            ex.put(node.token);
+            ex.put('(');
             for (int i = 0, n = descriptor.getSigArgCount(); i < n; i++) {
                 if (i > 0) {
-                    ex.put(',');
+                    ex.put(", ");
                 }
-                final int mask = descriptor.getArgTypeMask(i);
-                ex.put(ColumnType.nameOf(FunctionFactoryDescriptor.toType(mask)));
-                if (FunctionFactoryDescriptor.isArray(mask)) {
+                final int typeWithFlags = descriptor.getArgTypeWithFlags(i);
+                ex.put(ColumnType.nameOf(FunctionFactoryDescriptor.toTypeTag(typeWithFlags)));
+                if (FunctionFactoryDescriptor.isArray(typeWithFlags)) {
                     ex.put("[]");
                 }
-                if (FunctionFactoryDescriptor.isConstant(mask)) {
+                if (FunctionFactoryDescriptor.isConstant(typeWithFlags)) {
                     ex.put(" constant");
                 }
             }
+            ex.put(')');
+            return ex;
         }
-        ex.put("). actual args: ");
-        ex.put('(');
-        if (args != null) {
-            for (int i = 0, n = args.size(); i < n; i++) {
-                if (i > 0) {
-                    ex.put(',');
+
+        OperatorExpression op = OperatorExpression.getRegistry().getOperatorDefinition(node.token);
+        if (op == null) {
+            // function, not an operator, is not found
+            if (args != null) {
+                ex.put("there is no matching function `").put(node.token).put("` with the argument types: (");
+                for (int i = 0, n = args.size(); i < n; i++) {
+                    if (i > 0) {
+                        ex.put(", ");
+                    }
+                    putArgType(args, i, ex);
                 }
-                Function arg = args.getQuick(i);
-                ex.put(ColumnType.nameOf(arg.getType()));
-                if (arg.isConstant()) {
-                    ex.put(" constant");
-                }
+                ex.put(')');
+            } else {
+                ex.put("function `").put(node.token).put("` requires arguments");
             }
+            Misc.freeObjList(args, ex);
+            return ex;
         }
-        ex.put(')');
-        Misc.freeObjList(args);
+
+        if (args != null && args.size() == 2) {
+            // binary operator not found
+            // function, not an operator, is not found
+            ex.put("there is no matching operator `").put(node.token).put("` with the argument types: ");
+            putArgType(args, 0, ex);
+            ex.put(' ');
+            ex.put(node.token);
+            ex.put(' ');
+            putArgType(args, 1, ex);
+            Misc.freeObjList(args, ex);
+            return ex;
+        }
+
+        assert args != null;
+
+        // Unary operator with the specific argument types not found.
+        // function, not an operator, is not found
+        ex.put("there is no matching operator `").put(node.token).put("` with the argument type: ");
+        putArgType(args, 0, ex);
+        Misc.freeObjList(args, ex);
         return ex;
     }
 
     private static SqlException invalidFunction(ExpressionNode node, ObjList<Function> args) {
+        if (isUnnestKeyword(node.token)) {
+            final SqlException ex = SqlException.position(node.position)
+                    .put("UNNEST cannot be used as an expression; use it in the FROM clause");
+            Misc.freeObjList(args, ex);
+            return ex;
+        }
         SqlException ex = SqlException.position(node.position);
         ex.put("unknown function name");
         ex.put(": ");
@@ -375,16 +677,21 @@ public class FunctionParser implements PostOrderTreeTraversalAlgo.Visitor, Mutab
             }
         }
         ex.put(')');
-        Misc.freeObjList(args);
+        Misc.freeObjList(args, ex);
         return ex;
     }
 
     private static long parseDate(CharSequence str, int position) throws SqlException {
         try {
-            return DateFormatUtils.parseDate(str);
+            return MillisTimestampDriver.floor(str);
         } catch (NumericException e) {
             throw SqlException.invalidDate(str, position);
         }
+    }
+
+    private static void putArgType(ObjList<Function> args, int i, SqlException ex) {
+        Function arg = args.getQuick(i);
+        ex.put(ColumnType.nameOf(arg.getType()));
     }
 
     private Function checkAndCreateFunction(
@@ -397,25 +704,61 @@ public class FunctionParser implements PostOrderTreeTraversalAlgo.Visitor, Mutab
         final int position = node.position;
         Function function;
         try {
-            LOG.debug().$("call ").$(node).$(" -> ").$(factory.getSignature()).$("[factory=").$(factory).$(']').$();
+            LOG.debug().$("call ").$(node)
+                    .$(" -> ").$safe(factory.getSignature())
+                    .$("[factory=").$(factory)
+                    .I$();
             function = factory.newInstance(position, args, argPositions, configuration, sqlExecutionContext);
         } catch (SqlException | ImplicitCastException e) {
-            Misc.freeObjList(args);
+            // Best-effort cleanup: keep closing args even if one close() throws, and fold any
+            // close failure into the original error as suppressed instead of masking it.
+            Misc.freeObjList(args, e);
             throw e;
         } catch (Throwable e) {
             LOG.error().$("exception in function factory: ").$(e).$();
-            Misc.freeObjList(args);
-            throw SqlException.position(position).put("exception in function factory");
+            final SqlException ex = SqlException.position(position).put("exception in function factory: ").put(e.getMessage());
+            Misc.freeObjList(args, ex);
+            throw ex;
         }
 
         if (function == null) {
             LOG.error().$("NULL function")
-                    .$(" [signature=").$(factory.getSignature())
-                    .$(", class=").$(factory.getClass().getName()).$(']')
-                    .$();
-            Misc.freeObjList(args);
-            throw SqlException.position(position).put("bad function factory (NULL), check log");
+                    .$(" [signature=").$safe(factory.getSignature())
+                    .$(", class=").$safe(factory.getClass().getName())
+                    .I$();
+            final SqlException ex = SqlException.position(position).put("bad function factory (NULL), check log");
+            Misc.freeObjList(args, ex);
+            throw ex;
+        } else if (!sqlExecutionContext.allowNonDeterministicFunctions() && function.isNonDeterministic()) {
+            // The same guard is armed for both a materialized view and a live view
+            // SELECT; name the kind actually being compiled so the reject reads right.
+            final SqlException exception = SqlException.nonDeterministicColumn(
+                    node.position,
+                    node.token,
+                    sqlExecutionContext.isLiveViewCompile() ? "live view" : "materialized view"
+            );
+            // Construction succeeded, so the function has taken ownership of args (see the args.clear()
+            // below on the success path). Close the function itself - not just its argument list - so
+            // any native resource it allocated beyond its arguments (e.g. an IN-value set) is released
+            // instead of leaked. Closing the function also frees the args it owns, so do not free them
+            // separately. Preserve the rejection exception if close() were to throw.
+            if (args != null) {
+                args.clear(); // newInstance() transferred argument ownership to function
+            }
+            Misc.free(function, exception);
+            throw exception;
         }
+        executionRequirements.add(
+                factory.getExecutionRequirements(),
+                executionRequirementPosition > -1 ? executionRequirementPosition : position
+        );
+        if (args != null) {
+            args.clear(); // To enforce that args are not used after this point
+        }
+        if (ColumnType.isCursor(function.getType())) {
+            cursorFunctionInstantiated = true;
+        }
+        lastFunctionFactorySignature = factory.getSignature();
         return function;
     }
 
@@ -429,19 +772,18 @@ public class FunctionParser implements PostOrderTreeTraversalAlgo.Visitor, Mutab
     private Function createConstant(int position, final CharSequence tok) throws SqlException {
         final int len = tok.length();
 
-        if (isNullKeyword(tok)) {
+        if (isNullKeyword(tok) || isNanKeyword(tok)) {
             return NullConstant.NULL;
         }
 
         if (Chars.isQuoted(tok)) {
-            switch (len) {
-                case 3: // this is 'x' - char
-                    return CharConstant.newInstance(tok.charAt(1));
-                case 2: // this is '' - char
-                    return StrConstant.EMPTY;
-                default:
-                    return new StrConstant(tok);
-            }
+            return switch (len) {
+                case 3 -> // this is 'x' - char
+                        CharConstant.newInstance(tok.charAt(1));
+                case 2 -> // this is '' - char
+                        StrConstant.EMPTY;
+                default -> new StrConstant(tok);
+            };
         }
 
         // special case E'str' - we treat it like normal string for now
@@ -478,16 +820,18 @@ public class FunctionParser implements PostOrderTreeTraversalAlgo.Visitor, Mutab
         }
 
         // type constant for 'CAST' operation
-
-        final short columnType = ColumnType.tagOf(tok);
+        final int columnType = ColumnType.typeOf(tok);
+        final short columnTag = ColumnType.tagOf(columnType);
         if (
-                (columnType >= ColumnType.BOOLEAN && columnType <= ColumnType.BINARY)
-                        || columnType == ColumnType.REGCLASS
-                        || columnType == ColumnType.REGPROCEDURE
-                        || columnType == ColumnType.ARRAY_STRING
-                        || columnType == ColumnType.UUID
-                        || columnType == ColumnType.IPv4
-                        || columnType == ColumnType.VARCHAR
+                (columnTag >= ColumnType.BOOLEAN && columnTag <= ColumnType.BINARY)
+                        || columnTag == ColumnType.REGCLASS
+                        || columnTag == ColumnType.REGPROCEDURE
+                        || columnTag == ColumnType.ARRAY_STRING
+                        || columnTag == ColumnType.UUID
+                        || columnTag == ColumnType.IPv4
+                        || columnTag == ColumnType.VARCHAR
+                        || columnTag == ColumnType.INTERVAL
+                        || columnTag == ColumnType.ARRAY
         ) {
             return Constants.getTypeConstant(columnType);
         }
@@ -506,6 +850,22 @@ public class FunctionParser implements PostOrderTreeTraversalAlgo.Visitor, Mutab
             }
         }
 
+        //region decimal
+        if (len >= DECIMAL_KEYWORD_LENGTH && startsWithDecimalKeyword(tok)) {
+            return createDecimalTypeConstant(tok, len, position);
+        }
+
+        if (len > 1 && (tok.charAt(len - 1) | 32) == 'm') {
+            return DecimalUtil.parseDecimalConstant(position, sqlExecutionContext, tok, -1, -1);
+        }
+
+        if (isNumericKeyword(tok)) {
+            // We don't know the actual size of the decimal that will be sent,
+            // we assume it's going to be enough but cannot be sure.
+            return new DecimalTypeConstant(76, 38);
+        }
+        //endregion
+
         // long256
         if (Numbers.extractLong256(tok, long256Sink)) {
             return new Long256Constant(long256Sink); // values are copied from this sink
@@ -516,18 +876,126 @@ public class FunctionParser implements PostOrderTreeTraversalAlgo.Visitor, Mutab
 
     private Function createCursorFunction(ExpressionNode node) throws SqlException {
         assert node.queryModel != null;
-        // Disable async offload for in (select ...) sub-queries to avoid infinite loops
-        // due to nested reduce calls. See SqlCodeGenerator#testBug484() for the reproducer.
-        boolean currentFilterEnabled = sqlExecutionContext.isParallelFilterEnabled();
-        sqlExecutionContext.setParallelFilterEnabled(false);
+        final ScalarTimestampBoundHolder scalarBoundHolder = node.scalarBoundHolder;
+        if (scalarBoundHolder != null) {
+            // This sub-query was already compiled and evaluated once as a designated-timestamp
+            // pruning bound (WhereClauseParser). Re-opening it here for the residual filter could
+            // observe a different commit than the pruning open and drop qualifying rows, so read the
+            // pruning bound's single frozen value instead.
+            return new ScalarSubQueryBoundRefFunction(scalarBoundHolder);
+        }
+        final ScalarSubQueryCompileCache compileCache = node.scalarBoundCompileCache;
+        if (compileCache != null) {
+            // This sub-query was already compiled as a speculative pruning bound that was then
+            // declined. Nothing froze its value - the bound was not provably stable - so reuse the
+            // compiled function itself and evaluate it here, exactly as a fresh generation would,
+            // instead of generating the identical sub-query a second time. An empty slot (a later
+            // per-worker clone, or a parser that already released it) falls through and compiles.
+            final Function reused = compileCache.take();
+            if (reused != null) {
+                return reused;
+            }
+        }
         // Make sure to override timestamp required flag from base query.
         sqlExecutionContext.pushTimestampRequiredFlag(false);
         try {
-            return new CursorFunction(sqlCodeGenerator.generate(node.queryModel, sqlExecutionContext));
+            final CursorFunction function = new CursorFunction(sqlCodeGenerator.generate(node.queryModel, sqlExecutionContext));
+            // Reject only sub-queries reading a source outside the database. Genuinely
+            // non-deterministic functions (now(), sysdate(), rnd_*) inside the sub-query are already
+            // rejected while the sub-query is generated, by the guard above, which names the offending
+            // function. Do NOT consult isNonDeterministic() here: it is a fail-safe optimizer hint that
+            // defaults to true, so 97 of 114 factories would make legal SQL illegal by accident.
+            if (!sqlExecutionContext.allowNonDeterministicFunctions() && function.getRecordCursorFactory().usesExternalDataSource()) {
+                final SqlException exception = SqlException.nonDeterministicColumn(
+                        node.position,
+                        "sub-query",
+                        sqlExecutionContext.isLiveViewCompile() ? "live view" : "materialized view"
+                );
+                try {
+                    function.close();
+                } catch (Throwable cleanupFailure) {
+                    exception.addSuppressed(cleanupFailure);
+                }
+                throw exception;
+            }
+            return function;
         } finally {
-            sqlExecutionContext.setParallelFilterEnabled(currentFilterEnabled);
             sqlExecutionContext.popTimestampRequiredFlag();
         }
+    }
+
+    /**
+     * Creates a DecimalTypeConstant function from a token representing a decimal type specification.
+     * <p>
+     * This function parses tokens in the format DECIMAL_p or DECIMAL_p_s, where 'p' represents
+     * the precision (total number of digits) and 's' represents the scale (number of decimal places).
+     * The token format uses underscores as separators because parentheses are handled separately
+     * by the expression parser.
+     *
+     * @param tok      the token containing the decimal type specification (e.g., "DECIMAL_10" or "DECIMAL_10_2")
+     * @param len      the length of the token
+     * @param position the position in the SQL query for error reporting
+     * @return a DecimalTypeConstant containing the validated precision and scale
+     * @throws SqlException if:
+     *                      - precision is not between 1 and MAX_PRECISION
+     *                      - scale is not between 0 and MAX_SCALE
+     *                      - the token format is invalid or contains non-numeric values
+     */
+    private Function createDecimalTypeConstant(CharSequence tok, int len, int position) throws SqlException {
+        // A decimal type is of the format DECIMAL[_p[_s]], to this point we have only validated `DECIMAL_`.
+        int precision;
+        int scale = 0;
+        if (tok instanceof GenericLexer.FloatingSequencePair) {
+            CharSequence cs1 = ((GenericLexer.FloatingSequencePair) tok).cs1;
+            precision = DecimalUtil.parsePrecision(position, cs1, 0, cs1.length());
+        } else if (tok instanceof GenericLexer.FloatingSequenceTriple) {
+            CharSequence cs1 = ((GenericLexer.FloatingSequenceTriple) tok).cs1;
+            CharSequence cs2 = ((GenericLexer.FloatingSequenceTriple) tok).cs2;
+            precision = DecimalUtil.parsePrecision(position, cs1, 0, cs1.length());
+            scale = DecimalUtil.parseScale(position, cs2, 0, cs2.length());
+        } else {
+            // Slower path
+            if (len == DECIMAL_KEYWORD_LENGTH) {
+                precision = 18;
+                scale = 3;
+            } else {
+                int sepIndex = Chars.indexOf(tok, 8, '_');
+                precision = DecimalUtil.parsePrecision(position, tok, 8, sepIndex == -1 ? len : sepIndex);
+                if (sepIndex != -1) {
+                    scale = DecimalUtil.parseScale(position, tok, sepIndex + 1, len);
+                }
+            }
+        }
+
+        if (precision <= 0) {
+            throw SqlException.position(position)
+                    .put("Invalid decimal type. The precision (")
+                    .put(precision)
+                    .put(") must be greater than zero");
+        }
+        if (precision > Decimals.MAX_PRECISION) {
+            throw SqlException.position(position)
+                    .put("Invalid decimal type. The precision (")
+                    .put(precision)
+                    .put(") must be less than ")
+                    .put(Decimals.MAX_PRECISION);
+        }
+        if (scale < 0) {
+            throw SqlException.position(position)
+                    .put("Invalid decimal type. The scale (")
+                    .put(scale)
+                    .put(") must be greater than or equal to zero");
+        }
+        if (scale > precision) {
+            throw SqlException.position(position)
+                    .put("Invalid decimal type. The precision (")
+                    .put(precision)
+                    .put(") must be greater than or equal to the scale (")
+                    .put(scale)
+                    .put(")");
+        }
+
+        return new DecimalTypeConstant(precision, scale);
     }
 
     private Function createFunction(
@@ -550,38 +1018,68 @@ public class FunctionParser implements PostOrderTreeTraversalAlgo.Visitor, Mutab
         int bestMatch = MATCH_NO_MATCH;
         boolean isWindowContext = !sqlExecutionContext.getWindowContext().isEmpty();
 
-        // If a bind variable of unknown type appears inside a cast expression, we should
-        // assign a default type to it. Otherwise, since casting is a heavily overloaded
-        // operation (can cast lots of things to a string/number), we'll end up picking
-        // whatever happens to be the first cast function in the traversal order, and force
-        // the bind variable to that type. This will then fail when an actual value is bound
-        // to the variable, and it's most likely not that arbitrary type.
-        if (Chars.equals("cast", node.token)
-                && argCount == 2
-                && args.getQuick(0).isUndefined()
-                && args.getQuick(1).isConstant()
+        if (
+                SqlKeywords.isCastKeyword(node.token)
+                        && argCount == 2
+                        && args.getQuick(1).isConstant()
         ) skipAssigningType:{
-            final Function undefinedArg = args.getQuick(0);
+            Function arg0 = args.getQuick(0);
+            final int fromType = arg0.getType();
             final int castToType = args.getQuick(1).getType();
-            final int assignType;
-            switch (castToType) {
-                case ColumnType.VARCHAR:
-                case ColumnType.STRING:
-                case ColumnType.CHAR:
-                    assignType = ColumnType.STRING;
-                    break;
-                case ColumnType.BYTE:
-                case ColumnType.SHORT:
-                case ColumnType.INT:
-                case ColumnType.LONG:
-                case ColumnType.FLOAT:
-                case ColumnType.DOUBLE:
-                    assignType = ColumnType.DOUBLE;
-                    break;
-                default:
-                    break skipAssigningType;
+            // If this the cast into same type, return the first argument
+            if (args.getQuick(0).getType() == castToType) {
+                return args.getQuick(0);
             }
-            undefinedArg.assignType(assignType, sqlExecutionContext.getBindVariableService());
+
+            // We manually handle the float/double to decimal cast here to avoid precision loss
+            if (node.lhs.type == ExpressionNode.CONSTANT && ColumnType.isDecimal(castToType) &&
+                    (fromType == ColumnType.DOUBLE || fromType == ColumnType.FLOAT)) {
+                int precision = ColumnType.getDecimalPrecision(castToType);
+                int scale = ColumnType.getDecimalScale(castToType);
+                return DecimalUtil.parseDecimalConstant(node.lhs.position, sqlExecutionContext, node.lhs.token, precision, scale);
+            }
+
+            // If a bind variable of unknown type appears inside a cast expression, we should
+            // assign a default type to it. Otherwise, since casting is a heavily overloaded
+            // operation (can cast lots of things to a string/number), we'll end up picking
+            // whatever happens to be the first cast function in the traversal order, and force
+            // the bind variable to that type. This will then fail when an actual value is bound
+            // to the variable, and it's most likely not that arbitrary type.
+            if (ColumnType.isUndefined(fromType)) {
+                short castToTypeTag = ColumnType.tagOf(castToType);
+                final int assignType;
+                switch (castToTypeTag) {
+                    case ColumnType.VARCHAR:
+                    case ColumnType.STRING:
+                    case ColumnType.CHAR:
+                        assignType = ColumnType.STRING;
+                        break;
+                    case ColumnType.BYTE:
+                    case ColumnType.SHORT:
+                    case ColumnType.INT:
+                    case ColumnType.LONG:
+                    case ColumnType.FLOAT:
+                    case ColumnType.DOUBLE:
+                        assignType = ColumnType.DOUBLE;
+                        break;
+                    case ColumnType.ARRAY:
+                    case ColumnType.DECIMAL8:
+                    case ColumnType.DECIMAL16:
+                    case ColumnType.DECIMAL32:
+                    case ColumnType.DECIMAL64:
+                    case ColumnType.DECIMAL128:
+                    case ColumnType.DECIMAL256:
+                        assignType = castToType;
+                        break;
+                    default:
+                        break skipAssigningType;
+                }
+                arg0.assignType(assignType, sqlExecutionContext.getBindVariableService());
+                if (assignType == castToType) {
+                    // Now that that type is assigned, we can return the first argument, no additional cast needed
+                    return arg0;
+                }
+            }
         }
 
         undefinedVariables.clear();
@@ -602,9 +1100,9 @@ public class FunctionParser implements PostOrderTreeTraversalAlgo.Visitor, Mutab
             final boolean sigVarArgConst;
 
             if (sigArgCount > 0) {
-                final int lastSigArgMask = descriptor.getArgTypeMask(sigArgCount - 1);
-                sigVarArg = FunctionFactoryDescriptor.toType(lastSigArgMask) == ColumnType.VAR_ARG;
-                sigVarArgConst = FunctionFactoryDescriptor.isConstant(lastSigArgMask);
+                final int lastSigArgTypeWithFlags = descriptor.getArgTypeWithFlags(sigArgCount - 1);
+                sigVarArg = FunctionFactoryDescriptor.toTypeTag(lastSigArgTypeWithFlags) == ColumnType.VAR_ARG;
+                sigVarArgConst = FunctionFactoryDescriptor.isConstant(lastSigArgTypeWithFlags);
             } else {
                 sigVarArg = false;
                 sigVarArgConst = false;
@@ -616,11 +1114,40 @@ public class FunctionParser implements PostOrderTreeTraversalAlgo.Visitor, Mutab
 
             // this is no-arg function, match right away
             if (argCount == 0 && sigArgCount == 0) {
-                return checkAndCreateFunction(factory, args, argPositions, node, configuration);
+                if (factory.isWindow() == isWindowContext || n == 1) {
+                    return checkAndCreateFunction(factory, args, argPositions, node, configuration);
+                }
+                continue;
             }
 
-            if (candidateDescriptor == null) {
-                candidateDescriptor = descriptor;
+            // This block resolves ambiguity between variadic functions (e.g., InSymbolFunctionFactory "in(KV)")
+            // and array functions (e.g., InSymbolVarcharArrayFunctionFactory "in(KØ[])") when bind variables
+            // have undefined types (deferred type inference at bind time).
+            //
+            // Example Problem: For "symbol_col IN ($1)" where $1 is an undefined bind variable, the default overload
+            // rules would match the variadic version "in(KV)" (variadic functions exactly match).
+            // However, when there is only one undefined argument, we want "in(KØ[])" to match instead.
+            //
+            // Solution: When all variadic arguments are undefined, we delegate to the factory's
+            // variadicTypeSupportUndefinedBindVariables() method to decide whether to skip this function.
+            // This gives more specific signatures (like "in(KØ[]")) a chance to match first.
+            //
+            // Note: The function matching logic is intricate and fragile. So introduced this as a minimal fix
+            // to avoid side effects.
+            if (sigVarArg && argCount != sigArgCount) {
+                if (argCount < sigArgCount) {
+                    continue;
+                }
+                boolean variadicTypeAreAllUndefinedVariables = true;
+                for (int argIdx = sigArgCount; argIdx < argCount; argIdx++) {
+                    if (!args.getQuick(argIdx).isUndefined()) {
+                        variadicTypeAreAllUndefinedVariables = false;
+                        break;
+                    }
+                }
+                if (variadicTypeAreAllUndefinedVariables && !factory.variadicTypeSupportUndefinedBindVariables(args)) {
+                    continue;
+                }
             }
 
             // otherwise, is number of arguments the same?
@@ -629,56 +1156,64 @@ public class FunctionParser implements PostOrderTreeTraversalAlgo.Visitor, Mutab
                 int sigArgTypeScore = 0;
                 for (int argIdx = 0; argIdx < sigArgCount; argIdx++) {
                     final Function arg = args.getQuick(argIdx);
-                    final int sigArgTypeMask = descriptor.getArgTypeMask(argIdx);
+                    final int sigArgTypeWithFlags = descriptor.getArgTypeWithFlags(argIdx);
 
-                    if (FunctionFactoryDescriptor.isConstant(sigArgTypeMask) && !arg.isConstant()) {
-                        match = MATCH_NO_MATCH; // no match
+                    if (FunctionFactoryDescriptor.isConstant(sigArgTypeWithFlags) && !arg.isConstant()) {
+                        match = MATCH_NO_MATCH;
                         break;
                     }
 
-                    final boolean isArray = FunctionFactoryDescriptor.isArray(sigArgTypeMask);
-                    final boolean isScalar = arg instanceof ScalarFunction;
-                    if ((isArray && isScalar) || (!isArray && !isScalar)) {
-                        match = MATCH_NO_MATCH; // no match
-                        break;
-                    }
-
-                    final short sigArgType = FunctionFactoryDescriptor.toType(sigArgTypeMask);
                     final int argType = arg.getType();
                     final short argTypeTag = ColumnType.tagOf(argType);
-                    final short sigArgTypeTag = ColumnType.tagOf(sigArgType);
+                    final short sigArgTypeTag = FunctionFactoryDescriptor.toTypeTag(sigArgTypeWithFlags);
+
+                    final boolean sigIsArray = FunctionFactoryDescriptor.isArray(sigArgTypeWithFlags);
+                    final boolean argIsArray = argTypeTag == ColumnType.ARRAY;
+                    final boolean argIsStringArray = argTypeTag == ColumnType.ARRAY_STRING;
+                    final boolean sigIsStringArray = sigArgTypeTag == ColumnType.ARRAY_STRING;
+                    if (sigIsArray != argIsArray || sigIsStringArray != argIsStringArray) {
+                        if (argType != ColumnType.UNDEFINED) {
+                            match = MATCH_NO_MATCH;
+                            break;
+                        }
+                    }
+                    if (argIsStringArray) { // give the above checks, implies that sigIsStringArray is also true
+                        match = mergeWithExactMatch(match);
+                        continue;
+                    }
+                    if (argIsArray) { // given the above checks, implies that sigIsArray is also true
+                        short argElemTypeTag = ColumnType.decodeArrayElementType(argType);
+                        if (sigArgTypeTag == argElemTypeTag) {
+                            match = mergeWithExactMatch(match);
+                            continue;
+                        } else {
+                            match = MATCH_NO_MATCH;
+                            break;
+                        }
+                    }
 
                     if (sigArgTypeTag == argTypeTag ||
                             (argTypeTag == ColumnType.CHAR &&              // 'a' could also be a string literal, so it should count as proper match
-                                    sigArgTypeTag == ColumnType.STRING &&  // for both string and char, otherwise ? > 'a' matches char function even though    
-                                    arg.isConstant() &&                    // bind variable parameter might be a string and throw error during execution.     
-                                    arg != CharTypeConstant.INSTANCE) ||   // Ignore type constant to keep cast(X as char) working     
-                            (sigArgTypeTag == ColumnType.GEOHASH && ColumnType.isGeoHash(argType))) {
-                        switch (match) {
-                            case MATCH_NO_MATCH: // was it no match
-                                match = MATCH_EXACT_MATCH;
-                                break;
-                            case MATCH_FUZZY_MATCH: // was it fuzzy match ?
-                                match = MATCH_PARTIAL_MATCH; // this is mixed match, fuzzy and exact
-                                break;
-                            default:
-                                // don't change match otherwise
-                                break;
-                        }
+                                    sigArgTypeTag == ColumnType.STRING &&  // for both string and char, otherwise ? > 'a' matches char function even though
+                                    factory.supportImplicitCastCharToStr() &&
+                                    arg.isConstant() && // bind variable parameter might be a string and throw error during execution.
+                                    arg != CharTypeConstant.INSTANCE) ||   // Ignore type constant to keep cast(X as char) working
+                            (sigArgTypeTag == ColumnType.GEOHASH && ColumnType.isGeoHash(argType)) ||
+                            (sigArgTypeTag == ColumnType.DECIMAL && ColumnType.isDecimal(argType))) {
+                        match = mergeWithExactMatch(match);
                         continue;
                     }
 
                     boolean overloadPossible = false;
                     // we do not want to use any overload when checking the output of a cast() function.
-                    // the output must be the exact type as specified by a user. that's the whole point of casting. 
+                    // the output must be the exact type as specified by a user. that's the whole point of casting.
                     // for all other functions, else, we want to explore possible casting opportunities
                     //
                     // output of a cast() function is always the 2nd argument in a function signature
-                    if (argIdx != 1 || !Chars.equals("cast", node.token)) {
-                        int overloadDistance = ColumnType.overloadDistance(argTypeTag, sigArgType); // NULL to any is 0
+                    if (argIdx != 1 || !SqlKeywords.isCastKeyword(node.token)) {
+                        int overloadDistance = ColumnType.overloadDistance(argTypeTag, sigArgTypeTag); // NULL to any is 0
 
-                        if (argTypeTag == ColumnType.STRING &&
-                                sigArgTypeTag == ColumnType.CHAR) {
+                        if (argTypeTag == ColumnType.STRING && sigArgTypeTag == ColumnType.CHAR) {
                             if (arg.isConstant()) {
                                 // string longer than 1 char can't be cast to char implicitly
                                 if (arg.getStrLen(null) > 1) {
@@ -688,52 +1223,12 @@ public class FunctionParser implements PostOrderTreeTraversalAlgo.Visitor, Mutab
                                 // prefer CHAR -> STRING to STRING -> CHAR conversion
                                 overloadDistance = 2 * overloadDistance;
                             }
+                        } else if (argTypeTag == ColumnType.CHAR && sigArgTypeTag == ColumnType.STRING && !factory.supportImplicitCastCharToStr()) {
+                            overloadDistance = ColumnType.OVERLOAD_NONE;
                         }
 
                         sigArgTypeScore += overloadDistance;
-                        // Overload with cast to higher precision
                         overloadPossible = overloadDistance != ColumnType.OVERLOAD_NONE;
-
-                        // Overload when arg is double NaN to func which accepts INT, LONG
-                        overloadPossible |= argTypeTag == ColumnType.DOUBLE &&
-                                arg.isConstant() &&
-                                Numbers.isNull(arg.getDouble(null)) &&
-                                (sigArgTypeTag == ColumnType.LONG || sigArgTypeTag == ColumnType.INT);
-
-                        // Implicit cast from CHAR to STRING
-                        overloadPossible |= argTypeTag == ColumnType.CHAR &&
-                                sigArgTypeTag == ColumnType.STRING;
-
-                        // Implicit cast from CHAR to VARCHAR
-                        overloadPossible |= argTypeTag == ColumnType.CHAR &&
-                                sigArgTypeTag == ColumnType.VARCHAR;
-
-                        // Implicit cast from STRING to TIMESTAMP
-                        overloadPossible |= argTypeTag == ColumnType.STRING && arg.isConstant() &&
-                                sigArgTypeTag == ColumnType.TIMESTAMP && !factory.isGroupBy();
-
-                        // Implicit cast from STRING to DATE
-                        overloadPossible |= argTypeTag == ColumnType.STRING && arg.isConstant() &&
-                                sigArgTypeTag == ColumnType.DATE && !factory.isGroupBy();
-
-                        // Implicit cast from STRING to GEOHASH
-                        overloadPossible |= argTypeTag == ColumnType.STRING &&
-                                sigArgTypeTag == ColumnType.GEOHASH && !factory.isGroupBy();
-
-                        // Implicit cast from SYMBOL to TIMESTAMP
-                        overloadPossible |= argTypeTag == ColumnType.SYMBOL && arg.isConstant() &&
-                                sigArgTypeTag == ColumnType.TIMESTAMP && !factory.isGroupBy();
-
-                        // Implicit cast from VARCHAR to TIMESTAMP
-                        overloadPossible |= argTypeTag == ColumnType.VARCHAR && arg.isConstant() && sigArgTypeTag == ColumnType.TIMESTAMP && !factory.isGroupBy();
-
-                        // Implicit cast from VARCHAR to STRING
-                        overloadPossible |= argTypeTag == ColumnType.VARCHAR && arg.isConstant() && sigArgTypeTag == ColumnType.STRING && !factory.isGroupBy();
-
-                        // Implicit cast from VARCHAR to CHAR
-                        overloadPossible |= argTypeTag == ColumnType.VARCHAR &&
-                                sigArgTypeTag == ColumnType.CHAR;
-
                         overloadPossible |= arg.isUndefined();
                     }
                     // can we use overload mechanism?
@@ -763,15 +1258,11 @@ public class FunctionParser implements PostOrderTreeTraversalAlgo.Visitor, Mutab
                     continue;
                 }
 
-                if (factory.isWindow()) {
-                    // prefer window functions in window context, otherwise non-window functions
-                    if (isWindowContext) {
-                        // choose window-ed avg(D) over group by implementation that matches arg type better
-                        match = MATCH_EXACT_MATCH;
-                        sigArgTypeScore -= 10;
-                    } else {
-                        sigArgTypeScore += 10;
-                    }
+                if (isWindowContext != factory.isWindow()) {
+                    match = MATCH_FUZZY_MATCH;
+                    sigArgTypeScore += 20;
+                } else if (factory.isWindow()) { // make windowFunction high priority when isWindowContext
+                    sigArgTypeScore -= 20;
                 }
 
                 if (match == MATCH_EXACT_MATCH || match >= bestMatch) {
@@ -810,33 +1301,80 @@ public class FunctionParser implements PostOrderTreeTraversalAlgo.Visitor, Mutab
         }
 
         if (candidate == null) {
-            // no signature match
-            throw invalidArgument(node, args, candidateDescriptor);
+            // no signature match. A CURSOR argument may be a scalar boolean sub-query used in
+            // boolean context (e.g. "a and (select b from x)"); coerce such arguments to
+            // BOOLEAN and retry once. Coerced arguments are no longer CURSOR-typed, so the
+            // retry cannot recurse further.
+            boolean coerced = false;
+            for (int i = 0; i < argCount; i++) {
+                final Function wrapped = BooleanSubQueryFunction.maybeWrap(args.getQuick(i), argPositions.getQuick(i));
+                if (wrapped != null) {
+                    args.setQuick(i, wrapped);
+                    coerced = true;
+                }
+            }
+            if (coerced) {
+                return createFunction(node, args, argPositions);
+            }
+
+            // find the best descriptor for a helpful error message
+            if (overload.size() == 1) {
+                candidateDescriptor = overload.getQuick(0);
+            } else {
+                // multiple overloads: filter by context (window vs group-by) to find the relevant one
+                FunctionFactoryDescriptor contextMatch = null;
+                int contextMatchCount = 0;
+                for (int i = 0, n = overload.size(); i < n; i++) {
+                    FunctionFactoryDescriptor d = overload.getQuick(i);
+                    if (isWindowContext == d.getFactory().isWindow()) {
+                        contextMatch = d;
+                        contextMatchCount++;
+                    }
+                }
+                if (contextMatchCount == 1) {
+                    candidateDescriptor = contextMatch;
+                }
+            }
+            throw invalidArgument(node, args, argPositions, candidateDescriptor);
         }
 
         if (candidateSigVarArgConst) {
             for (int k = candidateSigArgCount; k < argCount; k++) {
                 Function func = args.getQuick(k);
                 if (!(func.isConstant() || func.isRuntimeConstant())) {
-                    Misc.freeObjList(args);
-                    throw SqlException.$(argPositions.getQuick(k), "constant expected");
+                    final SqlException ex = SqlException.$(argPositions.getQuick(k), "constant expected");
+                    Misc.freeObjList(args, ex);
+                    throw ex;
                 }
             }
         }
-
-        // it is possible that we have more undefined variables than
-        // args in the descriptor, in case of vararg for example
+        // resolve previously UNDEFINED function types
         for (int i = 0, n = undefinedVariables.size(); i < n; i++) {
             final int pos = undefinedVariables.getQuick(i);
             if (pos < candidateSigArgCount) {
-                final int sigArgType = FunctionFactoryDescriptor.toType(candidateDescriptor.getArgTypeMask(pos));
-                args.getQuick(pos).assignType(sigArgType, sqlExecutionContext.getBindVariableService());
+                // assign arguments based on the candidate function descriptor
+                int t = candidateDescriptor.getArgTypeWithFlags(pos);
+                final short sigArgType = FunctionFactoryDescriptor.toTypeTag(t);
+                final int argType;
+                if (FunctionFactoryDescriptor.isArray(t)) {
+                    // allow varchar array only if the element type in signature is varchar
+                    argType = ColumnType.encodeArrayTypeWithWeakDims(sigArgType, sigArgType != ColumnType.VARCHAR);
+                } else {
+                    argType = sigArgType;
+                }
+                args.getQuick(pos).assignType(argType, sqlExecutionContext.getBindVariableService());
+            } else {
+                // in case of vararg it is possible that we have more undefined variables than args in the function descriptor,
+                // assign type to all remaining undefined variables based on the preference of the candidate function factory
+                int type = candidate.resolvePreferredVariadicType(argPositions.getQuick(pos), pos, args);
+                args.getQuick(pos).assignType(type, sqlExecutionContext.getBindVariableService());
             }
         }
 
         for (int k = 0; k < candidateSigArgCount; k++) {
             final Function arg = args.getQuick(k);
-            final short sigArgTypeTag = FunctionFactoryDescriptor.toType(candidateDescriptor.getArgTypeMask(k));
+            final int sigArgType = candidateDescriptor.getArgTypeWithFlags(k);
+            final short sigArgTypeTag = FunctionFactoryDescriptor.toTypeTag(sigArgType);
             final short argTypeTag = ColumnType.tagOf(arg.getType());
 
             if (argTypeTag == ColumnType.DOUBLE && arg.isConstant() && Numbers.isNull(arg.getDouble(null))) {
@@ -849,8 +1387,11 @@ public class FunctionParser implements PostOrderTreeTraversalAlgo.Visitor, Mutab
             } else if ((argTypeTag == ColumnType.STRING || argTypeTag == ColumnType.SYMBOL || argTypeTag == ColumnType.VARCHAR) && arg.isConstant()) {
                 if (sigArgTypeTag == ColumnType.TIMESTAMP) {
                     int position = argPositions.getQuick(k);
-                    long timestamp = parseTimestamp(arg.getStrA(null), position);
-                    args.set(k, TimestampConstant.newInstance(timestamp));
+                    CharSequence timestampStr = arg.getStrA(null);
+                    // Adaptive precision: prefer nano if the string has nanosecond precision
+                    int adaptiveType = getAdaptiveTimestampType(timestampStr, sigArgType);
+                    long timestamp = parseTimestamp(adaptiveType, timestampStr, position);
+                    args.set(k, TimestampConstant.newInstance(timestamp, adaptiveType));
                 } else if (sigArgTypeTag == ColumnType.DATE) {
                     int position = argPositions.getQuick(k);
                     long millis = parseDate(arg.getStrA(null), position);
@@ -858,7 +1399,35 @@ public class FunctionParser implements PostOrderTreeTraversalAlgo.Visitor, Mutab
                 }
             } else if (argTypeTag == ColumnType.UUID && sigArgTypeTag == ColumnType.STRING) {
                 args.setQuick(k, new CastUuidToStrFunctionFactory.Func(arg));
+            } else if (argTypeTag == ColumnType.IPv4 && sigArgTypeTag == ColumnType.STRING) {
+                args.setQuick(k, new CastIPv4ToStrFunctionFactory.Func(arg));
+            } else if (argTypeTag == ColumnType.INTERVAL && sigArgTypeTag == ColumnType.STRING) {
+                args.setQuick(k, new CastIntervalToStrFunctionFactory.Func(arg));
+            } else if (argTypeTag == ColumnType.INT && sigArgTypeTag == ColumnType.DECIMAL) {
+                args.setQuick(k, CastIntToDecimalFunctionFactory.newInstance(argPositions.getQuick(k), arg, sqlExecutionContext));
+            } else if (argTypeTag == ColumnType.LONG && sigArgTypeTag == ColumnType.DECIMAL) {
+                args.setQuick(k, CastLongToDecimalFunctionFactory.newInstance(argPositions.getQuick(k), arg, sqlExecutionContext.getDecimal256()));
+            } else if (argTypeTag == ColumnType.SHORT && sigArgTypeTag == ColumnType.DECIMAL) {
+                args.setQuick(k, CastShortToDecimalFunctionFactory.newInstance(argPositions.getQuick(k), arg, sqlExecutionContext));
+            } else if (argTypeTag == ColumnType.BYTE && sigArgTypeTag == ColumnType.DECIMAL) {
+                args.setQuick(k, CastByteToDecimalFunctionFactory.newInstance(argPositions.getQuick(k), arg, sqlExecutionContext));
             }
+        }
+        // An untyped NULL literal as the value argument of a polymorphic window function (lead, min,
+        // sum, nth_value, ...) is ambiguous: it ties across every typed variant (NULL to any type has
+        // zero overload distance), so the winner - and the resulting behaviour - depends on classpath
+        // scan order. Different winners give different observable behaviour: a clean rejection on one
+        // platform, a "not yet implemented for NULL" factory error on another, or even silent acceptance
+        // returning NULLs. Reject it deterministically here, before any factory runs, so the user gets
+        // the same clear "cast it" error everywhere. Window functions with a single overload (e.g. ntile,
+        // whose argument is a bucket count rather than a value) resolve deterministically and keep their
+        // own argument validation.
+        if (isWindowContext && candidate.isWindow() && argCount > 0
+                && ColumnType.tagOf(args.getQuick(0).getType()) == ColumnType.NULL
+                && countWindowOverloads(overload) > 1) {
+            final SqlException ex = SqlException.$(node.position, "window function ").put(node.token).put(" does not support an untyped NULL argument; cast it to a concrete type, e.g. null::double");
+            Misc.freeObjList(args, ex);
+            throw ex;
         }
         return checkAndCreateFunction(candidate, args, argPositions, node, configuration);
     }
@@ -871,36 +1440,48 @@ public class FunctionParser implements PostOrderTreeTraversalAlgo.Visitor, Mutab
             case ColumnType.SYMBOL:
                 if (toType == ColumnType.UUID) {
                     return new CastStrToUuidFunctionFactory.Func(function);
-                }
-                if (toType == ColumnType.TIMESTAMP) {
-                    return new CastStrToTimestampFunctionFactory.Func(function);
-                }
-                if (ColumnType.isGeoHash(toType)) {
+                } else if (ColumnType.isTimestamp(toType)) {
+                    return new CastStrToTimestampFunctionFactory.Func(function, toType);
+                } else if (ColumnType.isArray(toType)) {
+                    assert ColumnType.decodeArrayElementType(toType) == ColumnType.DOUBLE;
+                    return new CastStrToDoubleArrayFunctionFactory.Func(function, toType);
+                } else if (ColumnType.isGeoHash(toType)) {
                     return CastStrToGeoHashFunctionFactory.newInstance(position, toType, function);
+                } else if (ColumnType.isDecimal(toType)) {
+                    return CastStrToDecimalFunctionFactory.newInstance(sqlExecutionContext.getDecimal256(), position, toType, function);
                 }
                 break;
             case ColumnType.VARCHAR:
                 if (toType == ColumnType.UUID) {
                     return new CastVarcharToUuidFunctionFactory.Func(function);
-                }
-                if (toType == ColumnType.TIMESTAMP) {
-                    return new CastVarcharToTimestampFunctionFactory.Func(function);
-                }
-                if (ColumnType.isGeoHash(toType)) {
+                } else if (ColumnType.isTimestamp(toType)) {
+                    return new CastVarcharToTimestampFunctionFactory.Func(function, toType);
+                } else if (ColumnType.isGeoHash(toType)) {
                     return CastVarcharToGeoHashFunctionFactory.newInstance(position, toType, function);
+                } else if (ColumnType.isDecimal(toType)) {
+                    return CastVarcharToDecimalFunctionFactory.newInstance(sqlExecutionContext.getDecimal256(), position, toType, function);
                 }
                 break;
             case ColumnType.UUID:
                 if (toType == ColumnType.STRING) {
                     return new CastUuidToStrFunctionFactory.Func(function);
-                }
-                if (toType == ColumnType.VARCHAR) {
+                } else if (toType == ColumnType.VARCHAR) {
                     return new CastUuidToVarcharFunctionFactory.Func(function);
                 }
                 break;
             case ColumnType.CHAR:
                 if (toType == ColumnType.SYMBOL) {
                     return new CastCharToSymbolFunctionFactory.Func(function);
+                } else if (ColumnType.isDecimal(toType)) {
+                    return CastStrToDecimalFunctionFactory.newInstance(sqlExecutionContext.getDecimal256(), position, toType, function);
+                }
+                break;
+            case ColumnType.IPv4:
+                if (toType == ColumnType.STRING) {
+                    return new CastIPv4ToStrFunctionFactory.Func(function);
+                }
+                if (toType == ColumnType.VARCHAR) {
+                    return new CastIPv4ToVarcharFunctionFactory.Func(function);
                 }
                 break;
             default:
@@ -912,6 +1493,9 @@ public class FunctionParser implements PostOrderTreeTraversalAlgo.Visitor, Mutab
                     }
                 }
                 break;
+        }
+        if (ColumnType.isDecimal(toType)) {
+            return DecimalUtil.getImplicitCastFunction(function, position, toType, sqlExecutionContext);
         }
         return null;
     }
@@ -933,8 +1517,54 @@ public class FunctionParser implements PostOrderTreeTraversalAlgo.Visitor, Mutab
         return new NamedParameterLinkFunction(Chars.toString(name), function.getType());
     }
 
+    /**
+     * Extracts the year from a timestamp string.
+     * Supports formats like "YYYY-MM-DD...", "YYYY/MM/DD...", etc.
+     *
+     * @param timestampStr the timestamp string
+     * @return the year, or -1 if cannot be extracted
+     */
+    private int extractYearFromTimestamp(CharSequence timestampStr) {
+        if (timestampStr == null || timestampStr.length() < 4) {
+            return -1;
+        }
+
+        // Look for the first 4 consecutive digits at the start
+        int yearStart = 0;
+        int digitCount = 0;
+
+        for (int i = 0; i < timestampStr.length() && i < 10; i++) { // Limit search to first 10 chars
+            char c = timestampStr.charAt(i);
+            if (c >= '0' && c <= '9') {
+                if (digitCount == 0) {
+                    yearStart = i;
+                }
+                digitCount++;
+                if (digitCount == 4) {
+                    // Found 4 consecutive digits, extract as year
+                    try {
+                        return Numbers.parseInt(timestampStr, yearStart, yearStart + 4);
+                    } catch (NumericException e) {
+                        return -1;
+                    }
+                }
+            } else {
+                digitCount = 0; // Reset if non-digit found
+            }
+        }
+
+        return -1; // Could not extract year
+    }
+
     private Function functionToConstant(Function function) {
-        Function newFunction = functionToConstant0(function);
+        Function newFunction;
+        try {
+            newFunction = functionToConstant0(function);
+        } catch (Throwable th) {
+            function.close();
+            throw th;
+        }
+
         // Sometimes functionToConstant0 returns same instance as passed in parameter
         if (newFunction != function) {
             // and we want to close underlying function only in case it's different form returned newFunction
@@ -950,7 +1580,8 @@ public class FunctionParser implements PostOrderTreeTraversalAlgo.Visitor, Mutab
                 if (function instanceof IntConstant) {
                     return function;
                 } else {
-                    return IntConstant.newInstance(function.getInt(null));
+                    final int intConst = function.getInt(null);
+                    return intConst == Numbers.INT_NULL ? IntConstant.NULL : IntConstant.newInstance(intConst);
                 }
             case ColumnType.BOOLEAN:
                 if (function instanceof BooleanConstant) {
@@ -1051,7 +1682,7 @@ public class FunctionParser implements PostOrderTreeTraversalAlgo.Visitor, Mutab
                 if (function instanceof TimestampConstant) {
                     return function;
                 } else {
-                    return TimestampConstant.newInstance(function.getTimestamp(null));
+                    return TimestampConstant.newInstance(function.getTimestamp(null), type);
                 }
             case ColumnType.UUID:
                 if (function instanceof UuidConstant) {
@@ -1065,9 +1696,125 @@ public class FunctionParser implements PostOrderTreeTraversalAlgo.Visitor, Mutab
                 } else {
                     return IPv4Constant.newInstance(function.getIPv4(null));
                 }
+            case ColumnType.ARRAY:
+                if (function instanceof ArrayConstant) {
+                    return function;
+                }
+                ArrayView array = function.getArray(null);
+                if (array instanceof FunctionArray) {
+                    return new ArrayConstant((FunctionArray) array);
+                }
+                return function;
+            case ColumnType.DECIMAL8:
+                if (function instanceof Decimal8Constant) {
+                    return function;
+                } else {
+                    return new Decimal8Constant(function.getDecimal8(null), type);
+                }
+            case ColumnType.DECIMAL16:
+                if (function instanceof Decimal16Constant) {
+                    return function;
+                } else {
+                    return new Decimal16Constant(function.getDecimal16(null), type);
+                }
+            case ColumnType.DECIMAL32:
+                if (function instanceof Decimal32Constant) {
+                    return function;
+                } else {
+                    return new Decimal32Constant(function.getDecimal32(null), type);
+                }
+            case ColumnType.DECIMAL64:
+                if (function instanceof Decimal64Constant) {
+                    return function;
+                } else {
+                    return new Decimal64Constant(function.getDecimal64(null), type);
+                }
+            case ColumnType.DECIMAL128:
+                if (function instanceof Decimal128Constant) {
+                    return function;
+                } else {
+                    Decimal128 d = Misc.getThreadLocalDecimal128();
+                    function.getDecimal128(null, d);
+                    return new Decimal128Constant(
+                            d.getHigh(),
+                            d.getLow(),
+                            type
+                    );
+                }
+            case ColumnType.DECIMAL256:
+                if (function instanceof Decimal256Constant) {
+                    return function;
+                } else {
+                    Decimal256 d = Misc.getThreadLocalDecimal256();
+                    function.getDecimal256(null, d);
+                    return new Decimal256Constant(
+                            d.getHh(),
+                            d.getHl(),
+                            d.getLh(),
+                            d.getLl(),
+                            type
+                    );
+                }
             default:
                 return function;
         }
+    }
+
+    /**
+     * Determines the appropriate timestamp type based on the string precision and year range.
+     * If the string contains nanosecond precision (more than 6 digits after seconds) and
+     * the year is within nano timestamp range (< 2262), returns nano type;
+     * otherwise returns the original signature type.
+     *
+     * @param timestampStr the timestamp string to analyze
+     * @param sigArgType   the original signature argument type
+     * @return adaptive timestamp type (nano if detected and within range, otherwise original)
+     */
+    private int getAdaptiveTimestampType(CharSequence timestampStr, int sigArgType) {
+        if (timestampStr == null || timestampStr.isEmpty()) {
+            return FunctionFactoryDescriptor.toType(sigArgType);
+        }
+
+        // Extract year from timestamp string to check nano range
+        int year = extractYearFromTimestamp(timestampStr);
+        if (year >= 2262) {
+            // Year is beyond nano timestamp range, use original type
+            return FunctionFactoryDescriptor.toType(sigArgType);
+        }
+
+        // Look for fractional seconds part after last '.' or ':'
+        int lastDot = -1;
+        for (int i = timestampStr.length() - 1; i >= 0; i--) {
+            char c = timestampStr.charAt(i);
+            if (c == '.' || c == ':') {
+                lastDot = i;
+                break;
+            }
+            // Stop if we hit a space or non-digit (except for timezone indicators)
+            if (c == ' ' || c == 'T' || c == '+' || c == '-') {
+                break;
+            }
+        }
+
+        if (lastDot >= 0 && lastDot < timestampStr.length() - 1) {
+            // Count digits after the dot/colon until we hit non-digit
+            int digitCount = 0;
+            for (int i = lastDot + 1; i < timestampStr.length(); i++) {
+                char c = timestampStr.charAt(i);
+                if (c >= '0' && c <= '9') {
+                    digitCount++;
+                } else {
+                    break; // Stop at timezone or other non-digit characters
+                }
+            }
+
+            // If more than 6 digits (microsecond precision) and within nano range, use nanosecond type
+            if (digitCount > 6) {
+                return ColumnType.TIMESTAMP_NANO;
+            }
+        }
+
+        return FunctionFactoryDescriptor.toType(sigArgType); // Use original signature type
     }
 
     @NotNull
@@ -1077,6 +1824,12 @@ public class FunctionParser implements PostOrderTreeTraversalAlgo.Visitor, Mutab
             throw SqlException.$(0, "bind variable service is not provided");
         }
         return bindVariableService;
+    }
+
+    private int mergeWithExactMatch(int match) {
+        return match == MATCH_NO_MATCH ? MATCH_EXACT_MATCH
+                : match == MATCH_FUZZY_MATCH ? MATCH_PARTIAL_MATCH
+                  : match;
     }
 
     private Function parseIndexedParameter(int position, CharSequence name) throws SqlException {
@@ -1092,9 +1845,9 @@ public class FunctionParser implements PostOrderTreeTraversalAlgo.Visitor, Mutab
         }
     }
 
-    private long parseTimestamp(CharSequence str, int position) throws SqlException {
+    private long parseTimestamp(int timestampType, CharSequence str, int position) throws SqlException {
         try {
-            return IntervalUtils.parseFloorPartialTimestamp(str);
+            return ColumnType.getTimestampDriver(timestampType).parseFloorLiteral(str);
         } catch (NumericException e) {
             throw SqlException.invalidDate(str, position);
         }

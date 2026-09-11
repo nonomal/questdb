@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -71,15 +71,15 @@ public class OooCppBenchmarkSetMemoryShuffle {
     }
 
     private static void testSetMemoryShuffleToCsv() {
-        long index = Unsafe.getUnsafe().allocateMemory(BUFFER_MAX_SIZE * 2);
-        long src = Unsafe.getUnsafe().allocateMemory(BUFFER_MAX_SIZE);
-        long dest = Unsafe.getUnsafe().allocateMemory(BUFFER_MAX_SIZE);
+        long index = Unsafe.allocateMemory(BUFFER_MAX_SIZE * 2);
+        long src = Unsafe.allocateMemory(BUFFER_MAX_SIZE);
+        long dest = Unsafe.allocateMemory(BUFFER_MAX_SIZE);
 
         System.out.printf("src=%d, dest=%d, index=%d\n%n", src, dest, index);
         Rnd random = new Rnd();
         long size = BUFFER_MAX_SIZE / Long.BYTES;
         for (int i = 0; i < size; i++) {
-            Unsafe.getUnsafe().putLong(index + (i + 1L) * Long.BYTES, Math.abs(random.nextLong()) % size);
+            Unsafe.putLong(index + (i + 1L) * Long.BYTES, Math.abs(random.nextLong()) % size);
         }
 
         try {

@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -25,27 +25,87 @@
 package io.questdb.griffin.engine.functions.groupby;
 
 import io.questdb.cairo.ArrayColumnTypes;
-import io.questdb.cairo.ColumnType;
+import io.questdb.cairo.map.Map;
 import io.questdb.cairo.map.MapValue;
 import io.questdb.cairo.sql.Function;
+import io.questdb.cairo.sql.PageFrameMemoryRecord;
 import io.questdb.cairo.sql.Record;
 import io.questdb.griffin.engine.functions.GroupByFunction;
 import io.questdb.griffin.engine.functions.TimestampFunction;
 import io.questdb.griffin.engine.functions.UnaryFunction;
+import io.questdb.griffin.engine.groupby.FlyweightPackedMapValue;
+import io.questdb.griffin.engine.groupby.GroupByUtils;
 import io.questdb.std.Numbers;
+import io.questdb.std.Unsafe;
+import io.questdb.std.Vect;
 import org.jetbrains.annotations.NotNull;
 
 public class MaxTimestampGroupByFunction extends TimestampFunction implements GroupByFunction, UnaryFunction {
     private final Function arg;
+    private final int argColumnIndex;
+    // Set when arg is the designated timestamp column. Page frame data is sorted ASC by the designated
+    // timestamp, so the last row of any frame is its maximum and computeBatch can skip the column scan.
+    private boolean isDesignated;
     private int valueIndex;
 
-    public MaxTimestampGroupByFunction(@NotNull Function arg) {
+    public MaxTimestampGroupByFunction(@NotNull Function arg, int timestampType) {
+        super(timestampType);
         this.arg = arg;
+        // The factory derives timestampType from arg.getType(), so this check also
+        // filters out non-direct args (e.g., CASTs) that happen to produce timestamps.
+        this.argColumnIndex = GroupByUtils.directArgColumnIndex(arg, timestampType);
+    }
+
+    @Override
+    public void computeBatch(MapValue mapValue, long dataAddr, int rowCount, long startRowId) {
+        if (rowCount > 0) {
+            // Designated timestamp column has no nulls and is sorted ASC within a frame.
+            final long batchMax = isDesignated
+                    ? Unsafe.getLong(dataAddr + ((long) (rowCount - 1) << 3))
+                    : Vect.maxLong(dataAddr, rowCount);
+            final long existing = mapValue.getLong(valueIndex);
+            if (batchMax > existing) {
+                mapValue.putLong(valueIndex, batchMax);
+            }
+        }
     }
 
     @Override
     public void computeFirst(MapValue mapValue, Record record, long rowId) {
         mapValue.putTimestamp(valueIndex, arg.getTimestamp(record));
+    }
+
+    @Override
+    public void computeKeyedBatch(
+            PageFrameMemoryRecord record,
+            FlyweightPackedMapValue mapValue,
+            long baseValueAddr,
+            long batchAddr,
+            long rowCount,
+            long baseRowId
+    ) {
+        // LONG_NULL == Long.MIN_VALUE, so Math.max handles every LONG_NULL combination naturally.
+        final long valueColumnOffset = mapValue.getOffset(valueIndex);
+        // Fast path: arg is a direct timestamp column with data on the current frame.
+        // Zero page address means a column top; fall through to the record-based path.
+        final long argAddr = argColumnIndex >= 0 ? record.getPageAddress(argColumnIndex) : 0;
+        if (argAddr != 0) {
+            for (long i = 0; i < rowCount; i++) {
+                final long encoded = Unsafe.getLong(batchAddr + (i << 3));
+                final long rowIndex = Map.decodeBatchRowIndex(encoded);
+                final long value = Unsafe.getLong(argAddr + (rowIndex << 3));
+                final long addr = baseValueAddr + Map.decodeBatchOffset(encoded) + valueColumnOffset;
+                Unsafe.putLong(addr, Math.max(value, Unsafe.getLong(addr)));
+            }
+        } else {
+            for (long i = 0; i < rowCount; i++) {
+                final long encoded = Unsafe.getLong(batchAddr + (i << 3));
+                record.setRowIndex(Map.decodeBatchRowIndex(encoded));
+                final long value = arg.getTimestamp(record);
+                final long addr = baseValueAddr + Map.decodeBatchOffset(encoded) + valueColumnOffset;
+                Unsafe.putLong(addr, Math.max(value, Unsafe.getLong(addr)));
+            }
+        }
     }
 
     @Override
@@ -60,7 +120,7 @@ public class MaxTimestampGroupByFunction extends TimestampFunction implements Gr
 
     @Override
     public String getName() {
-        return "max";
+        return isDesignated ? "max_designated" : "max";
     }
 
     @Override
@@ -81,7 +141,7 @@ public class MaxTimestampGroupByFunction extends TimestampFunction implements Gr
     @Override
     public void initValueTypes(ArrayColumnTypes columnTypes) {
         this.valueIndex = columnTypes.getColumnCount();
-        columnTypes.add(ColumnType.TIMESTAMP);
+        columnTypes.add(timestampType);
     }
 
     @Override
@@ -90,8 +150,8 @@ public class MaxTimestampGroupByFunction extends TimestampFunction implements Gr
     }
 
     @Override
-    public boolean isReadThreadSafe() {
-        return UnaryFunction.super.isReadThreadSafe();
+    public boolean isThreadSafe() {
+        return UnaryFunction.super.isThreadSafe();
     }
 
     @Override
@@ -103,9 +163,18 @@ public class MaxTimestampGroupByFunction extends TimestampFunction implements Gr
         }
     }
 
+    public void setDesignated(boolean isDesignated) {
+        this.isDesignated = isDesignated;
+    }
+
     @Override
     public void setNull(MapValue mapValue) {
         mapValue.putTimestamp(valueIndex, Numbers.LONG_NULL);
+    }
+
+    @Override
+    public boolean supportsBatchComputation() {
+        return true;
     }
 
     @Override

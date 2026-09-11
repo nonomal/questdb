@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -33,7 +33,7 @@ import io.questdb.std.Vect;
 /**
  * Specialized flyweight hash set used in {@link io.questdb.griffin.engine.functions.GroupByFunction}s.
  * <p>
- * Uses provided {@link GroupByAllocatorImpl} to allocate the underlying buffer. Grows the buffer when needed.
+ * Uses provided {@link GroupByAllocator} to allocate the underlying buffer. Grows the buffer when needed.
  * <p>
  * Buffer layout is the following:
  * <pre>
@@ -45,7 +45,7 @@ import io.questdb.std.Vect;
  */
 public class GroupByIntHashSet {
     private static final long HEADER_SIZE = 3 * Integer.BYTES;
-    private static final int MIN_INITIAL_CAPACITY = 16;
+    private static final int MIN_INITIAL_CAPACITY = 2;
     private static final long SIZE_LIMIT_OFFSET = 2 * Integer.BYTES;
     private static final long SIZE_OFFSET = Integer.BYTES;
     private final int initialCapacity;
@@ -83,18 +83,18 @@ public class GroupByIntHashSet {
         setKeyAt(index, key);
         int size = size();
         int sizeLimit = sizeLimit();
-        Unsafe.getUnsafe().putInt(ptr + SIZE_OFFSET, ++size);
+        Unsafe.putInt(ptr + SIZE_OFFSET, ++size);
         if (size >= sizeLimit) {
             rehash(capacity() << 1, sizeLimit << 1);
         }
     }
 
     public int capacity() {
-        return ptr != 0 ? Unsafe.getUnsafe().getInt(ptr) : 0;
+        return ptr != 0 ? Unsafe.getInt(ptr) : 0;
     }
 
     public int keyAt(long index) {
-        return Unsafe.getUnsafe().getInt(ptr + HEADER_SIZE + 4L * index);
+        return Unsafe.getInt(ptr + HEADER_SIZE + 4L * index);
     }
 
     public long keyIndex(int key) {
@@ -111,22 +111,8 @@ public class GroupByIntHashSet {
     }
 
     public void merge(GroupByIntHashSet srcSet) {
-        final int size = size();
-        // Math.max is here for overflow protection.
-        final int newSize = Math.max(size + srcSet.size(), size);
-        final int sizeLimit = sizeLimit();
-        if (sizeLimit < newSize) {
-            int newSizeLimit = sizeLimit;
-            int newCapacity = capacity();
-            while (newSizeLimit < newSize) {
-                newSizeLimit *= 2;
-                newCapacity *= 2;
-            }
-            rehash(newCapacity, newSizeLimit);
-        }
-
         for (long p = srcSet.ptr + HEADER_SIZE, lim = srcSet.ptr + HEADER_SIZE + 4L * srcSet.capacity(); p < lim; p += 4L) {
-            int val = Unsafe.getUnsafe().getInt(p);
+            int val = Unsafe.getInt(p);
             if (val != noKeyValue) {
                 final long index = keyIndex(val);
                 if (index >= 0) {
@@ -140,9 +126,9 @@ public class GroupByIntHashSet {
         if (ptr == 0) {
             this.ptr = allocator.malloc(HEADER_SIZE + 4L * initialCapacity);
             zero(this.ptr, initialCapacity);
-            Unsafe.getUnsafe().putInt(this.ptr, initialCapacity);
-            Unsafe.getUnsafe().putInt(this.ptr + SIZE_OFFSET, 0);
-            Unsafe.getUnsafe().putInt(this.ptr + SIZE_LIMIT_OFFSET, (int) (initialCapacity * loadFactor));
+            Unsafe.putInt(this.ptr, initialCapacity);
+            Unsafe.putInt(this.ptr + SIZE_OFFSET, 0);
+            Unsafe.putInt(this.ptr + SIZE_LIMIT_OFFSET, (int) (initialCapacity * loadFactor));
             mask = initialCapacity - 1;
         } else {
             this.ptr = ptr;
@@ -164,14 +150,15 @@ public class GroupByIntHashSet {
     }
 
     public int size() {
-        return ptr != 0 ? Unsafe.getUnsafe().getInt(ptr + SIZE_OFFSET) : 0;
+        return ptr != 0 ? Unsafe.getInt(ptr + SIZE_OFFSET) : 0;
     }
 
     public int sizeLimit() {
-        return ptr != 0 ? Unsafe.getUnsafe().getInt(ptr + SIZE_LIMIT_OFFSET) : 0;
+        return ptr != 0 ? Unsafe.getInt(ptr + SIZE_LIMIT_OFFSET) : 0;
     }
 
     private long probe(int key, long index) {
+        final long index0 = index;
         do {
             index = (index + 1) & mask;
             int k = keyAt(index);
@@ -181,12 +168,14 @@ public class GroupByIntHashSet {
             if (key == k) {
                 return -index - 1;
             }
-        } while (true);
+        } while (index != index0);
+
+        throw CairoException.critical(0).put("corrupt int hash set");
     }
 
     private void rehash(int newCapacity, int newSizeLimit) {
         if (newCapacity < 0) {
-            throw CairoException.nonCritical().put("set capacity overflow");
+            throw CairoException.nonCritical().put("int hash set capacity overflow");
         }
 
         final int oldSize = size();
@@ -195,13 +184,13 @@ public class GroupByIntHashSet {
         long oldPtr = ptr;
         ptr = allocator.malloc(HEADER_SIZE + 4L * newCapacity);
         zero(ptr, newCapacity);
-        Unsafe.getUnsafe().putInt(ptr, newCapacity);
-        Unsafe.getUnsafe().putInt(ptr + SIZE_OFFSET, oldSize);
-        Unsafe.getUnsafe().putInt(ptr + SIZE_LIMIT_OFFSET, newSizeLimit);
+        Unsafe.putInt(ptr, newCapacity);
+        Unsafe.putInt(ptr + SIZE_OFFSET, oldSize);
+        Unsafe.putInt(ptr + SIZE_LIMIT_OFFSET, newSizeLimit);
         mask = newCapacity - 1;
 
         for (long p = oldPtr + HEADER_SIZE, lim = oldPtr + HEADER_SIZE + 4L * oldCapacity; p < lim; p += 4L) {
-            int key = Unsafe.getUnsafe().getInt(p);
+            int key = Unsafe.getInt(p);
             if (key != noKeyValue) {
                 long index = keyIndex(key);
                 setKeyAt(index, key);
@@ -212,7 +201,7 @@ public class GroupByIntHashSet {
     }
 
     private void setKeyAt(long index, int key) {
-        Unsafe.getUnsafe().putInt(ptr + HEADER_SIZE + 4L * index, key);
+        Unsafe.putInt(ptr + HEADER_SIZE + 4L * index, key);
     }
 
     private void zero(long ptr, int cap) {
@@ -221,7 +210,7 @@ public class GroupByIntHashSet {
             Vect.memset(ptr + HEADER_SIZE, 4L * cap, 0);
         } else {
             for (long p = ptr + HEADER_SIZE, lim = ptr + HEADER_SIZE + 4L * cap; p < lim; p += 4L) {
-                Unsafe.getUnsafe().putInt(p, noKeyValue);
+                Unsafe.putInt(p, noKeyValue);
             }
         }
     }

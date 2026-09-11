@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -25,7 +25,9 @@
 package io.questdb.cairo.security;
 
 import io.questdb.cairo.CairoException;
+import io.questdb.cairo.SecurityContext;
 import io.questdb.cairo.TableToken;
+import io.questdb.cairo.view.ViewDefinition;
 import io.questdb.std.ObjList;
 import org.jetbrains.annotations.NotNull;
 
@@ -33,16 +35,6 @@ public class DenyAllSecurityContext extends ReadOnlySecurityContext {
     public static final DenyAllSecurityContext INSTANCE = new DenyAllSecurityContext();
 
     protected DenyAllSecurityContext() {
-    }
-
-    @Override
-    public void authorizeAdminAction() {
-        throw CairoException.nonCritical().put("permission denied");
-    }
-
-    @Override
-    public void authorizeCancelQuery() {
-        throw CairoException.nonCritical().put("permission denied");
     }
 
     @Override
@@ -61,6 +53,11 @@ public class DenyAllSecurityContext extends ReadOnlySecurityContext {
     }
 
     @Override
+    public void authorizeSelect(ViewDefinition viewDefinition) {
+        throw CairoException.nonCritical().put("permission denied");
+    }
+
+    @Override
     public void authorizeSelect(TableToken tableToken, @NotNull ObjList<CharSequence> columnNames) {
         throw CairoException.nonCritical().put("permission denied");
     }
@@ -68,5 +65,27 @@ public class DenyAllSecurityContext extends ReadOnlySecurityContext {
     @Override
     public void authorizeSelectOnAnyColumn(TableToken tableToken) {
         throw CairoException.nonCritical().put("permission denied");
+    }
+
+    @Override
+    public void authorizeSettings() {
+        throw CairoException.nonCritical().put("permission denied");
+    }
+
+    @Override
+    public void authorizeSqlEngineAdmin() {
+        throw CairoException.nonCritical().put("permission denied");
+    }
+
+    @Override
+    public void authorizeSystemAdmin() {
+        throw CairoException.nonCritical().put("permission denied");
+    }
+
+    @Override
+    protected SecurityContext newPrincipalContext(CharSequence principal) {
+        // a deny-all context has no per-user identity and must never be downgraded to a
+        // plain read-only (i.e. read-allowing) context, so it ignores the principal
+        return this;
     }
 }

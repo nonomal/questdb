@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -79,18 +79,18 @@ public class MemCopyBenchmark {
 
     @Benchmark
     public void testJavaCopyMemory() {
-        Unsafe.getUnsafe().copyMemory(mem1, mem2, len);
+        Unsafe.copyMemory(mem1, mem2, len);
     }
 
     @Benchmark
     public void testJavaSetMemory() {
-        Unsafe.getUnsafe().setMemory(mem1, len, (byte) 0);
+        Unsafe.setMemory(mem1, len, (byte) 0);
     }
 
     @Benchmark
     public void testVanillaLoop() {
         for (long i = 0; i < len; i++) {
-            Unsafe.getUnsafe().putByte(mem2 + i, Unsafe.getUnsafe().getByte(mem1 + i));
+            Unsafe.putByte(mem2 + i, Unsafe.getByte(mem1 + i));
         }
     }
 }

@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -25,8 +25,9 @@
 package io.questdb.cutlass.http;
 
 import io.questdb.FactoryProvider;
+import io.questdb.Metrics;
 import io.questdb.network.NetworkFacade;
-import io.questdb.std.NanosecondClock;
+import io.questdb.std.datetime.NanosecondClock;
 import io.questdb.std.datetime.millitime.MillisecondClock;
 
 public interface HttpContextConfiguration {
@@ -41,6 +42,8 @@ public interface HttpContextConfiguration {
 
     boolean getDumpNetworkTraffic();
 
+    int getExportConnectionLimit();
+
     FactoryProvider getFactoryProvider();
 
     int getForceRecvFragmentationChunkSize();
@@ -48,6 +51,12 @@ public interface HttpContextConfiguration {
     int getForceSendFragmentationChunkSize();
 
     String getHttpVersion();
+
+    int getIlpConnectionLimit();
+
+    int getJsonQueryConnectionLimit();
+
+    Metrics getMetrics();
 
     MillisecondClock getMillisecondClock();
 
@@ -59,13 +68,11 @@ public interface HttpContextConfiguration {
 
     NetworkFacade getNetworkFacade();
 
-    int getRecvBufferSize();
-
     int getRequestHeaderBufferSize();
 
-    int getSendBufferSize();
-
     boolean getServerKeepAlive();
+
+    long getSessionTimeout();
 
     boolean readOnlySecurityContext();
 }

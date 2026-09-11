@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -27,32 +27,50 @@ package io.questdb.griffin.engine.orderby;
 import io.questdb.cairo.Reopenable;
 import io.questdb.cairo.sql.Record;
 import io.questdb.cairo.sql.RecordCursor;
-import io.questdb.cairo.vm.Vm;
-import io.questdb.cairo.vm.api.MemoryARW;
 import io.questdb.griffin.engine.AbstractRedBlackTree;
 import io.questdb.griffin.engine.RecordComparator;
-import io.questdb.std.MemoryTag;
-import io.questdb.std.Misc;
 
+/**
+ * Values are stored on a heap. Value chain addresses are 4-byte aligned.
+ */
 public class LongTreeChain extends AbstractRedBlackTree implements Reopenable {
     private final TreeCursor cursor = new TreeCursor();
-    private final MemoryARW valueChain;
 
-    public LongTreeChain(long keyPageSize, int keyMaxPages, long valuePageSize, int valueMaxPages) {
-        super(keyPageSize, keyMaxPages);
-        this.valueChain = Vm.getARWInstance(valuePageSize, valueMaxPages, MemoryTag.NATIVE_TREE_CHAIN);
+    public LongTreeChain(
+            long keyPageSize,
+            long maxKeyHeapBytes,
+            long valuePageSize,
+            long maxValueHeapBytes,
+            String keyHeapConfigKey,
+            String valueHeapConfigKey
+    ) {
+        this(keyPageSize, maxKeyHeapBytes, valuePageSize, maxValueHeapBytes, keyHeapConfigKey, valueHeapConfigKey, true);
     }
 
-    @Override
-    public void clear() {
-        super.clear();
-        this.valueChain.jumpTo(0);
+    public LongTreeChain(
+            long keyPageSize,
+            long maxKeyHeapBytes,
+            long valuePageSize,
+            long maxValueHeapBytes,
+            String keyHeapConfigKey,
+            String valueHeapConfigKey,
+            boolean openOnInit
+    ) {
+        super(
+                keyPageSize,
+                maxKeyHeapBytes,
+                valuePageSize,
+                maxValueHeapBytes,
+                keyHeapConfigKey,
+                valueHeapConfigKey,
+                "LongTreeChain",
+                openOnInit
+        );
     }
 
     @Override
     public void close() {
         super.close();
-        Misc.free(valueChain);
         cursor.clear();
     }
 
@@ -67,86 +85,89 @@ public class LongTreeChain extends AbstractRedBlackTree implements Reopenable {
             Record rightRecord,
             RecordComparator comparator
     ) {
-        if (root == -1) {
-            putParent(leftRecord.getRowId());
+        put(leftRecord, sourceCursor, rightRecord, comparator, leftRecord.getRowId());
+    }
+
+    /**
+     * Inserts a row whose stored rowId is provided explicitly, decoupled from
+     * {@code leftRecord.getRowId()}. Callers that index their records by a
+     * different key (e.g. a dense rowIndex, not the underlying base rowId)
+     * use this overload so {@code sourceCursor.recordAt} sees the right key.
+     */
+    public void put(
+            Record leftRecord,
+            RecordCursor sourceCursor,
+            Record rightRecord,
+            RecordComparator comparator,
+            long rowId
+    ) {
+        if (root == EMPTY) {
+            putParent(rowId);
             return;
         }
 
         comparator.setLeft(leftRecord);
 
-        long ptr = root;
-        long parent;
+        int offset = root;
+        int parent;
         int cmp;
         do {
-            parent = ptr;
-            final long ref = refOf(ptr);
-            sourceCursor.recordAt(rightRecord, valueChain.getLong(ref));
+            parent = offset;
+            final int ref = refOf(offset);
+            sourceCursor.recordAt(rightRecord, rowId(ref));
             cmp = comparator.compare(rightRecord);
             if (cmp < 0) {
-                ptr = leftOf(ptr);
+                offset = leftOf(offset);
             } else if (cmp > 0) {
-                ptr = rightOf(ptr);
+                offset = rightOf(offset);
             } else {
-                long oldChainEnd = lastRefOf(ptr);
-                long newChainEnd = appendValue(leftRecord.getRowId(), -1);
-                valueChain.putLong(oldChainEnd + Long.BYTES, newChainEnd);
-                setLastRef(ptr, newChainEnd);
+                final int oldChainEnd = lastRefOf(offset);
+                final int newChainEnd = appendValue(rowId, CHAIN_END);
+                setNextValueOffset(oldChainEnd, newChainEnd);
+                setLastRef(offset, newChainEnd);
                 return;
             }
-        } while (ptr > -1);
+        } while (offset != EMPTY);
 
-        ptr = allocateBlock();
-        setParent(ptr, parent);
+        offset = allocateBlock();
+        setParent(offset, parent);
 
-        long chainStart = appendValue(leftRecord.getRowId(), -1L);
-        setRef(ptr, chainStart);
-        setLastRef(ptr, chainStart);
+        final int chainStart = appendValue(rowId, CHAIN_END);
+        setRef(offset, chainStart);
+        setLastRef(offset, chainStart);
 
         if (cmp < 0) {
-            setLeft(parent, ptr);
+            setLeft(parent, offset);
         } else {
-            setRight(parent, ptr);
+            setRight(parent, offset);
         }
-        fixInsert(ptr);
+        fixInsert(offset);
     }
 
-    @Override
-    public void reopen() {
-        //nothing to do here
-    }
-
-    private long appendValue(long value, long nextValueOffset) {
-        final long offset = valueChain.getAppendOffset();
-        valueChain.putLong128(value, nextValueOffset);
-        return offset;
-    }
-
-    @Override
-    protected void putParent(long value) {
+    private void putParent(long rowId) {
         root = allocateBlock();
-        long chainStart = appendValue(value, -1L);
+        final int chainStart = appendValue(rowId, CHAIN_END);
         setRef(root, chainStart);
         setLastRef(root, chainStart);
-        setParent(root, -1);
+        setParent(root, EMPTY);
     }
 
     public class TreeCursor {
-
-        private long chainCurrent;
-        private long treeCurrent;
+        private int chainCurrent;
+        private int treeCurrent;
 
         public void clear() {
-            treeCurrent = -1;
-            chainCurrent = -1;
+            treeCurrent = EMPTY;
+            chainCurrent = CHAIN_END;
         }
 
         public boolean hasNext() {
-            if (chainCurrent != -1) {
+            if (chainCurrent != CHAIN_END) {
                 return true;
             }
 
             treeCurrent = successor(treeCurrent);
-            if (treeCurrent == -1) {
+            if (treeCurrent == EMPTY) {
                 return false;
             }
 
@@ -155,9 +176,9 @@ public class LongTreeChain extends AbstractRedBlackTree implements Reopenable {
         }
 
         public long next() {
-            long result = chainCurrent;
-            chainCurrent = valueChain.getLong(chainCurrent + Long.BYTES);
-            return valueChain.getLong(result);
+            int result = chainCurrent;
+            chainCurrent = nextValueOffset(chainCurrent);
+            return rowId(result);
         }
 
         public void toTop() {
@@ -165,9 +186,9 @@ public class LongTreeChain extends AbstractRedBlackTree implements Reopenable {
         }
 
         private void setup() {
-            long p = root;
-            if (p != -1) {
-                while (leftOf(p) != -1) {
+            int p = root;
+            if (p != EMPTY) {
+                while (leftOf(p) != EMPTY) {
                     p = leftOf(p);
                 }
             }

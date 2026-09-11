@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -26,7 +26,6 @@ package io.questdb.test.cairo;
 
 import io.questdb.cairo.CairoConfiguration;
 import io.questdb.cairo.CairoException;
-import io.questdb.cairo.CommitMode;
 import io.questdb.cairo.vm.MemoryCMORImpl;
 import io.questdb.cairo.vm.MemoryCMRImpl;
 import io.questdb.cairo.vm.MemoryPMARImpl;
@@ -35,7 +34,12 @@ import io.questdb.cairo.vm.api.MemoryARW;
 import io.questdb.cairo.vm.api.MemoryCMARW;
 import io.questdb.cairo.vm.api.MemoryMA;
 import io.questdb.cairo.vm.api.MemoryMR;
-import io.questdb.std.*;
+import io.questdb.std.Files;
+import io.questdb.std.FilesFacade;
+import io.questdb.std.FilesFacadeImpl;
+import io.questdb.std.MemoryTag;
+import io.questdb.std.Rnd;
+import io.questdb.std.Unsafe;
 import io.questdb.std.str.LPSZ;
 import io.questdb.std.str.Path;
 import io.questdb.std.str.Utf8s;
@@ -58,7 +62,7 @@ public class CairoMemoryTest extends AbstractTest {
             boolean force = true;
 
             @Override
-            public long mmap(int fd, long len, long offset, int flags, int memoryTag) {
+            public long mmap(long fd, long len, long offset, int flags, int memoryTag) {
                 if (force || rnd.nextBoolean()) {
                     force = false;
                     return super.mmap(fd, len, offset, flags, memoryTag);
@@ -74,7 +78,7 @@ public class CairoMemoryTest extends AbstractTest {
         int failureCount = 0;
         try (Path path = new Path()) {
             path.of(temp.newFile().getAbsolutePath());
-            try (MemoryMA mem = Vm.getMAInstance(CommitMode.NOSYNC)) {
+            try (MemoryMA mem = Vm.getPMARInstance(null)) {
                 mem.of(ff, path.$(), ff.getPageSize() * 2, MemoryTag.MMAP_DEFAULT, CairoConfiguration.O_NONE);
                 int i = 0;
                 while (i < N) {
@@ -102,7 +106,7 @@ public class CairoMemoryTest extends AbstractTest {
             int count = 2;
 
             @Override
-            public boolean allocate(int fd, long size) {
+            public boolean allocate(long fd, long size) {
                 if (allClear || --count > 0) {
                     return super.allocate(fd, size);
                 }
@@ -138,7 +142,7 @@ public class CairoMemoryTest extends AbstractTest {
 
         class X extends FilesFacadeImpl {
             @Override
-            public int openRW(LPSZ name, long opts) {
+            public long openRW(LPSZ name, int opts) {
                 int n = name.size();
                 if (n > 5 && Utf8s.equalsAscii(".fail", name, n - 5, n)) {
                     return -1;
@@ -155,7 +159,7 @@ public class CairoMemoryTest extends AbstractTest {
         try (Path path = new Path()) {
             path.of(temp.getRoot().getAbsolutePath());
             int prefixLen = path.size();
-            try (MemoryMA mem = Vm.getMAInstance(CommitMode.NOSYNC)) {
+            try (MemoryMA mem = Vm.getPMARInstance(null)) {
                 Rnd rnd = new Rnd();
                 for (int k = 0; k < 10; k++) {
                     path.trimTo(prefixLen).concat(rnd.nextString(10));
@@ -195,7 +199,7 @@ public class CairoMemoryTest extends AbstractTest {
     public void testAppendMemoryJump() throws Exception {
         testVirtualMemoryJump(path -> new MemoryPMARImpl(
                         FF,
-                path.$(),
+                        path.$(),
                         FF.getPageSize(),
                         MemoryTag.MMAP_DEFAULT,
                         CairoConfiguration.O_NONE
@@ -220,11 +224,11 @@ public class CairoMemoryTest extends AbstractTest {
                     mem.putLong(i);
                 }
                 Assert.assertEquals(8L * N, mem.getAppendOffset());
-                int fd = mem.getFd();
+                long fd = mem.getFd();
                 mem.detachFdClose();
 
                 MemoryCMORImpl memR = new MemoryCMORImpl();
-                memR.ofOffset(FF, fd, null, 0, 8 * N, MemoryTag.MMAP_DEFAULT, CairoConfiguration.O_NONE);
+                memR.ofOffset(FF, fd, false, null, 0, 8 * N, MemoryTag.MMAP_DEFAULT, CairoConfiguration.O_NONE);
                 for (int i = 0; i < N; i++) {
                     Assert.assertEquals(i, memR.getLong(i * 8));
                 }
@@ -245,11 +249,11 @@ public class CairoMemoryTest extends AbstractTest {
                 for (int i = 0; i < N; i++) {
                     mem.putLong(i);
                 }
-                int fd = mem.getFd();
+                long fd = mem.getFd();
                 mem.detachFdClose();
 
                 MemoryCMORImpl memR = new MemoryCMORImpl();
-                memR.ofOffset(FF, fd, null, 0, 8 * N, MemoryTag.MMAP_DEFAULT, CairoConfiguration.O_NONE);
+                memR.ofOffset(FF, fd, false, null, 0, 8 * N, MemoryTag.MMAP_DEFAULT, CairoConfiguration.O_NONE);
                 for (int i = 0; i < N; i++) {
                     Assert.assertEquals(i, memR.getLong(i * 8));
                 }
@@ -267,7 +271,7 @@ public class CairoMemoryTest extends AbstractTest {
 
         class X extends FilesFacadeImpl {
             @Override
-            public int openRW(LPSZ name, long opts) {
+            public long openRW(LPSZ name, int opts) {
                 int n = name.size();
                 if (n > 5 && Utf8s.equalsAscii(".fail", name, n - 5, n)) {
                     return -1;
@@ -337,7 +341,7 @@ public class CairoMemoryTest extends AbstractTest {
                     long addr = FF.mmap(mem.getFd(), fileSize, 0, Files.MAP_RO, MemoryTag.MMAP_DEFAULT);
                     try {
                         for (int i = 0; i < count; i++) {
-                            Assert.assertEquals(i, Unsafe.getUnsafe().getLong(addr + i * Long.BYTES));
+                            Assert.assertEquals(i, Unsafe.getLong(addr + i * Long.BYTES));
                         }
                     } finally {
                         FF.munmap(addr, fileSize, MemoryTag.MMAP_DEFAULT);
@@ -350,11 +354,44 @@ public class CairoMemoryTest extends AbstractTest {
                     addr = FF.mmap(mem.getFd(), fileSize, 0, Files.MAP_RO, MemoryTag.MMAP_DEFAULT);
                     try {
                         for (int i = 0; i < fileSize / Long.BYTES; i++) {
-                            Assert.assertEquals(0, Unsafe.getUnsafe().getLong(addr + i * 8L));
+                            Assert.assertEquals(0, Unsafe.getLong(addr + i * 8L));
                         }
                     } finally {
                         FF.munmap(addr, fileSize, MemoryTag.MMAP_DEFAULT);
                     }
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testSmallFileReportsLengthErrnoNotCloseErrno() throws Exception {
+        TestUtils.assertMemoryLeak(() -> {
+            try (
+                    Path path = new Path().of(temp.newFile().getAbsolutePath());
+                    Path missing = new Path().of(temp.getRoot().getAbsolutePath()).concat("definitely_missing")
+            ) {
+                FilesFacade ff = new TestFilesFacadeImpl() {
+                    @Override
+                    public boolean close(long fd) {
+                        boolean res = super.close(fd);
+                        Files.closeDetached(-1);
+                        return res;
+                    }
+
+                    @Override
+                    public long length(long fd) {
+                        return Files.length(missing.$());
+                    }
+                };
+
+                try (MemoryCMRImpl mem = new MemoryCMRImpl()) {
+                    mem.smallFile(ff, path.$(), MemoryTag.MMAP_DEFAULT);
+                    Assert.fail("expected CairoException");
+                } catch (CairoException e) {
+                    TestUtils.assertContains(e.getFlyweightMessage(), "could not get length");
+                    Assert.assertTrue(Files.isErrnoFileDoesNotExist(e.getErrno()));
+                    Assert.assertTrue(e.isFileCannotRead());
                 }
             }
         });
@@ -413,7 +450,7 @@ public class CairoMemoryTest extends AbstractTest {
                 }
                 Assert.assertEquals(8L * N, mem.getAppendOffset());
             }
-            try (MemoryMR mem = new MemoryCMRImpl(FF, path.$(), 8L * N, MemoryTag.MMAP_DEFAULT, false)) {
+            try (MemoryMR mem = new MemoryCMRImpl(FF, path.$(), 8L * N, MemoryTag.MMAP_DEFAULT)) {
                 for (int i = 0; i < N; i++) {
                     Assert.assertEquals(i, mem.getLong(i * 8));
                 }
@@ -432,7 +469,7 @@ public class CairoMemoryTest extends AbstractTest {
             }
 
             @Override
-            public long mremap(int fd, long addr, long previousSize, long newSize, long offset, int mode, int memoryTag) {
+            public long mremap(long fd, long addr, long previousSize, long newSize, long offset, int mode, int memoryTag) {
                 if (rnd.nextBoolean()) {
                     return -1;
                 }
@@ -476,7 +513,7 @@ public class CairoMemoryTest extends AbstractTest {
                     mem.jumpTo(800);
                 }
 
-                try (MemoryMR roMem = new MemoryCMRImpl(FF, path.$(), 800, MemoryTag.MMAP_DEFAULT, false)) {
+                try (MemoryMR roMem = new MemoryCMRImpl(FF, path.$(), 800, MemoryTag.MMAP_DEFAULT)) {
                     for (int i = 0; i < 50; i++) {
                         Assert.assertEquals(50 - i, roMem.getLong(i * 8));
                     }

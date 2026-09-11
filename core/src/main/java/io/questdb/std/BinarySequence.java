@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -38,7 +38,7 @@ public interface BinarySequence {
     default void copyTo(long address, long start, long length) {
         final long n = Math.min(length() - start, length);
         for (long l = 0; l < n; l++) {
-            Unsafe.getUnsafe().putByte(address + l, byteAt(start + l));
+            Unsafe.putByte(address + l, byteAt(start + l));
         }
     }
 

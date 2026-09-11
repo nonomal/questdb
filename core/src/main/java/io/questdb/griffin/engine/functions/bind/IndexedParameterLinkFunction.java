@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -25,21 +25,28 @@
 package io.questdb.griffin.engine.functions.bind;
 
 import io.questdb.cairo.ColumnType;
+import io.questdb.cairo.arr.ArrayView;
+import io.questdb.cairo.sql.BindVariableService;
+import io.questdb.cairo.sql.Function;
+import io.questdb.cairo.sql.FunctionExtension;
 import io.questdb.cairo.sql.Record;
-import io.questdb.cairo.sql.*;
+import io.questdb.cairo.sql.RecordCursorFactory;
+import io.questdb.cairo.sql.SymbolTableSource;
 import io.questdb.griffin.PlanSink;
 import io.questdb.griffin.SqlException;
 import io.questdb.griffin.SqlExecutionContext;
 import io.questdb.std.BinarySequence;
 import io.questdb.std.Chars;
+import io.questdb.std.Decimal128;
+import io.questdb.std.Decimal256;
+import io.questdb.std.Interval;
 import io.questdb.std.Long256;
 import io.questdb.std.Misc;
 import io.questdb.std.str.CharSink;
-import io.questdb.std.str.Utf16Sink;
 import io.questdb.std.str.Utf8Sequence;
-import io.questdb.std.str.Utf8Sink;
+import org.jetbrains.annotations.NotNull;
 
-public class IndexedParameterLinkFunction implements ScalarFunction {
+public class IndexedParameterLinkFunction implements Function, FunctionExtension {
     private final int position;
     private final int variableIndex;
     private Function base;
@@ -59,6 +66,21 @@ public class IndexedParameterLinkFunction implements ScalarFunction {
     @Override
     public void close() {
         base = Misc.free(base);
+    }
+
+    @Override
+    public FunctionExtension extendedOps() {
+        return this;
+    }
+
+    @Override
+    public ArrayView getArray(Record rec) {
+        return getBase().getArray(rec);
+    }
+
+    @Override
+    public int getArrayLength() {
+        return getBase().extendedOps().getArrayLength();
     }
 
     @Override
@@ -89,6 +111,36 @@ public class IndexedParameterLinkFunction implements ScalarFunction {
     @Override
     public long getDate(Record rec) {
         return getBase().getDate(rec);
+    }
+
+    @Override
+    public void getDecimal128(Record rec, Decimal128 sink) {
+        getBase().getDecimal128(rec, sink);
+    }
+
+    @Override
+    public short getDecimal16(Record rec) {
+        return getBase().getDecimal16(rec);
+    }
+
+    @Override
+    public void getDecimal256(Record rec, Decimal256 sink) {
+        getBase().getDecimal256(rec, sink);
+    }
+
+    @Override
+    public int getDecimal32(Record rec) {
+        return getBase().getDecimal32(rec);
+    }
+
+    @Override
+    public long getDecimal64(Record rec) {
+        return getBase().getDecimal64(rec);
+    }
+
+    @Override
+    public byte getDecimal8(Record rec) {
+        return getBase().getDecimal8(rec);
     }
 
     @Override
@@ -132,6 +184,11 @@ public class IndexedParameterLinkFunction implements ScalarFunction {
     }
 
     @Override
+    public @NotNull Interval getInterval(Record rec) {
+        return getBase().getInterval(rec);
+    }
+
+    @Override
     public long getLong(Record rec) {
         return getBase().getLong(rec);
     }
@@ -162,6 +219,11 @@ public class IndexedParameterLinkFunction implements ScalarFunction {
     }
 
     @Override
+    public Record getRecord(Record rec) {
+        return getBase().extendedOps().getRecord(rec);
+    }
+
+    @Override
     public RecordCursorFactory getRecordCursorFactory() {
         return getBase().getRecordCursorFactory();
     }
@@ -172,8 +234,8 @@ public class IndexedParameterLinkFunction implements ScalarFunction {
     }
 
     @Override
-    public void getStr(Record rec, Utf16Sink utf16Sink) {
-        getBase().getStr(rec, utf16Sink);
+    public CharSequence getStrA(Record rec, int arrayIndex) {
+        return getBase().extendedOps().getStrA(rec, arrayIndex);
     }
 
     @Override
@@ -182,8 +244,18 @@ public class IndexedParameterLinkFunction implements ScalarFunction {
     }
 
     @Override
+    public CharSequence getStrB(Record rec, int arrayIndex) {
+        return getBase().extendedOps().getStrB(rec, arrayIndex);
+    }
+
+    @Override
     public CharSequence getStrB(Record rec) {
         return getBase().getStrB(rec);
+    }
+
+    @Override
+    public int getStrLen(Record rec, int arrayIndex) {
+        return getBase().extendedOps().getStrLen(rec, arrayIndex);
     }
 
     @Override
@@ -212,11 +284,6 @@ public class IndexedParameterLinkFunction implements ScalarFunction {
     }
 
     @Override
-    public void getVarchar(Record rec, Utf8Sink utf8Sink) {
-        getBase().getVarchar(rec, utf8Sink);
-    }
-
-    @Override
     public Utf8Sequence getVarcharA(Record rec) {
         return getBase().getVarcharA(rec);
     }
@@ -231,10 +298,6 @@ public class IndexedParameterLinkFunction implements ScalarFunction {
         return getBase().getVarcharSize(rec);
     }
 
-    public int getVariableIndex() {
-        return variableIndex;
-    }
-
     @Override
     public void init(SymbolTableSource symbolTableSource, SqlExecutionContext executionContext) throws SqlException {
         base = executionContext.getBindVariableService().getFunction(variableIndex);
@@ -246,12 +309,23 @@ public class IndexedParameterLinkFunction implements ScalarFunction {
     }
 
     @Override
-    public boolean isReadThreadSafe() {
+    public boolean isNonDeterministic() {
         return true;
     }
 
     @Override
     public boolean isRuntimeConstant() {
+        return true;
+    }
+
+    @Override
+    public boolean isStableWithinExecution() {
+        // the bound value is set before execution starts and is immutable while it runs
+        return true;
+    }
+
+    @Override
+    public boolean isThreadSafe() {
         return true;
     }
 

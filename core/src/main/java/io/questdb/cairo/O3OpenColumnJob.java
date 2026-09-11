@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -25,12 +25,18 @@
 package io.questdb.cairo;
 
 import io.questdb.MessageBus;
+import io.questdb.cairo.idx.IndexFactory;
+import io.questdb.cairo.idx.IndexWriter;
 import io.questdb.cairo.vm.api.MemoryMA;
 import io.questdb.log.Log;
 import io.questdb.log.LogFactory;
 import io.questdb.mp.AbstractQueueConsumerJob;
 import io.questdb.mp.Sequence;
-import io.questdb.std.*;
+import io.questdb.std.Files;
+import io.questdb.std.FilesFacade;
+import io.questdb.std.MemoryTag;
+import io.questdb.std.Unsafe;
+import io.questdb.std.Vect;
 import io.questdb.std.str.Path;
 import io.questdb.tasks.O3CopyTask;
 import io.questdb.tasks.O3OpenColumnTask;
@@ -75,7 +81,7 @@ public class O3OpenColumnJob extends AbstractQueueConsumerJob<O3OpenColumnTask> 
             long srcDataOldPartitionSize,
             long o3SplitPartitionSize,
             TableWriter tableWriter,
-            BitmapIndexWriter indexWriter,
+            IndexWriter indexWriter,
             long columnNameTxn,
             long partitionUpdateSinkAddr
     ) {
@@ -170,13 +176,14 @@ public class O3OpenColumnJob extends AbstractQueueConsumerJob<O3OpenColumnTask> 
             AtomicInteger columnCounter,
             long timestampMergeIndexAddr,
             long timestampMergeIndexSize,
-            int srcTimestampFd,
+            long srcTimestampFd,
             long srcTimestampAddr,
             long srcTimestampSize,
             TableWriter tableWriter,
-            FilesFacade ff
+            FilesFacade ff,
+            boolean isOom
     ) {
-        tableWriter.o3BumpErrorCount();
+        tableWriter.o3BumpErrorCount(isOom);
         if (columnCounter.decrementAndGet() == 0) {
             O3Utils.unmap(ff, srcTimestampAddr, srcTimestampSize);
             O3Utils.close(ff, srcTimestampFd);
@@ -189,17 +196,13 @@ public class O3OpenColumnJob extends AbstractQueueConsumerJob<O3OpenColumnTask> 
     }
 
     public static boolean isOpenColumnModeForAppend(int openColumnMode) {
-        switch (openColumnMode) {
-            case OPEN_MID_PARTITION_FOR_APPEND:
-            case OPEN_LAST_PARTITION_FOR_APPEND:
-            case OPEN_NEW_PARTITION_FOR_APPEND:
-                return true;
-            default:
-                return false;
-        }
+        return switch (openColumnMode) {
+            case OPEN_MID_PARTITION_FOR_APPEND, OPEN_LAST_PARTITION_FOR_APPEND, OPEN_NEW_PARTITION_FOR_APPEND -> true;
+            default -> false;
+        };
     }
 
-    public static void o3PartitionMerge(
+    public static void mergeVarColumn(
             Path pathToNewPartition,
             int pplen,
             CharSequence columnName,
@@ -230,11 +233,11 @@ public class O3OpenColumnJob extends AbstractQueueConsumerJob<O3OpenColumnTask> 
             long suffixLo,
             long suffixHi,
             int indexBlockCapacity,
-            int srcTimestampFd,
+            long srcTimestampFd,
             long srcTimestampAddr,
             long srcTimestampSize,
-            int srcDataFixFd,
-            int srcDataVarFd,
+            long srcDataFixFd,
+            long srcDataVarFd,
             long srcDataNewPartitionSize,
             long srcDataOldPartitionSize,
             long o3SplitPartitionSize,
@@ -244,7 +247,7 @@ public class O3OpenColumnJob extends AbstractQueueConsumerJob<O3OpenColumnTask> 
             long partitionUpdateSinkAddr
     ) {
         int partCount = 0;
-        int dstDataFd = 0;
+        long dstDataFd = 0;
         long dstVarAddr = 0;
         long srcDataFixOffset;
         long srcAuxAddr = 0;
@@ -256,146 +259,158 @@ public class O3OpenColumnJob extends AbstractQueueConsumerJob<O3OpenColumnTask> 
         long srcDataSize = 0;
         long dstDataAppendOffset2;
         long dstAuxAppendOffset2;
-        int dstAuxFd = 0;
+        long dstAuxFd = 0;
         long dstAuxAddr = 0;
         long srcDataAddr = 0;
         long srcDataOffset = 0;
         long dstDataAppendOffset1 = 0;
-        final int srcFixFd = Math.abs(srcDataFixFd);
-        final int srcVarFd = Math.abs(srcDataVarFd);
+        final long srcFixFd = Math.abs(srcDataFixFd);
+        final long srcVarFd = Math.abs(srcDataVarFd);
         final FilesFacade ff = tableWriter.getFilesFacade();
         final boolean mixedIOFlag = tableWriter.allowMixedIO();
-        final long initialSrcDataTop = srcDataTop;
-
         try {
             pathToNewPartition.trimTo(pplen);
             final ColumnTypeDriver columnTypeDriver = ColumnType.getDriver(columnType);
+            // srcDataMax is the row count in the existing column data.
+            // Use Math.max as a defensive guard against srcDataTop > srcDataMax edge cases.
+            final long auxRowCountOld = Math.max(0L, srcDataMax - srcDataTop);
+            if (srcDataTop > 0 && tableWriter.isCommitReplaceMode()) {
+                // Adjust source data lengths limiting to what we need for the range replace merge.
+                long dataMax = 0;
+                if (prefixType == O3_BLOCK_DATA && prefixHi >= prefixLo) {
+                    dataMax = prefixHi + 1;
+                }
+                if (suffixType == O3_BLOCK_DATA && suffixHi >= suffixLo) {
+                    dataMax = suffixHi + 1;
+                }
+                srcDataMax = Math.min(srcDataMax, dataMax);
+                srcDataTop = Math.min(srcDataTop, dataMax);
+            }
+
             if (srcDataTop > 0) {
-                // srcDataMax is the row count in the existing column data
-                final long auxRowCount = srcDataMax - srcDataTop;
                 // Size of data actually in the aux (fixed) file,
                 // THIS IS N+1 size, it used to be N offset, e.g. this used to be pointing at
-                // the last row of the aux vector (column)
-                final long oldAuxSize = columnTypeDriver.getAuxVectorSize(auxRowCount);
+                // the last row of the aux vector (column).
+                final long auxSizeOld = columnTypeDriver.getAuxVectorSize(auxRowCountOld);
+                // Size of data in the aux (fixed) file if it didn't have column top.
+                // this size DOES NOT INCLUDE N+1, so it is N here.
+                final long auxSizeNew = columnTypeDriver.getAuxVectorSize(srcDataMax);
+                final long auxRowCountNew = Math.max(0L, srcDataMax - srcDataTop);
 
-                // Size of data in the index (fixed) file if it didn't have column top.
-                // this size DOES NOT INCLUDE N+1, so it is N here
-                final long wouldBeAuxSize = columnTypeDriver.getAuxVectorSize(srcDataMax);
-
+                // if column top on the partition column is in the middle of the prefix
+                // we need to materialize nulls
+                // if the prefix is new O3 data it means the O3 data comes first in the merged result
+                // and the column top will also not work so we need to materialize nulls too
                 if (srcDataTop > prefixHi || prefixType == O3_BLOCK_O3) {
+
                     // Extend the existing column down, we will be discarding it anyway.
                     // Materialize nulls at the end of the column and add non-null data to merge.
                     // Do all of this beyond existing written data, using column as a buffer.
-                    // It is also fine in case when last partition contains WAL LAG, since
-                    // At the beginning of the transaction LAG is copied into memory buffers (o3 mem columns).
-                    newAuxSize =
-                            columnTypeDriver.getAuxVectorSize(auxRowCount) +
-                                    columnTypeDriver.getAuxVectorSize(srcDataMax);
+                    // It is also fine in case when last partition contains WAL LAG, since at the
+                    // beginning of the transaction LAG is copied into memory buffers (o3 mem columns).
+                    newAuxSize = auxSizeOld + auxSizeNew;
 
                     srcAuxAddr = mapRW(ff, srcFixFd, newAuxSize, MemoryTag.MMAP_O3);
                     ff.madvise(srcAuxAddr, newAuxSize, Files.POSIX_MADV_SEQUENTIAL);
-                    if (auxRowCount > 0) {
-                        srcDataSize = columnTypeDriver.getDataVectorSizeAt(srcAuxAddr, auxRowCount - 1);
+                    if (auxRowCountOld > 0) {
+                        srcDataSize = columnTypeDriver.getDataVectorSizeAt(srcAuxAddr, auxRowCountOld - 1);
                     }
 
-                    // at bottom of source var column set length of strings to null (-1) for as many strings
+                    // At bottom of source var column set length of strings to null (-1) for as many strings
                     // as srcDataTop value.
                     srcDataOffset = srcDataSize;
                     // We need to reserve null values for every column top value
                     // in the variable len file. Each null value takes 4 bytes for string
                     final long reservedBytesForColTopNulls = srcDataTop * columnTypeDriver.getDataVectorMinEntrySize();
-                    srcDataSize += reservedBytesForColTopNulls + srcDataSize;
+                    srcDataSize += reservedBytesForColTopNulls;
+                    // This value may be lower than auxRowCount.
+                    // We use it when copying non-column top column data.
+                    if (auxRowCountNew > 0) {
+                        srcDataSize += columnTypeDriver.getDataVectorSizeAt(srcAuxAddr, auxRowCountNew - 1);
+                    }
                     srcDataAddr = srcDataSize > 0 ? mapRW(ff, srcVarFd, srcDataSize, MemoryTag.MMAP_O3) : srcDataAddr;
                     ff.madvise(srcDataAddr, srcDataSize, Files.POSIX_MADV_SEQUENTIAL);
 
                     // Set var column values to null first srcDataTop times
-                    // Next line should be:
-                    // Vect.setMemoryInt(srcDataAddr + srcDataOffset, -1, srcDataTop);
-                    // But we can replace it with memset setting each byte to -1
-                    // because binary repr of int -1 is 4 bytes of -1
-                    // memset is faster than any SIMD implementation we can come with
                     columnTypeDriver.setDataVectorEntriesToNull(srcDataAddr + srcDataOffset, srcDataTop);
 
-                    // Copy var column data
-                    Vect.memcpy(srcDataAddr + srcDataOffset + reservedBytesForColTopNulls, srcDataAddr, srcDataOffset);
+                    if (auxRowCountNew > 0) {
+                        // Copy var column data
+                        Vect.memcpy(
+                                srcDataAddr + srcDataOffset + reservedBytesForColTopNulls,
+                                srcDataAddr,
+                                columnTypeDriver.getDataVectorSizeAt(srcAuxAddr, auxRowCountNew - 1)
+                        );
+                    }
 
-                    // we need to shift copy the original column so that new block points at strings "below" the
-                    // nulls we created above
-                    long dstAddr = srcAuxAddr + wouldBeAuxSize;
-                    long dstAddrSize = newAuxSize - wouldBeAuxSize;
+                    // We need to shift copy the original column so that new block points at strings "below"
+                    // the nulls we created above.
+                    final long dstOffset = auxSizeOld + columnTypeDriver.auxRowsToBytes(srcDataTop);
+                    final long dstAddr = srcAuxAddr + dstOffset;
+                    final long dstAddrSize = newAuxSize - dstOffset;
                     columnTypeDriver.shiftCopyAuxVector(
                             -reservedBytesForColTopNulls,
                             srcAuxAddr,
                             0,
-                            auxRowCount - 1, // inclusive
+                            auxRowCountNew - 1, // inclusive, -1 is tolerated by the driver
                             dstAddr,
                             dstAddrSize
                     );
 
-                    // now set the "empty" bit of fixed size column with references to those
-                    // null strings we just added
-                    // Call to o3setColumnRefs must be after o3shiftCopyAuxVector
-                    // because data first have to be shifted before overwritten
-                    columnTypeDriver.setPartAuxVectorNull(srcAuxAddr + oldAuxSize, 0, srcDataTop);
+                    // Now set the "empty" bit of fixed size column with references to those
+                    // null strings we just added.
+                    // Call to setPartAuxVectorNull must be after shiftCopyAuxVector
+                    // because the data has to be shifted before being overwritten.
+                    columnTypeDriver.setPartAuxVectorNull(srcAuxAddr + auxSizeOld, 0, srcDataTop);
                     srcDataTop = 0;
-                    srcDataFixOffset = oldAuxSize;
+                    srcDataFixOffset = auxSizeOld;
                 } else {
-                    // when we are shuffling "empty" space we can just reduce column top instead
-                    // of moving data
+                    // When we are shuffling "empty" space we can just reduce column top instead
+                    // of moving the data.
                     if (prefixType != O3_BLOCK_NONE) {
                         // Set the column top if it's not split partition case.
-                        Unsafe.getUnsafe().putLong(colTopSinkAddr, srcDataTop);
+                        Unsafe.putLong(colTopSinkAddr, srcDataTop);
                         // For split partition, old partition column top will remain the same.
                         // And the new partition will not have any column top since srcDataTop <= prefixHi.
                     }
 
-                    newAuxSize = columnTypeDriver.getAuxVectorSize(auxRowCount);
+                    srcDataFixOffset = 0;
+                    if (auxRowCountNew > 0) {
+                        newAuxSize = columnTypeDriver.getAuxVectorSize(auxRowCountNew);
+                        srcAuxAddr = mapRW(ff, srcFixFd, newAuxSize, MemoryTag.MMAP_O3);
+                        ff.madvise(srcAuxAddr, newAuxSize, Files.POSIX_MADV_SEQUENTIAL);
+
+                        srcDataSize = columnTypeDriver.getDataVectorSizeAt(srcAuxAddr, auxRowCountNew - 1);
+                        srcDataAddr = srcDataSize > 0 ? mapRO(ff, srcVarFd, srcDataSize, MemoryTag.MMAP_O3) : 0;
+                        ff.madvise(srcDataAddr, srcDataSize, Files.POSIX_MADV_SEQUENTIAL);
+                    }
+                }
+            } else {
+                srcDataFixOffset = 0;
+                if (srcDataMax > 0) {
+                    newAuxSize = columnTypeDriver.getAuxVectorSize(srcDataMax);
                     srcAuxAddr = mapRW(ff, srcFixFd, newAuxSize, MemoryTag.MMAP_O3);
                     ff.madvise(srcAuxAddr, newAuxSize, Files.POSIX_MADV_SEQUENTIAL);
-                    srcDataFixOffset = 0;
 
-                    srcDataSize = columnTypeDriver.getDataVectorSizeAt(srcAuxAddr, auxRowCount - 1);
+                    srcDataSize = columnTypeDriver.getDataVectorSizeAt(srcAuxAddr, srcDataMax - 1);
                     srcDataAddr = srcDataSize > 0 ? mapRO(ff, srcVarFd, srcDataSize, MemoryTag.MMAP_O3) : 0;
                     ff.madvise(srcDataAddr, srcDataSize, Files.POSIX_MADV_SEQUENTIAL);
                 }
-            } else {
-                newAuxSize = columnTypeDriver.getAuxVectorSize(srcDataMax);
-                srcAuxAddr = mapRW(ff, srcFixFd, newAuxSize, MemoryTag.MMAP_O3);
-                ff.madvise(srcAuxAddr, newAuxSize, Files.POSIX_MADV_SEQUENTIAL);
-                srcDataFixOffset = 0;
-                srcDataSize = columnTypeDriver.getDataVectorSizeAt(srcAuxAddr, srcDataMax - 1);
-                srcDataAddr = srcDataSize > 0 ? mapRO(ff, srcVarFd, srcDataSize, MemoryTag.MMAP_O3) : 0;
-                ff.madvise(srcDataAddr, srcDataSize, Files.POSIX_MADV_SEQUENTIAL);
             }
 
-            // upgrade srcDataTop to offset
+            // Upgrade srcDataTop to offset.
             srcDataTopOffset = columnTypeDriver.getAuxVectorOffset(srcDataTop);
 
             dstAuxFd = openRW(ff, iFile(pathToNewPartition.trimTo(pplen), columnName, columnNameTxn), LOG, tableWriter.getConfiguration().getWriterFileOpenOpts());
-            dstAuxSize = columnTypeDriver.auxRowsToBytes(srcOooHi - srcOooLo + 1) +
-                    columnTypeDriver.getAuxVectorSize(srcDataMax - srcDataTop);
 
-            if (prefixType == O3_BLOCK_NONE) {
-                // split partition
-                dstAuxSize -= columnTypeDriver.auxRowsToBytes(prefixHi + 1 - srcDataTop);
-            }
+            // Use target partition size to determine the size of fixed file, it's already compensated
+            // for partitions splits and duplicates found by dedup.
+            long newRowCount = o3SplitPartitionSize > 0 ? o3SplitPartitionSize : srcDataNewPartitionSize - srcDataTop;
+            dstAuxSize = columnTypeDriver.getAuxVectorSize(newRowCount);
+
             dstAuxAddr = mapRW(ff, dstAuxFd, dstAuxSize, MemoryTag.MMAP_O3);
             if (!mixedIOFlag) {
                 ff.madvise(dstAuxAddr, dstAuxSize, Files.POSIX_MADV_RANDOM);
-            }
-
-            dstDataFd = openRW(ff, dFile(pathToNewPartition.trimTo(pplen), columnName, columnNameTxn), LOG, tableWriter.getConfiguration().getWriterFileOpenOpts());
-            dstDataSize = srcDataSize - srcDataOffset + columnTypeDriver.getDataVectorSize(o3AuxAddr, srcOooLo, srcOooHi);
-
-            if (prefixType == O3_BLOCK_NONE && prefixHi > initialSrcDataTop) {
-                // split partition
-                assert prefixLo == 0;
-                dstDataSize -= columnTypeDriver.getDataVectorSize(srcAuxAddr, prefixLo, prefixHi - initialSrcDataTop);
-            }
-
-            dstVarAddr = dstDataSize > 0 ? mapRW(ff, dstDataFd, dstDataSize, MemoryTag.MMAP_O3) : 0;
-            if (!mixedIOFlag) {
-                ff.madvise(dstVarAddr, dstDataSize, Files.POSIX_MADV_RANDOM);
             }
 
             if (prefixType == O3_BLOCK_DATA) {
@@ -432,7 +447,7 @@ public class O3OpenColumnJob extends AbstractQueueConsumerJob<O3OpenColumnTask> 
 
             // offset 2
             if (mergeDataLo > -1 && mergeOOOLo > -1) {
-                dstAuxAppendOffset2 = dstAuxAppendOffset1 + columnTypeDriver.getAuxVectorOffset(mergeRowCount);
+                final long mergeDataSize;
                 if (mergeRowCount == mergeDataHi - mergeDataLo + 1 + mergeOOOHi - mergeOOOLo + 1) {
                     // No deduplication, all rows from O3 and column data will be written.
                     // In this case var col length is calculated as o3 var col len + data var col len
@@ -442,7 +457,10 @@ public class O3OpenColumnJob extends AbstractQueueConsumerJob<O3OpenColumnTask> 
                             mergeDataLo - srcDataTop,
                             mergeDataHi - srcDataTop
                     );
-                    dstDataAppendOffset2 = dstDataAppendOffset1 + o3size + dataSize;
+
+                    mergeDataSize = o3size + dataSize;
+                } else if (tableWriter.isCommitReplaceMode() && mergeType == O3_BLOCK_O3) {
+                    mergeDataSize = columnTypeDriver.getDataVectorSize(o3AuxAddr, mergeOOOLo, mergeOOOHi);
                 } else {
                     // Deduplication happens, some rows are eliminated.
                     // Dedup eliminates some rows, there is no way to know the append offset of var file beforehand.
@@ -458,20 +476,42 @@ public class O3OpenColumnJob extends AbstractQueueConsumerJob<O3OpenColumnTask> 
                     // 'long long value'
                     // 'long long value'
                     // Which is longer than oooLen + dataLen
-                    // To deal with unpredicatability of the dedup var col size run the dedup merged size calculation
-                    long dedupMergeVarColumnSize = columnTypeDriver.dedupMergeVarColumnSize(
+                    // To deal with unpredictability of the dedup var col size run the dedup merged size calculation
+                    mergeDataSize = timestampMergeIndexAddr > 0 ? columnTypeDriver.dedupMergeVarColumnSize(
                             timestampMergeIndexAddr,
-                            timestampMergeIndexSize / TIMESTAMP_MERGE_ENTRY_BYTES,
+                            mergeRowCount,
                             srcAuxAddr + srcDataFixOffset - columnTypeDriver.getAuxVectorOffset(srcDataTop),
                             o3AuxAddr
-                    );
-
-                    assert dedupMergeVarColumnSize >= 0;
-                    dstDataAppendOffset2 = dstDataAppendOffset1 + dedupMergeVarColumnSize;
+                    ) : 0;
                 }
+
+                dstAuxAppendOffset2 = dstAuxAppendOffset1 + columnTypeDriver.getAuxVectorOffset(mergeRowCount);
+                dstDataAppendOffset2 = dstDataAppendOffset1 + mergeDataSize;
             } else {
                 dstAuxAppendOffset2 = dstAuxAppendOffset1;
                 dstDataAppendOffset2 = dstDataAppendOffset1;
+            }
+
+            long suffixSize = suffixType == O3_BLOCK_DATA ?
+                    columnTypeDriver.getDataVectorSize(
+                            // No need to compensate for srcDataTop here,
+                            // suffixLo, suffixHi are already adjusted for srcDataTop
+                            srcAuxAddr + srcDataFixOffset,
+                            suffixLo,
+                            suffixHi
+                    )
+                    : 0;
+            long suffixSize2 = suffixType == O3_BLOCK_O3
+                    ? columnTypeDriver.getDataVectorSize(o3AuxAddr, suffixLo, suffixHi)
+                    : 0;
+            dstDataSize = dstDataAppendOffset2 + suffixSize + suffixSize2;
+
+            dstDataFd = openRW(ff, dFile(pathToNewPartition.trimTo(pplen), columnName, columnNameTxn), LOG, tableWriter.getConfiguration().getWriterFileOpenOpts());
+            if (dstDataSize > 0) {
+                dstVarAddr = mapRW(ff, dstDataFd, dstDataSize, MemoryTag.MMAP_O3);
+                if (!mixedIOFlag) {
+                    ff.madvise(dstVarAddr, dstDataSize, Files.POSIX_MADV_RANDOM);
+                }
             }
 
             if (mergeType != O3_BLOCK_NONE) {
@@ -482,11 +522,11 @@ public class O3OpenColumnJob extends AbstractQueueConsumerJob<O3OpenColumnTask> 
                 partCount++;
             }
         } catch (Throwable e) {
-            LOG.error().$("merge var error [table=").utf8(tableWriter.getTableToken().getTableName())
+            LOG.error().$("merge var error [table=").$(tableWriter.getTableToken())
                     .$(", e=").$(e)
                     .I$();
-            tableWriter.o3BumpErrorCount();
-            O3CopyJob.copyIdleQuick(
+            tableWriter.o3BumpErrorCount(CairoException.isCairoOomError(e));
+            O3CopyJob.unmapAndCloseAllPartsComplete(
                     columnCounter,
                     timestampMergeIndexAddr,
                     timestampMergeIndexSize,
@@ -581,11 +621,11 @@ public class O3OpenColumnJob extends AbstractQueueConsumerJob<O3OpenColumnTask> 
             int blockType,
             long timestampMergeIndexAddr,
             long timestampMergeIndexSize,
-            int srcDataFixFd,
+            long srcDataFixFd,
             long srcDataFixAddr,
             long srcDataFixOffset,
             long srcDataFixSize,
-            int srcDataVarFd,
+            long srcDataVarFd,
             long srcDataVarAddr,
             long srcDataVarOffset,
             long srcDataVarSize,
@@ -602,22 +642,22 @@ public class O3OpenColumnJob extends AbstractQueueConsumerJob<O3OpenColumnTask> 
             long srcOooPartitionHi,
             long timestampMin,
             long partitionTimestamp,
-            int dstFixFd,
+            long dstFixFd,
             long dstFixAddr,
             long dstFixOffset,
             long dstFixFileOffset,
             long dstFixSize,
-            int dstVarFd,
+            long dstVarFd,
             long dstVarAddr,
             long dstVarOffset,
             long dstVarAdjust,
             long dstVarSize,
-            int dstKFd,
-            int dstVFd,
+            long dstKFd,
+            long dstVFd,
             long dstIndexOffset,
             long dstIndexAdjust,
             int indexBlockCapacity,
-            int srcTimestampFd,
+            long srcTimestampFd,
             long srcTimestampAddr,
             long srcTimestampSize,
             boolean partitionMutates,
@@ -625,7 +665,7 @@ public class O3OpenColumnJob extends AbstractQueueConsumerJob<O3OpenColumnTask> 
             long srcDataOldPartitionSize,
             long o3SplitPartitionSize,
             TableWriter tableWriter,
-            BitmapIndexWriter indexWriter,
+            IndexWriter indexWriter,
             long partitionUpdateSinkAddr
     ) {
         long cursor = tableWriter.getO3CopyPubSeq().next();
@@ -750,11 +790,11 @@ public class O3OpenColumnJob extends AbstractQueueConsumerJob<O3OpenColumnTask> 
             int columnType,
             long timestampMergeIndexAddr,
             long timestampMergeIndexSize,
-            int srcDataFixFd,
+            long srcDataFixFd,
             long srcDataFixAddr,
             long srcDataFixOffset,
             long srcDataFixSize,
-            int srcDataVarFd,
+            long srcDataVarFd,
             long srcDataVarAddr,
             long srcDataVarOffset,
             long srcDataVarSize,
@@ -778,436 +818,478 @@ public class O3OpenColumnJob extends AbstractQueueConsumerJob<O3OpenColumnTask> 
             int suffixType,
             long suffixLo,
             long suffixHi,
-            int dstFixFd,
+            long dstFixFd,
             long dstFixAddr,
             long dstFixSize,
-            int dstVarFd,
+            long dstVarFd,
             long dstVarAddr,
             long dstVarSize,
             long dstAuxAppendOffset1,
             long dstAuxAppendOffset2,
             long dstDataAppendOffset1,
             long dstDataAppendOffset2,
-            int dstKFd,
-            int dstVFd,
+            long dstKFd,
+            long dstVFd,
             int indexBlockCapacity,
-            int srcTimestampFd,
+            long srcTimestampFd,
             long srcTimestampAddr,
             long srcTimestampSize,
             long srcDataNewPartitionSize,
             long srcDataOldPartitionSize,
             long o3SplitPartitionSize,
             TableWriter tableWriter,
-            BitmapIndexWriter indexWriter,
+            IndexWriter indexWriter,
             long dstIndexAdjust,
             long partitionUpdateSinkAddr
     ) {
         final boolean partitionMutates = true;
-        switch (prefixType) {
-            case O3_BLOCK_O3:
-                o3PublishCopyTask(
-                        columnCounter,
-                        partCounter,
-                        columnType,
-                        prefixType,
-                        timestampMergeIndexAddr,
-                        timestampMergeIndexSize,
-                        srcDataFixFd,
-                        srcDataFixAddr,
-                        srcDataFixOffset,
-                        srcDataFixSize,
-                        srcDataVarFd,
-                        srcDataVarAddr,
-                        srcDataVarOffset,
-                        srcDataVarSize,
-                        0,
-                        0,
-                        srcDataTopOffset,
-                        srcDataMax,
-                        srcOooFixAddr,
-                        srcOooVarAddr,
-                        prefixLo,
-                        prefixHi,
-                        srcOooMax,
-                        srcOooLo,
-                        srcOooHi,
-                        timestampMin,
-                        partitionTimestamp,
-                        dstFixFd,
-                        dstFixAddr,
-                        0,
-                        0,
-                        dstFixSize,
-                        dstVarFd,
-                        dstVarAddr,
-                        0,
-                        0,
-                        dstVarSize,
-                        dstKFd,
-                        dstVFd,
-                        0,
-                        dstIndexAdjust,
-                        indexBlockCapacity,
-                        srcTimestampFd,
-                        srcTimestampAddr,
-                        srcTimestampSize,
-                        partitionMutates,
-                        srcDataNewPartitionSize,
-                        srcDataOldPartitionSize,
-                        o3SplitPartitionSize,
-                        tableWriter,
-                        indexWriter,
-                        partitionUpdateSinkAddr
-                );
-                break;
-            case O3_BLOCK_DATA:
-                o3PublishCopyTask(
-                        columnCounter,
-                        partCounter,
-                        columnType,
-                        prefixType,
-                        timestampMergeIndexAddr,
-                        timestampMergeIndexSize,
-                        srcDataFixFd,
-                        srcDataFixAddr,
-                        srcDataFixOffset,
-                        srcDataFixSize,
-                        srcDataVarFd,
-                        srcDataVarAddr,
-                        srcDataVarOffset,
-                        srcDataVarSize,
-                        prefixLo,
-                        prefixHi,
-                        srcDataTopOffset,
-                        srcDataMax,
-                        0,
-                        0,
-                        0,
-                        0,
-                        srcOooMax,
-                        srcOooLo,
-                        srcOooHi,
-                        timestampMin,
-                        partitionTimestamp,
-                        dstFixFd,
-                        dstFixAddr,
-                        0,
-                        0,
-                        dstFixSize,
-                        dstVarFd,
-                        dstVarAddr,
-                        0,
-                        0,
-                        dstVarSize,
-                        dstKFd,
-                        dstVFd,
-                        0,
-                        dstIndexAdjust,
-                        indexBlockCapacity,
-                        srcTimestampFd,
-                        srcTimestampAddr,
-                        srcTimestampSize,
-                        partitionMutates,
-                        srcDataNewPartitionSize,
-                        srcDataOldPartitionSize,
-                        o3SplitPartitionSize,
-                        tableWriter,
-                        indexWriter,
-                        partitionUpdateSinkAddr
-                );
-                break;
-            default:
-                break;
-        }
 
-        switch (mergeType) {
-            case O3_BLOCK_O3:
-                o3PublishCopyTask(
-                        columnCounter,
-                        partCounter,
-                        columnType,
-                        mergeType,
-                        timestampMergeIndexAddr,
-                        timestampMergeIndexSize,
-                        srcDataFixFd,
-                        srcDataFixAddr,
-                        srcDataFixOffset,
-                        srcDataFixSize,
-                        srcDataVarFd,
-                        srcDataVarAddr,
-                        srcDataVarOffset,
-                        srcDataVarSize,
-                        0,
-                        0,
-                        srcDataTopOffset,
-                        srcDataMax,
-                        srcOooFixAddr,
-                        srcOooVarAddr,
-                        mergeOOOLo,
-                        mergeOOOHi,
-                        srcOooMax,
-                        srcOooLo,
-                        srcOooHi,
-                        timestampMin,
-                        partitionTimestamp,
-                        dstFixFd,
-                        dstFixAddr,
-                        dstAuxAppendOffset1,
-                        dstAuxAppendOffset1,
-                        dstFixSize,
-                        dstVarFd,
-                        dstVarAddr,
-                        dstDataAppendOffset1,
-                        0,
-                        dstVarSize,
-                        dstKFd,
-                        dstVFd,
-                        0,
-                        dstIndexAdjust,
-                        indexBlockCapacity,
-                        srcTimestampFd,
-                        srcTimestampAddr,
-                        srcTimestampSize,
-                        partitionMutates,
-                        srcDataNewPartitionSize,
-                        srcDataOldPartitionSize,
-                        o3SplitPartitionSize,
-                        tableWriter,
-                        indexWriter,
-                        partitionUpdateSinkAddr
-                );
-                break;
-            case O3_BLOCK_DATA:
-                o3PublishCopyTask(
-                        columnCounter,
-                        partCounter,
-                        columnType,
-                        mergeType,
-                        timestampMergeIndexAddr,
-                        timestampMergeIndexSize,
-                        srcDataFixFd,
-                        srcDataFixAddr,
-                        srcDataFixOffset,
-                        srcDataFixSize,
-                        srcDataVarFd,
-                        srcDataVarAddr,
-                        srcDataVarOffset,
-                        srcDataVarSize,
-                        mergeDataLo,
-                        mergeDataHi,
-                        srcDataTopOffset,
-                        srcDataMax,
-                        0,
-                        0,
-                        0,
-                        0,
-                        srcOooMax,
-                        srcOooLo,
-                        srcOooHi,
-                        timestampMin,
-                        partitionTimestamp,
-                        dstFixFd,
-                        dstFixAddr,
-                        dstAuxAppendOffset1,
-                        dstAuxAppendOffset1,
-                        dstFixSize,
-                        dstVarFd,
-                        dstVarAddr,
-                        dstDataAppendOffset1,
-                        0,
-                        dstVarSize,
-                        dstKFd,
-                        dstVFd,
-                        0,
-                        dstIndexAdjust,
-                        indexBlockCapacity,
-                        srcTimestampFd,
-                        srcTimestampAddr,
-                        srcTimestampSize,
-                        partitionMutates,
-                        srcDataNewPartitionSize,
-                        srcDataOldPartitionSize,
-                        o3SplitPartitionSize,
-                        tableWriter,
-                        indexWriter,
-                        partitionUpdateSinkAddr
-                );
-                break;
-            case O3_BLOCK_MERGE:
-                o3PublishCopyTask(
-                        columnCounter,
-                        partCounter,
-                        columnType,
-                        mergeType,
-                        timestampMergeIndexAddr,
-                        timestampMergeIndexSize,
-                        srcDataFixFd,
-                        srcDataFixAddr,
-                        srcDataFixOffset,
-                        srcDataFixSize,
-                        srcDataVarFd,
-                        srcDataVarAddr,
-                        srcDataVarOffset,
-                        srcDataVarSize,
-                        mergeDataLo,
-                        mergeDataHi,
-                        srcDataTopOffset,
-                        srcDataMax,
-                        srcOooFixAddr,
-                        srcOooVarAddr,
-                        mergeOOOLo,
-                        mergeOOOHi,
-                        srcOooMax,
-                        srcOooLo,
-                        srcOooHi,
-                        timestampMin,
-                        partitionTimestamp,
-                        dstFixFd,
-                        dstFixAddr,
-                        dstAuxAppendOffset1,
-                        dstAuxAppendOffset1,
-                        dstFixSize,
-                        dstVarFd,
-                        dstVarAddr,
-                        dstDataAppendOffset1,
-                        0,
-                        dstVarSize,
-                        dstKFd,
-                        dstVFd,
-                        0,
-                        dstIndexAdjust,
-                        indexBlockCapacity,
-                        srcTimestampFd,
-                        srcTimestampAddr,
-                        srcTimestampSize,
-                        partitionMutates,
-                        srcDataNewPartitionSize,
-                        srcDataOldPartitionSize,
-                        o3SplitPartitionSize,
-                        tableWriter,
-                        indexWriter,
-                        partitionUpdateSinkAddr
-                );
-                break;
-            default:
-                break;
-        }
+        int partsPublished = 0;
+        int partsToPublish = partCounter.get();
 
-        switch (suffixType) {
-            case O3_BLOCK_O3:
-                o3PublishCopyTask(
-                        columnCounter,
-                        partCounter,
-                        columnType,
-                        suffixType,
-                        timestampMergeIndexAddr,
-                        timestampMergeIndexSize,
-                        srcDataFixFd,
-                        srcDataFixAddr,
-                        srcDataFixOffset,
-                        srcDataFixSize,
-                        srcDataVarFd,
-                        srcDataVarAddr,
-                        srcDataVarOffset,
-                        srcDataVarSize,
-                        0,
-                        0,
-                        srcDataTopOffset,
-                        srcDataMax,
-                        srcOooFixAddr,
-                        srcOooVarAddr,
-                        suffixLo,
-                        suffixHi,
-                        srcOooMax,
-                        srcOooLo,
-                        srcOooHi,
-                        timestampMin,
-                        partitionTimestamp,
-                        dstFixFd,
-                        dstFixAddr,
-                        dstAuxAppendOffset2,
-                        dstAuxAppendOffset2,
-                        dstFixSize,
-                        dstVarFd,
-                        dstVarAddr,
-                        dstDataAppendOffset2,
-                        0,
-                        dstVarSize,
-                        dstKFd,
-                        dstVFd,
-                        0,
-                        dstIndexAdjust,
-                        indexBlockCapacity,
-                        srcTimestampFd,
-                        srcTimestampAddr,
-                        srcTimestampSize,
-                        partitionMutates,
-                        srcDataNewPartitionSize,
-                        srcDataOldPartitionSize,
-                        o3SplitPartitionSize,
-                        tableWriter,
-                        indexWriter,
-                        partitionUpdateSinkAddr
-                );
-                break;
-            case O3_BLOCK_DATA:
-                o3PublishCopyTask(
-                        columnCounter,
-                        partCounter,
-                        columnType,
-                        suffixType,
-                        timestampMergeIndexAddr,
-                        timestampMergeIndexSize,
-                        srcDataFixFd,
-                        srcDataFixAddr,
-                        srcDataFixOffset,
-                        srcDataFixSize,
-                        srcDataVarFd,
-                        srcDataVarAddr,
-                        srcDataVarOffset,
-                        srcDataVarSize,
-                        suffixLo,
-                        suffixHi,
-                        srcDataTopOffset,
-                        srcDataMax,
-                        0,
-                        0,
-                        0,
-                        0,
-                        srcOooMax,
-                        srcOooLo,
-                        srcOooHi,
-                        timestampMin,
-                        partitionTimestamp,
-                        dstFixFd,
-                        dstFixAddr,
-                        dstAuxAppendOffset2,
-                        dstAuxAppendOffset2,
-                        dstFixSize,
-                        dstVarFd,
-                        dstVarAddr,
-                        dstDataAppendOffset2,
-                        0,
-                        dstVarSize,
-                        dstKFd,
-                        dstVFd,
-                        0,
-                        dstIndexAdjust,
-                        indexBlockCapacity,
-                        srcTimestampFd,
-                        srcTimestampAddr,
-                        srcTimestampSize,
-                        partitionMutates,
-                        srcDataNewPartitionSize,
-                        srcDataOldPartitionSize,
-                        o3SplitPartitionSize,
-                        tableWriter,
-                        indexWriter,
-                        partitionUpdateSinkAddr
-                );
-                break;
-            default:
-                break;
+        try {
+            switch (prefixType) {
+                case O3_BLOCK_O3:
+                    partsPublished++;
+                    o3PublishCopyTask(
+                            columnCounter,
+                            partCounter,
+                            columnType,
+                            prefixType,
+                            timestampMergeIndexAddr,
+                            timestampMergeIndexSize,
+                            srcDataFixFd,
+                            srcDataFixAddr,
+                            srcDataFixOffset,
+                            srcDataFixSize,
+                            srcDataVarFd,
+                            srcDataVarAddr,
+                            srcDataVarOffset,
+                            srcDataVarSize,
+                            0,
+                            0,
+                            srcDataTopOffset,
+                            srcDataMax,
+                            srcOooFixAddr,
+                            srcOooVarAddr,
+                            prefixLo,
+                            prefixHi,
+                            srcOooMax,
+                            srcOooLo,
+                            srcOooHi,
+                            timestampMin,
+                            partitionTimestamp,
+                            dstFixFd,
+                            dstFixAddr,
+                            0,
+                            0,
+                            dstFixSize,
+                            dstVarFd,
+                            dstVarAddr,
+                            0,
+                            0,
+                            dstVarSize,
+                            dstKFd,
+                            dstVFd,
+                            0,
+                            dstIndexAdjust,
+                            indexBlockCapacity,
+                            srcTimestampFd,
+                            srcTimestampAddr,
+                            srcTimestampSize,
+                            partitionMutates,
+                            srcDataNewPartitionSize,
+                            srcDataOldPartitionSize,
+                            o3SplitPartitionSize,
+                            tableWriter,
+                            indexWriter,
+                            partitionUpdateSinkAddr
+                    );
+                    break;
+                case O3_BLOCK_DATA:
+                    partsPublished++;
+                    o3PublishCopyTask(
+                            columnCounter,
+                            partCounter,
+                            columnType,
+                            prefixType,
+                            timestampMergeIndexAddr,
+                            timestampMergeIndexSize,
+                            srcDataFixFd,
+                            srcDataFixAddr,
+                            srcDataFixOffset,
+                            srcDataFixSize,
+                            srcDataVarFd,
+                            srcDataVarAddr,
+                            srcDataVarOffset,
+                            srcDataVarSize,
+                            prefixLo,
+                            prefixHi,
+                            srcDataTopOffset,
+                            srcDataMax,
+                            0,
+                            0,
+                            0,
+                            0,
+                            srcOooMax,
+                            srcOooLo,
+                            srcOooHi,
+                            timestampMin,
+                            partitionTimestamp,
+                            dstFixFd,
+                            dstFixAddr,
+                            0,
+                            0,
+                            dstFixSize,
+                            dstVarFd,
+                            dstVarAddr,
+                            0,
+                            0,
+                            dstVarSize,
+                            dstKFd,
+                            dstVFd,
+                            0,
+                            dstIndexAdjust,
+                            indexBlockCapacity,
+                            srcTimestampFd,
+                            srcTimestampAddr,
+                            srcTimestampSize,
+                            partitionMutates,
+                            srcDataNewPartitionSize,
+                            srcDataOldPartitionSize,
+                            o3SplitPartitionSize,
+                            tableWriter,
+                            indexWriter,
+                            partitionUpdateSinkAddr
+                    );
+                    break;
+                default:
+                    break;
+            }
+
+            switch (mergeType) {
+                case O3_BLOCK_O3:
+                    partsPublished++;
+                    o3PublishCopyTask(
+                            columnCounter,
+                            partCounter,
+                            columnType,
+                            mergeType,
+                            timestampMergeIndexAddr,
+                            timestampMergeIndexSize,
+                            srcDataFixFd,
+                            srcDataFixAddr,
+                            srcDataFixOffset,
+                            srcDataFixSize,
+                            srcDataVarFd,
+                            srcDataVarAddr,
+                            srcDataVarOffset,
+                            srcDataVarSize,
+                            0,
+                            0,
+                            srcDataTopOffset,
+                            srcDataMax,
+                            srcOooFixAddr,
+                            srcOooVarAddr,
+                            mergeOOOLo,
+                            mergeOOOHi,
+                            srcOooMax,
+                            srcOooLo,
+                            srcOooHi,
+                            timestampMin,
+                            partitionTimestamp,
+                            dstFixFd,
+                            dstFixAddr,
+                            dstAuxAppendOffset1,
+                            dstAuxAppendOffset1,
+                            dstFixSize,
+                            dstVarFd,
+                            dstVarAddr,
+                            dstDataAppendOffset1,
+                            0,
+                            dstVarSize,
+                            dstKFd,
+                            dstVFd,
+                            0,
+                            dstIndexAdjust,
+                            indexBlockCapacity,
+                            srcTimestampFd,
+                            srcTimestampAddr,
+                            srcTimestampSize,
+                            partitionMutates,
+                            srcDataNewPartitionSize,
+                            srcDataOldPartitionSize,
+                            o3SplitPartitionSize,
+                            tableWriter,
+                            indexWriter,
+                            partitionUpdateSinkAddr
+                    );
+                    break;
+                case O3_BLOCK_DATA:
+                    partsPublished++;
+                    o3PublishCopyTask(
+                            columnCounter,
+                            partCounter,
+                            columnType,
+                            mergeType,
+                            timestampMergeIndexAddr,
+                            timestampMergeIndexSize,
+                            srcDataFixFd,
+                            srcDataFixAddr,
+                            srcDataFixOffset,
+                            srcDataFixSize,
+                            srcDataVarFd,
+                            srcDataVarAddr,
+                            srcDataVarOffset,
+                            srcDataVarSize,
+                            mergeDataLo,
+                            mergeDataHi,
+                            srcDataTopOffset,
+                            srcDataMax,
+                            0,
+                            0,
+                            0,
+                            0,
+                            srcOooMax,
+                            srcOooLo,
+                            srcOooHi,
+                            timestampMin,
+                            partitionTimestamp,
+                            dstFixFd,
+                            dstFixAddr,
+                            dstAuxAppendOffset1,
+                            dstAuxAppendOffset1,
+                            dstFixSize,
+                            dstVarFd,
+                            dstVarAddr,
+                            dstDataAppendOffset1,
+                            0,
+                            dstVarSize,
+                            dstKFd,
+                            dstVFd,
+                            0,
+                            dstIndexAdjust,
+                            indexBlockCapacity,
+                            srcTimestampFd,
+                            srcTimestampAddr,
+                            srcTimestampSize,
+                            partitionMutates,
+                            srcDataNewPartitionSize,
+                            srcDataOldPartitionSize,
+                            o3SplitPartitionSize,
+                            tableWriter,
+                            indexWriter,
+                            partitionUpdateSinkAddr
+                    );
+                    break;
+                case O3_BLOCK_MERGE:
+                    partsPublished++;
+                    o3PublishCopyTask(
+                            columnCounter,
+                            partCounter,
+                            columnType,
+                            mergeType,
+                            timestampMergeIndexAddr,
+                            timestampMergeIndexSize,
+                            srcDataFixFd,
+                            srcDataFixAddr,
+                            srcDataFixOffset,
+                            srcDataFixSize,
+                            srcDataVarFd,
+                            srcDataVarAddr,
+                            srcDataVarOffset,
+                            srcDataVarSize,
+                            mergeDataLo,
+                            mergeDataHi,
+                            srcDataTopOffset,
+                            srcDataMax,
+                            srcOooFixAddr,
+                            srcOooVarAddr,
+                            mergeOOOLo,
+                            mergeOOOHi,
+                            srcOooMax,
+                            srcOooLo,
+                            srcOooHi,
+                            timestampMin,
+                            partitionTimestamp,
+                            dstFixFd,
+                            dstFixAddr,
+                            dstAuxAppendOffset1,
+                            dstAuxAppendOffset1,
+                            dstFixSize,
+                            dstVarFd,
+                            dstVarAddr,
+                            dstDataAppendOffset1,
+                            0,
+                            dstVarSize,
+                            dstKFd,
+                            dstVFd,
+                            0,
+                            dstIndexAdjust,
+                            indexBlockCapacity,
+                            srcTimestampFd,
+                            srcTimestampAddr,
+                            srcTimestampSize,
+                            partitionMutates,
+                            srcDataNewPartitionSize,
+                            srcDataOldPartitionSize,
+                            o3SplitPartitionSize,
+                            tableWriter,
+                            indexWriter,
+                            partitionUpdateSinkAddr
+                    );
+                    break;
+                default:
+                    break;
+            }
+
+            switch (suffixType) {
+                case O3_BLOCK_O3:
+                    partsPublished++;
+                    o3PublishCopyTask(
+                            columnCounter,
+                            partCounter,
+                            columnType,
+                            suffixType,
+                            timestampMergeIndexAddr,
+                            timestampMergeIndexSize,
+                            srcDataFixFd,
+                            srcDataFixAddr,
+                            srcDataFixOffset,
+                            srcDataFixSize,
+                            srcDataVarFd,
+                            srcDataVarAddr,
+                            srcDataVarOffset,
+                            srcDataVarSize,
+                            0,
+                            0,
+                            srcDataTopOffset,
+                            srcDataMax,
+                            srcOooFixAddr,
+                            srcOooVarAddr,
+                            suffixLo,
+                            suffixHi,
+                            srcOooMax,
+                            srcOooLo,
+                            srcOooHi,
+                            timestampMin,
+                            partitionTimestamp,
+                            dstFixFd,
+                            dstFixAddr,
+                            dstAuxAppendOffset2,
+                            dstAuxAppendOffset2,
+                            dstFixSize,
+                            dstVarFd,
+                            dstVarAddr,
+                            dstDataAppendOffset2,
+                            0,
+                            dstVarSize,
+                            dstKFd,
+                            dstVFd,
+                            0,
+                            dstIndexAdjust,
+                            indexBlockCapacity,
+                            srcTimestampFd,
+                            srcTimestampAddr,
+                            srcTimestampSize,
+                            partitionMutates,
+                            srcDataNewPartitionSize,
+                            srcDataOldPartitionSize,
+                            o3SplitPartitionSize,
+                            tableWriter,
+                            indexWriter,
+                            partitionUpdateSinkAddr
+                    );
+                    break;
+                case O3_BLOCK_DATA:
+                    partsPublished++;
+                    o3PublishCopyTask(
+                            columnCounter,
+                            partCounter,
+                            columnType,
+                            suffixType,
+                            timestampMergeIndexAddr,
+                            timestampMergeIndexSize,
+                            srcDataFixFd,
+                            srcDataFixAddr,
+                            srcDataFixOffset,
+                            srcDataFixSize,
+                            srcDataVarFd,
+                            srcDataVarAddr,
+                            srcDataVarOffset,
+                            srcDataVarSize,
+                            suffixLo,
+                            suffixHi,
+                            srcDataTopOffset,
+                            srcDataMax,
+                            0,
+                            0,
+                            0,
+                            0,
+                            srcOooMax,
+                            srcOooLo,
+                            srcOooHi,
+                            timestampMin,
+                            partitionTimestamp,
+                            dstFixFd,
+                            dstFixAddr,
+                            dstAuxAppendOffset2,
+                            dstAuxAppendOffset2,
+                            dstFixSize,
+                            dstVarFd,
+                            dstVarAddr,
+                            dstDataAppendOffset2,
+                            0,
+                            dstVarSize,
+                            dstKFd,
+                            dstVFd,
+                            0,
+                            dstIndexAdjust,
+                            indexBlockCapacity,
+                            srcTimestampFd,
+                            srcTimestampAddr,
+                            srcTimestampSize,
+                            partitionMutates,
+                            srcDataNewPartitionSize,
+                            srcDataOldPartitionSize,
+                            o3SplitPartitionSize,
+                            tableWriter,
+                            indexWriter,
+                            partitionUpdateSinkAddr
+                    );
+                    break;
+                default:
+                    break;
+            }
+        } finally {
+            if (partsPublished != partsToPublish) {
+                // An exception happened, we need to adjust partCounter
+                if (partCounter.addAndGet(partsPublished - partsToPublish) == 0) {
+                    O3CopyJob.unmapAndCloseAllPartsComplete(
+                            columnCounter,
+                            timestampMergeIndexAddr,
+                            timestampMergeIndexSize,
+                            srcDataFixFd,
+                            srcDataFixAddr,
+                            srcDataFixSize,
+                            srcDataVarFd,
+                            srcDataVarAddr,
+                            srcDataVarSize,
+                            srcTimestampFd,
+                            srcTimestampAddr,
+                            srcTimestampSize,
+                            dstFixFd,
+                            dstFixAddr,
+                            dstFixSize,
+                            dstVarFd,
+                            dstVarAddr,
+                            dstVarSize,
+                            dstKFd,
+                            dstVFd,
+                            tableWriter
+                    );
+                }
+            }
         }
     }
 
@@ -1224,11 +1306,11 @@ public class O3OpenColumnJob extends AbstractQueueConsumerJob<O3OpenColumnTask> 
             long srcDataTop,
             long srcDataMax,
             int indexBlockCapacity,
-            int srcTimestampFd,
+            long srcTimestampFd,
             long srcTimestampAddr,
             long srcTimestampSize,
-            int activeFixFd,
-            int activeVarFd,
+            long activeFixFd,
+            long activeVarFd,
             MemoryMA dstAuxMem,
             MemoryMA dstDataMem,
             long dstRowCount,
@@ -1285,7 +1367,7 @@ public class O3OpenColumnJob extends AbstractQueueConsumerJob<O3OpenColumnTask> 
                 dstDataAdjust = dstDataMem.getAppendOffset();
             }
         } catch (Throwable e) {
-            LOG.error().$("append var error [table=").utf8(tableWriter.getTableToken().getTableName())
+            LOG.error().$("append var error [table=").$(tableWriter.getTableToken())
                     .$(", e=").$(e)
                     .I$();
             O3Utils.unmapAndClose(ff, activeFixFd, dstAuxAddr, dstAuxSize);
@@ -1298,7 +1380,8 @@ public class O3OpenColumnJob extends AbstractQueueConsumerJob<O3OpenColumnTask> 
                     srcTimestampAddr,
                     srcTimestampSize,
                     tableWriter,
-                    ff
+                    ff,
+                    CairoException.isCairoOomError(e)
             );
             throw e;
         }
@@ -1391,17 +1474,17 @@ public class O3OpenColumnJob extends AbstractQueueConsumerJob<O3OpenColumnTask> 
             int suffixType,
             long suffixLo,
             long suffixHi,
-            int srcTimestampFd,
+            long srcTimestampFd,
             long srcTimestampAddr,
             long srcTimestampSize,
             int indexBlockCapacity,
-            int activeFixFd,
-            int activeVarFd,
+            long activeFixFd,
+            long activeVarFd,
             long srcDataNewPartitionSize,
             long srcDataOldPartitionSize,
             long o3SplitPartitionSize,
             TableWriter tableWriter,
-            BitmapIndexWriter indexWriter,
+            IndexWriter indexWriter,
             long partitionUpdateSinkAddr,
             int columnIndex,
             long columnNameTxn
@@ -1409,21 +1492,40 @@ public class O3OpenColumnJob extends AbstractQueueConsumerJob<O3OpenColumnTask> 
         final long mergeRowCount;
         if (mergeType == O3_BLOCK_MERGE) {
             mergeRowCount = timestampMergeIndexSize / TIMESTAMP_MERGE_ENTRY_BYTES;
+        } else if (mergeType == O3_BLOCK_O3) {
+            // This can happen in replace commit mode
+            mergeRowCount = mergeOOOHi - mergeOOOLo + 1;
+        } else if (mergeType == O3_BLOCK_NONE) {
+            // This can happen in replace commit mode
+            mergeRowCount = 0;
         } else {
             mergeRowCount = mergeOOOHi - mergeOOOLo + 1 + mergeDataHi - mergeDataLo + 1;
         }
         final Path pathToOldPartition = Path.getThreadLocal(pathToTable);
-        TableUtils.setPathForPartition(pathToOldPartition, tableWriter.getPartitionBy(), oldPartitionTimestamp, srcNameTxn);
+        TableUtils.setPathForNativePartition(
+                pathToOldPartition,
+                tableWriter.getMetadata().getTimestampType(),
+                tableWriter.getPartitionBy(),
+                oldPartitionTimestamp,
+                srcNameTxn
+        );
         int plen = pathToOldPartition.size();
 
         final Path pathToNewPartition = Path.getThreadLocal2(pathToTable);
-        boolean partitionAppend = openColumnMode == OPEN_MID_PARTITION_FOR_APPEND || openColumnMode == OPEN_NEW_PARTITION_FOR_APPEND;
-        TableUtils.setPathForPartition(pathToNewPartition, tableWriter.getPartitionBy(), partitionTimestamp, partitionAppend ? srcNameTxn : txn);
+        boolean partitionAppend = isOpenColumnModeForAppend(openColumnMode);
+        TableUtils.setPathForNativePartition(
+                pathToNewPartition,
+                tableWriter.getMetadata().getTimestampType(),
+                tableWriter.getPartitionBy(),
+                partitionTimestamp,
+                partitionAppend ? srcNameTxn : txn
+        );
         int pplen = pathToNewPartition.size();
         final long colTopSinkAddr = columnTopAddress(partitionUpdateSinkAddr, columnIndex);
 
         // append jobs do not set value of part counter, we do it here for those
         switch (openColumnMode) {
+            case OPEN_LAST_PARTITION_FOR_APPEND:
             case OPEN_MID_PARTITION_FOR_APPEND:
                 appendMidPartition(
                         pathToNewPartition,
@@ -1449,7 +1551,18 @@ public class O3OpenColumnJob extends AbstractQueueConsumerJob<O3OpenColumnTask> 
                         srcDataOldPartitionSize,
                         o3SplitPartitionSize,
                         tableWriter,
-                        indexWriter,
+                        // Even though we are not using mapped memory for the last partition from the table writer
+                        // we must use its indexers to produce consistent index results. The condition here is
+                        // "creative" - we want to avoid bitmap index lookup for each and every column. We will use
+                        // presence of "indexWriter" as the guide. For columns that do not need indexing, this
+                        // writer would be null.
+
+                        // Consistent use of tableWriter's indexer is required because last partition could be updated
+                        // from two places, this is one of them. The other also uses tableWriter's index and is more
+                        // straightforward. Failure to make them consistent manifests when this site updates index and
+                        // extends its value memory, it may do so without extending key memory. Then key memory has
+                        // the reference to a value block, which would be outside the mapped area for tableWriters' indexer.
+                        openColumnMode == OPEN_LAST_PARTITION_FOR_APPEND && indexWriter != null ? tableWriter.getIndexWriter(columnIndex) : indexWriter,
                         colTopSinkAddr,
                         columnIndex,
                         columnNameTxn,
@@ -1555,7 +1668,7 @@ public class O3OpenColumnJob extends AbstractQueueConsumerJob<O3OpenColumnTask> 
             case OPEN_NEW_PARTITION_FOR_APPEND:
                 // mark the fact that the column is touched in the partition to the column version file
                 // It's fine to overwrite this value if needed inside the job branches.
-                Unsafe.getUnsafe().putLong(colTopSinkAddr, 0L);
+                Unsafe.putLong(colTopSinkAddr, 0L);
                 appendNewPartition(
                         pathToNewPartition,
                         plen,
@@ -1583,6 +1696,7 @@ public class O3OpenColumnJob extends AbstractQueueConsumerJob<O3OpenColumnTask> 
                 );
                 break;
             default:
+                assert false;
                 break;
         }
     }
@@ -1600,7 +1714,7 @@ public class O3OpenColumnJob extends AbstractQueueConsumerJob<O3OpenColumnTask> 
         final long oldPartitionTimestamp = task.getOldPartitionTimestamp();
         final long srcDataMax = task.getSrcDataMax();
         final long srcNameTxn = task.getSrcNameTxn();
-        final int srcTimestampFd = task.getSrcTimestampFd();
+        final long srcTimestampFd = task.getSrcTimestampFd();
         final long srcTimestampAddr = task.getSrcTimestampAddr();
         final long srcTimestampSize = task.getSrcTimestampSize();
         final AtomicInteger columnCounter = task.getColumnCounter();
@@ -1622,11 +1736,11 @@ public class O3OpenColumnJob extends AbstractQueueConsumerJob<O3OpenColumnTask> 
         final int mergeType = task.getMergeType();
         final long timestampMergeIndexAddr = task.getTimestampMergeIndexAddr();
         final long timestampMergeIndexSize = task.getTimestampMergeIndexSize();
-        final int activeFixFd = task.getActiveFixFd();
-        final int activeVarFd = task.getActiveVarFd();
+        final long activeFixFd = task.getActiveFixFd();
+        final long activeVarFd = task.getActiveVarFd();
         final long srcDataTop = task.getSrcDataTop();
         final TableWriter tableWriter = task.getTableWriter();
-        final BitmapIndexWriter indexWriter = task.getIndexWriter();
+        final IndexWriter indexWriter = task.getIndexWriter();
         final long partitionUpdateSinkAddr = task.getPartitionUpdateSinkAddr();
         final int columnIndex = task.getColumnIndex();
         final long columnNameTxn = task.getColumnNameTxn();
@@ -1701,22 +1815,22 @@ public class O3OpenColumnJob extends AbstractQueueConsumerJob<O3OpenColumnTask> 
             long srcDataTop,
             long srcDataMax,
             int indexBlockCapacity,
-            int srcTimestampFd,
+            long srcTimestampFd,
             long srcTimestampAddr,
             long srcTimestampSize,
-            int dstFixFd,
+            long dstFixFd,
             MemoryMA dstFixMem,
             long dstLen,
             TableWriter tableWriter,
             long srcDataNewPartitionSize,
             long srcDataOldPartitionSize,
             long o3SplitPartitionSize,
-            BitmapIndexWriter indexWriter,
+            IndexWriter indexWriter,
             long columnNameTxn,
             long partitionUpdateSinkAddr
     ) {
-        int dstKFd = 0;
-        int dstVFd = 0;
+        long dstKFd = 0;
+        long dstVFd = 0;
         long dstFixAddr;
         long dstFixOffset;
         long dstFixFileOffset;
@@ -1726,8 +1840,9 @@ public class O3OpenColumnJob extends AbstractQueueConsumerJob<O3OpenColumnTask> 
         final int shl = ColumnType.pow2SizeOf(columnType);
         final FilesFacade ff = tableWriter.getFilesFacade();
 
+        dstFixAddr = 0;
+        dstFixSize = dstLen << shl;
         try {
-            dstFixSize = dstLen << shl;
             dstFixOffset = (srcDataMax - srcDataTop) << shl;
             if (dstFixMem == null || dstFixMem.getAppendAddressSize() < dstFixSize) {
                 // Area we want to write is not mapped
@@ -1744,14 +1859,28 @@ public class O3OpenColumnJob extends AbstractQueueConsumerJob<O3OpenColumnTask> 
             dstFixFileOffset = dstFixOffset;
 
             if (indexBlockCapacity > -1 && !indexWriter.isOpen()) {
-                dstKFd = openRW(ff, BitmapIndexUtils.keyFileName(pathToNewPartition.trimTo(pNewLen), columnName, columnNameTxn), LOG, tableWriter.getConfiguration().getWriterFileOpenOpts());
-                dstVFd = openRW(ff, BitmapIndexUtils.valueFileName(pathToNewPartition.trimTo(pNewLen), columnName, columnNameTxn), LOG, tableWriter.getConfiguration().getWriterFileOpenOpts());
+                byte indexType = indexWriter.getIndexType();
+                if (IndexType.isPosting(indexType)) {
+                    indexWriter.setO3PathContext(
+                            pathToNewPartition.trimTo(pNewLen),
+                            columnName,
+                            columnNameTxn,
+                            tableWriter.getTxn() + 1L
+                    );
+                } else {
+                    dstKFd = openRW(ff, IndexFactory.keyFileName(indexType, pathToNewPartition.trimTo(pNewLen), columnName, columnNameTxn), LOG, tableWriter.getConfiguration().getWriterFileOpenOpts());
+                    dstVFd = openRW(ff, IndexFactory.valueFileName(indexType, pathToNewPartition.trimTo(pNewLen), columnName, columnNameTxn, columnNameTxn), LOG, tableWriter.getConfiguration().getWriterFileOpenOpts());
+                }
             }
         } catch (Throwable e) {
-            LOG.error().$("append fix error [table=").utf8(tableWriter.getTableToken().getTableName())
+            LOG.error().$("append fix error [table=").$(tableWriter.getTableToken())
                     .$(", e=").$(e)
                     .I$();
-            O3Utils.unmapAndClose(ff, dstFixFd, 0, 0);
+            if (dstFixSize > 0) {
+                O3Utils.unmapAndClose(ff, dstFixFd, dstFixAddr, dstFixSize);
+            } else {
+                O3Utils.unmapAndClose(ff, dstFixFd, 0, 0);
+            }
             O3Utils.close(ff, dstKFd);
             O3Utils.close(ff, dstVFd);
             freeTimestampIndex(
@@ -1762,7 +1891,8 @@ public class O3OpenColumnJob extends AbstractQueueConsumerJob<O3OpenColumnTask> 
                     srcTimestampAddr,
                     srcTimestampSize,
                     tableWriter,
-                    ff
+                    ff,
+                    CairoException.isCairoOomError(e)
             );
             throw e;
         }
@@ -1840,21 +1970,21 @@ public class O3OpenColumnJob extends AbstractQueueConsumerJob<O3OpenColumnTask> 
             long srcDataTop,
             long srcDataMax,
             int indexBlockCapacity,
-            int srcTimestampFd,
+            long srcTimestampFd,
             long srcTimestampAddr,
             long srcTimestampSize,
             long srcDataNewPartitionSize,
             long srcDataOldPartitionSize,
             long o3SplitPartitionSize,
             TableWriter tableWriter,
-            BitmapIndexWriter indexWriter,
+            IndexWriter indexWriter,
             long colTopSinkAddr,
             int columnIndex,
             long columnNameTxn,
             long partitionUpdateSinkAddr
     ) {
-        int dstFixFd = 0;
-        int dstVarFd = 0;
+        long dstFixFd = 0;
+        long dstVarFd = 0;
         final FilesFacade ff = tableWriter.getFilesFacade();
         if (srcDataTop == -1) {
             try {
@@ -1863,7 +1993,7 @@ public class O3OpenColumnJob extends AbstractQueueConsumerJob<O3OpenColumnTask> 
                 // Trim column top to partition top.
                 srcDataTop = Math.min(srcDataMax, tableWriter.getColumnTop(oldPartitionTimestamp, columnIndex, srcDataMax));
                 if (srcDataTop == srcDataMax) {
-                    Unsafe.getUnsafe().putLong(colTopSinkAddr, srcDataMax);
+                    Unsafe.putLong(colTopSinkAddr, srcDataMax);
                 }
             } catch (Throwable e) {
                 LOG.error().$("append mid partition error 1 [table=").$(tableWriter.getTableToken())
@@ -1877,7 +2007,8 @@ public class O3OpenColumnJob extends AbstractQueueConsumerJob<O3OpenColumnTask> 
                         srcTimestampAddr,
                         srcTimestampSize,
                         tableWriter,
-                        ff
+                        ff,
+                        CairoException.isCairoOomError(e)
                 );
                 throw e;
             }
@@ -1891,7 +2022,7 @@ public class O3OpenColumnJob extends AbstractQueueConsumerJob<O3OpenColumnTask> 
                 // open data file now
                 dstVarFd = openRW(ff, dFile(pathToNewPartition.trimTo(pNewLen), columnName, columnNameTxn), LOG, tableWriter.getConfiguration().getWriterFileOpenOpts());
             } catch (Throwable e) {
-                LOG.error().$("append mid partition error 2 [table=").utf8(tableWriter.getTableToken().getTableName())
+                LOG.error().$("append mid partition error 2 [table=").$(tableWriter.getTableToken())
                         .$(", e=").$(e)
                         .I$();
                 O3Utils.close(ff, dstFixFd);
@@ -1904,7 +2035,8 @@ public class O3OpenColumnJob extends AbstractQueueConsumerJob<O3OpenColumnTask> 
                         srcTimestampAddr,
                         srcTimestampSize,
                         tableWriter,
-                        ff
+                        ff,
+                        CairoException.isCairoOomError(e)
                 );
                 throw e;
             }
@@ -1963,7 +2095,7 @@ public class O3OpenColumnJob extends AbstractQueueConsumerJob<O3OpenColumnTask> 
             try {
                 dstFixFd = openRW(ff, dFile(pathToNewPartition.trimTo(pNewLen), columnName, columnNameTxn), LOG, tableWriter.getConfiguration().getWriterFileOpenOpts());
             } catch (Throwable e) {
-                LOG.error().$("append mid partition error 3 [table=").utf8(tableWriter.getTableToken().getTableName())
+                LOG.error().$("append mid partition error 3 [table=").$(tableWriter.getTableToken())
                         .$(", e=").$(e)
                         .I$();
                 O3Utils.close(ff, dstFixFd);
@@ -1976,7 +2108,8 @@ public class O3OpenColumnJob extends AbstractQueueConsumerJob<O3OpenColumnTask> 
                         srcTimestampAddr,
                         srcTimestampSize,
                         tableWriter,
-                        ff
+                        ff,
+                        CairoException.isCairoOomError(e)
                 );
                 throw e;
             }
@@ -2034,18 +2167,18 @@ public class O3OpenColumnJob extends AbstractQueueConsumerJob<O3OpenColumnTask> 
             long srcDataOldPartitionSize,
             long o3SplitPartitionSize,
             TableWriter tableWriter,
-            BitmapIndexWriter indexWriter,
+            IndexWriter indexWriter,
             long columnNameTxn,
             long partitionUpdateSinkAddr
     ) {
-        int dstFixFd = 0;
+        long dstFixFd = 0;
         long dstFixAddr = 0;
         long dstFixSize = 0;
-        int dstVarFd = 0;
+        long dstVarFd = 0;
         long dstVarAddr = 0;
         long dstVarSize = 0;
-        int dstKFd = 0;
-        int dstVFd = 0;
+        long dstKFd = 0;
+        long dstVFd = 0;
         final FilesFacade ff = tableWriter.getFilesFacade();
 
         try {
@@ -2064,16 +2197,26 @@ public class O3OpenColumnJob extends AbstractQueueConsumerJob<O3OpenColumnTask> 
                 dstFixFd = openRW(ff, dFile(pathToNewPartition.trimTo(pNewLen), columnName, columnNameTxn), LOG, tableWriter.getConfiguration().getWriterFileOpenOpts());
                 dstFixSize = (srcOooHi - srcOooLo + 1) << ColumnType.pow2SizeOf(Math.abs(columnType));
                 dstFixAddr = mapRW(ff, dstFixFd, dstFixSize, MemoryTag.MMAP_O3);
-                if (indexBlockCapacity > -1) {
-                    dstKFd = openRW(ff, BitmapIndexUtils.keyFileName(pathToNewPartition.trimTo(pNewLen), columnName, columnNameTxn), LOG, tableWriter.getConfiguration().getWriterFileOpenOpts());
-                    dstVFd = openRW(ff, BitmapIndexUtils.valueFileName(pathToNewPartition.trimTo(pNewLen), columnName, columnNameTxn), LOG, tableWriter.getConfiguration().getWriterFileOpenOpts());
+                if (indexBlockCapacity > -1 && !indexWriter.isOpen()) {
+                    byte indexType = indexWriter.getIndexType();
+                    if (IndexType.isPosting(indexType)) {
+                        indexWriter.setO3PathContext(
+                                pathToNewPartition.trimTo(pNewLen),
+                                columnName,
+                                columnNameTxn,
+                                tableWriter.getTxn() + 1L
+                        );
+                    } else {
+                        dstKFd = openRW(ff, IndexFactory.keyFileName(indexType, pathToNewPartition.trimTo(pNewLen), columnName, columnNameTxn), LOG, tableWriter.getConfiguration().getWriterFileOpenOpts());
+                        dstVFd = openRW(ff, IndexFactory.valueFileName(indexType, pathToNewPartition.trimTo(pNewLen), columnName, columnNameTxn, columnNameTxn), LOG, tableWriter.getConfiguration().getWriterFileOpenOpts());
+                    }
                 }
             }
         } catch (Throwable e) {
-            LOG.error().$("append new partition error [table=").utf8(tableWriter.getTableToken().getTableName())
+            LOG.error().$("append new partition error [table=").$(tableWriter.getTableToken())
                     .$(", e=").$(e)
                     .I$();
-            tableWriter.o3BumpErrorCount();
+            tableWriter.o3BumpErrorCount(CairoException.isCairoOomError(e));
             final FilesFacade ff1 = tableWriter.getFilesFacade();
             O3Utils.unmapAndClose(ff1, dstFixFd, dstFixAddr, dstFixSize);
             O3Utils.unmapAndClose(ff1, dstVarFd, dstVarAddr, dstVarSize);
@@ -2155,7 +2298,7 @@ public class O3OpenColumnJob extends AbstractQueueConsumerJob<O3OpenColumnTask> 
             long partitionTimestamp,
             long srcDataMax,
             int indexBlockCapacity,
-            int srcTimestampFd,
+            long srcTimestampFd,
             long srcTimestampAddr,
             long srcTimestampSize,
             MemoryMA dstFixMem,
@@ -2166,7 +2309,7 @@ public class O3OpenColumnJob extends AbstractQueueConsumerJob<O3OpenColumnTask> 
             TableWriter tableWriter,
             long partitionUpdateSinkAddr
     ) {
-        int dstFixFd = 0;
+        long dstFixFd = 0;
         long dstFixAddr;
         long dstFixOffset;
         long dstFixFileOffset;
@@ -2186,7 +2329,7 @@ public class O3OpenColumnJob extends AbstractQueueConsumerJob<O3OpenColumnTask> 
                 dstFixSize = -dstFixSize;
             }
         } catch (Throwable e) {
-            LOG.error().$("append ts error [table=").utf8(tableWriter.getTableToken().getTableName())
+            LOG.error().$("append ts error [table=").$(tableWriter.getTableToken())
                     .$(", e=").$(e)
                     .I$();
             O3Utils.close(ff, dstFixFd);
@@ -2198,7 +2341,8 @@ public class O3OpenColumnJob extends AbstractQueueConsumerJob<O3OpenColumnTask> 
                     srcTimestampAddr,
                     srcTimestampSize,
                     tableWriter,
-                    ff
+                    ff,
+                    CairoException.isCairoOomError(e)
             );
             throw e;
         }
@@ -2281,8 +2425,8 @@ public class O3OpenColumnJob extends AbstractQueueConsumerJob<O3OpenColumnTask> 
             long oooPartitionHi,
             long srcDataMax,
             long srcDataTop,
-            int srcDataFixFd,
-            int srcTimestampFd,
+            long srcDataFixFd,
+            long srcTimestampFd,
             long srcTimestampAddr,
             long srcTimestampSize,
             int prefixType,
@@ -2302,7 +2446,7 @@ public class O3OpenColumnJob extends AbstractQueueConsumerJob<O3OpenColumnTask> 
             long srcDataOldPartitionSize,
             long o3SplitPartitionSize,
             TableWriter tableWriter,
-            BitmapIndexWriter indexWriter,
+            IndexWriter indexWriter,
             long colTopSinkAddr,
             long columnNameTxn,
             long partitionUpdateSinkAddr
@@ -2313,69 +2457,95 @@ public class O3OpenColumnJob extends AbstractQueueConsumerJob<O3OpenColumnTask> 
         long srcDataFixOffset;
         long srcDataFixAddr = 0;
         long dstFixAppendOffset2;
-        int dstFixFd = 0;
+        long dstFixFd = 0;
         long dstFixAddr = 0;
         long srcDataTopOffset;
         long dstIndexAdjust;
         long dstFixSize = 0;
-        int dstKFd = 0;
-        int dstVFd = 0;
-        final int srcFixFd = Math.abs(srcDataFixFd);
+        long dstKFd = 0;
+        long dstVFd = 0;
+        final long srcFixFd = Math.abs(srcDataFixFd);
         final int shl = ColumnType.pow2SizeOf(Math.abs(columnType));
         final FilesFacade ff = tableWriter.getFilesFacade();
         final boolean mixedIOFlag = tableWriter.allowMixedIO();
 
         try {
+            final long srcDataActualBytesOld = Math.max(0L, srcDataMax - srcDataTop) << shl;
+            if (srcDataTop > 0 && tableWriter.isCommitReplaceMode()) {
+                long dataMax = 0;
+                if (prefixType == O3_BLOCK_DATA && prefixHi >= prefixLo) {
+                    dataMax = prefixHi + 1;
+                }
+                if (suffixType == O3_BLOCK_DATA && suffixHi >= suffixLo) {
+                    dataMax = suffixHi + 1;
+                }
+                srcDataMax = Math.min(srcDataMax, dataMax);
+                srcDataTop = Math.min(srcDataTop, dataMax);
+            }
+
             if (srcDataTop > 0) {
-                // Size of data actually in the file.
-                final long srcDataActualBytes = (srcDataMax - srcDataTop) << shl;
-                // Size of data in the file if it didn't have column top.
-                final long srcDataMaxBytes = srcDataMax << shl;
+                // Size of data in the file we want to merge if it didn't have column top.
+                final long srcDataActualBytesNew = Math.max(0, srcDataMax - srcDataTop) << shl;
+
+                // if column top on the partition column is in the middle of the prefix
+                // we need to materialize nulls
+                // if the prefix is new O3 data it means the O3 data comes first in the merged result
+                // and the column top will also not work so we need to materialize nulls too
                 if (srcDataTop > prefixHi || prefixType == O3_BLOCK_O3) {
+
                     // Extend the existing column down, we will be discarding it anyway.
                     // Materialize nulls at the end of the column and add non-null data to merge.
                     // Do all of this beyond existing written data, using column as a buffer.
-                    // It is also fine in case when last partition contains WAL LAG, since
-                    // At the beginning of the transaction LAG is copied into memory buffers (o3 mem columns).
-                    srcDataFixSize = srcDataActualBytes + srcDataMaxBytes;
+                    // It is also fine in case when last partition contains WAL LAG, since at the
+                    // beginning of the transaction LAG is copied into memory buffers (o3 mem columns).
+
+                    srcDataFixSize = srcDataActualBytesOld + (srcDataMax << shl);
                     srcDataFixAddr = mapRW(ff, srcFixFd, srcDataFixSize, MemoryTag.MMAP_O3);
                     ff.madvise(srcDataFixAddr, srcDataFixSize, Files.POSIX_MADV_SEQUENTIAL);
-                    TableUtils.setNull(columnType, srcDataFixAddr + srcDataActualBytes, srcDataTop);
-                    Vect.memcpy(srcDataFixAddr + srcDataMaxBytes, srcDataFixAddr, srcDataActualBytes);
+                    TableUtils.setNull(columnType, srcDataFixAddr + srcDataActualBytesOld, srcDataTop);
+                    // srcDataActualBytesNew may be zero, so that the below memcpy call is no-op.
+                    Vect.memcpy(srcDataFixAddr + srcDataActualBytesOld + (srcDataTop << shl), srcDataFixAddr, srcDataActualBytesNew);
                     srcDataTop = 0;
-                    srcDataFixOffset = srcDataActualBytes;
+                    srcDataFixOffset = srcDataActualBytesOld;
                 } else {
-                    // when we are shuffling "empty" space we can just reduce column top instead
-                    // of moving data
+                    // When we are shuffling "empty" space we can just reduce column top instead
+                    // of moving the data.
                     if (prefixType != O3_BLOCK_NONE) {
                         // Set column top if it's not split partition.
-                        Unsafe.getUnsafe().putLong(colTopSinkAddr, srcDataTop);
+                        Unsafe.putLong(colTopSinkAddr, srcDataTop);
                         // If it's split partition, do nothing. Old partition will have the old column top
                         // New partition will have 0 column top, since srcDataTop <= prefixHi.
                     }
-                    srcDataFixSize = srcDataActualBytes;
-                    srcDataFixAddr = mapRW(ff, srcFixFd, srcDataFixSize, MemoryTag.MMAP_O3);
-                    ff.madvise(srcDataFixAddr, srcDataFixSize, Files.POSIX_MADV_SEQUENTIAL);
+                    srcDataFixSize = srcDataActualBytesNew;
                     srcDataFixOffset = 0;
+                    if (srcDataFixSize > 0) {
+                        srcDataFixAddr = mapRW(ff, srcFixFd, srcDataFixSize, MemoryTag.MMAP_O3);
+                        ff.madvise(srcDataFixAddr, srcDataFixSize, Files.POSIX_MADV_SEQUENTIAL);
+                    }
                 }
             } else {
                 srcDataFixSize = srcDataMax << shl;
-                srcDataFixAddr = mapRW(ff, srcFixFd, srcDataFixSize, MemoryTag.MMAP_O3);
-                ff.madvise(srcDataFixAddr, srcDataFixSize, Files.POSIX_MADV_SEQUENTIAL);
                 srcDataFixOffset = 0;
+                if (srcDataFixSize > 0) {
+                    srcDataFixAddr = mapRW(ff, srcFixFd, srcDataFixSize, MemoryTag.MMAP_O3);
+                    ff.madvise(srcDataFixAddr, srcDataFixSize, Files.POSIX_MADV_SEQUENTIAL);
+                }
             }
 
             srcDataTopOffset = srcDataTop << shl;
             dstIndexAdjust = srcDataTopOffset >> 2;
 
             dstFixFd = openRW(ff, dFile(pathToNewPartition.trimTo(pNewLen), columnName, columnNameTxn), LOG, tableWriter.getConfiguration().getWriterFileOpenOpts());
-            dstFixSize = ((srcOooHi - srcOooLo + 1) + srcDataMax - srcDataTop) << shl;
+            // Use target partition size to determine the size of fixed file, it's already compensated
+            // for partitions splits and duplicates found by dedup
+            long rowCount = o3SplitPartitionSize > 0 ? o3SplitPartitionSize : srcDataNewPartitionSize - srcDataTop;
+            dstFixSize = rowCount << shl;
             dstFixAddr = mapRW(ff, dstFixFd, dstFixSize, MemoryTag.MMAP_O3);
             if (!mixedIOFlag) {
                 ff.madvise(dstFixAddr, dstFixSize, Files.POSIX_MADV_RANDOM);
             }
 
-            // when prefix is "data" we need to reduce it by "srcDataTop"
+            // When prefix is "data" we need to reduce it by "srcDataTop".
             if (prefixType == O3_BLOCK_DATA) {
                 dstFixAppendOffset1 = (prefixHi - prefixLo + 1 - srcDataTop) << shl;
                 prefixHi -= srcDataTop;
@@ -2399,9 +2569,19 @@ public class O3OpenColumnJob extends AbstractQueueConsumerJob<O3OpenColumnTask> 
                 suffixLo -= srcDataTop;
             }
 
-            if (indexBlockCapacity > -1) {
-                dstKFd = openRW(ff, BitmapIndexUtils.keyFileName(pathToNewPartition.trimTo(pNewLen), columnName, columnNameTxn), LOG, tableWriter.getConfiguration().getWriterFileOpenOpts());
-                dstVFd = openRW(ff, BitmapIndexUtils.valueFileName(pathToNewPartition.trimTo(pNewLen), columnName, columnNameTxn), LOG, tableWriter.getConfiguration().getWriterFileOpenOpts());
+            if (indexBlockCapacity > -1 && !indexWriter.isOpen()) {
+                byte indexType = indexWriter.getIndexType();
+                if (IndexType.isPosting(indexType)) {
+                    indexWriter.setO3PathContext(
+                            pathToNewPartition.trimTo(pNewLen),
+                            columnName,
+                            columnNameTxn,
+                            tableWriter.getTxn() + 1L
+                    );
+                } else {
+                    dstKFd = openRW(ff, IndexFactory.keyFileName(indexType, pathToNewPartition.trimTo(pNewLen), columnName, columnNameTxn), LOG, tableWriter.getConfiguration().getWriterFileOpenOpts());
+                    dstVFd = openRW(ff, IndexFactory.valueFileName(indexType, pathToNewPartition.trimTo(pNewLen), columnName, columnNameTxn, columnNameTxn), LOG, tableWriter.getConfiguration().getWriterFileOpenOpts());
+                }
             }
 
             if (prefixType != O3_BLOCK_NONE) {
@@ -2416,14 +2596,14 @@ public class O3OpenColumnJob extends AbstractQueueConsumerJob<O3OpenColumnTask> 
                 partCount++;
             }
         } catch (Throwable e) {
-            LOG.error().$("merge fix error [table=").utf8(tableWriter.getTableToken().getTableName())
+            LOG.error().$("merge fix error [table=").$(tableWriter.getTableToken())
                     .$(", e=").$(e)
                     .I$();
             O3Utils.unmapAndClose(ff, srcDataFixFd, srcDataFixAddr, srcDataFixSize);
             O3Utils.unmapAndClose(ff, dstFixFd, dstFixAddr, dstFixSize);
             O3Utils.close(ff, dstKFd);
             O3Utils.close(ff, dstVFd);
-            tableWriter.o3BumpErrorCount();
+            tableWriter.o3BumpErrorCount(CairoException.isCairoOomError(e));
             if (columnCounter.decrementAndGet() == 0) {
                 O3Utils.unmap(ff, srcTimestampAddr, srcTimestampSize);
                 O3Utils.close(ff, srcTimestampFd);
@@ -2526,16 +2706,16 @@ public class O3OpenColumnJob extends AbstractQueueConsumerJob<O3OpenColumnTask> 
             long suffixLo,
             long suffixHi,
             int indexBlockCapacity,
-            int activeFixFd,
-            int activeVarFd,
-            int srcTimestampFd,
+            long activeFixFd,
+            long activeVarFd,
+            long srcTimestampFd,
             long srcTimestampAddr,
             long srcTimestampSize,
             long srcDataNewPartitionSize,
             long srcDataOldPartitionSize,
             long o3SplitPartitionSize,
             TableWriter tableWriter,
-            BitmapIndexWriter indexWriter,
+            IndexWriter indexWriter,
             long colTopSinkAddr,
             long columnNameTxn,
             long partitionUpdateSinkAddr
@@ -2543,7 +2723,7 @@ public class O3OpenColumnJob extends AbstractQueueConsumerJob<O3OpenColumnTask> 
 
         if (ColumnType.isVarSize(columnType)) {
             // index files are opened as normal
-            o3PartitionMerge(
+            mergeVarColumn(
                     pathToNewPartition,
                     pplen,
                     columnName,
@@ -2668,14 +2848,14 @@ public class O3OpenColumnJob extends AbstractQueueConsumerJob<O3OpenColumnTask> 
             long suffixLo,
             long suffixHi,
             int indexBlockCapacity,
-            int srcTimestampFd,
+            long srcTimestampFd,
             long srcTimestampAddr,
             long srcTimestampSize,
             long srcDataNewPartitionSize,
             long srcDataOldPartitionSize,
             long o3SplitPartitionSize,
             TableWriter tableWriter,
-            BitmapIndexWriter indexWriter,
+            IndexWriter indexWriter,
             long colTopSinkAddr,
             long oldPartitionTimestamp,
             int columnIndex,
@@ -2688,7 +2868,7 @@ public class O3OpenColumnJob extends AbstractQueueConsumerJob<O3OpenColumnTask> 
             try {
                 srcDataTop = Math.min(tableWriter.getColumnTop(oldPartitionTimestamp, columnIndex, srcDataMax), srcDataMax);
             } catch (Throwable e) {
-                LOG.error().$("merge mid partition error 1 [table=").utf8(tableWriter.getTableToken().getTableName())
+                LOG.error().$("merge mid partition error 1 [table=").$(tableWriter.getTableToken())
                         .$(", e=").$(e)
                         .I$();
                 freeTimestampIndex(
@@ -2699,20 +2879,21 @@ public class O3OpenColumnJob extends AbstractQueueConsumerJob<O3OpenColumnTask> 
                         srcTimestampAddr,
                         srcTimestampSize,
                         tableWriter,
-                        ff
+                        ff,
+                        CairoException.isCairoOomError(e)
                 );
                 throw e;
             }
         }
 
-        int srcDataFixFd = 0;
-        int srcDataVarFd = 0;
+        long srcDataFixFd = 0;
+        long srcDataVarFd = 0;
         if (ColumnType.isVarSize(columnType)) {
             try {
                 srcDataFixFd = openRW(ff, iFile(pathToOldPartition.trimTo(plen), columnName, columnNameTxn), LOG, tableWriter.getConfiguration().getWriterFileOpenOpts());
                 srcDataVarFd = openRW(ff, dFile(pathToOldPartition.trimTo(plen), columnName, columnNameTxn), LOG, tableWriter.getConfiguration().getWriterFileOpenOpts());
             } catch (Throwable e) {
-                LOG.error().$("merge mid partition error 2 [table=").utf8(tableWriter.getTableToken().getTableName())
+                LOG.error().$("merge mid partition error 2 [table=").$(tableWriter.getTableToken())
                         .$(", e=").$(e)
                         .I$();
                 O3Utils.close(ff, srcDataFixFd);
@@ -2725,12 +2906,13 @@ public class O3OpenColumnJob extends AbstractQueueConsumerJob<O3OpenColumnTask> 
                         srcTimestampAddr,
                         srcTimestampSize,
                         tableWriter,
-                        ff
+                        ff,
+                        CairoException.isCairoOomError(e)
                 );
                 throw e;
             }
 
-            o3PartitionMerge(
+            mergeVarColumn(
                     pathToNewPartition,
                     pplen,
                     columnName,
@@ -2783,7 +2965,7 @@ public class O3OpenColumnJob extends AbstractQueueConsumerJob<O3OpenColumnTask> 
                     srcDataFixFd = openRW(ff, dFile(pathToOldPartition.trimTo(plen), columnName, columnNameTxn), LOG, tableWriter.getConfiguration().getWriterFileOpenOpts());
                 }
             } catch (Throwable e) {
-                LOG.error().$("merge mid partition error 3 [table=").utf8(tableWriter.getTableToken().getTableName())
+                LOG.error().$("merge mid partition error 3 [table=").$(tableWriter.getTableToken())
                         .$(", e=").$(e)
                         .I$();
                 freeTimestampIndex(
@@ -2794,7 +2976,8 @@ public class O3OpenColumnJob extends AbstractQueueConsumerJob<O3OpenColumnTask> 
                         srcTimestampAddr,
                         srcTimestampSize,
                         tableWriter,
-                        ff
+                        ff,
+                        CairoException.isCairoOomError(e)
                 );
                 throw e;
             }
@@ -2853,11 +3036,11 @@ public class O3OpenColumnJob extends AbstractQueueConsumerJob<O3OpenColumnTask> 
             int blockType,
             long timestampMergeIndexAddr,
             long timestampMergeIndexSize,
-            int srcDataFixFd,
+            long srcDataFixFd,
             long srcDataFixAddr,
             long srcDataFixOffset,
             long srcDataFixSize,
-            int srcDataVarFd,
+            long srcDataVarFd,
             long srcDataVarAddr,
             long srcDataVarOffset,
             long srcDataVarSize,
@@ -2874,22 +3057,22 @@ public class O3OpenColumnJob extends AbstractQueueConsumerJob<O3OpenColumnTask> 
             long srcOooPartitionHi,
             long timestampMin,
             long partitionTimestamp,
-            int dstFixFd,
+            long dstFixFd,
             long dstFixAddr,
             long dstFixOffset,
             long dstFixFileOffset,
             long dstFixSize,
-            int dstVarFd,
+            long dstVarFd,
             long dstVarAddr,
             long dstVarOffset,
             long dstVarAdjust,
             long dstVarSize,
-            int dstKFd,
-            int dstVFd,
+            long dstKFd,
+            long dstVFd,
             long dstIndexOffset,
             long dstIndexAdjust,
             int indexBlockCapacity,
-            int srcTimestampFd,
+            long srcTimestampFd,
             long srcTimestampAddr,
             long srcTimestampSize,
             boolean partitionMutates,
@@ -2897,7 +3080,7 @@ public class O3OpenColumnJob extends AbstractQueueConsumerJob<O3OpenColumnTask> 
             long srcDataOldPartitionSize,
             long o3SplitPartitionSize,
             TableWriter tableWriter,
-            BitmapIndexWriter indexWriter,
+            IndexWriter indexWriter,
             long partitionUpdateSinkAddr
     ) {
         while (cursor == -2) {
@@ -3025,11 +3208,11 @@ public class O3OpenColumnJob extends AbstractQueueConsumerJob<O3OpenColumnTask> 
             int blockType,
             long timestampMergeIndexAddr,
             long timestampMergeIndexSize,
-            int srcDataFixFd,
+            long srcDataFixFd,
             long srcDataFixAddr,
             long srcDataFixOffset,
             long srcDataFixSize,
-            int srcDataVarFd,
+            long srcDataVarFd,
             long srcDataVarAddr,
             long srcDataVarOffset,
             long srcDataVarSize,
@@ -3046,23 +3229,23 @@ public class O3OpenColumnJob extends AbstractQueueConsumerJob<O3OpenColumnTask> 
             long srcOooPartitionHi,
             long timestampMin,
             long partitionTimestamp,
-            int dstFixFd,
+            long dstFixFd,
             long dstFixAddr,
             long dstFixOffset,
             long dstFixFileOffset,
             long dstFixSize,
-            int dstVarFd,
+            long dstVarFd,
             long dstVarAddr,
             long dstVarOffset,
             long dstVarAdjust,
             long dstVarSize,
-            int dstKFd,
-            int dstVFd,
+            long dstKFd,
+            long dstVFd,
             long dstIndexOffset,
             long dstIndexAdjust,
             int indexBlockCapacity,
             long cursor,
-            int srcTimestampFd,
+            long srcTimestampFd,
             long srcTimestampAddr,
             long srcTimestampSize,
             boolean partitionMutates,
@@ -3070,7 +3253,7 @@ public class O3OpenColumnJob extends AbstractQueueConsumerJob<O3OpenColumnTask> 
             long srcDataOldPartitionSize,
             long o3SplitPartitionSize,
             TableWriter tableWriter,
-            BitmapIndexWriter indexWriter,
+            IndexWriter indexWriter,
             long partitionUpdateSinkAddr
     ) {
         final O3CopyTask task = tableWriter.getO3CopyQueue().get(cursor);
@@ -3132,7 +3315,7 @@ public class O3OpenColumnJob extends AbstractQueueConsumerJob<O3OpenColumnTask> 
     }
 
     @Override
-    protected boolean doRun(int workerId, long cursor, RunStatus runStatus) {
+    protected boolean doRun(long cursor, WorkerContext workerContext) {
         openColumn(queue.get(cursor), cursor, subSeq);
         return true;
     }

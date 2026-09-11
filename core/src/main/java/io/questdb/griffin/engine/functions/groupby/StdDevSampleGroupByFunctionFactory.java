@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -26,10 +26,13 @@ package io.questdb.griffin.engine.functions.groupby;
 
 import io.questdb.cairo.CairoConfiguration;
 import io.questdb.cairo.sql.Function;
+import io.questdb.cairo.sql.Record;
 import io.questdb.griffin.FunctionFactory;
 import io.questdb.griffin.SqlExecutionContext;
+import io.questdb.griffin.engine.functions.GroupByFunction;
 import io.questdb.std.IntList;
 import io.questdb.std.ObjList;
+import org.jetbrains.annotations.NotNull;
 
 public class StdDevSampleGroupByFunctionFactory implements FunctionFactory {
     @Override
@@ -43,7 +46,41 @@ public class StdDevSampleGroupByFunctionFactory implements FunctionFactory {
     }
 
     @Override
-    public Function newInstance(int position, ObjList<Function> args, IntList argPositions, CairoConfiguration configuration, SqlExecutionContext sqlExecutionContext) {
+    public Function newInstance(
+            int position,
+            ObjList<Function> args,
+            IntList argPositions,
+            CairoConfiguration configuration,
+            SqlExecutionContext sqlExecutionContext
+    ) {
         return new StdDevSampleGroupByFunction(args.getQuick(0));
+    }
+
+    private static class StdDevSampleGroupByFunction extends AbstractStdDevGroupByFunction {
+
+        public StdDevSampleGroupByFunction(@NotNull Function arg) {
+            super(arg);
+        }
+
+        @Override
+        public double getDouble(Record rec) {
+            long count = rec.getLong(valueIndex + 2);
+            if (count - 1 > 0) {
+                double sum = rec.getDouble(valueIndex + 1);
+                double variance = sum / (count - 1);
+                return Math.sqrt(variance);
+            }
+            return Double.NaN;
+        }
+
+        @Override
+        public String getName() {
+            return "stddev_samp";
+        }
+
+        @Override
+        public int getSampleByFlags() {
+            return GroupByFunction.SAMPLE_BY_FILL_ALL;
+        }
     }
 }

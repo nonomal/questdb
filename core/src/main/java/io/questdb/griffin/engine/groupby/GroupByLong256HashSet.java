@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -33,7 +33,7 @@ import io.questdb.std.Vect;
 /**
  * Specialized flyweight hash set used in {@link io.questdb.griffin.engine.functions.GroupByFunction}s.
  * <p>
- * Uses provided {@link GroupByAllocatorImpl} to allocate the underlying buffer. Grows the buffer when needed.
+ * Uses provided {@link GroupByAllocator} to allocate the underlying buffer. Grows the buffer when needed.
  * <p>
  * Buffer layout is the following:
  * <pre>
@@ -45,7 +45,7 @@ import io.questdb.std.Vect;
  */
 public class GroupByLong256HashSet {
     private static final long HEADER_SIZE = 4 * Integer.BYTES;
-    private static final int MIN_INITIAL_CAPACITY = 16;
+    private static final int MIN_INITIAL_CAPACITY = 2;
     private static final long SIZE_LIMIT_OFFSET = 2 * Integer.BYTES;
     private static final long SIZE_OFFSET = Integer.BYTES;
     private final int initialCapacity;
@@ -86,14 +86,14 @@ public class GroupByLong256HashSet {
         setKeyAt(index, k0, k1, k2, k3);
         int size = size();
         int sizeLimit = sizeLimit();
-        Unsafe.getUnsafe().putInt(ptr + SIZE_OFFSET, ++size);
+        Unsafe.putInt(ptr + SIZE_OFFSET, ++size);
         if (size >= sizeLimit) {
             rehash(capacity() << 1, sizeLimit << 1);
         }
     }
 
     public int capacity() {
-        return ptr != 0 ? Unsafe.getUnsafe().getInt(ptr) : 0;
+        return ptr != 0 ? Unsafe.getInt(ptr) : 0;
     }
 
     public long keyAddrAt(long index) {
@@ -104,10 +104,10 @@ public class GroupByLong256HashSet {
         long hashCode = Hash.hashLong256_64(k0, k1, k2, k3);
         long index = hashCode & mask;
         long p = keyAddrAt(index);
-        long k0Key = Unsafe.getUnsafe().getLong(p);
-        long k1Key = Unsafe.getUnsafe().getLong(p + 8L);
-        long k2Key = Unsafe.getUnsafe().getLong(p + 16L);
-        long k3Key = Unsafe.getUnsafe().getLong(p + 24L);
+        long k0Key = Unsafe.getLong(p);
+        long k1Key = Unsafe.getLong(p + 8L);
+        long k2Key = Unsafe.getLong(p + 16L);
+        long k3Key = Unsafe.getLong(p + 24L);
         if (k0Key == noKeyValue && k1Key == noKeyValue && k2Key == noKeyValue && k3Key == noKeyValue) {
             return index;
         }
@@ -118,25 +118,11 @@ public class GroupByLong256HashSet {
     }
 
     public void merge(GroupByLong256HashSet srcSet) {
-        final int size = size();
-        // Math.max is here for overflow protection.
-        final int newSize = Math.max(size + srcSet.size(), size);
-        final int sizeLimit = sizeLimit();
-        if (sizeLimit < newSize) {
-            int newSizeLimit = sizeLimit;
-            int newCapacity = capacity();
-            while (newSizeLimit < newSize) {
-                newSizeLimit *= 2;
-                newCapacity *= 2;
-            }
-            rehash(newCapacity, newSizeLimit);
-        }
-
         for (long p = srcSet.ptr + HEADER_SIZE, lim = srcSet.ptr + HEADER_SIZE + 32L * srcSet.capacity(); p < lim; p += 32L) {
-            long k0 = Unsafe.getUnsafe().getLong(p);
-            long k1 = Unsafe.getUnsafe().getLong(p + 8L);
-            long k2 = Unsafe.getUnsafe().getLong(p + 16L);
-            long k3 = Unsafe.getUnsafe().getLong(p + 24L);
+            long k0 = Unsafe.getLong(p);
+            long k1 = Unsafe.getLong(p + 8L);
+            long k2 = Unsafe.getLong(p + 16L);
+            long k3 = Unsafe.getLong(p + 24L);
             if (k0 != noKeyValue || k1 != noKeyValue || k2 != noKeyValue || k3 != noKeyValue) {
                 final long index = keyIndex(k0, k1, k2, k3);
                 if (index >= 0) {
@@ -150,9 +136,9 @@ public class GroupByLong256HashSet {
         if (ptr == 0) {
             this.ptr = allocator.malloc(HEADER_SIZE + 32L * initialCapacity);
             zero(this.ptr, initialCapacity);
-            Unsafe.getUnsafe().putInt(this.ptr, initialCapacity);
-            Unsafe.getUnsafe().putInt(this.ptr + SIZE_OFFSET, 0);
-            Unsafe.getUnsafe().putInt(this.ptr + SIZE_LIMIT_OFFSET, (int) (initialCapacity * loadFactor));
+            Unsafe.putInt(this.ptr, initialCapacity);
+            Unsafe.putInt(this.ptr + SIZE_OFFSET, 0);
+            Unsafe.putInt(this.ptr + SIZE_LIMIT_OFFSET, (int) (initialCapacity * loadFactor));
             mask = initialCapacity - 1;
         } else {
             this.ptr = ptr;
@@ -174,33 +160,36 @@ public class GroupByLong256HashSet {
     }
 
     public int size() {
-        return ptr != 0 ? Unsafe.getUnsafe().getInt(ptr + SIZE_OFFSET) : 0;
+        return ptr != 0 ? Unsafe.getInt(ptr + SIZE_OFFSET) : 0;
     }
 
     public int sizeLimit() {
-        return ptr != 0 ? Unsafe.getUnsafe().getInt(ptr + SIZE_LIMIT_OFFSET) : 0;
+        return ptr != 0 ? Unsafe.getInt(ptr + SIZE_LIMIT_OFFSET) : 0;
     }
 
     private long probe(long k0, long k1, long k2, long k3, long index) {
+        final long index0 = index;
         do {
             index = (index + 1) & mask;
             long p = keyAddrAt(index);
-            long k0Key = Unsafe.getUnsafe().getLong(p);
-            long k1Key = Unsafe.getUnsafe().getLong(p + 8L);
-            long k2Key = Unsafe.getUnsafe().getLong(p + 16L);
-            long k3Key = Unsafe.getUnsafe().getLong(p + 24L);
+            long k0Key = Unsafe.getLong(p);
+            long k1Key = Unsafe.getLong(p + 8L);
+            long k2Key = Unsafe.getLong(p + 16L);
+            long k3Key = Unsafe.getLong(p + 24L);
             if (k0Key == noKeyValue && k1Key == noKeyValue && k2Key == noKeyValue && k3Key == noKeyValue) {
                 return index;
             }
             if (k0Key == k0 && k1Key == k1 && k2Key == k2 && k3Key == k3) {
                 return -index - 1;
             }
-        } while (true);
+        } while (index != index0);
+
+        throw CairoException.critical(0).put("corrupt long256 hash set");
     }
 
     private void rehash(int newCapacity, int newSizeLimit) {
         if (newCapacity < 0) {
-            throw CairoException.nonCritical().put("set capacity overflow");
+            throw CairoException.nonCritical().put("long256 hash set capacity overflow");
         }
 
         final int oldSize = size();
@@ -209,16 +198,16 @@ public class GroupByLong256HashSet {
         long oldPtr = ptr;
         ptr = allocator.malloc(32L * newCapacity + HEADER_SIZE);
         zero(ptr, newCapacity);
-        Unsafe.getUnsafe().putInt(ptr, newCapacity);
-        Unsafe.getUnsafe().putInt(ptr + SIZE_OFFSET, oldSize);
-        Unsafe.getUnsafe().putInt(ptr + SIZE_LIMIT_OFFSET, newSizeLimit);
+        Unsafe.putInt(ptr, newCapacity);
+        Unsafe.putInt(ptr + SIZE_OFFSET, oldSize);
+        Unsafe.putInt(ptr + SIZE_LIMIT_OFFSET, newSizeLimit);
         mask = newCapacity - 1;
 
         for (long p = oldPtr + HEADER_SIZE, lim = oldPtr + HEADER_SIZE + 32L * oldCapacity; p < lim; p += 32L) {
-            long k0 = Unsafe.getUnsafe().getLong(p);
-            long k1 = Unsafe.getUnsafe().getLong(p + 8L);
-            long k2 = Unsafe.getUnsafe().getLong(p + 16L);
-            long k3 = Unsafe.getUnsafe().getLong(p + 24L);
+            long k0 = Unsafe.getLong(p);
+            long k1 = Unsafe.getLong(p + 8L);
+            long k2 = Unsafe.getLong(p + 16L);
+            long k3 = Unsafe.getLong(p + 24L);
             if (k0 != noKeyValue || k1 != noKeyValue || k2 != noKeyValue || k3 != noKeyValue) {
                 long index = keyIndex(k0, k1, k2, k3);
                 setKeyAt(index, k0, k1, k2, k3);
@@ -230,10 +219,10 @@ public class GroupByLong256HashSet {
 
     private void setKeyAt(long index, long k0, long k1, long k2, long k3) {
         long p = keyAddrAt(index);
-        Unsafe.getUnsafe().putLong(p, k0);
-        Unsafe.getUnsafe().putLong(p + 8L, k1);
-        Unsafe.getUnsafe().putLong(p + 16L, k2);
-        Unsafe.getUnsafe().putLong(p + 24L, k3);
+        Unsafe.putLong(p, k0);
+        Unsafe.putLong(p + 8L, k1);
+        Unsafe.putLong(p + 16L, k2);
+        Unsafe.putLong(p + 24L, k3);
     }
 
     private void zero(long ptr, int cap) {
@@ -242,10 +231,10 @@ public class GroupByLong256HashSet {
             Vect.memset(ptr + HEADER_SIZE, 32L * cap, 0);
         } else {
             for (long p = ptr + HEADER_SIZE, lim = ptr + HEADER_SIZE + 32L * cap; p < lim; p += 32L) {
-                Unsafe.getUnsafe().putLong(p, noKeyValue);
-                Unsafe.getUnsafe().putLong(p + 8L, noKeyValue);
-                Unsafe.getUnsafe().putLong(p + 16L, noKeyValue);
-                Unsafe.getUnsafe().putLong(p + 24L, noKeyValue);
+                Unsafe.putLong(p, noKeyValue);
+                Unsafe.putLong(p + 8L, noKeyValue);
+                Unsafe.putLong(p + 16L, noKeyValue);
+                Unsafe.putLong(p + 24L, noKeyValue);
             }
         }
     }

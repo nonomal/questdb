@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -33,26 +33,23 @@ public class LastNotNullGroupByFunctionFactoryTest extends AbstractCairoTest {
 
     @Test
     public void testAllNull() throws Exception {
-        assertQuery(
-                "a0\ta1\ta2\ta3\ta4\ta5\ta6\ta7\ta8\ta9\ta10\ta11\ta12\ta13\ta14\n" +
-                        "\t\tnull\tnull\tnull\tnull\t\t\t\t\t\t\t\t\t\n",
-                "select last_not_null(a0) a0," +
-                        "     last_not_null(a1) a1," +
-                        "     last_not_null(a2) a2," +
-                        "     last_not_null(a3) a3," +
-                        "     last_not_null(a4) a4," +
-                        "     last_not_null(a5) a5," +
-                        "     last_not_null(a6) a6," +
-                        "     last_not_null(a7) a7," +
-                        "     last_not_null(a8) a8," +
-                        "     last_not_null(a9) a9, " +
-                        "     last_not_null(a10) a10, " +
-                        "     last_not_null(a11) a11, " +
-                        "     last_not_null(a12) a12, " +
-                        "     last_not_null(a13) a13, " +
-                        "     last_not_null(a14) a14 " +
-                        "from tab",
-                "create table tab as ( " +
+        assertQuery("select last_not_null(a0) a0," +
+                "     last_not_null(a1) a1," +
+                "     last_not_null(a2) a2," +
+                "     last_not_null(a3) a3," +
+                "     last_not_null(a4) a4," +
+                "     last_not_null(a5) a5," +
+                "     last_not_null(a6) a6," +
+                "     last_not_null(a7) a7," +
+                "     last_not_null(a8) a8," +
+                "     last_not_null(a9) a9, " +
+                "     last_not_null(a10) a10, " +
+                "     last_not_null(a11) a11, " +
+                "     last_not_null(a12) a12, " +
+                "     last_not_null(a13) a13, " +
+                "     last_not_null(a14) a14 " +
+                "from tab")
+                .ddl("create table tab as ( " +
                         "select cast(null as char) a0," +
                         "       cast(null as date) a1," +
                         "       cast(null as double) a2," +
@@ -68,18 +65,20 @@ public class LastNotNullGroupByFunctionFactoryTest extends AbstractCairoTest {
                         "       cast(null as geohash(25b)) a12, " +
                         "       cast(null as geohash(35b)) a13, " +
                         "       cast(null as ipv4) a14 " +
-                        "from long_sequence(3))",
-                null,
-                false,
-                true
-        );
+                        "from long_sequence(3))")
+                .noRandomAccess()
+                .expectSize()
+                .returns("""
+                        a0\ta1\ta2\ta3\ta4\ta5\ta6\ta7\ta8\ta9\ta10\ta11\ta12\ta13\ta14
+                        \t\tnull\tnull\tnull\tnull\t\t\t\t\t\t\t\t\t
+                        """);
     }
 
     @Test
     public void testLastNotNull() throws Exception {
         UUID lastUuid = UUID.randomUUID();
 
-        ddl("create table tab (a0 char," +
+        execute("create table tab (a0 char," +
                 "a1 date," +
                 "a2 double," +
                 "a3 float," +
@@ -96,7 +95,7 @@ public class LastNotNullGroupByFunctionFactoryTest extends AbstractCairoTest {
                 "a14 ipv4 " +
                 ")");
 
-        insert("insert into tab values(" +
+        execute("insert into tab values(" +
                 "'b'," +
                 "to_date('2023-10-22','yyyy-MM-dd')," +
                 "22.2," +
@@ -114,7 +113,7 @@ public class LastNotNullGroupByFunctionFactoryTest extends AbstractCairoTest {
                 " '2.0.0.0'" +
                 ")");
 
-        insert("insert into tab values(" +
+        execute("insert into tab values(" +
                 "'a', " +
                 "to_date('2023-10-23','yyyy-MM-dd')," +
                 "2.2," +
@@ -132,27 +131,27 @@ public class LastNotNullGroupByFunctionFactoryTest extends AbstractCairoTest {
                 " '1.0.0.0'" +
                 ")");
 
-        insert("insert into tab (a1) values (null)"); // other columns default to null
+        execute("insert into tab (a1) values (null)"); // other columns default to null
 
-        assertSql(
-                "a0\ta1\ta2\ta3\ta4\ta5\ta6\ta7\ta8\ta9\ta10\ta11\ta12\ta13\ta14\n" +
-                        "a\t2023-10-23T00:00:00.000Z\t2.2\t3.3000\t4\t5\ta_symbol\t2023-10-23T12:34:59.000000Z\t" + lastUuid + "\ta_string\tu\tuu\tuuuuu\tuuuuuuu\t1.0.0.0\n",
-                "select last_not_null(a0) a0," +
-                        "     last_not_null(a1) a1," +
-                        "     last_not_null(a2) a2," +
-                        "     last_not_null(a3) a3," +
-                        "     last_not_null(a4) a4," +
-                        "     last_not_null(a5) a5," +
-                        "     last_not_null(a6) a6," +
-                        "     last_not_null(a7) a7," +
-                        "     last_not_null(a8) a8," +
-                        "     last_not_null(a9) a9, " +
-                        "     last_not_null(a10) a10, " +
-                        "     last_not_null(a11) a11, " +
-                        "     last_not_null(a12) a12, " +
-                        "     last_not_null(a13) a13, " +
-                        "     last_not_null(a14) a14 " +
-                        "from tab"
-        );
+        assertQuery("select last_not_null(a0) a0," +
+                "     last_not_null(a1) a1," +
+                "     last_not_null(a2) a2," +
+                "     last_not_null(a3) a3," +
+                "     last_not_null(a4) a4," +
+                "     last_not_null(a5) a5," +
+                "     last_not_null(a6) a6," +
+                "     last_not_null(a7) a7," +
+                "     last_not_null(a8) a8," +
+                "     last_not_null(a9) a9, " +
+                "     last_not_null(a10) a10, " +
+                "     last_not_null(a11) a11, " +
+                "     last_not_null(a12) a12, " +
+                "     last_not_null(a13) a13, " +
+                "     last_not_null(a14) a14 " +
+                "from tab")
+                .noRandomAccess()
+                .expectSize()
+                .returns("a0\ta1\ta2\ta3\ta4\ta5\ta6\ta7\ta8\ta9\ta10\ta11\ta12\ta13\ta14\n" +
+                        "a\t2023-10-23T00:00:00.000Z\t2.2\t3.3\t4\t5\ta_symbol\t2023-10-23T12:34:59.000000Z\t" + lastUuid + "\ta_string\tu\tuu\tuuuuu\tuuuuuuu\t1.0.0.0\n");
     }
 }

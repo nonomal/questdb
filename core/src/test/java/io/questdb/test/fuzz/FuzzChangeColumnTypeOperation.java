@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -26,43 +26,45 @@ package io.questdb.test.fuzz;
 
 import io.questdb.cairo.CairoEngine;
 import io.questdb.cairo.ColumnType;
+import io.questdb.cairo.IndexType;
 import io.questdb.cairo.TableColumnMetadata;
 import io.questdb.cairo.TableWriterAPI;
+import io.questdb.cairo.security.AllowAllSecurityContext;
 import io.questdb.cairo.sql.RecordMetadata;
+import io.questdb.griffin.SqlExecutionContextImpl;
 import io.questdb.griffin.engine.ops.AlterOperation;
 import io.questdb.griffin.engine.ops.AlterOperationBuilder;
+import io.questdb.std.LongList;
 import io.questdb.std.ObjList;
 import io.questdb.std.Rnd;
+import io.questdb.test.tools.TestUtils;
 
 public class FuzzChangeColumnTypeOperation implements FuzzTransactionOperation {
-    private static final short[] numericConvertableColumnTypes = {
+    private static final long MAX_TABLE_ROWS_TO_CONVERT_TO_SYMBOL = 60_000;
+    private static final int[] numericConvertableColumnTypes = {
             ColumnType.BYTE, ColumnType.SHORT, ColumnType.INT, ColumnType.LONG,
-            ColumnType.FLOAT, ColumnType.DOUBLE, ColumnType.TIMESTAMP, ColumnType.BOOLEAN,
-            ColumnType.DATE,
+            ColumnType.FLOAT, ColumnType.DOUBLE, ColumnType.BOOLEAN,
+            ColumnType.DATE, ColumnType.TIMESTAMP, ColumnType.TIMESTAMP_NANO,
             ColumnType.STRING, ColumnType.VARCHAR
     };
-
-    private static final short[] varSizeConvertableColumnTypes = {
+    private static final int[] varSizeConvertableColumnTypes = {
             ColumnType.BYTE, ColumnType.SHORT, ColumnType.INT, ColumnType.LONG,
-            ColumnType.FLOAT, ColumnType.DOUBLE, ColumnType.TIMESTAMP, ColumnType.BOOLEAN,
-            ColumnType.DATE,
+            ColumnType.FLOAT, ColumnType.DOUBLE, ColumnType.BOOLEAN,
+            ColumnType.DATE, ColumnType.TIMESTAMP, ColumnType.TIMESTAMP_NANO,
             ColumnType.UUID, ColumnType.IPv4,
             ColumnType.STRING, ColumnType.SYMBOL, ColumnType.VARCHAR
     };
-
-    private static final long MAX_TABLE_ROWS_TO_CONVERT_TO_SYMBOL = 60_000;
-
     private final boolean cacheSymbolMap;
     private final String columName;
-    private final boolean indexFlag;
+    private final byte indexType;
     private final int indexValueBlockCapacity;
     private final int newColumnType;
     private final int symbolCapacity;
 
-    public FuzzChangeColumnTypeOperation(String columName, int newColumnType, int symbolCapacity, boolean indexFlag, int indexValueBlockCapacity, boolean cacheSymbolMap) {
-        this.columName = columName;
+    public FuzzChangeColumnTypeOperation(Rnd rnd, String columName, int newColumnType, int symbolCapacity, byte indexType, int indexValueBlockCapacity, boolean cacheSymbolMap) {
+        this.columName = TestUtils.randomiseCase(rnd, columName);
         this.newColumnType = newColumnType;
-        this.indexFlag = indexFlag;
+        this.indexType = indexType;
         this.indexValueBlockCapacity = indexValueBlockCapacity;
         this.cacheSymbolMap = cacheSymbolMap;
         this.symbolCapacity = symbolCapacity;
@@ -83,46 +85,35 @@ public class FuzzChangeColumnTypeOperation implements FuzzTransactionOperation {
         }
 
         int columnType = meta.getColumnType(columnIndex);
-        switch (columnType) {
-            case ColumnType.STRING:
-            case ColumnType.SYMBOL:
-            case ColumnType.VARCHAR:
-            case ColumnType.BYTE:
-            case ColumnType.BOOLEAN:
-            case ColumnType.SHORT:
-            case ColumnType.INT:
-            case ColumnType.LONG:
-            case ColumnType.FLOAT:
-            case ColumnType.DOUBLE:
-            case ColumnType.DATE:
-            case ColumnType.TIMESTAMP:
-                return true;
-        }
-        return false;
+        return switch (columnType) {
+            case ColumnType.STRING, ColumnType.SYMBOL, ColumnType.VARCHAR, ColumnType.BYTE, ColumnType.BOOLEAN,
+                 ColumnType.SHORT, ColumnType.INT, ColumnType.LONG, ColumnType.FLOAT, ColumnType.DOUBLE,
+                 ColumnType.DATE, ColumnType.TIMESTAMP, ColumnType.TIMESTAMP_NANO -> true;
+            default -> false;
+        };
     }
 
     public static int changeColumnTypeTo(Rnd rnd, int columnType, long estimatedTotalRowCount) {
-        switch (columnType) {
-            case ColumnType.STRING:
-            case ColumnType.SYMBOL:
-            case ColumnType.VARCHAR:
-                return generateNextType(columnType, varSizeConvertableColumnTypes, rnd, estimatedTotalRowCount < MAX_TABLE_ROWS_TO_CONVERT_TO_SYMBOL);
-            case ColumnType.BOOLEAN:
-            case ColumnType.BYTE:
-            case ColumnType.SHORT:
-            case ColumnType.INT:
-            case ColumnType.LONG:
-            case ColumnType.FLOAT:
-            case ColumnType.DATE:
-            case ColumnType.TIMESTAMP:
-            case ColumnType.DOUBLE:
-                return generateNextType(columnType, numericConvertableColumnTypes, rnd, estimatedTotalRowCount < MAX_TABLE_ROWS_TO_CONVERT_TO_SYMBOL);
-            default:
-                throw new UnsupportedOperationException("Unsupported column type to generate type change: " + columnType);
-        }
+        return switch (columnType) {
+            case ColumnType.STRING, ColumnType.SYMBOL, ColumnType.VARCHAR ->
+                    generateNextType(columnType, varSizeConvertableColumnTypes, rnd, estimatedTotalRowCount < MAX_TABLE_ROWS_TO_CONVERT_TO_SYMBOL);
+            case ColumnType.BOOLEAN, ColumnType.BYTE, ColumnType.SHORT, ColumnType.INT, ColumnType.LONG,
+                 ColumnType.FLOAT, ColumnType.DATE, ColumnType.TIMESTAMP, ColumnType.TIMESTAMP_NANO,
+                 ColumnType.DOUBLE ->
+                    generateNextType(columnType, numericConvertableColumnTypes, rnd, estimatedTotalRowCount < MAX_TABLE_ROWS_TO_CONVERT_TO_SYMBOL);
+            default ->
+                    throw new UnsupportedOperationException("Unsupported column type to generate type change: " + columnType);
+        };
     }
 
-    public static RecordMetadata generateColumnTypeChange(ObjList<FuzzTransaction> transactionList, long estimatedTotalRowCount, int metadataVersion, int waitBarrierVersion, Rnd rnd, RecordMetadata tableMetadata) {
+    public static RecordMetadata generateColumnTypeChange(
+            ObjList<FuzzTransaction> transactionList,
+            long estimatedTotalRowCount,
+            int metadataVersion,
+            int waitBarrierVersion,
+            Rnd rnd,
+            RecordMetadata tableMetadata
+    ) {
         FuzzTransaction transaction = new FuzzTransaction();
         int startColumnIndex = rnd.nextInt(tableMetadata.getColumnCount());
 
@@ -139,10 +130,30 @@ public class FuzzChangeColumnTypeOperation implements FuzzTransactionOperation {
                 int newColType = changeColumnTypeTo(rnd, columnType, estimatedTotalRowCount);
 
                 int capacity = 1 << (5 + rnd.nextInt(3));
-                boolean indexFlag = ColumnType.isSymbol(newColType) && (columnType == ColumnType.BOOLEAN || columnType == ColumnType.BYTE);
+                byte indexType;
+                if (ColumnType.isSymbol(newColType) && (columnType == ColumnType.BOOLEAN || columnType == ColumnType.BYTE)) {
+                    // Spread index choice across BITMAP and the three POSTING
+                    // encoding variants so column-type changes exercise both
+                    // index families.
+                    double pick = rnd.nextDouble();
+                    if (pick < 0.5) {
+                        indexType = IndexType.BITMAP;
+                    } else if (pick < 0.7) {
+                        indexType = IndexType.POSTING;
+                    } else if (pick < 0.85) {
+                        indexType = IndexType.POSTING_DELTA;
+                    } else {
+                        indexType = IndexType.POSTING_EF;
+                    }
+                } else {
+                    indexType = IndexType.NONE;
+                }
+                // CAPACITY is parser-rejected for POSTING but the metadata
+                // field still requires a value >= 2; reuse the BITMAP default.
                 int indexValueBlockCapacity = (columnType == ColumnType.BOOLEAN) ? 4 : 128;
                 boolean cacheSymbolMap = ColumnType.isSymbol(newColType) && rnd.nextBoolean();
-                transaction.operationList.add(new FuzzChangeColumnTypeOperation(columnName, newColType, capacity, indexFlag, indexValueBlockCapacity, cacheSymbolMap));
+                FuzzChangeColumnTypeOperation operation = new FuzzChangeColumnTypeOperation(rnd, columnName, newColType, capacity, indexType, indexValueBlockCapacity, cacheSymbolMap);
+                transaction.operationList.add(operation);
                 transaction.structureVersion = metadataVersion;
                 transaction.waitBarrierVersion = waitBarrierVersion;
                 transactionList.add(transaction);
@@ -155,7 +166,7 @@ public class FuzzChangeColumnTypeOperation implements FuzzTransactionOperation {
                         newMeta.add(new TableColumnMetadata(
                                 columnName,
                                 newColType,
-                                indexFlag,
+                                indexType,
                                 indexValueBlockCapacity,
                                 cacheSymbolMap,
                                 null,
@@ -175,20 +186,24 @@ public class FuzzChangeColumnTypeOperation implements FuzzTransactionOperation {
     }
 
     @Override
-    public boolean apply(Rnd rnd, CairoEngine engine, TableWriterAPI wApi, int virtualTimestampIndex) {
+    public boolean apply(Rnd tempRnd, CairoEngine engine, TableWriterAPI wApi, int virtualTimestampIndex, LongList excludedTsIntervals) {
         AlterOperationBuilder builder = new AlterOperationBuilder().ofColumnChangeType(
                 0,
                 wApi.getTableToken(),
                 wApi.getMetadata().getTableId()
         );
         builder.addColumnToList(columName, 0, newColumnType, symbolCapacity, cacheSymbolMap,
-                indexFlag, indexValueBlockCapacity, false);
+                indexType, indexValueBlockCapacity, false);
         AlterOperation alterOp = builder.build();
-        wApi.apply(alterOp, true);
+        try (SqlExecutionContextImpl context = new SqlExecutionContextImpl(engine, 1).with(AllowAllSecurityContext.INSTANCE)
+        ) {
+            alterOp.withContext(context);
+            wApi.apply(alterOp, true);
+        }
         return true;
     }
 
-    private static int generateNextType(int columnType, short[] numericConvertableColumnTypes, Rnd rnd, boolean symbolsAllowed) {
+    private static int generateNextType(int columnType, int[] numericConvertableColumnTypes, Rnd rnd, boolean symbolsAllowed) {
         int nextColType = columnType;
         // disallow noop conversion
         // disallow conversions from non-nullable to nullable
@@ -199,15 +214,9 @@ public class FuzzChangeColumnTypeOperation implements FuzzTransactionOperation {
     }
 
     private static boolean isNullable(int columnType) {
-        switch (columnType) {
-            case ColumnType.BYTE:
-            case ColumnType.SHORT:
-            case ColumnType.UUID:
-            case ColumnType.IPv4:
-            case ColumnType.BOOLEAN:
-                return false;
-            default:
-                return true;
-        }
+        return switch (columnType) {
+            case ColumnType.BYTE, ColumnType.SHORT, ColumnType.UUID, ColumnType.IPv4, ColumnType.BOOLEAN -> false;
+            default -> true;
+        };
     }
 }

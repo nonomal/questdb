@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -30,49 +30,45 @@ import io.questdb.std.LongList;
 public class SegmentColumnRollSink implements ColumnConversionOffsetSink {
     private final int ENTRIES_PER_COLUMN = 6;
     private final LongList data = new LongList();
-    private int baseIndex = 0;
-
-    public SegmentColumnRollSink() {
-        data.extendAndSet(ENTRIES_PER_COLUMN - 1, -1);
-    }
+    private int baseIndex = -ENTRIES_PER_COLUMN;
 
     public void clear() {
         data.clear();
-        data.extendAndSet(ENTRIES_PER_COLUMN - 1, -1);
-        baseIndex = 0;
+        baseIndex = -ENTRIES_PER_COLUMN;
     }
 
     public int count() {
         return data.size() / ENTRIES_PER_COLUMN;
     }
 
-    public int getDestAuxFd(int columnIndex) {
-        return (int) data.get(columnIndex * ENTRIES_PER_COLUMN + 1);
+    public long getDestAuxFd(int columnIndex) {
+        return data.get(columnIndex * ENTRIES_PER_COLUMN + 1);
     }
 
     public long getDestAuxSize(int columnIndex) {
-        return (int) data.get(columnIndex * ENTRIES_PER_COLUMN + 5);
+        return data.get(columnIndex * ENTRIES_PER_COLUMN + 5);
     }
 
-    public int getDestPrimaryFd(int columnIndex) {
-        return (int) data.get(columnIndex * ENTRIES_PER_COLUMN);
+    public long getDestPrimaryFd(int columnIndex) {
+        return data.get(columnIndex * ENTRIES_PER_COLUMN);
     }
 
     public long getDestPrimarySize(int columnIndex) {
-        return (int) data.get(columnIndex * ENTRIES_PER_COLUMN + 4);
+        return data.get(columnIndex * ENTRIES_PER_COLUMN + 4);
     }
 
     public long getSrcAuxOffset(int c) {
-        return (int) data.get(c * ENTRIES_PER_COLUMN + 3);
+        return data.get(c * ENTRIES_PER_COLUMN + 3);
     }
 
     public long getSrcPrimaryOffset(int columnIndex) {
-        return (int) data.get(columnIndex * ENTRIES_PER_COLUMN + 2);
+        return data.get(columnIndex * ENTRIES_PER_COLUMN + 2);
     }
 
     public void nextColumn() {
         baseIndex += ENTRIES_PER_COLUMN;
-        data.extendAndSet(baseIndex + ENTRIES_PER_COLUMN - 1, -1);
+        data.setPos(baseIndex + ENTRIES_PER_COLUMN);
+        data.fill(baseIndex, baseIndex + ENTRIES_PER_COLUMN, -1);
     }
 
     public void setDestPrimaryFd(long fd) {

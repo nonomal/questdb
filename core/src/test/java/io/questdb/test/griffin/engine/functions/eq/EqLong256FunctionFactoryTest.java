@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -55,19 +55,17 @@ public class EqLong256FunctionFactoryTest extends AbstractFunctionFactoryTest {
 
     @Test
     public void testEqualitySameRecordDifferentColumns_negativeCase() throws Exception {
-        assertQuery("a\tb\n",
-                "select * from tab where a = b",
-                "create table tab as (select rnd_long256() as a, rnd_long256() as b from long_sequence(10))",
-                null, true);
+        assertQuery("select * from tab where a = b")
+                .ddl("create table tab as (select rnd_long256() as a, rnd_long256() as b from long_sequence(10))")
+                .returns("a\tb\n");
     }
 
     @Test
     public void testEqualitySameRecordDifferentColumns_positiveCase() throws Exception {
-        assertQuery("a\tb\n" +
-                        "0x11111111\t0x11111111\n",
-                "select * from tab where a = b",
-                "create table tab as (select 0x11111111 as a, 0x11111111 as b from long_sequence(1))",
-                null, true);
+        assertQuery("select * from tab where a = b")
+                .ddl("create table tab as (select 0x11111111 as a, 0x11111111 as b from long_sequence(1))")
+                .returns("a\tb\n" +
+                        "0x11111111\t0x11111111\n");
     }
 
     @Test

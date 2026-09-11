@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,12 +24,20 @@
 
 package io.questdb.network;
 
+import io.questdb.Metrics;
+import io.questdb.metrics.Counter;
+import io.questdb.metrics.LongGauge;
 import io.questdb.std.datetime.millitime.MillisecondClock;
 import io.questdb.std.datetime.millitime.MillisecondClockImpl;
 
 public class DefaultIODispatcherConfiguration implements IODispatcherConfiguration {
-
     public static final IODispatcherConfiguration INSTANCE = new DefaultIODispatcherConfiguration();
+
+    @Override
+    public long getAcceptLoopTimeout() {
+        // 500 millis
+        return 500;
+    }
 
     @Override
     public int getBindIPv4Address() {
@@ -47,6 +55,11 @@ public class DefaultIODispatcherConfiguration implements IODispatcherConfigurati
     }
 
     @Override
+    public LongGauge getConnectionCountGauge() {
+        return Metrics.DISABLED.httpMetrics().connectionCountGauge();
+    }
+
+    @Override
     public EpollFacade getEpollFacade() {
         return EpollFacadeImpl.INSTANCE;
     }
@@ -54,7 +67,7 @@ public class DefaultIODispatcherConfiguration implements IODispatcherConfigurati
     @Override
     public long getHeartbeatInterval() {
         // don't send heartbeat messages by default
-        return -1L;
+        return -1;
     }
 
     @Override
@@ -68,6 +81,16 @@ public class DefaultIODispatcherConfiguration implements IODispatcherConfigurati
     }
 
     @Override
+    public int getNetRecvBufferSize() {
+        return -1; // use system default
+    }
+
+    @Override
+    public int getNetSendBufferSize() {
+        return -1; // use system default
+    }
+
+    @Override
     public NetworkFacade getNetworkFacade() {
         return NetworkFacadeImpl.INSTANCE;
     }
@@ -78,8 +101,8 @@ public class DefaultIODispatcherConfiguration implements IODispatcherConfigurati
     }
 
     @Override
-    public int getRcvBufSize() {
-        return -1; // use system default
+    public int getRecvBufferSize() {
+        return 131072;
     }
 
     @Override
@@ -88,17 +111,17 @@ public class DefaultIODispatcherConfiguration implements IODispatcherConfigurati
     }
 
     @Override
-    public int getSndBufSize() {
-        return -1; // use system default
-    }
-
-    @Override
-    public int getTestConnectionBufferSize() {
-        return 64;
+    public int getSendBufferSize() {
+        return 131072;
     }
 
     @Override
     public long getTimeout() {
         return 5 * 60 * 1000L;
+    }
+
+    @Override
+    public Counter listenerStateChangeCounter() {
+        return Metrics.DISABLED.httpMetrics().listenerStateChangeCounter();
     }
 }

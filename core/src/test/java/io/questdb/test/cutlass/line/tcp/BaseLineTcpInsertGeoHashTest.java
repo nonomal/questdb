@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -34,28 +34,15 @@ import io.questdb.test.tools.TestUtils;
 import org.junit.Assert;
 import org.junit.Before;
 import org.junit.Test;
-import org.junit.runner.RunWith;
-import org.junit.runners.Parameterized;
 
-import java.util.Arrays;
-import java.util.Collection;
-
-@RunWith(Parameterized.class)
 abstract class BaseLineTcpInsertGeoHashTest extends BaseLineTcpContextTest {
     static final String tableName = "tracking";
     static final String targetColumnName = "geohash";
 
     private final boolean walEnabled;
 
-    public BaseLineTcpInsertGeoHashTest(WalMode walMode) {
-        this.walEnabled = (walMode == WalMode.WITH_WAL);
-    }
-
-    @Parameterized.Parameters(name = "{0}")
-    public static Collection<Object[]> data() {
-        return Arrays.asList(new Object[][]{
-                {WalMode.WITH_WAL}, {WalMode.NO_WAL}
-        });
+    public BaseLineTcpInsertGeoHashTest() {
+        this.walEnabled = TestUtils.isWal();
     }
 
     @Before
@@ -106,7 +93,7 @@ abstract class BaseLineTcpInsertGeoHashTest extends BaseLineTcpContextTest {
             if (walEnabled) {
                 model.wal();
             }
-            TestUtils.create(model, engine);
+            TestUtils.createTable(engine, model);
             if (walEnabled) {
                 Assert.assertTrue(isWalTable(tableName));
             }

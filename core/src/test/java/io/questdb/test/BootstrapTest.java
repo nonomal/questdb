@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -26,8 +26,19 @@ package io.questdb.test;
 
 import io.questdb.Bootstrap;
 import io.questdb.cairo.CairoConfiguration;
-import io.questdb.log.*;
-import io.questdb.std.*;
+import io.questdb.cairo.CairoEngine;
+import io.questdb.cairo.DefaultCairoConfiguration;
+import io.questdb.log.Log;
+import io.questdb.log.LogFactory;
+import io.questdb.log.LogFileWriter;
+import io.questdb.log.LogLevel;
+import io.questdb.log.LogWriterConfig;
+import io.questdb.log.Logger;
+import io.questdb.std.CharSequenceObjHashMap;
+import io.questdb.std.Files;
+import io.questdb.std.MemoryTag;
+import io.questdb.std.Os;
+import io.questdb.std.Unsafe;
 import io.questdb.std.str.DirectUtf8StringZ;
 import io.questdb.std.str.Path;
 import io.questdb.std.str.Utf8s;
@@ -51,6 +62,16 @@ public class BootstrapTest extends AbstractBootstrapTest {
         assertFail("Root directory does not exist: nope", "-d", "nope");
     }
 
+
+    @Test
+    public void testDirectoryWithSpaces() throws Exception {
+        auxPath.of(root + "\\spaced path").$();
+        java.nio.file.Files.createDirectories(java.nio.file.Path.of(auxPath.toString()));
+        CairoConfiguration configuration = new DefaultCairoConfiguration(auxPath.toString());
+        CairoEngine engine = new CairoEngine(configuration);
+        engine.close();
+    }
+
     @Test
     public void testExtractSite() throws Exception {
         createDummyConfiguration();
@@ -59,7 +80,7 @@ public class BootstrapTest extends AbstractBootstrapTest {
         Bootstrap bootstrap = new Bootstrap(getServerMainArgs());
         Assert.assertNotNull(bootstrap.getLog());
         Assert.assertNotNull(bootstrap.getConfiguration());
-        Assert.assertNotNull(bootstrap.getMetrics());
+        Assert.assertNotNull(bootstrap.getConfiguration().getMetrics());
         bootstrap.extractSite();
         Assert.assertTrue(Files.exists(auxPath.trimTo(pathLen).concat("conf").concat(LogFactory.DEFAULT_CONFIG_NAME).$()));
     }
@@ -134,7 +155,7 @@ public class BootstrapTest extends AbstractBootstrapTest {
             int bufSize = 4096;
             long buf = Unsafe.calloc(bufSize, MemoryTag.NATIVE_DEFAULT);
             // we should read sub-4k bytes from the file
-            int fd = TestFilesFacadeImpl.INSTANCE.openRO(path.$());
+            long fd = TestFilesFacadeImpl.INSTANCE.openRO(path.$());
             Assert.assertTrue(fd > -1);
             try {
                 while (true) {

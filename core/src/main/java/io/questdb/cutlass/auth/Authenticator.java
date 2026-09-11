@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -25,19 +25,15 @@
 package io.questdb.cutlass.auth;
 
 import io.questdb.cairo.SecurityContext;
-import io.questdb.network.Socket;
+import io.questdb.cairo.security.PrincipalContext;
 import io.questdb.std.Mutable;
 import io.questdb.std.QuietCloseable;
-import org.jetbrains.annotations.NotNull;
+import io.questdb.std.ReadOnlyObjList;
+import org.jetbrains.annotations.Nullable;
 
-public interface Authenticator extends QuietCloseable, Mutable {
+public interface Authenticator extends QuietCloseable, Mutable, PrincipalContext {
 
-    int NEEDS_DISCONNECT = 3;
-    int NEEDS_READ = 0;
-    int NEEDS_WRITE = 1;
-    int OK = -1;
-    int QUEUE_FULL = 2;
-
+    @Override
     default void clear() {
     }
 
@@ -45,27 +41,16 @@ public interface Authenticator extends QuietCloseable, Mutable {
     default void close() {
     }
 
-    default int denyAccess(CharSequence message) throws AuthenticatorException {
-        throw new UnsupportedOperationException();
-    }
-
     default byte getAuthType() {
         return SecurityContext.AUTH_TYPE_NONE;
     }
 
-    CharSequence getPrincipal();
-
-    long getRecvBufPos();
-
-    long getRecvBufPseudoStart();
-
-    int handleIO() throws AuthenticatorException;
-
-    void init(@NotNull Socket socket, long recvBuffer, long recvBufferLimit, long sendBuffer, long sendBufferLimit);
-
-    boolean isAuthenticated();
-
-    default int loginOK() throws AuthenticatorException {
-        throw new UnsupportedOperationException();
+    /**
+     * Returns list of groups provided by external identity provider, such as OpenID Connect provider.
+     * For other authentication types returns null.
+     */
+    @Nullable
+    default ReadOnlyObjList<CharSequence> getGroups() {
+        return null;
     }
 }

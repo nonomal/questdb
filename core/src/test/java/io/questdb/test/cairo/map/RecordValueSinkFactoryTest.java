@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,16 +24,31 @@
 
 package io.questdb.test.cairo.map;
 
-import io.questdb.cairo.*;
-import io.questdb.cairo.map.*;
+import io.questdb.cairo.ArrayColumnTypes;
+import io.questdb.cairo.ColumnType;
+import io.questdb.cairo.EntityColumnFilter;
+import io.questdb.cairo.ListColumnFilter;
+import io.questdb.cairo.PartitionBy;
+import io.questdb.cairo.SingleColumnType;
+import io.questdb.cairo.SymbolAsIntTypes;
+import io.questdb.cairo.TableReader;
+import io.questdb.cairo.TableWriter;
+import io.questdb.cairo.map.Map;
+import io.questdb.cairo.map.MapKey;
+import io.questdb.cairo.map.MapValue;
+import io.questdb.cairo.map.OrderedMap;
+import io.questdb.cairo.map.RecordValueSink;
+import io.questdb.cairo.map.RecordValueSinkFactory;
 import io.questdb.cairo.sql.Record;
-import io.questdb.cairo.sql.RecordCursor;
 import io.questdb.cairo.sql.StaticSymbolTable;
 import io.questdb.std.BytecodeAssembler;
+import io.questdb.std.Decimal128;
+import io.questdb.std.Decimal256;
 import io.questdb.std.Numbers;
 import io.questdb.std.Rnd;
 import io.questdb.test.AbstractCairoTest;
 import io.questdb.test.cairo.TableModel;
+import io.questdb.test.cairo.TestTableReaderRecordCursor;
 import org.junit.Assert;
 import org.junit.Test;
 
@@ -53,12 +68,18 @@ public class RecordValueSinkFactoryTest extends AbstractCairoTest {
                 .col("bool", ColumnType.BOOLEAN)
                 .col("date", ColumnType.DATE)
                 .col("ts", ColumnType.TIMESTAMP)
-                .col("ipv4", ColumnType.IPv4);
+                .col("ipv4", ColumnType.IPv4)
+                .col("dec8", ColumnType.getDecimalType(2, 1))
+                .col("dec16", ColumnType.getDecimalType(4, 2))
+                .col("dec32", ColumnType.getDecimalType(8, 3))
+                .col("dec64", ColumnType.getDecimalType(18, 4))
+                .col("dec128", ColumnType.getDecimalType(38, 5))
+                .col("dec256", ColumnType.getDecimalType(76, 6));
         AbstractCairoTest.create(model);
 
         final int N = 1024;
         final Rnd rnd = new Rnd();
-        try (TableWriter writer = newOffPoolWriter(configuration, "all", metrics)) {
+        try (TableWriter writer = newOffPoolWriter(configuration, "all")) {
             for (int i = 0; i < N; i++) {
                 TableWriter.Row row = writer.newRow();
                 row.putInt(0, rnd.nextInt());
@@ -72,18 +93,26 @@ public class RecordValueSinkFactoryTest extends AbstractCairoTest {
                 row.putDate(8, rnd.nextLong());
                 row.putTimestamp(9, rnd.nextLong());
                 row.putInt(10, rnd.nextInt());
+                row.putByte(11, rnd.nextByte((byte) 100));
+                row.putShort(12, rnd.nextShort((short) 10000));
+                row.putInt(13, rnd.nextInt(100000000));
+                row.putLong(14, rnd.nextLong(1_000_000_000_000_000_000L));
+                row.putDecimal128(15, rnd.nextLong(Decimal128.MAX_VALUE.getHigh()), rnd.nextLong());
+                row.putDecimal256(16, rnd.nextLong(Decimal256.MAX_VALUE.getHh()), rnd.nextLong(), rnd.nextLong(), rnd.nextLong());
                 row.append();
             }
             writer.commit();
         }
 
-        try (TableReader reader = newOffPoolReader(configuration, "all")) {
+        try (
+                TableReader reader = newOffPoolReader(configuration, "all");
+                TestTableReaderRecordCursor cursor = new TestTableReaderRecordCursor().of(reader)
+        ) {
             final SymbolAsIntTypes valueTypes = new SymbolAsIntTypes().of(reader.getMetadata());
             try (final Map map = new OrderedMap(Numbers.SIZE_1MB, keyTypes, valueTypes, N, 0.5, 100)) {
                 EntityColumnFilter columnFilter = new EntityColumnFilter();
                 columnFilter.of(reader.getMetadata().getColumnCount());
                 RecordValueSink sink = RecordValueSinkFactory.getInstance(new BytecodeAssembler(), reader.getMetadata(), columnFilter);
-                RecordCursor cursor = reader.getCursor();
                 final Record record = cursor.getRecord();
 
                 int index = 0;
@@ -117,8 +146,47 @@ public class RecordValueSinkFactoryTest extends AbstractCairoTest {
                     Assert.assertEquals(rnd.nextLong(), value.getDate(8));
                     Assert.assertEquals(rnd.nextLong(), value.getTimestamp(9));
                     Assert.assertEquals(rnd.nextInt(), value.getIPv4(10));
+                    Assert.assertEquals(rnd.nextByte((byte) 100), value.getDecimal8(11));
+                    Assert.assertEquals(rnd.nextShort((short) 10000), value.getDecimal16(12));
+                    Assert.assertEquals(rnd.nextInt(100000000), value.getDecimal32(13));
+                    Assert.assertEquals(rnd.nextLong(1_000_000_000_000_000_000L), value.getDecimal64(14));
+                    Decimal128 decimal128 = new Decimal128();
+                    value.getDecimal128(15, decimal128);
+                    Assert.assertEquals(rnd.nextLong(Decimal128.MAX_VALUE.getHigh()), decimal128.getHigh());
+                    Assert.assertEquals(rnd.nextLong(), decimal128.getLow());
+                    Decimal256 decimal256 = new Decimal256();
+                    value.getDecimal256(16, decimal256);
+                    Assert.assertEquals(rnd.nextLong(Decimal256.MAX_VALUE.getHh()), decimal256.getHh());
+                    Assert.assertEquals(rnd.nextLong(), decimal256.getHl());
+                    Assert.assertEquals(rnd.nextLong(), decimal256.getLh());
+                    Assert.assertEquals(rnd.nextLong(), decimal256.getLl());
                 }
             }
+        }
+    }
+
+    @Test
+    public void testIsSupportedColumnTypeAgreesWithGetInstance() {
+        // isSupportedColumnType() hand-mirrors getInstance()'s switch under a "keep in sync" comment,
+        // and callers rely on it to reject a type before getInstance() throws. Walk the whole tag
+        // space so the two cannot drift: every tag getInstance() can emit a sink for must be reported
+        // as supported, and every tag it rejects must be reported as unsupported.
+        final BytecodeAssembler asm = new BytecodeAssembler();
+        final ListColumnFilter filter = new ListColumnFilter();
+        filter.add(1); // 1-based, so this selects column 0
+        for (short tag = ColumnType.UNDEFINED; tag <= ColumnType.NULL; tag++) {
+            boolean isSinkGenerated;
+            try {
+                RecordValueSinkFactory.getInstance(asm, new SingleColumnType(tag), filter);
+                isSinkGenerated = true;
+            } catch (UnsupportedOperationException e) {
+                isSinkGenerated = false;
+            }
+            Assert.assertEquals(
+                    ColumnType.nameOf(tag),
+                    isSinkGenerated,
+                    RecordValueSinkFactory.isSupportedColumnType(tag)
+            );
         }
     }
 
@@ -141,7 +209,7 @@ public class RecordValueSinkFactoryTest extends AbstractCairoTest {
 
         final int N = 1024;
         final Rnd rnd = new Rnd();
-        try (TableWriter writer = newOffPoolWriter(configuration, "all", metrics)) {
+        try (TableWriter writer = newOffPoolWriter(configuration, "all")) {
             for (int i = 0; i < N; i++) {
                 TableWriter.Row row = writer.newRow();
                 row.putInt(0, rnd.nextInt());
@@ -160,19 +228,21 @@ public class RecordValueSinkFactoryTest extends AbstractCairoTest {
             writer.commit();
         }
 
-        try (TableReader reader = newOffPoolReader(configuration, "all")) {
+        try (
+                TableReader reader = newOffPoolReader(configuration, "all");
+                TestTableReaderRecordCursor cursor = new TestTableReaderRecordCursor().of(reader)
+        ) {
             ArrayColumnTypes valueTypes = new ArrayColumnTypes();
             valueTypes.add(ColumnType.BOOLEAN);
             valueTypes.add(ColumnType.TIMESTAMP);
             valueTypes.add(ColumnType.INT);
-            try (final Map map = new OrderedMap(Numbers.SIZE_1MB, keyTypes, valueTypes, N, 0.5, 100)) {
+            try (Map map = new OrderedMap(Numbers.SIZE_1MB, keyTypes, valueTypes, N, 0.5, 100)) {
                 ListColumnFilter columnFilter = new ListColumnFilter();
                 columnFilter.add(8);
                 columnFilter.add(10);
                 columnFilter.add(7);
 
                 RecordValueSink sink = RecordValueSinkFactory.getInstance(new BytecodeAssembler(), reader.getMetadata(), columnFilter);
-                RecordCursor cursor = reader.getCursor();
                 final Record record = cursor.getRecord();
 
                 int index = 0;

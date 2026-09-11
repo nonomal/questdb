@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -26,16 +26,23 @@ package io.questdb.cairo.mig;
 
 import io.questdb.cairo.CairoConfiguration;
 import io.questdb.cairo.CairoException;
+import io.questdb.cairo.ColumnType;
 import io.questdb.cairo.PartitionBy;
 import io.questdb.cairo.vm.Vm;
 import io.questdb.cairo.vm.api.MemoryMARW;
 import io.questdb.log.Log;
 import io.questdb.log.LogFactory;
-import io.questdb.std.*;
+import io.questdb.std.Chars;
+import io.questdb.std.Files;
+import io.questdb.std.FilesFacade;
+import io.questdb.std.LongList;
+import io.questdb.std.MemoryTag;
+import io.questdb.std.ObjList;
+import io.questdb.std.Vect;
 import io.questdb.std.str.LPSZ;
 import io.questdb.std.str.Path;
 
-import static io.questdb.cairo.TableUtils.setPathForPartition;
+import static io.questdb.cairo.TableUtils.setPathForNativePartition;
 import static io.questdb.cairo.mig.MigrationUtils.openFileSafe;
 
 public class Mig620 {
@@ -135,8 +142,8 @@ public class Mig620 {
     }
 
 
-    private static int openRO(FilesFacade ff, LPSZ path) {
-        final int fd = ff.openRO(path);
+    private static long openRO(FilesFacade ff, LPSZ path) {
+        final long fd = ff.openRO(path);
         if (fd > -1) {
             Mig620.LOG.debug().$("open [file=").$(path).$(", fd=").$(fd).$(']').$();
             return fd;
@@ -168,7 +175,7 @@ public class Mig620 {
     private static long readColumnTop(FilesFacade ff, Path path, CharSequence name, int plen) {
         try {
             if (ff.exists(topFile(path, name))) {
-                final int fd = openRO(ff, path.$());
+                final long fd = openRO(ff, path.$());
                 try {
                     long n;
                     if ((n = ff.readNonNegativeLong(fd, 0)) < 0) {
@@ -185,7 +192,17 @@ public class Mig620 {
         }
     }
 
-    private static LongList readColumnTops(int columnCount, int partitionBy, long partitionSizeOffset, int partitionTableSize, MemoryMARW txMemory, FilesFacade ff, Path path, int pathLen, ObjList<String> columnNames) {
+    private static LongList readColumnTops(
+            int columnCount,
+            int partitionBy,
+            long partitionSizeOffset,
+            int partitionTableSize,
+            MemoryMARW txMemory,
+            FilesFacade ff,
+            Path path,
+            int pathLen,
+            ObjList<String> columnNames
+    ) {
         if (!PartitionBy.isPartitioned(partitionBy)) {
             LongList result = new LongList();
             readColumnTopsForPartition(result, columnNames, columnCount, partitionBy, TX_DEFAULT_PARTITION_TIMESTAMP_MIG, -1L, ff, path, pathLen);
@@ -194,7 +211,17 @@ public class Mig620 {
         return readColumnTopsAllPartitions(columnCount, partitionBy, partitionSizeOffset, partitionTableSize, txMemory, ff, path, pathLen, columnNames);
     }
 
-    private static LongList readColumnTopsAllPartitions(int columnCount, int partitionBy, long partitionSizeOffset, int partitionTableSize, MemoryMARW txMemory, FilesFacade ff, Path path, int pathLen, ObjList<String> columnNames) {
+    private static LongList readColumnTopsAllPartitions(
+            int columnCount,
+            int partitionBy,
+            long partitionSizeOffset,
+            int partitionTableSize,
+            MemoryMARW txMemory,
+            FilesFacade ff,
+            Path path,
+            int pathLen,
+            ObjList<String> columnNames
+    ) {
         LongList result = new LongList();
         int partitionCount = partitionTableSize / 8 / 4;
         long offset = partitionSizeOffset + 4;
@@ -216,11 +243,21 @@ public class Mig620 {
         return result;
     }
 
-    private static void readColumnTopsForPartition(LongList tops, ObjList<String> columnNames, int columnCount, int partitionBy, long partitionTimestamp, long partitionNameTxn, FilesFacade ff, Path path, int pathLen) {
+    private static void readColumnTopsForPartition(
+            LongList tops,
+            ObjList<String> columnNames,
+            int columnCount,
+            int partitionBy,
+            long partitionTimestamp,
+            long partitionNameTxn,
+            FilesFacade ff,
+            Path path,
+            int pathLen
+    ) {
         tops.add(partitionTimestamp);
 
         path.trimTo(pathLen);
-        setPathForPartition(path, partitionBy, partitionTimestamp, partitionNameTxn);
+        setPathForNativePartition(path, ColumnType.TIMESTAMP_MICRO, partitionBy, partitionTimestamp, partitionNameTxn);
         int partitionPathLen = path.size();
 
         if (ff.exists(path.put(Files.SEPARATOR).$())) {

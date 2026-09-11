@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,18 +24,23 @@
 
 package io.questdb.griffin.engine.table;
 
-import io.questdb.cairo.DataUnavailableException;
+import io.questdb.cairo.sql.ParquetDecodeHint;
 import io.questdb.cairo.sql.Record;
 import io.questdb.cairo.sql.RecordCursor;
 import io.questdb.cairo.sql.SqlExecutionCircuitBreaker;
 import io.questdb.cairo.sql.SymbolTable;
+import io.questdb.std.DirectLongLongSortedList;
+import io.questdb.std.IntHashSet;
 import io.questdb.std.IntList;
+import io.questdb.std.Misc;
+import org.jetbrains.annotations.Nullable;
 
 class SelectedRecordCursor implements RecordCursor {
     private final IntList columnCrossIndex;
     private final SelectedRecord recordA;
     private final SelectedRecord recordB;
     private RecordCursor baseCursor;
+    private IntHashSet baseUsedColumns;
 
     public SelectedRecordCursor(IntList columnCrossIndex, boolean supportsRandomAccess) {
         this.recordA = new SelectedRecord(columnCrossIndex);
@@ -54,7 +59,12 @@ class SelectedRecordCursor implements RecordCursor {
 
     @Override
     public void close() {
-        baseCursor.close();
+        baseCursor = Misc.free(baseCursor);
+    }
+
+    @Override
+    public void expectLimitedIteration() {
+        baseCursor.expectLimitedIteration();
     }
 
     @Override
@@ -81,8 +91,18 @@ class SelectedRecordCursor implements RecordCursor {
     }
 
     @Override
+    public void longTopK(DirectLongLongSortedList list, int columnIndex) {
+        baseCursor.longTopK(list, columnCrossIndex.getQuick(columnIndex));
+    }
+
+    @Override
     public SymbolTable newSymbolTable(int columnIndex) {
         return baseCursor.newSymbolTable(columnCrossIndex.getQuick(columnIndex));
+    }
+
+    @Override
+    public long preComputedStateSize() {
+        return baseCursor.preComputedStateSize();
     }
 
     @Override
@@ -91,13 +111,40 @@ class SelectedRecordCursor implements RecordCursor {
     }
 
     @Override
+    public void setParentUsedColumns(@Nullable IntHashSet columnIndexes) {
+        if (columnIndexes == null) {
+            baseCursor.setParentUsedColumns(null);
+            return;
+        }
+        if (baseUsedColumns == null) {
+            baseUsedColumns = new IntHashSet(columnIndexes.size());
+        } else {
+            baseUsedColumns.clear();
+        }
+        for (int i = 0, n = columnIndexes.size(); i < n; i++) {
+            baseUsedColumns.add(columnCrossIndex.getQuick(columnIndexes.get(i)));
+        }
+        baseCursor.setParentUsedColumns(baseUsedColumns);
+    }
+
+    @Override
+    public void setParquetDecodeHint(ParquetDecodeHint hint) {
+        baseCursor.setParquetDecodeHint(hint);
+    }
+
+    @Override
+    public void setRecordAtRows(@Nullable RowIdSource source) {
+        baseCursor.setRecordAtRows(source);
+    }
+
+    @Override
     public long size() {
         return baseCursor.size();
     }
 
     @Override
-    public void skipRows(Counter rowCount) throws DataUnavailableException {
-        baseCursor.skipRows(rowCount);
+    public void skipRows(Counter rowCount, long maxRowsAfterSkip) {
+        baseCursor.skipRows(rowCount, maxRowsAfterSkip);
     }
 
     @Override

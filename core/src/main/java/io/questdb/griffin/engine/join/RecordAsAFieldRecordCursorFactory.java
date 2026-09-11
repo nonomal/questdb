@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -29,13 +29,14 @@ import io.questdb.cairo.ColumnType;
 import io.questdb.cairo.GenericRecordMetadata;
 import io.questdb.cairo.TableColumnMetadata;
 import io.questdb.cairo.sql.DelegatingRecordCursor;
+import io.questdb.cairo.sql.ParquetDecodeHint;
 import io.questdb.cairo.sql.Record;
 import io.questdb.cairo.sql.RecordCursor;
 import io.questdb.cairo.sql.RecordCursorFactory;
 import io.questdb.griffin.PlanSink;
 import io.questdb.griffin.SqlException;
 import io.questdb.griffin.SqlExecutionContext;
-import io.questdb.std.Chars;
+import io.questdb.griffin.SqlUtil;
 import io.questdb.std.Misc;
 
 public class RecordAsAFieldRecordCursorFactory extends AbstractRecordCursorFactory {
@@ -47,17 +48,18 @@ public class RecordAsAFieldRecordCursorFactory extends AbstractRecordCursorFacto
         this.base = base;
         cursor = new RecordAsAFieldRecordCursor(base.recordCursorSupportsRandomAccess());
         GenericRecordMetadata metadata = (GenericRecordMetadata) getMetadata();
-        metadata.add(new TableColumnMetadata(Chars.toString(columnAlias), ColumnType.RECORD, base.getMetadata()));
+        metadata.add(new TableColumnMetadata(SqlUtil.toColumnName(columnAlias), ColumnType.RECORD, base.getMetadata()));
     }
 
     @Override
     public RecordCursor getCursor(SqlExecutionContext executionContext) throws SqlException {
-        RecordCursor cursor1 = base.getCursor(executionContext);
+        final RecordCursor baseCursor = base.getCursor(executionContext);
         try {
-            cursor.of(cursor1, executionContext);
+            baseCursor.setParquetDecodeHint(ParquetDecodeHint.MONOTONIC);
+            cursor.of(baseCursor, executionContext);
             return cursor;
         } catch (Throwable th) {
-            cursor1.close();
+            cursor.close();
             throw th;
         }
     }
@@ -76,6 +78,13 @@ public class RecordAsAFieldRecordCursorFactory extends AbstractRecordCursorFacto
     @Override
     public boolean usesCompiledFilter() {
         return base.usesCompiledFilter();
+    }
+
+    // Wraps the sub-query factory without exposing it through getBaseFactory(), so the
+    // external-source property is propagated explicitly.
+    @Override
+    public boolean usesExternalDataSource() {
+        return base.usesExternalDataSource();
     }
 
     @Override
@@ -101,7 +110,7 @@ public class RecordAsAFieldRecordCursorFactory extends AbstractRecordCursorFacto
     private static final class RecordAsAFieldRecordCursor implements DelegatingRecordCursor {
         private final RecordAsAFieldRecord record = new RecordAsAFieldRecord();
         private final RecordAsAFieldRecord recordB;
-        private RecordCursor base;
+        private RecordCursor baseCursor;
 
         public RecordAsAFieldRecordCursor(boolean baseSupportsRandomAccess) {
             recordB = baseSupportsRandomAccess ? new RecordAsAFieldRecord() : null;
@@ -109,7 +118,7 @@ public class RecordAsAFieldRecordCursorFactory extends AbstractRecordCursorFacto
 
         @Override
         public void close() {
-            Misc.free(base);
+            baseCursor = Misc.free(baseCursor);
         }
 
         @Override
@@ -127,31 +136,41 @@ public class RecordAsAFieldRecordCursorFactory extends AbstractRecordCursorFacto
 
         @Override
         public boolean hasNext() {
-            return base.hasNext();
+            return baseCursor.hasNext();
         }
 
         @Override
-        public void of(RecordCursor base, SqlExecutionContext executionContext) {
-            this.base = base;
-            record.base = base.getRecord();
+        public void of(RecordCursor baseCursor, SqlExecutionContext executionContext) {
+            this.baseCursor = baseCursor;
+            record.base = baseCursor.getRecord();
             if (recordB != null) {
-                recordB.base = base.getRecordB();
+                recordB.base = baseCursor.getRecordB();
             }
         }
 
         @Override
+        public long preComputedStateSize() {
+            return 0;
+        }
+
+        @Override
         public void recordAt(Record record, long atRowId) {
-            base.recordAt(((RecordAsAFieldRecord) record).base, atRowId);
+            baseCursor.recordAt(((RecordAsAFieldRecord) record).base, atRowId);
+        }
+
+        @Override
+        public void setParquetDecodeHint(ParquetDecodeHint hint) {
+            baseCursor.setParquetDecodeHint(hint);
         }
 
         @Override
         public long size() {
-            return base.size();
+            return baseCursor.size();
         }
 
         @Override
         public void toTop() {
-            base.toTop();
+            baseCursor.toTop();
         }
     }
 }

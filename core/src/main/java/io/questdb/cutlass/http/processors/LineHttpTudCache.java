@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -25,21 +25,38 @@
 package io.questdb.cutlass.http.processors;
 
 import io.questdb.Telemetry;
+import io.questdb.TelemetryEvent;
 import io.questdb.TelemetryOrigin;
-import io.questdb.TelemetrySystemEvent;
-import io.questdb.cairo.*;
+import io.questdb.cairo.CairoEngine;
+import io.questdb.cairo.ColumnType;
+import io.questdb.cairo.CommitFailedException;
+import io.questdb.cairo.SecurityContext;
+import io.questdb.cairo.TableToken;
+import io.questdb.cairo.TableUtils;
 import io.questdb.cairo.vm.Vm;
 import io.questdb.cairo.vm.api.MemoryMARW;
-import io.questdb.cutlass.line.tcp.*;
-import io.questdb.std.*;
-import io.questdb.std.str.*;
+import io.questdb.cutlass.line.tcp.DefaultColumnTypes;
+import io.questdb.cutlass.line.tcp.LineTcpParser;
+import io.questdb.cutlass.line.tcp.SymbolCache;
+import io.questdb.cutlass.line.tcp.TableStructureAdapter;
+import io.questdb.cutlass.line.tcp.WalTableUpdateDetails;
+import io.questdb.std.LowerCaseUtf8SequenceObjHashMap;
+import io.questdb.std.Misc;
+import io.questdb.std.ObjList;
+import io.questdb.std.Pool;
+import io.questdb.std.QuietCloseable;
+import io.questdb.std.str.Path;
+import io.questdb.std.str.StringSink;
+import io.questdb.std.str.Utf8Sequence;
+import io.questdb.std.str.Utf8String;
+import io.questdb.std.str.Utf8s;
 import io.questdb.tasks.TelemetryTask;
 import org.jetbrains.annotations.NotNull;
 
 public class LineHttpTudCache implements QuietCloseable {
     private final boolean autoCreateNewColumns;
     private final boolean autoCreateNewTables;
-    private final MemoryMARW ddlMem = Vm.getMARWInstance();
+    private final MemoryMARW ddlMem = Vm.getCMARWInstance();
     private final DefaultColumnTypes defaultColumnTypes;
     private final CairoEngine engine;
     private final TableCreateException parseException = new TableCreateException();
@@ -66,7 +83,7 @@ public class LineHttpTudCache implements QuietCloseable {
     }
 
     public void clear() {
-        ObjList<Utf8String> keys = tableUpdateDetails.keys();
+        ObjList<Utf8Sequence> keys = tableUpdateDetails.keys();
         for (int i = 0, n = keys.size(); i < n; i++) {
             Utf8Sequence tableName = tableUpdateDetails.keys().get(i);
             WalTableUpdateDetails tud = tableUpdateDetails.get(tableName);
@@ -78,13 +95,14 @@ public class LineHttpTudCache implements QuietCloseable {
         }
         if (distressed) {
             tableUpdateDetails.clear();
+            distressed = false;
         }
     }
 
     @Override
     public void close() {
         // Close happens when HTTP connection is closed
-        ObjList<Utf8String> keys = tableUpdateDetails.keys();
+        ObjList<Utf8Sequence> keys = tableUpdateDetails.keys();
         for (int i = 0, n = keys.size(); i < n; i++) {
             Utf8Sequence tableName = tableUpdateDetails.keys().get(i);
             WalTableUpdateDetails tud = tableUpdateDetails.get(tableName);
@@ -99,7 +117,7 @@ public class LineHttpTudCache implements QuietCloseable {
         boolean droppedTableFound;
         do {
             droppedTableFound = false;
-            ObjList<Utf8String> keys = tableUpdateDetails.keys();
+            ObjList<Utf8Sequence> keys = tableUpdateDetails.keys();
             for (int i = 0, n = keys.size(); i < n; i++) {
                 Utf8Sequence tableName = tableUpdateDetails.keys().get(i);
                 WalTableUpdateDetails tud = tableUpdateDetails.get(tableName);
@@ -136,7 +154,18 @@ public class LineHttpTudCache implements QuietCloseable {
     ) throws TableCreateException {
         int key = tableUpdateDetails.keyIndex(parser.getMeasurementName());
         if (key < 0) {
-            return tableUpdateDetails.valueAt(key);
+            WalTableUpdateDetails tud = tableUpdateDetails.valueAt(key);
+            // We only need to check for rename if there are no uncommitted rows
+            // it's too taxing to check for renames for every row
+            if (!tud.isFirstRow() || !tud.isTableRenamed()) {
+                return tud;
+            } else {
+                // Table was renamed, we need to evict this TUD from cache
+                tableUpdateDetails.removeAt(key);
+                Misc.free(tud);
+                // continue and re-create the tud
+                key = -key - 1;
+            }
         }
 
         tableNameUtf16.clear();
@@ -146,9 +175,9 @@ public class LineHttpTudCache implements QuietCloseable {
             throw parseException.of("cannot insert in non-WAL table", null);
         }
 
-        TelemetryTask.store(telemetry, TelemetryOrigin.ILP_TCP, TelemetrySystemEvent.ILP_RESERVE_WRITER);
+        TelemetryTask.store(telemetry, TelemetryOrigin.ILP_HTTP, TelemetryEvent.ILP_RESERVE_WRITER);
         // check if table on disk is WAL
-        path.of(engine.getConfiguration().getRoot());
+        path.of(engine.getConfiguration().getDbRoot());
         Utf8String nameUtf8 = Utf8String.newInstance(parser.getMeasurementName());
         WalTableUpdateDetails tud = new WalTableUpdateDetails(
                 engine,
@@ -167,7 +196,7 @@ public class LineHttpTudCache implements QuietCloseable {
     }
 
     public void reset() {
-        ObjList<Utf8String> keys = tableUpdateDetails.keys();
+        ObjList<Utf8Sequence> keys = tableUpdateDetails.keys();
         for (int i = 0, n = keys.size(); i < n; i++) {
             Utf8Sequence tableName = tableUpdateDetails.keys().get(i);
             WalTableUpdateDetails tud = tableUpdateDetails.get(tableName);
@@ -202,11 +231,17 @@ public class LineHttpTudCache implements QuietCloseable {
                 if (!TableUtils.isValidColumnName(columnName, maxFileNameLength)) {
                     throw parseException.of("invalid column name", columnName);
                 }
-                if (tsa.getColumnType(i) == LineTcpParser.ENTITY_TYPE_NULL) {
+                final int columnType = tsa.getColumnType(i);
+                if (columnType == LineTcpParser.ENTITY_TYPE_NULL) {
                     throw parseException.of("invalid column type", columnName);
+                } else if (columnType == ColumnType.DECIMAL) {
+                    throw parseException.of("decimal columns must be created manually", columnName);
                 }
             }
-            tableToken = engine.createTable(securityContext, ddlMem, path, true, tsa, false);
+            tableToken = engine.createTable(securityContext, ddlMem, path, true, tsa, false, TableUtils.TABLE_KIND_REGULAR_TABLE);
+        }
+        if (tableToken != null && tableToken.getType() != TableToken.Type.TABLE) {
+            throw parseException.of("cannot modify " + tableToken.getType().keyword(), tableToken.getTableName());
         }
         return tableToken;
     }

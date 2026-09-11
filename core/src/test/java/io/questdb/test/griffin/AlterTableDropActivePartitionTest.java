@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,7 +24,14 @@
 
 package io.questdb.test.griffin;
 
-import io.questdb.cairo.*;
+import io.questdb.cairo.CairoException;
+import io.questdb.cairo.ColumnType;
+import io.questdb.cairo.EntryUnavailableException;
+import io.questdb.cairo.O3PartitionPurgeJob;
+import io.questdb.cairo.PartitionBy;
+import io.questdb.cairo.TableReader;
+import io.questdb.cairo.TableWriter;
+import io.questdb.cairo.TimestampDriver;
 import io.questdb.cairo.sql.RecordCursor;
 import io.questdb.cairo.sql.RecordCursorFactory;
 import io.questdb.griffin.SqlException;
@@ -32,29 +39,47 @@ import io.questdb.mp.WorkerPool;
 import io.questdb.std.Files;
 import io.questdb.std.FilesFacade;
 import io.questdb.std.Misc;
-import io.questdb.std.datetime.microtime.TimestampFormatUtils;
 import io.questdb.std.str.Path;
 import io.questdb.test.AbstractCairoTest;
+import io.questdb.test.TestTimestampType;
 import io.questdb.test.cairo.TableModel;
 import io.questdb.test.mp.TestWorkerPool;
 import io.questdb.test.std.TestFilesFacadeImpl;
 import io.questdb.test.tools.TestUtils;
 import org.junit.Assert;
 import org.junit.Test;
+import org.junit.runner.RunWith;
+import org.junit.runners.Parameterized;
 
+import java.util.Arrays;
+import java.util.Collection;
+
+@RunWith(Parameterized.class)
 public class AlterTableDropActivePartitionTest extends AbstractCairoTest {
-
     private static final String LastPartitionTs = "2023-10-15";
     private static final String MinMaxCountHeader = "min\tmax\tcount\n";
     private static final String EmptyTableMinMaxCount = MinMaxCountHeader + "\t\t0\n";
     private static final String TableHeader = "id\ttimestamp\n";
+
+    private final TestTimestampType timestampType;
     private int txn;
     private WorkerPool workerPool;
+
+    public AlterTableDropActivePartitionTest(TestTimestampType timestampType) {
+        this.timestampType = timestampType;
+    }
+
+    @Parameterized.Parameters(name = "{0}")
+    public static Collection<Object[]> testParams() {
+        return Arrays.asList(new Object[][]{
+                {TestTimestampType.MICRO}, {TestTimestampType.NANO}
+        });
+    }
 
     @Test
     public void testCannotDropActivePartitionWhenO3HasARowFromTheFuture() throws Exception {
         assertMemoryLeak(TestFilesFacadeImpl.INSTANCE, () -> {
-                    final String tableName = testName.getMethodName();
+                    final String tableName = "tab";
                     try {
                         createTableX(tableName,
                                 TableHeader +
@@ -75,16 +100,20 @@ public class AlterTableDropActivePartitionTest extends AbstractCairoTest {
                         insert("insert into " + tableName + " values(5, '2023-10-15T00:00:02.000000Z')");
                         dropPartition(tableName, "2023-10-12");
                         dropPartition(tableName, LastPartitionTs);
-                        assertSql(TableHeader +
-                                "1\t2023-10-10T00:00:00.000000Z\n" +
-                                "2\t2023-10-11T00:00:00.000000Z\n", tableName);
+                        assertQuery(tableName)
+                                .noLeakCheck()
+                                .expectSize()
+                                .timestamp("timestamp")
+                                .returns(replaceTimestampSuffix(TableHeader +
+                                        "1\t2023-10-10T00:00:00.000000Z\n" +
+                                        "2\t2023-10-11T00:00:00.000000Z\n"));
                         insert("insert into " + tableName + " values(5, '2023-10-12T00:00:00.000000Z')");
                         insert("insert into " + tableName + " values(1, '2023-10-16T00:00:00.000000Z')");
 
                         try {
                             dropPartition(tableName, LastPartitionTs); // because it does not exist
                         } catch (CairoException ex) {
-                            TestUtils.assertContains(ex.getFlyweightMessage(), "could not remove partition [table=testCannotDropActivePartitionWhenO3HasARowFromTheFuture, partitionTimestamp=2023-10-15");
+                            TestUtils.assertContains(ex.getFlyweightMessage(), "could not remove partition [table=tab, partitionTimestamp=2023-10-15");
                         }
 
                         assertTableX(tableName, TableHeader +
@@ -112,7 +141,7 @@ public class AlterTableDropActivePartitionTest extends AbstractCairoTest {
     @Test
     public void testCannotDropWhenThereIsAWriter() throws Exception {
         assertMemoryLeak(TestFilesFacadeImpl.INSTANCE, () -> {
-                    final String tableName = testName.getMethodName();
+                    final String tableName = "tab";
                     try {
                         createTableX(
                                 tableName,
@@ -146,7 +175,7 @@ public class AlterTableDropActivePartitionTest extends AbstractCairoTest {
     @Test
     public void testDetachPartitionsLongerPartitionName() throws Exception {
         assertMemoryLeak(TestFilesFacadeImpl.INSTANCE, () -> {
-                    final String tableName = testName.getMethodName();
+                    final String tableName = "tab";
                     try {
                         createTableX(tableName,
                                 TableHeader +
@@ -181,7 +210,7 @@ public class AlterTableDropActivePartitionTest extends AbstractCairoTest {
     @Test
     public void testDropActivePartitionCreateItAgainAndDoItAgain() throws Exception {
         assertMemoryLeak(TestFilesFacadeImpl.INSTANCE, () -> {
-                    final String tableName = testName.getMethodName();
+                    final String tableName = "tab";
                     try {
                         createTableX(tableName,
                                 TableHeader +
@@ -194,9 +223,13 @@ public class AlterTableDropActivePartitionTest extends AbstractCairoTest {
                         assertTableX(tableName, TableHeader, EmptyTableMinMaxCount);
                         insert("insert into " + tableName + " values(5, '2023-10-15T00:00:00.000000Z')");
                         insert("insert into " + tableName + " values(1, '2023-10-16T00:00:00.000000Z')"); // spurious row from the future
-                        assertSql(TableHeader +
-                                "5\t2023-10-15T00:00:00.000000Z\n" +
-                                "1\t2023-10-16T00:00:00.000000Z\n", tableName); // new active partition
+                        assertQuery(tableName)
+                                .noLeakCheck()
+                                .expectSize()
+                                .timestamp("timestamp")
+                                .returns(replaceTimestampSuffix(TableHeader +
+                                        "5\t2023-10-15T00:00:00.000000Z\n" +
+                                        "1\t2023-10-16T00:00:00.000000Z\n")); // new active partition
                         dropPartition(tableName, "2023-10-16");
                         dropPartition(tableName, LastPartitionTs);
                         assertTableX(tableName, TableHeader, EmptyTableMinMaxCount);
@@ -210,7 +243,7 @@ public class AlterTableDropActivePartitionTest extends AbstractCairoTest {
     @Test
     public void testDropActivePartitionDetach() throws Exception {
         assertMemoryLeak(TestFilesFacadeImpl.INSTANCE, () -> {
-                    final String tableName = testName.getMethodName();
+                    final String tableName = "tab";
                     try {
                         createTableX(tableName,
                                 TableHeader +
@@ -232,9 +265,13 @@ public class AlterTableDropActivePartitionTest extends AbstractCairoTest {
                         dropPartition(tableName, LastPartitionTs); // drop active partition
 
                         dropPartition(tableName, "2023-10-12"); // drop new active partition
-                        assertSql(TableHeader +
-                                "1\t2023-10-10T00:00:00.000000Z\n" +
-                                "2\t2023-10-11T00:00:00.000000Z\n", tableName);
+                        assertQuery(tableName)
+                                .noLeakCheck()
+                                .expectSize()
+                                .timestamp("timestamp")
+                                .returns(replaceTimestampSuffix(TableHeader +
+                                        "1\t2023-10-10T00:00:00.000000Z\n" +
+                                        "2\t2023-10-11T00:00:00.000000Z\n"));
 
                         insert("insert into " + tableName + " values(5, '2023-10-12T00:00:17.000000Z')");
                         insert("insert into " + tableName + " values(1, '2023-10-16T00:00:00.000000Z')");
@@ -256,7 +293,7 @@ public class AlterTableDropActivePartitionTest extends AbstractCairoTest {
     @Test
     public void testDropActivePartitionDetachHigherResolutionTimestamp() throws Exception {
         assertMemoryLeak(TestFilesFacadeImpl.INSTANCE, () -> {
-                    final String tableName = testName.getMethodName();
+                    final String tableName = "tab";
                     try {
                         createTableX(tableName,
                                 TableHeader +
@@ -297,7 +334,7 @@ public class AlterTableDropActivePartitionTest extends AbstractCairoTest {
     @Test
     public void testDropActivePartitionDetachLowerResolutionTimestamp() throws Exception {
         assertMemoryLeak(TestFilesFacadeImpl.INSTANCE, () -> {
-                    final String tableName = testName.getMethodName();
+                    final String tableName = "tab";
                     try {
                         createTableX(tableName,
                                 TableHeader +
@@ -340,13 +377,13 @@ public class AlterTableDropActivePartitionTest extends AbstractCairoTest {
     public void testDropActivePartitionFailsBecausePrevMaxPartitionIsIncorrect() throws Exception {
         FilesFacade myFf = new TestFilesFacadeImpl() {
             @Override
-            public long readNonNegativeLong(int fd, long offset) {
+            public long readNonNegativeLong(long fd, long offset) {
                 return 17;
             }
         };
 
         assertMemoryLeak(myFf, () -> {
-                    final String tableName = testName.getMethodName();
+                    final String tableName = "tab";
                     try {
                         createTableX(tableName,
                                 TableHeader +
@@ -361,8 +398,8 @@ public class AlterTableDropActivePartitionTest extends AbstractCairoTest {
                             dropPartition(tableName, LastPartitionTs);
                         } catch (CairoException |
                                  SqlException ex) { // the latter is due to an assertion in SqlException.position
-                            TestUtils.assertContains(ex.getFlyweightMessage(), "invalid timestamp column data in detached partition");
-                            TestUtils.assertContains(ex.getFlyweightMessage(), "timestamp.d, minTimestamp=1970-01-01T00:00:00.000Z, maxTimestamp=1970-01-01T00:00:00.000Z]");
+                            TestUtils.assertContains(ex.getFlyweightMessage(), "invalid timestamp data in detached partition");
+                            TestUtils.assertContains(ex.getFlyweightMessage(), replaceTimestampSuffix("minTimestamp=1970-01-01T00:00:00.000017Z, maxTimestamp=1970-01-01T00:00:00.000017Z]", timestampType.getTypeName()));
                         }
                     } finally {
                         Misc.free(workerPool);
@@ -375,13 +412,13 @@ public class AlterTableDropActivePartitionTest extends AbstractCairoTest {
     public void testDropActivePartitionFailsBecauseWeCannotReadPrevMaxPartition() throws Exception {
         FilesFacade myFf = new TestFilesFacadeImpl() {
             @Override
-            public long readNonNegativeLong(int fd, long offset) {
+            public long readNonNegativeLong(long fd, long offset) {
                 return -1;
             }
         };
 
         assertMemoryLeak(myFf, () -> {
-                    final String tableName = testName.getMethodName();
+                    final String tableName = "tab";
                     try {
                         createTableX(tableName,
                                 TableHeader +
@@ -396,7 +433,7 @@ public class AlterTableDropActivePartitionTest extends AbstractCairoTest {
                             dropPartition(tableName, LastPartitionTs);
                         } catch (CairoException |
                                  SqlException ex) { // the latter is due to an assertion in SqlException.position
-                            TestUtils.assertContains(ex.getFlyweightMessage(), "cannot read min, max timestamp from the column");
+                            TestUtils.assertContains(ex.getFlyweightMessage(), "cannot read min, max timestamp from the");
                         }
                     } finally {
                         Misc.free(workerPool);
@@ -408,7 +445,7 @@ public class AlterTableDropActivePartitionTest extends AbstractCairoTest {
     @Test
     public void testDropActivePartitionNoReaders() throws Exception {
         assertMemoryLeak(TestFilesFacadeImpl.INSTANCE, () -> {
-                    final String tableName = testName.getMethodName();
+                    final String tableName = "tab";
                     try {
                         createTableX(tableName,
                                 TableHeader +
@@ -443,7 +480,7 @@ public class AlterTableDropActivePartitionTest extends AbstractCairoTest {
     @Test
     public void testDropActivePartitionWithReaders() throws Exception {
         assertMemoryLeak(TestFilesFacadeImpl.INSTANCE, () -> {
-                    final String tableName = testName.getMethodName();
+                    final String tableName = "tab";
 
                     final String expectedTable = TableHeader +
                             "1\t2023-10-10T00:00:00.000000Z\n" +
@@ -490,7 +527,11 @@ public class AlterTableDropActivePartitionTest extends AbstractCairoTest {
                                 TableReader reader0 = getReader(tableName);
                                 TableReader reader1 = getReader(tableName)
                         ) {
-                            assertSql(expectedTable, tableName);
+                            assertQuery(tableName)
+                                    .noLeakCheck()
+                                    .expectSize()
+                                    .timestamp("timestamp")
+                                    .returns(replaceTimestampSuffix(expectedTable));
                             Assert.assertEquals(6, reader0.size());
                             Assert.assertEquals(6, reader1.size());
 
@@ -499,11 +540,19 @@ public class AlterTableDropActivePartitionTest extends AbstractCairoTest {
                             reader1.reload();
                             Assert.assertEquals(5, reader0.size());
                             Assert.assertEquals(5, reader1.size());
-                            assertSql(expectedTableAfterFirstDrop, tableName);
+                            assertQuery(tableName)
+                                    .noLeakCheck()
+                                    .expectSize()
+                                    .timestamp("timestamp")
+                                    .returns(replaceTimestampSuffix(expectedTableAfterFirstDrop));
 
                             insert("insert into " + tableName + " values(8, '2023-10-12T00:00:05.000001Z')");
                             insert("insert into " + tableName + " values(7, '2023-10-15T00:00:01.000000Z')");
-                            assertSql(expectedTableInTransaction, tableName);
+                            assertQuery(tableName)
+                                    .noLeakCheck()
+                                    .expectSize()
+                                    .timestamp("timestamp")
+                                    .returns(replaceTimestampSuffix(expectedTableInTransaction));
                             reader0.reload();
                             reader1.reload();
                             Assert.assertEquals(7, reader0.size());
@@ -522,7 +571,7 @@ public class AlterTableDropActivePartitionTest extends AbstractCairoTest {
     @Test
     public void testDropActivePartitionWithUncommittedO3RowsWithReaders() throws Exception {
         assertMemoryLeak(TestFilesFacadeImpl.INSTANCE, () -> {
-                    final String tableName = testName.getMethodName();
+                    final String tableName = "tab";
 
                     final String expectedTable = TableHeader +
                             "1\t2023-10-10T00:00:00.000000Z\n" +
@@ -549,31 +598,40 @@ public class AlterTableDropActivePartitionTest extends AbstractCairoTest {
                             "6\t2023-10-12T00:00:02.000000Z\n" +
                             "50\t2023-10-12T00:00:03.000000Z\n";
 
+                    TimestampDriver driver = timestampType.getDriver();
                     try (
                             TableReader reader0 = getReader(tableName);
                             TableReader reader1 = getReader(tableName);
                             TableWriter writer = getWriter(tableName)
                     ) {
-                        long lastTs = TimestampFormatUtils.parseTimestamp(LastPartitionTs + "T00:00:00.000000Z");
+                        long lastTs = driver.parseFloorLiteral(LastPartitionTs + "T00:00:00.000000Z");
 
                         TableWriter.Row row = writer.newRow(lastTs);
                         row.putInt(0, 100); // will be removed
                         row.append();
 
-                        row = writer.newRow(TimestampFormatUtils.parseTimestamp("2023-10-12T00:00:03.000000Z")); // earlier timestamp
+                        row = writer.newRow(driver.parseFloorLiteral("2023-10-12T00:00:03.000000Z")); // earlier timestamp
                         row.putInt(0, 50);
                         row.append();
 
                         Assert.assertEquals(6, reader0.size());
                         Assert.assertEquals(6, reader1.size());
 
-                        assertSql(expectedTable, tableName);
+                        assertQuery(tableName)
+                                .noLeakCheck()
+                                .expectSize()
+                                .timestamp("timestamp")
+                                .returns(replaceTimestampSuffix(expectedTable));
 
                         writer.removePartition(lastTs);
 
                         Assert.assertEquals(6, reader0.size());
                         Assert.assertEquals(6, reader1.size());
-                        assertSql(expectedTableAfterDrop, tableName);
+                        assertQuery(tableName)
+                                .noLeakCheck()
+                                .expectSize()
+                                .timestamp("timestamp")
+                                .returns(replaceTimestampSuffix(expectedTableAfterDrop));
                         reader0.reload();
                         reader1.reload();
                         Assert.assertEquals(6, reader0.size());
@@ -595,7 +653,7 @@ public class AlterTableDropActivePartitionTest extends AbstractCairoTest {
     @Test
     public void testDropActivePartitionWithUncommittedRowsNoReaders() throws Exception {
         assertMemoryLeak(TestFilesFacadeImpl.INSTANCE, () -> {
-                    final String tableName = testName.getMethodName();
+                    final String tableName = "tab";
                     try {
                         createTableX(tableName,
                                 TableHeader +
@@ -611,18 +669,19 @@ public class AlterTableDropActivePartitionTest extends AbstractCairoTest {
                                 "insert into " + tableName + " values(4, '2023-10-12T00:00:01.000000Z')",
                                 "insert into " + tableName + " values(5, '2023-10-15T00:00:00.000000Z')",
                                 "insert into " + tableName + " values(6, '2023-10-12T00:00:02.000000Z')");
+                        TimestampDriver driver = timestampType.getDriver();
                         try (TableWriter writer = getWriter(tableName)) {
-                            long lastTs = TimestampFormatUtils.parseTimestamp(LastPartitionTs + "T00:00:00.000000Z");
+                            long lastTs = driver.parseFloorLiteral(LastPartitionTs + "T00:00:00.000000Z");
 
                             TableWriter.Row row = writer.newRow(lastTs); // expected to be lost
                             row.putInt(0, 100);
                             row.append();
 
-                            row = writer.newRow(TimestampFormatUtils.parseTimestamp("2023-10-10T00:00:07.000000Z")); // expected to survive
+                            row = writer.newRow(driver.parseFloorLiteral("2023-10-10T00:00:07.000000Z")); // expected to survive
                             row.putInt(0, 50);
                             row.append();
 
-                            row = writer.newRow(TimestampFormatUtils.parseTimestamp("2023-10-12T10:00:03.000000Z")); // expected to be lost
+                            row = writer.newRow(driver.parseFloorLiteral("2023-10-12T10:00:03.000000Z")); // expected to be lost
                             row.putInt(0, 75);
                             row.append();
 
@@ -648,7 +707,7 @@ public class AlterTableDropActivePartitionTest extends AbstractCairoTest {
     @Test
     public void testDropActivePartitionWithUncommittedRowsWithReaders() throws Exception {
         assertMemoryLeak(TestFilesFacadeImpl.INSTANCE, () -> {
-                    final String tableName = testName.getMethodName();
+                    final String tableName = "tab";
 
                     final String expectedTable = TableHeader +
                             "1\t2023-10-10T00:00:00.000000Z\n" +
@@ -676,14 +735,15 @@ public class AlterTableDropActivePartitionTest extends AbstractCairoTest {
                                 "6\t2023-10-12T00:00:02.000000Z\n" +
                                 "50\t2023-10-12T00:00:03.000000Z\n";
 
+                        TimestampDriver driver = timestampType.getDriver();
                         try (
                                 TableReader reader0 = getReader(tableName);
                                 TableReader reader1 = getReader(tableName);
                                 TableWriter writer = getWriter(tableName)
                         ) {
-                            long lastTs = TimestampFormatUtils.parseTimestamp(LastPartitionTs + "T00:00:00.000000Z");
+                            long lastTs = driver.parseFloorLiteral(LastPartitionTs + "T00:00:00.000000Z");
 
-                            TableWriter.Row row = writer.newRow(TimestampFormatUtils.parseTimestamp("2023-10-12T00:00:03.000000Z")); // earlier timestamp
+                            TableWriter.Row row = writer.newRow(driver.parseFloorLiteral("2023-10-12T00:00:03.000000Z")); // earlier timestamp
                             row.putInt(0, 50);
                             row.append();
 
@@ -694,13 +754,21 @@ public class AlterTableDropActivePartitionTest extends AbstractCairoTest {
                             Assert.assertEquals(6, reader0.size());
                             Assert.assertEquals(6, reader1.size());
 
-                            assertSql(expectedTable, tableName);
+                            assertQuery(tableName)
+                                    .noLeakCheck()
+                                    .expectSize()
+                                    .timestamp("timestamp")
+                                    .returns(replaceTimestampSuffix(expectedTable));
 
                             writer.removePartition(lastTs);
 
                             Assert.assertEquals(6, reader0.size());
                             Assert.assertEquals(6, reader1.size());
-                            assertSql(expectedTableAfterDrop, tableName);
+                            assertQuery(tableName)
+                                    .noLeakCheck()
+                                    .expectSize()
+                                    .timestamp("timestamp")
+                                    .returns(replaceTimestampSuffix(expectedTableAfterDrop));
                             reader0.reload();
                             reader1.reload();
                             Assert.assertEquals(6, reader0.size());
@@ -725,7 +793,7 @@ public class AlterTableDropActivePartitionTest extends AbstractCairoTest {
     @Test
     public void testDropAllPartitions() throws Exception {
         assertMemoryLeak(TestFilesFacadeImpl.INSTANCE, () -> {
-                    final String tableName = testName.getMethodName();
+                    final String tableName = "tab";
                     try {
                         createTableX(tableName,
                                 TableHeader +
@@ -743,7 +811,7 @@ public class AlterTableDropActivePartitionTest extends AbstractCairoTest {
                                 "insert into " + tableName + " values(6, '2023-10-12T00:00:02.000000Z')");
 
 
-                        ddl("alter table " + tableName + " drop partition where timestamp > 0");
+                        execute("alter table " + tableName + " drop partition where timestamp > 0");
                         assertTableX(tableName, TableHeader, EmptyTableMinMaxCount); // empty table
                     } finally {
                         Misc.free(workerPool);
@@ -755,11 +823,11 @@ public class AlterTableDropActivePartitionTest extends AbstractCairoTest {
     @Test
     public void testDropAllPartitionsButThereAreNoPartitions() throws Exception {
         assertMemoryLeak(() -> {
-                    final String tableName = testName.getMethodName();
+                    final String tableName = "tab";
                     try {
                         createTableX(tableName, TableHeader);
                         try {
-                            ddl("alter table " + tableName + " drop partition where timestamp > 0", sqlExecutionContext);
+                            execute("alter table " + tableName + " drop partition where timestamp > 0", sqlExecutionContext);
                             Assert.fail();
                         } catch (CairoException e) {
                             Assert.assertEquals(("alter table " + tableName + " drop partition where ").length(), e.getPosition());
@@ -775,7 +843,7 @@ public class AlterTableDropActivePartitionTest extends AbstractCairoTest {
     @Test
     public void testDropLastPartitionNoReaders() throws Exception {
         assertMemoryLeak(TestFilesFacadeImpl.INSTANCE, () -> {
-                    final String tableName = testName.getMethodName();
+                    final String tableName = "tab";
                     try {
                         createTableX(tableName,
                                 TableHeader +
@@ -793,7 +861,7 @@ public class AlterTableDropActivePartitionTest extends AbstractCairoTest {
     @Test
     public void testDropLastPartitionWithReaders() throws Exception {
         assertMemoryLeak(TestFilesFacadeImpl.INSTANCE, () -> {
-                    final String tableName = testName.getMethodName();
+                    final String tableName = "tab";
                     try {
                         createTableX(
                                 tableName,
@@ -819,7 +887,11 @@ public class AlterTableDropActivePartitionTest extends AbstractCairoTest {
 
                                 Assert.assertEquals(2, reader0.size());
                                 Assert.assertEquals(3, reader1.size());
-                                assertSql(expectedTableInTransaction, tableName);
+                                assertQuery(tableName)
+                                        .noLeakCheck()
+                                        .expectSize()
+                                        .timestamp("timestamp")
+                                        .returns(replaceTimestampSuffix(expectedTableInTransaction));
 
                                 dropPartition(tableName, LastPartitionTs);
 
@@ -833,7 +905,7 @@ public class AlterTableDropActivePartitionTest extends AbstractCairoTest {
                                         RecordCursorFactory factory = select(tableName);
                                         RecordCursor cursor = factory.getCursor(sqlExecutionContext)
                                 ) {
-                                    assertCursor(expectedTableAfterDrop, cursor, factory.getMetadata(), true);
+                                    assertCursor(replaceTimestampSuffix(expectedTableAfterDrop), cursor, factory.getMetadata(), true);
                                 }
                                 assertFactoryMemoryUsage();
                             }
@@ -850,12 +922,13 @@ public class AlterTableDropActivePartitionTest extends AbstractCairoTest {
     @Test
     public void testDropLastPartitionWithUncommittedO3RowsNoReaders() throws Exception {
         assertMemoryLeak(TestFilesFacadeImpl.INSTANCE, () -> {
-                    final String tableName = testName.getMethodName();
+                    final String tableName = "tab";
                     try {
                         createTableX(tableName, TableHeader); // empty table
+                        TimestampDriver driver = timestampType.getDriver();
                         try (TableWriter writer = getWriter(tableName)) {
-                            long lastTs = TimestampFormatUtils.parseTimestamp(LastPartitionTs + "T00:00:00.000000Z");
-                            long o3Ts = TimestampFormatUtils.parseTimestamp("2023-10-14T23:59:59.999999Z"); // o3 previous day
+                            long lastTs = driver.parseFloorLiteral(LastPartitionTs + "T00:00:00.000000Z");
+                            long o3Ts = driver.parseFloorLiteral("2023-10-14T23:59:59.999999Z"); // o3 previous day
 
                             TableWriter.Row row = writer.newRow(lastTs); // will not survive, as it belongs in the active partition
                             row.putInt(0, 100);
@@ -884,12 +957,13 @@ public class AlterTableDropActivePartitionTest extends AbstractCairoTest {
     @Test
     public void testDropLastPartitionWithUncommittedRowsNoReaders() throws Exception {
         assertMemoryLeak(TestFilesFacadeImpl.INSTANCE, () -> {
-                    final String tableName = testName.getMethodName();
+                    final String tableName = "tab";
                     try {
                         createTableX(tableName, TableHeader); // empty table
+                        TimestampDriver driver = timestampType.getDriver();
                         try (TableWriter writer = getWriter(tableName)) {
-                            long prevTs = TimestampFormatUtils.parseTimestamp("2023-10-14T23:59:59.999999Z"); // previous day
-                            long lastTs = TimestampFormatUtils.parseTimestamp(LastPartitionTs + "T00:00:00.000000Z");
+                            long prevTs = driver.parseFloorLiteral("2023-10-14T23:59:59.999999Z"); // previous day
+                            long lastTs = driver.parseFloorLiteral(LastPartitionTs + "T00:00:00.000000Z");
 
                             TableWriter.Row row = writer.newRow(prevTs); // expected to survive
                             row.putInt(0, 300);
@@ -918,7 +992,7 @@ public class AlterTableDropActivePartitionTest extends AbstractCairoTest {
     @Test
     public void testDropPartitionsLongerPartitionName() throws Exception {
         assertMemoryLeak(TestFilesFacadeImpl.INSTANCE, () -> {
-                    final String tableName = testName.getMethodName();
+                    final String tableName = "tab";
                     try {
                         createTableX(tableName,
                                 TableHeader +
@@ -950,9 +1024,13 @@ public class AlterTableDropActivePartitionTest extends AbstractCairoTest {
         );
     }
 
-    private void assertTableX(String tableName, String expectedRows, String expectedMinMaxCount) throws SqlException {
+    private void assertTableX(String tableName, String expectedRows, String expectedMinMaxCount) throws Exception {
         engine.releaseAllReaders();
-        assertSql(expectedRows, tableName);
+        assertQuery(tableName)
+                .noLeakCheck()
+                .expectSize()
+                .timestamp("timestamp")
+                .returns(replaceTimestampSuffix(expectedRows));
         engine.releaseAllWriters();
         try (Path path = new Path().of(root).concat(tableName).concat(LastPartitionTs)) {
             TestUtils.txnPartitionConditionally(path, txn);
@@ -961,21 +1039,31 @@ public class AlterTableDropActivePartitionTest extends AbstractCairoTest {
         } finally {
             Misc.free(workerPool);
         }
-        assertSql(expectedMinMaxCount, "select min(timestamp), max(timestamp), count() from " + tableName);
+        assertQuery("select min(timestamp), max(timestamp), count() from " + tableName)
+                .noLeakCheck()
+                .expectSize()
+                .noRandomAccess()
+                .returns(replaceTimestampSuffix(expectedMinMaxCount));
     }
 
-    private void createTableX(String tableName, String expected, String... insertStmt) throws SqlException {
-        TableModel model = new TableModel(configuration, tableName, PartitionBy.DAY).col("id", ColumnType.INT).timestamp();
+    private void createTableX(String tableName, String expected, String... insertStmt) throws Exception {
+        TableModel model = new TableModel(configuration, tableName, PartitionBy.DAY)
+                .col("id", ColumnType.INT)
+                .timestamp(timestampType.getTimestampType());
         AbstractCairoTest.create(model);
         txn = 0;
         //noinspection ForLoopReplaceableByForEach
         for (int i = 0, n = insertStmt.length; i < n; i++) {
             insert(insertStmt[i]);
         }
-        assertSql(expected, tableName);
+        assertQuery(tableName)
+                .noLeakCheck()
+                .expectSize()
+                .timestamp("timestamp")
+                .returns(replaceTimestampSuffix(expected));
 
         workerPool = new TestWorkerPool(1);
-        O3PartitionPurgeJob partitionPurgeJob = new O3PartitionPurgeJob(engine, engine.getSnapshotAgent(), 1);
+        O3PartitionPurgeJob partitionPurgeJob = new O3PartitionPurgeJob(engine, 1);
         workerPool.assign(partitionPurgeJob);
         workerPool.freeOnExit(partitionPurgeJob);
         workerPool.start(); // closed by assertTableX
@@ -983,15 +1071,21 @@ public class AlterTableDropActivePartitionTest extends AbstractCairoTest {
 
     @SuppressWarnings("SameParameterValue")
     private void detachPartition(String tableName, String partitionName) throws SqlException {
-        ddl("alter table " + tableName + " detach partition list '" + partitionName + "'");
+        execute("alter table " + tableName + " detach partition list '" + partitionName + "'");
     }
 
     private void dropPartition(String tableName, String partitionName) throws SqlException {
-        ddl("alter table " + tableName + " drop partition list '" + partitionName + "'");
+        execute("alter table " + tableName + " drop partition list '" + partitionName + "'");
     }
 
     private void insert(String stmt) throws SqlException {
-        AbstractCairoTest.insert(stmt);
+        AbstractCairoTest.execute(stmt);
         txn++;
+    }
+
+    private String replaceTimestampSuffix(String expected) {
+        return ColumnType.isTimestampNano(timestampType.getTimestampType())
+                ? expected.replace("Z\t", "000Z\t").replace("Z\n", "000Z\n")
+                : expected;
     }
 }

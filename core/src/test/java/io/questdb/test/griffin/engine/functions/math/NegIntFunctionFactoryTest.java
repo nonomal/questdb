@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -25,27 +25,25 @@
 package io.questdb.test.griffin.engine.functions.math;
 
 import io.questdb.griffin.FunctionFactory;
-import io.questdb.griffin.SqlException;
-import io.questdb.test.griffin.engine.AbstractFunctionFactoryTest;
 import io.questdb.griffin.engine.functions.math.NegIntFunctionFactory;
-import io.questdb.std.Numbers;
+import io.questdb.test.griffin.engine.AbstractFunctionFactoryTest;
 import org.junit.Test;
 
 public class NegIntFunctionFactoryTest extends AbstractFunctionFactoryTest {
 
     @Test
-    public void testNaN() throws SqlException {
-        call(Numbers.INT_NULL).andAssert(Numbers.INT_NULL);
+    public void testNaN() throws Exception {
+        assertQuery("SELECT -null").expectSize().returns("column\nnull\n");
     }
 
     @Test
-    public void testNegative() throws SqlException {
-        call(-123).andAssert(123);
+    public void testNegative() throws Exception {
+        assertQuery("SELECT -(-123)").expectSize().returns("column\n123\n");
     }
 
     @Test
-    public void testPositive() throws SqlException {
-        call(123).andAssert(-123);
+    public void testPositive() throws Exception {
+        assertQuery("SELECT -123").expectSize().returns("column\n-123\n");
     }
 
     @Override

@@ -1,0 +1,995 @@
+/*+*****************************************************************************
+ *     ___                  _   ____  ____
+ *    / _ \ _   _  ___  ___| |_|  _ \| __ )
+ *   | | | | | | |/ _ \/ __| __| | | |  _ \
+ *   | |_| | |_| |  __/\__ \ |_| |_| | |_) |
+ *    \__\_\\__,_|\___||___/\__|____/|____/
+ *
+ *  Copyright (c) 2014-2019 Appsicle
+ *  Copyright (c) 2019-2026 QuestDB
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *
+ *  http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ *
+ ******************************************************************************/
+
+package io.questdb.test.griffin.engine.functions.cast;
+
+import io.questdb.test.AbstractCairoTest;
+import org.junit.Test;
+
+public class CastDecimalToIntFunctionFactoryTest extends AbstractCairoTest {
+
+    @Test
+    public void testCastDecimalWithScale() throws Exception {
+        assertMemoryLeak(
+                () -> {
+                    // Truncates decimal part
+                    assertQuery("select cast(123.45m as int)")
+                            .noLeakCheck()
+                            .expectSize()
+                            .returns("""
+                                    cast
+                                    123
+                                    """);
+
+                    assertQuery("select cast(123.99m as int)")
+                            .noLeakCheck()
+                            .expectSize()
+                            .returns("""
+                                    cast
+                                    123
+                                    """);
+
+                    assertQuery("select cast(-123.45m as int)")
+                            .noLeakCheck()
+                            .expectSize()
+                            .returns("""
+                                    cast
+                                    -123
+                                    """);
+
+                    assertQuery("select cast(-123.99m as int)")
+                            .noLeakCheck()
+                            .expectSize()
+                            .returns("""
+                                    cast
+                                    -123
+                                    """);
+
+                    // Zero with decimal places
+                    assertQuery("select cast(0.99m as int)")
+                            .noLeakCheck()
+                            .expectSize()
+                            .returns("""
+                                    cast
+                                    0
+                                    """);
+
+                    assertQuery("select cast(0.01m as int)")
+                            .noLeakCheck()
+                            .expectSize()
+                            .returns("""
+                                    cast
+                                    0
+                                    """);
+
+                    assertQuery("select cast(-0.99m as int)")
+                            .noLeakCheck()
+                            .expectSize()
+                            .returns("""
+                                    cast
+                                    0
+                                    """);
+                }
+        );
+    }
+
+    @Test
+    public void testCastExplains() throws Exception {
+        assertMemoryLeak(
+                () -> {
+                    // Runtime value with scale
+                    assertQuery("WITH data AS (SELECT 123.45m AS value) SELECT cast(value as int) FROM data")
+                            .noLeakCheck()
+                            .assertsPlan("""
+                                    VirtualRecord
+                                      functions: [value::int]
+                                        VirtualRecord
+                                          functions: [123.45]
+                                            long_sequence count: 1
+                                    """);
+
+                    // Runtime value without scale
+                    assertQuery("WITH data AS (SELECT 123m AS value) SELECT cast(value as int) FROM data")
+                            .noLeakCheck()
+                            .assertsPlan("""
+                                    VirtualRecord
+                                      functions: [value::int]
+                                        VirtualRecord
+                                          functions: [123]
+                                            long_sequence count: 1
+                                    """);
+
+                    // Expression should be constant folded
+                    assertQuery("SELECT cast(123.45m as int)")
+                            .noLeakCheck()
+                            .assertsPlan("""
+                                    VirtualRecord
+                                      functions: [123]
+                                        long_sequence count: 1
+                                    """);
+                }
+        );
+    }
+
+    @Test
+    public void testCastExplainsForDifferentDecimalTypes() throws Exception {
+        assertMemoryLeak(
+                () -> {
+                    // DECIMAL8 unscaled
+                    assertQuery("WITH data AS (SELECT cast(99m as DECIMAL(2)) AS value) SELECT cast(value as int) FROM data")
+                            .noLeakCheck()
+                            .assertsPlan("""
+                                    VirtualRecord
+                                      functions: [value::int]
+                                        VirtualRecord
+                                          functions: [99]
+                                            long_sequence count: 1
+                                    """);
+
+                    // DECIMAL16 unscaled
+                    assertQuery("WITH data AS (SELECT cast(9999m as DECIMAL(4)) AS value) SELECT cast(value as int) FROM data")
+                            .noLeakCheck()
+                            .assertsPlan("""
+                                    VirtualRecord
+                                      functions: [value::int]
+                                        VirtualRecord
+                                          functions: [9999]
+                                            long_sequence count: 1
+                                    """);
+
+                    // DECIMAL32 unscaled
+                    assertQuery("WITH data AS (SELECT cast(999999999m as DECIMAL(9)) AS value) SELECT cast(value as int) FROM data")
+                            .noLeakCheck()
+                            .assertsPlan("""
+                                    VirtualRecord
+                                      functions: [value::int]
+                                        VirtualRecord
+                                          functions: [999999999]
+                                            long_sequence count: 1
+                                    """);
+
+                    // DECIMAL64 unscaled
+                    assertQuery("WITH data AS (SELECT cast(2147483647m as DECIMAL(10)) AS value) SELECT cast(value as int) FROM data")
+                            .noLeakCheck()
+                            .assertsPlan("""
+                                    VirtualRecord
+                                      functions: [value::int]
+                                        VirtualRecord
+                                          functions: [2147483647]
+                                            long_sequence count: 1
+                                    """);
+
+                    // DECIMAL128 unscaled
+                    assertQuery("WITH data AS (SELECT cast(2147483647m as DECIMAL(19)) AS value) SELECT cast(value as int) FROM data")
+                            .noLeakCheck()
+                            .assertsPlan("""
+                                    VirtualRecord
+                                      functions: [value::int]
+                                        VirtualRecord
+                                          functions: [2147483647]
+                                            long_sequence count: 1
+                                    """);
+
+                    // DECIMAL256 unscaled
+                    assertQuery("WITH data AS (SELECT cast(2147483647m as DECIMAL(40)) AS value) SELECT cast(value as int) FROM data")
+                            .noLeakCheck()
+                            .assertsPlan("""
+                                    VirtualRecord
+                                      functions: [value::int]
+                                        VirtualRecord
+                                          functions: [2147483647]
+                                            long_sequence count: 1
+                                    """);
+
+                    // With scale - tests ScaledDecimalFunction
+                    assertQuery("WITH data AS (SELECT cast(99.5m as DECIMAL(4,2)) AS value) SELECT cast(value as int) FROM data")
+                            .noLeakCheck()
+                            .assertsPlan("""
+                                    VirtualRecord
+                                      functions: [value::int]
+                                        VirtualRecord
+                                          functions: [99.50]
+                                            long_sequence count: 1
+                                    """);
+
+                    // Constant folding for all decimal types
+                    assertQuery("SELECT cast(99m as int)")
+                            .noLeakCheck()
+                            .assertsPlan("""
+                                    VirtualRecord
+                                      functions: [99]
+                                        long_sequence count: 1
+                                    """);
+
+                    assertQuery("SELECT cast(9999m as int)")
+                            .noLeakCheck()
+                            .assertsPlan("""
+                                    VirtualRecord
+                                      functions: [9999]
+                                        long_sequence count: 1
+                                    """);
+
+                    assertQuery("SELECT cast(999999999m as int)")
+                            .noLeakCheck()
+                            .assertsPlan("""
+                                    VirtualRecord
+                                      functions: [999999999]
+                                        long_sequence count: 1
+                                    """);
+
+                    // Constant folding with scale (truncation)
+                    assertQuery("SELECT cast(123.45m as int)")
+                            .noLeakCheck()
+                            .assertsPlan("""
+                                    VirtualRecord
+                                      functions: [123]
+                                        long_sequence count: 1
+                                    """);
+
+                    assertQuery("SELECT cast(99.99m as int)")
+                            .noLeakCheck()
+                            .assertsPlan("""
+                                    VirtualRecord
+                                      functions: [99]
+                                        long_sequence count: 1
+                                    """);
+                }
+        );
+    }
+
+    @Test
+    public void testCastFromDecimal128() throws Exception {
+        assertMemoryLeak(
+                () -> {
+                    assertQuery("select cast(cast(2147483647m as DECIMAL(19)) as int)")
+                            .noLeakCheck()
+                            .expectSize()
+                            .returns("""
+                                    cast
+                                    2147483647
+                                    """);
+
+                    assertQuery("select cast(cast(-2147483647m as DECIMAL(19)) as int)")
+                            .noLeakCheck()
+                            .expectSize()
+                            .returns("""
+                                    cast
+                                    -2147483647
+                                    """);
+
+                    assertQuery("select cast(cast(null as DECIMAL(19)) as int)")
+                            .noLeakCheck()
+                            .expectSize()
+                            .returns("""
+                                    cast
+                                    null
+                                    """);
+                }
+        );
+    }
+
+    @Test
+    public void testCastFromDecimal16() throws Exception {
+        assertMemoryLeak(
+                () -> {
+                    assertQuery("select cast(cast(9999m as DECIMAL(4)) as int)")
+                            .noLeakCheck()
+                            .expectSize()
+                            .returns("""
+                                    cast
+                                    9999
+                                    """);
+
+                    assertQuery("select cast(cast(-9999m as DECIMAL(4)) as int)")
+                            .noLeakCheck()
+                            .expectSize()
+                            .returns("""
+                                    cast
+                                    -9999
+                                    """);
+
+                    assertQuery("select cast(cast(null as DECIMAL(4)) as int)")
+                            .noLeakCheck()
+                            .expectSize()
+                            .returns("""
+                                    cast
+                                    null
+                                    """);
+                }
+        );
+    }
+
+    @Test
+    public void testCastFromDecimal256() throws Exception {
+        assertMemoryLeak(
+                () -> {
+                    assertQuery("select cast(cast(2147483647m as DECIMAL(40)) as int)")
+                            .noLeakCheck()
+                            .expectSize()
+                            .returns("""
+                                    cast
+                                    2147483647
+                                    """);
+
+                    assertQuery("select cast(cast(-2147483647m as DECIMAL(40)) as int)")
+                            .noLeakCheck()
+                            .expectSize()
+                            .returns("""
+                                    cast
+                                    -2147483647
+                                    """);
+
+                    assertQuery("select cast(cast(null as DECIMAL(40)) as int)")
+                            .noLeakCheck()
+                            .expectSize()
+                            .returns("""
+                                    cast
+                                    null
+                                    """);
+                }
+        );
+    }
+
+    @Test
+    public void testCastFromDecimal32() throws Exception {
+        assertMemoryLeak(
+                () -> {
+                    assertQuery("select cast(cast(999999999m as DECIMAL(9)) as int)")
+                            .noLeakCheck()
+                            .expectSize()
+                            .returns("""
+                                    cast
+                                    999999999
+                                    """);
+
+                    assertQuery("select cast(cast(-999999999m as DECIMAL(9)) as int)")
+                            .noLeakCheck()
+                            .expectSize()
+                            .returns("""
+                                    cast
+                                    -999999999
+                                    """);
+
+                    assertQuery("select cast(cast(null as DECIMAL(9)) as int)")
+                            .noLeakCheck()
+                            .expectSize()
+                            .returns("""
+                                    cast
+                                    null
+                                    """);
+                }
+        );
+    }
+
+    @Test
+    public void testCastFromDecimal64() throws Exception {
+        assertMemoryLeak(
+                () -> {
+                    assertQuery("select cast(cast(2147483647m as DECIMAL(18)) as int)")
+                            .noLeakCheck()
+                            .expectSize()
+                            .returns("""
+                                    cast
+                                    2147483647
+                                    """);
+
+                    assertQuery("select cast(cast(-2147483647m as DECIMAL(18)) as int)")
+                            .noLeakCheck()
+                            .expectSize()
+                            .returns("""
+                                    cast
+                                    -2147483647
+                                    """);
+
+                    assertQuery("select cast(cast(null as DECIMAL(18)) as int)")
+                            .noLeakCheck()
+                            .expectSize()
+                            .returns("""
+                                    cast
+                                    null
+                                    """);
+                }
+        );
+    }
+
+    @Test
+    public void testCastFromDecimal8() throws Exception {
+        assertMemoryLeak(
+                () -> {
+                    assertQuery("select cast(cast(99m as DECIMAL(2)) as int)")
+                            .noLeakCheck()
+                            .expectSize()
+                            .returns("""
+                                    cast
+                                    99
+                                    """);
+
+                    assertQuery("select cast(cast(-99m as DECIMAL(2)) as int)")
+                            .noLeakCheck()
+                            .expectSize()
+                            .returns("""
+                                    cast
+                                    -99
+                                    """);
+
+                    assertQuery("select cast(cast(0m as DECIMAL(2)) as int)")
+                            .noLeakCheck()
+                            .expectSize()
+                            .returns("""
+                                    cast
+                                    0
+                                    """);
+
+                    assertQuery("select cast(cast(null as DECIMAL(2)) as int)")
+                            .noLeakCheck()
+                            .expectSize()
+                            .returns("""
+                                    cast
+                                    null
+                                    """);
+                }
+        );
+    }
+
+    @Test
+    public void testCastMaxIntValues() throws Exception {
+        assertMemoryLeak(
+                () -> {
+                    // Max int value from decimal
+                    assertQuery("select cast(2147483647m as int)")
+                            .noLeakCheck()
+                            .expectSize()
+                            .returns("""
+                                    cast
+                                    2147483647
+                                    """);
+
+                    // Max int value minus 1
+                    assertQuery("select cast(2147483646m as int)")
+                            .noLeakCheck()
+                            .expectSize()
+                            .returns("""
+                                    cast
+                                    2147483646
+                                    """);
+
+                    // Min int value + 1 (to avoid overflow with negation)
+                    assertQuery("select cast(-2147483647m as int)")
+                            .noLeakCheck()
+                            .expectSize()
+                            .returns("""
+                                    cast
+                                    -2147483647
+                                    """);
+
+                    // With scale - truncated
+                    assertQuery("select cast(2147483647.99m as int)")
+                            .noLeakCheck()
+                            .expectSize()
+                            .returns("""
+                                    cast
+                                    2147483647
+                                    """);
+                }
+        );
+    }
+
+    @Test
+    public void testCastNegativeValues() throws Exception {
+        assertMemoryLeak(
+                () -> {
+                    assertQuery("select cast(-1m as int)")
+                            .noLeakCheck()
+                            .expectSize()
+                            .returns("""
+                                    cast
+                                    -1
+                                    """);
+
+                    assertQuery("select cast(-123m as int)")
+                            .noLeakCheck()
+                            .expectSize()
+                            .returns("""
+                                    cast
+                                    -123
+                                    """);
+
+                    assertQuery("select cast(-999999999m as int)")
+                            .noLeakCheck()
+                            .expectSize()
+                            .returns("""
+                                    cast
+                                    -999999999
+                                    """);
+                }
+        );
+    }
+
+    @Test
+    public void testCastOverflowDecimal128() throws Exception {
+        assertMemoryLeak(
+                () -> {
+                    // Value too large for int
+                    assertQuery("select cast(cast(9223372036854775807m as DECIMAL(19)) as int)")
+                            .fails(7, "inconvertible value: 9223372036854775807 [DECIMAL(19,0) -> INT]");
+
+                    assertQuery("select cast(cast(-9223372036854775808m as DECIMAL(19)) as int)")
+                            .fails(7, "inconvertible value: -9223372036854775808 [DECIMAL(19,0) -> INT]");
+                }
+        );
+    }
+
+    @Test
+    public void testCastOverflowDecimal256() throws Exception {
+        assertMemoryLeak(
+                () -> {
+                    // Value too large for int
+                    assertQuery("select cast(cast(99999999999999999999m as DECIMAL(40)) as int)")
+                            .fails(7, "inconvertible value: 99999999999999999999 [DECIMAL(40,0) -> INT]");
+
+                    assertQuery("select cast(cast(-99999999999999999999m as DECIMAL(40)) as int)")
+                            .fails(7, "inconvertible value: -99999999999999999999 [DECIMAL(40,0) -> INT]");
+                }
+        );
+    }
+
+    @Test
+    public void testCastOverflowDecimal32() throws Exception {
+        assertMemoryLeak(
+                () -> {
+                    // Value too large for int
+                    assertQuery("select cast(cast(2147483648m as DECIMAL(10)) as int)")
+                            .fails(7, "inconvertible value: 2147483648 [DECIMAL(10,0) -> INT]");
+
+                    assertQuery("select cast(cast(-2147483649m as DECIMAL(10)) as int)")
+                            .fails(7, "inconvertible value: -2147483649 [DECIMAL(10,0) -> INT]");
+                }
+        );
+    }
+
+    @Test
+    public void testCastOverflowDecimal64() throws Exception {
+        assertMemoryLeak(
+                () -> {
+                    // Value too large for int
+                    assertQuery("select cast(cast(9999999999m as DECIMAL(18)) as int)")
+                            .fails(7, "inconvertible value: 9999999999 [DECIMAL(18,0) -> INT]");
+
+                    assertQuery("select cast(cast(-9999999999m as DECIMAL(18)) as int)")
+                            .fails(7, "inconvertible value: -9999999999 [DECIMAL(18,0) -> INT]");
+                }
+        );
+    }
+
+    @Test
+    public void testCastZeroValues() throws Exception {
+        assertMemoryLeak(
+                () -> {
+                    assertQuery("select cast(0m as int)")
+                            .noLeakCheck()
+                            .expectSize()
+                            .returns("""
+                                    cast
+                                    0
+                                    """);
+
+                    assertQuery("select cast(0.0m as int)")
+                            .noLeakCheck()
+                            .expectSize()
+                            .returns("""
+                                    cast
+                                    0
+                                    """);
+
+                    assertQuery("select cast(0.00m as int)")
+                            .noLeakCheck()
+                            .expectSize()
+                            .returns("""
+                                    cast
+                                    0
+                                    """);
+
+                    assertQuery("select cast(0.000m as int)")
+                            .noLeakCheck()
+                            .expectSize()
+                            .returns("""
+                                    cast
+                                    0
+                                    """);
+                }
+        );
+    }
+
+    @Test
+    public void testImplicitCast() throws Exception {
+        assertMemoryLeak(
+                () -> {
+                    // No implicit cast from decimal to int in arithmetic
+                    // Must use explicit cast
+                    assertQuery("select cast(1234567m as int) + 100")
+                            .noLeakCheck()
+                            .expectSize()
+                            .returns("""
+                                    column
+                                    1234667
+                                    """);
+
+                    // Runtime conversion
+                    assertQuery("with data as (select 1234567m x) select cast(x as int) + 100 from data")
+                            .noLeakCheck()
+                            .expectSize()
+                            .returns("""
+                                    column
+                                    1234667
+                                    """);
+                }
+        );
+    }
+
+    @Test
+    public void testRuntimeCastOverflowScaled() throws Exception {
+        assertMemoryLeak(
+                () -> {
+                    // Runtime overflow with scaled decimal
+                    assertQuery("WITH data AS (SELECT cast(2147483648.5m as DECIMAL(11,1)) AS value) SELECT cast(value as int) FROM data")
+                            .fails(75, "inconvertible value: 2147483648.5 [DECIMAL(11,1) -> INT]");
+
+                    assertQuery("WITH data AS (SELECT cast(-2147483649.5m as DECIMAL(11,1)) AS value) SELECT cast(value as int) FROM data")
+                            .fails(76, "inconvertible value: -2147483649.5 [DECIMAL(11,1) -> INT]");
+                }
+        );
+    }
+
+    @Test
+    public void testRuntimeCastOverflowUnscaled() throws Exception {
+        assertMemoryLeak(
+                () -> {
+                    // Runtime overflow for DECIMAL32
+                    assertQuery("WITH data AS (SELECT cast(2147483648m as DECIMAL(10)) AS value) SELECT cast(value as int) FROM data")
+                            .fails(71, "inconvertible value: 2147483648 [DECIMAL(10,0) -> INT]");
+
+                    // Runtime overflow for DECIMAL64
+                    assertQuery("WITH data AS (SELECT cast(9999999999m as DECIMAL(18)) AS value) SELECT cast(value as int) FROM data")
+                            .fails(71, "inconvertible value: 9999999999 [DECIMAL(18,0) -> INT]");
+
+                    // Runtime overflow for DECIMAL128
+                    assertQuery("WITH data AS (SELECT cast(9223372036854775807m as DECIMAL(19)) AS value) SELECT cast(value as int) FROM data")
+                            .fails(80, "inconvertible value: 9223372036854775807 [DECIMAL(19,0) -> INT]");
+
+                    // Runtime overflow for DECIMAL256
+                    assertQuery("WITH data AS (SELECT cast(99999999999999999999m as DECIMAL(40)) AS value) SELECT cast(value as int) FROM data")
+                            .fails(81, "inconvertible value: 99999999999999999999 [DECIMAL(40,0) -> INT]");
+                }
+        );
+    }
+
+    @Test
+    public void testRuntimeCastScaledDecimal128() throws Exception {
+        assertMemoryLeak(
+                () -> assertQuery("WITH data AS (SELECT cast(21474836.99m as DECIMAL(20,2)) value " +
+                        "UNION ALL SELECT cast(-21474836.99m as DECIMAL(20,2)) " +
+                        "UNION ALL SELECT cast(12345678.89m as DECIMAL(20,2)) " +
+                        "UNION ALL SELECT cast(null as DECIMAL(20,2))) " +
+                        "SELECT value, cast(value as int) as int_value FROM data")
+                        .noLeakCheck()
+                        .noRandomAccess()
+                        .expectSize()
+                        .returns("""
+                                value\tint_value
+                                21474836.99\t21474836
+                                -21474836.99\t-21474836
+                                12345678.89\t12345678
+                                \tnull
+                                """)
+        );
+    }
+
+    @Test
+    public void testRuntimeCastScaledDecimal16() throws Exception {
+        assertMemoryLeak(
+                () -> assertQuery("WITH data AS (SELECT cast(99.5m as DECIMAL(4,2)) value " +
+                        "UNION ALL SELECT cast(-99.5m as DECIMAL(4,2)) " +
+                        "UNION ALL SELECT cast(12.99m as DECIMAL(4,2)) " +
+                        "UNION ALL SELECT cast(null as DECIMAL(4,2))) " +
+                        "SELECT value, cast(value as int) as int_value FROM data")
+                        .noLeakCheck()
+                        .noRandomAccess()
+                        .expectSize()
+                        .returns("""
+                                value\tint_value
+                                99.50\t99
+                                -99.50\t-99
+                                12.99\t12
+                                \tnull
+                                """)
+        );
+    }
+
+    @Test
+    public void testRuntimeCastScaledDecimal256() throws Exception {
+        assertMemoryLeak(
+                () -> assertQuery("WITH data AS (SELECT cast(21474836.9999999999m as DECIMAL(40,10)) value " +
+                        "UNION ALL SELECT cast(-21474836.9999999999m as DECIMAL(40,10)) " +
+                        "UNION ALL SELECT cast(12345678.1234567890m as DECIMAL(40,10)) " +
+                        "UNION ALL SELECT cast(null as DECIMAL(40,10))) " +
+                        "SELECT value, cast(value as int) as int_value FROM data")
+                        .noLeakCheck()
+                        .noRandomAccess()
+                        .expectSize()
+                        .returns("""
+                                value\tint_value
+                                21474836.9999999999\t21474836
+                                -21474836.9999999999\t-21474836
+                                12345678.1234567890\t12345678
+                                \tnull
+                                """)
+        );
+    }
+
+    @Test
+    public void testRuntimeCastScaledDecimal32() throws Exception {
+        assertMemoryLeak(
+                () -> assertQuery("WITH data AS (SELECT cast(999999.999m as DECIMAL(9,3)) value " +
+                        "UNION ALL SELECT cast(-999999.999m as DECIMAL(9,3)) " +
+                        "UNION ALL SELECT cast(123456.789m as DECIMAL(9,3)) " +
+                        "UNION ALL SELECT cast(null as DECIMAL(9, 3))) " +
+                        "SELECT value, cast(value as int) as int_value FROM data")
+                        .noLeakCheck()
+                        .noRandomAccess()
+                        .expectSize()
+                        .returns("""
+                                value\tint_value
+                                999999.999\t999999
+                                -999999.999\t-999999
+                                123456.789\t123456
+                                \tnull
+                                """)
+        );
+    }
+
+    @Test
+    public void testRuntimeCastScaledDecimal64() throws Exception {
+        assertMemoryLeak(
+                () -> assertQuery("WITH data AS (SELECT cast(2147483.999999m as DECIMAL(13,6)) value " +
+                        "UNION ALL SELECT cast(-2147483.999999m as DECIMAL(13,6)) " +
+                        "UNION ALL SELECT cast(1234567.890123m as DECIMAL(13,6)) " +
+                        "UNION ALL SELECT cast(null as DECIMAL(13, 6))) " +
+                        "SELECT value, cast(value as int) as int_value FROM data")
+                        .noLeakCheck()
+                        .noRandomAccess()
+                        .expectSize()
+                        .returns("""
+                                value\tint_value
+                                2147483.999999\t2147483
+                                -2147483.999999\t-2147483
+                                1234567.890123\t1234567
+                                \tnull
+                                """)
+        );
+    }
+
+    @Test
+    public void testRuntimeCastScaledDecimal8() throws Exception {
+        assertMemoryLeak(
+                () -> assertQuery("WITH data AS (SELECT cast(9.9m as DECIMAL(2,1)) value " +
+                        "UNION ALL SELECT cast(-9.9m as DECIMAL(2,1)) " +
+                        "UNION ALL SELECT cast(0.5m as DECIMAL(2,1)) " +
+                        "UNION ALL SELECT cast(null as DECIMAL(2,1))) " +
+                        "SELECT value, cast(value as int) as int_value FROM data")
+                        .noLeakCheck()
+                        .noRandomAccess()
+                        .expectSize()
+                        .returns("""
+                                value\tint_value
+                                9.9\t9
+                                -9.9\t-9
+                                0.5\t0
+                                \tnull
+                                """)
+        );
+    }
+
+    @Test
+    public void testRuntimeCastUnscaledDecimal128() throws Exception {
+        assertMemoryLeak(
+                () -> assertQuery("WITH data AS (SELECT cast(2147483647m as DECIMAL(19)) value " +
+                        "UNION ALL SELECT cast(-2147483647m as DECIMAL(19)) " +
+                        "UNION ALL SELECT cast(1234567890m as DECIMAL(19)) " +
+                        "UNION ALL SELECT cast(null as DECIMAL(19))) " +
+                        "SELECT value, cast(value as int) as int_value FROM data")
+                        .noLeakCheck()
+                        .noRandomAccess()
+                        .expectSize()
+                        .returns("""
+                                value\tint_value
+                                2147483647\t2147483647
+                                -2147483647\t-2147483647
+                                1234567890\t1234567890
+                                \tnull
+                                """)
+        );
+    }
+
+    @Test
+    public void testRuntimeCastUnscaledDecimal16() throws Exception {
+        assertMemoryLeak(
+                () -> assertQuery("WITH data AS (SELECT cast(9999m as DECIMAL(4)) value " +
+                        "UNION ALL SELECT cast(-9999m as DECIMAL(4)) " +
+                        "UNION ALL SELECT cast(1234m as DECIMAL(4)) " +
+                        "UNION ALL SELECT cast(null as DECIMAL(4))) " +
+                        "SELECT value, cast(value as int) as int_value FROM data")
+                        .noLeakCheck()
+                        .noRandomAccess()
+                        .expectSize()
+                        .returns("""
+                                value\tint_value
+                                9999\t9999
+                                -9999\t-9999
+                                1234\t1234
+                                \tnull
+                                """)
+        );
+    }
+
+    @Test
+    public void testRuntimeCastUnscaledDecimal256() throws Exception {
+        assertMemoryLeak(
+                () -> assertQuery("WITH data AS (SELECT cast(2147483647m as DECIMAL(40)) value " +
+                        "UNION ALL SELECT cast(-2147483647m as DECIMAL(40)) " +
+                        "UNION ALL SELECT cast(1234567890m as DECIMAL(40)) " +
+                        "UNION ALL SELECT cast(null as DECIMAL(40))) " +
+                        "SELECT value, cast(value as int) as int_value FROM data")
+                        .noLeakCheck()
+                        .noRandomAccess()
+                        .expectSize()
+                        .returns("""
+                                value\tint_value
+                                2147483647\t2147483647
+                                -2147483647\t-2147483647
+                                1234567890\t1234567890
+                                \tnull
+                                """)
+        );
+    }
+
+    @Test
+    public void testRuntimeCastUnscaledDecimal32() throws Exception {
+        assertMemoryLeak(
+                () -> assertQuery("WITH data AS (SELECT cast(999999999m as DECIMAL(9)) value " +
+                        "UNION ALL SELECT cast(-999999999m as DECIMAL(9)) " +
+                        "UNION ALL SELECT cast(123456789m as DECIMAL(9)) " +
+                        "UNION ALL SELECT cast(null as DECIMAL(9))) " +
+                        "SELECT value, cast(value as int) as int_value FROM data")
+                        .noLeakCheck()
+                        .noRandomAccess()
+                        .expectSize()
+                        .returns("""
+                                value\tint_value
+                                999999999\t999999999
+                                -999999999\t-999999999
+                                123456789\t123456789
+                                \tnull
+                                """)
+        );
+    }
+
+    @Test
+    public void testRuntimeCastUnscaledDecimal64() throws Exception {
+        assertMemoryLeak(
+                () -> assertQuery("WITH data AS (SELECT cast(2147483647m as DECIMAL(18)) value " +
+                        "UNION ALL SELECT cast(-2147483647m as DECIMAL(18)) " +
+                        "UNION ALL SELECT cast(1234567890m as DECIMAL(18)) " +
+                        "UNION ALL SELECT cast(null as DECIMAL(18))) " +
+                        "SELECT value, cast(value as int) as int_value FROM data")
+                        .noLeakCheck()
+                        .noRandomAccess()
+                        .expectSize()
+                        .returns("""
+                                value\tint_value
+                                2147483647\t2147483647
+                                -2147483647\t-2147483647
+                                1234567890\t1234567890
+                                \tnull
+                                """)
+        );
+    }
+
+    @Test
+    public void testRuntimeCastUnscaledDecimal8() throws Exception {
+        assertMemoryLeak(
+                () -> assertQuery("WITH data AS (SELECT cast(99m as DECIMAL(2)) value " +
+                        "UNION ALL SELECT cast(-99m as DECIMAL(2)) " +
+                        "UNION ALL SELECT cast(0m as DECIMAL(2)) " +
+                        "UNION ALL SELECT cast(null as DECIMAL(2))) " +
+                        "SELECT value, cast(value as int) as int_value FROM data")
+                        .noLeakCheck()
+                        .noRandomAccess()
+                        .expectSize()
+                        .returns("""
+                                value\tint_value
+                                99\t99
+                                -99\t-99
+                                0\t0
+                                \tnull
+                                """)
+        );
+    }
+
+    @Test
+    public void testTruncationBehavior() throws Exception {
+        assertMemoryLeak(
+                () -> {
+                    // Positive values - truncate towards zero
+                    assertQuery("select cast(1.1m as int)")
+                            .noLeakCheck()
+                            .expectSize()
+                            .returns("""
+                                    cast
+                                    1
+                                    """);
+
+                    assertQuery("select cast(1.5m as int)")
+                            .noLeakCheck()
+                            .expectSize()
+                            .returns("""
+                                    cast
+                                    1
+                                    """);
+
+                    assertQuery("select cast(1.9m as int)")
+                            .noLeakCheck()
+                            .expectSize()
+                            .returns("""
+                                    cast
+                                    1
+                                    """);
+
+                    // Negative values - truncate towards zero
+                    assertQuery("select cast(-1.1m as int)")
+                            .noLeakCheck()
+                            .expectSize()
+                            .returns("""
+                                    cast
+                                    -1
+                                    """);
+
+                    assertQuery("select cast(-1.5m as int)")
+                            .noLeakCheck()
+                            .expectSize()
+                            .returns("""
+                                    cast
+                                    -1
+                                    """);
+
+                    assertQuery("select cast(-1.9m as int)")
+                            .noLeakCheck()
+                            .expectSize()
+                            .returns("""
+                                    cast
+                                    -1
+                                    """);
+                }
+        );
+    }
+}

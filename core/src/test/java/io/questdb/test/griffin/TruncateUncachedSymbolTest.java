@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -25,7 +25,6 @@
 package io.questdb.test.griffin;
 
 import io.questdb.test.AbstractCairoTest;
-import io.questdb.test.tools.TestUtils;
 import org.junit.Test;
 
 public class TruncateUncachedSymbolTest extends AbstractCairoTest {
@@ -33,7 +32,7 @@ public class TruncateUncachedSymbolTest extends AbstractCairoTest {
     public void testSimple() throws Exception {
         assertMemoryLeak(
                 () -> {
-                    ddl("CREATE TABLE\n" +
+                    execute("CREATE TABLE\n" +
                             "positions(\n" +
                             "\ttime timestamp, \n" +
                             "\tuuid symbol cache, \n" +
@@ -53,8 +52,8 @@ public class TruncateUncachedSymbolTest extends AbstractCairoTest {
                             "\thash6i int\n" +
                             ")\n" +
                             "timestamp(time);");
-                    ddl("alter TABLE positions ALTER COLUMN hash6 ADD INDEX", sqlExecutionContext);
-                    insert("INSERT INTO positions\n" +
+                    execute("alter TABLE positions ALTER COLUMN hash6 ADD INDEX", sqlExecutionContext);
+                    execute("INSERT INTO positions\n" +
                             "VALUES(\n" +
                             "    1578506142000000L,\n" +
                             "    '123e4567-e89b-12d3-a456-426614174000',\n" +
@@ -74,24 +73,19 @@ public class TruncateUncachedSymbolTest extends AbstractCairoTest {
                             "    6\n" +
                             ");");
 
-                    TestUtils.assertSql(
-                            engine,
-                            sqlExecutionContext,
-                            "positions",
-                            sink,
-                            "time\tuuid\tlatitude\tlongitude\thash1\thash2\thash3\thash4\thash5\thash6\thash1i\thash2i\thash3i\thash4i\thash5i\thash6i\n" +
-                                    "2020-01-08T17:55:42.000000Z\t123e4567-e89b-12d3-a456-426614174000\t54.1803268\t7.8889438\tu\tu1\tu1t\tu1ts\tu1ts5\tu1ts5x\t1\t2\t3\t4\t5\t6\n"
-                    );
+                    assertQuery("positions")
+                            .noLeakCheck()
+                            .timestamp("time")
+                            .expectSize()
+                            .returns("time\tuuid\tlatitude\tlongitude\thash1\thash2\thash3\thash4\thash5\thash6\thash1i\thash2i\thash3i\thash4i\thash5i\thash6i\n" +
+                                    "2020-01-08T17:55:42.000000Z\t123e4567-e89b-12d3-a456-426614174000\t54.1803268\t7.8889438\tu\tu1\tu1t\tu1ts\tu1ts5\tu1ts5x\t1\t2\t3\t4\t5\t6\n");
 
-                    ddl("truncate table positions");
+                    execute("truncate table positions");
 
-                    TestUtils.assertSql(
-                            engine,
-                            sqlExecutionContext,
-                            "positions",
-                            sink,
-                            "time\tuuid\tlatitude\tlongitude\thash1\thash2\thash3\thash4\thash5\thash6\thash1i\thash2i\thash3i\thash4i\thash5i\thash6i\n"
-                    );
+                    assertQuery("positions")
+                            .noLeakCheck()
+                            .timestamp("time")
+                            .returns("time\tuuid\tlatitude\tlongitude\thash1\thash2\thash3\thash4\thash5\thash6\thash1i\thash2i\thash3i\thash4i\thash5i\thash6i\n");
                 }
         );
     }

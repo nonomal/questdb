@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -34,6 +34,7 @@ import io.questdb.griffin.engine.functions.GeoIntFunction;
 import io.questdb.griffin.engine.functions.GroupByFunction;
 import io.questdb.griffin.engine.functions.UnaryFunction;
 import io.questdb.std.Numbers;
+import io.questdb.std.Unsafe;
 
 class FirstGeoHashGroupByFunctionInt extends GeoIntFunction implements GroupByFunction, UnaryFunction {
     protected final Function arg;
@@ -45,6 +46,17 @@ class FirstGeoHashGroupByFunctionInt extends GeoIntFunction implements GroupByFu
     }
 
     @Override
+    public void computeBatch(MapValue mapValue, long dataAddr, int rowCount, long startRowId) {
+        if (rowCount > 0) {
+            long existingRowId = mapValue.getLong(valueIndex);
+            if (startRowId < existingRowId || existingRowId == Numbers.LONG_NULL) {
+                mapValue.putLong(valueIndex, startRowId);
+                mapValue.putInt(valueIndex + 1, Unsafe.getInt(dataAddr));
+            }
+        }
+    }
+
+    @Override
     public void computeFirst(MapValue mapValue, Record record, long rowId) {
         mapValue.putLong(valueIndex, rowId);
         mapValue.putInt(valueIndex + 1, arg.getGeoInt(record));
@@ -52,7 +64,9 @@ class FirstGeoHashGroupByFunctionInt extends GeoIntFunction implements GroupByFu
 
     @Override
     public void computeNext(MapValue mapValue, Record record, long rowId) {
-        // empty
+        if (rowId < mapValue.getLong(valueIndex)) {
+            computeFirst(mapValue, record, rowId);
+        }
     }
 
     @Override
@@ -68,6 +82,11 @@ class FirstGeoHashGroupByFunctionInt extends GeoIntFunction implements GroupByFu
     @Override
     public String getName() {
         return "first";
+    }
+
+    @Override
+    public int getSampleByFlags() {
+        return GroupByFunction.SAMPLE_BY_FILL_ALL;
     }
 
     @Override
@@ -88,8 +107,13 @@ class FirstGeoHashGroupByFunctionInt extends GeoIntFunction implements GroupByFu
     }
 
     @Override
-    public boolean isReadThreadSafe() {
-        return UnaryFunction.super.isReadThreadSafe();
+    public boolean isConstant() {
+        return false;
+    }
+
+    @Override
+    public boolean isThreadSafe() {
+        return UnaryFunction.super.isThreadSafe();
     }
 
     @Override
@@ -113,6 +137,11 @@ class FirstGeoHashGroupByFunctionInt extends GeoIntFunction implements GroupByFu
     @Override
     public void setNull(MapValue mapValue) {
         setInt(mapValue, GeoHashes.INT_NULL);
+    }
+
+    @Override
+    public boolean supportsBatchComputation() {
+        return true;
     }
 
     @Override

@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -169,11 +169,11 @@ public class FastDoubleMathTest {
     }
 
     private static long getLongFromBigEndianArray(byte[] array, int offset) {
-        return Long.reverseBytes(Unsafe.getUnsafe().getLong(array, Unsafe.BYTE_OFFSET + offset));
+        return Long.reverseBytes(Unsafe.getLong(array, Unsafe.BYTE_OFFSET + offset));
     }
 
     private static void setBigEndian(byte[] array, long lo, long hi) {
-        Unsafe.getUnsafe().putLong(array, Unsafe.BYTE_OFFSET + 1, Long.reverseBytes(lo));
-        Unsafe.getUnsafe().putLong(array, Unsafe.BYTE_OFFSET + 1 + 8, Long.reverseBytes(hi));
+        Unsafe.putLong(array, Unsafe.BYTE_OFFSET + 1, Long.reverseBytes(lo));
+        Unsafe.putLong(array, Unsafe.BYTE_OFFSET + 1 + 8, Long.reverseBytes(hi));
     }
 }

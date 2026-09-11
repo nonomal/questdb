@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -28,7 +28,17 @@ import io.questdb.cairo.CairoException;
 import io.questdb.cairo.ColumnType;
 import io.questdb.cairo.ColumnTypes;
 import io.questdb.cairo.sql.RecordCursor;
-import io.questdb.std.*;
+import io.questdb.griffin.engine.groupby.FlyweightPackedMapValue;
+import io.questdb.std.Decimal128;
+import io.questdb.std.Decimal256;
+import io.questdb.std.Hash;
+import io.questdb.std.IntList;
+import io.questdb.std.Interval;
+import io.questdb.std.Long256;
+import io.questdb.std.Long256Impl;
+import io.questdb.std.Numbers;
+import io.questdb.std.Transient;
+import io.questdb.std.Unsafe;
 import io.questdb.std.str.CharSink;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
@@ -40,14 +50,14 @@ import org.jetbrains.annotations.Nullable;
  */
 final class OrderedMapFixedSizeRecord implements OrderedMapRecord {
     private final long[] columnOffsets;
+    private final Interval[] intervals;
     private final Long256Impl[] keyLong256A;
     private final Long256Impl[] keyLong256B;
     private final long keySize;
-    private final OrderedMapValue value;
+    private final FlyweightPackedMapValue value;
     private final long[] valueOffsets;
     private final long valueSize;
     private long keyAddress;
-    private long limit;
     private IntList symbolTableIndex;
     private RecordCursor symbolTableResolver;
     private long valueAddress;
@@ -56,7 +66,7 @@ final class OrderedMapFixedSizeRecord implements OrderedMapRecord {
             long keySize,
             long valueSize,
             long[] valueOffsets,
-            OrderedMapValue value,
+            FlyweightPackedMapValue value,
             @NotNull @Transient ColumnTypes keyTypes,
             @Nullable @Transient ColumnTypes valueTypes
     ) {
@@ -65,7 +75,6 @@ final class OrderedMapFixedSizeRecord implements OrderedMapRecord {
         this.valueSize = valueSize;
         this.valueOffsets = valueOffsets;
         this.value = value;
-        this.value.linkRecord(this); // provides feature to position this record at location of map value
 
         int nColumns;
         int keyIndexOffset;
@@ -81,19 +90,31 @@ final class OrderedMapFixedSizeRecord implements OrderedMapRecord {
 
         Long256Impl[] long256A = null;
         Long256Impl[] long256B = null;
+        Interval[] intervals = null;
+
         int offset = 0;
         for (int i = 0, n = keyTypes.getColumnCount(); i < n; i++) {
             final int columnType = keyTypes.getColumnType(i);
-            if (ColumnType.tagOf(columnType) == ColumnType.LONG256) {
-                if (long256A == null) {
-                    long256A = new Long256Impl[nColumns];
-                    long256B = new Long256Impl[nColumns];
-                }
-                long256A[i + keyIndexOffset] = new Long256Impl();
-                long256B[i + keyIndexOffset] = new Long256Impl();
+            switch (ColumnType.tagOf(columnType)) {
+                case ColumnType.LONG256:
+                    if (long256A == null) {
+                        long256A = new Long256Impl[nColumns];
+                        long256B = new Long256Impl[nColumns];
+                    }
+                    long256A[i + keyIndexOffset] = new Long256Impl();
+                    long256B[i + keyIndexOffset] = new Long256Impl();
+                    break;
+                case ColumnType.INTERVAL:
+                    if (intervals == null) {
+                        intervals = new Interval[nColumns];
+                    }
+                    intervals[i + keyIndexOffset] = new Interval();
+                    break;
+                default:
+                    break;
             }
             final int size = ColumnType.sizeOf(columnType);
-            if (size <= 0) {
+            if (size < 0 || (size == 0 && columnType != ColumnType.NULL)) {
                 throw CairoException.nonCritical().put("key type is not supported: ").put(ColumnType.nameOf(columnType));
             }
             columnOffsets[i + keyIndexOffset] = offset;
@@ -122,6 +143,7 @@ final class OrderedMapFixedSizeRecord implements OrderedMapRecord {
 
         this.keyLong256A = long256A;
         this.keyLong256B = long256B;
+        this.intervals = intervals;
     }
 
     private OrderedMapFixedSizeRecord(
@@ -130,22 +152,25 @@ final class OrderedMapFixedSizeRecord implements OrderedMapRecord {
             long[] valueOffsets,
             long[] columnOffsets,
             Long256Impl[] keyLong256A,
-            Long256Impl[] keyLong256B
+            Long256Impl[] keyLong256B,
+            Interval[] intervals
     ) {
         this.keySize = keySize;
         this.valueSize = valueSize;
         this.valueOffsets = valueOffsets;
         this.columnOffsets = columnOffsets;
-        this.value = new OrderedMapValue(valueSize, valueOffsets);
+        this.value = new FlyweightPackedMapValue(valueSize, valueOffsets);
         this.keyLong256A = keyLong256A;
         this.keyLong256B = keyLong256B;
+        this.intervals = intervals;
     }
 
     @SuppressWarnings("MethodDoesntCallSuperMethod")
     @Override
-    public OrderedMapRecord clone() {
+    public OrderedMapFixedSizeRecord clone() {
         final Long256Impl[] long256A;
         final Long256Impl[] long256B;
+        final Interval[] intervals;
 
         if (this.keyLong256A != null) {
             int n = this.keyLong256A.length;
@@ -162,7 +187,20 @@ final class OrderedMapFixedSizeRecord implements OrderedMapRecord {
             long256A = null;
             long256B = null;
         }
-        return new OrderedMapFixedSizeRecord(keySize, valueSize, valueOffsets, columnOffsets, long256A, long256B);
+
+        if (this.intervals != null) {
+            int n = this.intervals.length;
+            intervals = new Interval[n];
+            for (int i = 0; i < n; i++) {
+                if (this.intervals[i] != null) {
+                    intervals[i] = new Interval();
+                }
+            }
+        } else {
+            intervals = null;
+        }
+
+        return new OrderedMapFixedSizeRecord(keySize, valueSize, valueOffsets, columnOffsets, long256A, long256B, intervals);
     }
 
     @Override
@@ -173,8 +211,8 @@ final class OrderedMapFixedSizeRecord implements OrderedMapRecord {
 
     @Override
     public void copyValue(MapValue destValue) {
-        OrderedMapValue destFastValue = (OrderedMapValue) destValue;
-        destFastValue.copyRawValue(valueAddress);
+        FlyweightPackedMapValue destPackedValue = (FlyweightPackedMapValue) destValue;
+        destPackedValue.copyRawValue(valueAddress);
     }
 
     @Override
@@ -184,22 +222,56 @@ final class OrderedMapFixedSizeRecord implements OrderedMapRecord {
 
     @Override
     public byte getByte(int columnIndex) {
-        return Unsafe.getUnsafe().getByte(addressOfColumn(columnIndex));
+        return Unsafe.getByte(addressOfColumn(columnIndex));
     }
 
     @Override
     public char getChar(int columnIndex) {
-        return Unsafe.getUnsafe().getChar(addressOfColumn(columnIndex));
+        return Unsafe.getChar(addressOfColumn(columnIndex));
+    }
+
+    @Override
+    public void getDecimal128(int col, Decimal128 sink) {
+        long addr = addressOfColumn(col);
+        sink.ofRaw(
+                Unsafe.getLong(addr),
+                Unsafe.getLong(addr + 8L)
+        );
+    }
+
+    @Override
+    public short getDecimal16(int columnIndex) {
+        return Unsafe.getShort(addressOfColumn(columnIndex));
+    }
+
+    @Override
+    public void getDecimal256(int col, Decimal256 sink) {
+        sink.ofRawAddress(addressOfColumn(col));
+    }
+
+    @Override
+    public int getDecimal32(int columnIndex) {
+        return Unsafe.getInt(addressOfColumn(columnIndex));
+    }
+
+    @Override
+    public long getDecimal64(int columnIndex) {
+        return Unsafe.getLong(addressOfColumn(columnIndex));
+    }
+
+    @Override
+    public byte getDecimal8(int columnIndex) {
+        return Unsafe.getByte(addressOfColumn(columnIndex));
     }
 
     @Override
     public double getDouble(int columnIndex) {
-        return Unsafe.getUnsafe().getDouble(addressOfColumn(columnIndex));
+        return Unsafe.getDouble(addressOfColumn(columnIndex));
     }
 
     @Override
     public float getFloat(int columnIndex) {
-        return Unsafe.getUnsafe().getFloat(addressOfColumn(columnIndex));
+        return Unsafe.getFloat(addressOfColumn(columnIndex));
     }
 
     @Override
@@ -224,37 +296,41 @@ final class OrderedMapFixedSizeRecord implements OrderedMapRecord {
 
     @Override
     public int getIPv4(int columnIndex) {
-        return Unsafe.getUnsafe().getInt(addressOfColumn(columnIndex));
+        return Unsafe.getInt(addressOfColumn(columnIndex));
     }
 
     @Override
     public int getInt(int columnIndex) {
-        return Unsafe.getUnsafe().getInt(addressOfColumn(columnIndex));
+        return Unsafe.getInt(addressOfColumn(columnIndex));
+    }
+
+    @Override
+    public Interval getInterval(int columnIndex) {
+        long address = addressOfColumn(columnIndex);
+        long lo = Unsafe.getLong(address);
+        long hi = Unsafe.getLong(address + Long.BYTES);
+        Interval interval = this.intervals[columnIndex];
+        return interval.of(lo, hi);
     }
 
     @Override
     public long getLong(int columnIndex) {
-        return Unsafe.getUnsafe().getLong(addressOfColumn(columnIndex));
+        return Unsafe.getLong(addressOfColumn(columnIndex));
     }
 
     @Override
     public long getLong128Hi(int columnIndex) {
-        return Unsafe.getUnsafe().getLong(addressOfColumn(columnIndex) + Long.BYTES);
+        return Unsafe.getLong(addressOfColumn(columnIndex) + Long.BYTES);
     }
 
     @Override
     public long getLong128Lo(int columnIndex) {
-        return Unsafe.getUnsafe().getLong(addressOfColumn(columnIndex));
+        return Unsafe.getLong(addressOfColumn(columnIndex));
     }
 
     @Override
     public void getLong256(int columnIndex, CharSink<?> sink) {
-        long address = addressOfColumn(columnIndex);
-        final long a = Unsafe.getUnsafe().getLong(address);
-        final long b = Unsafe.getUnsafe().getLong(address + Long.BYTES);
-        final long c = Unsafe.getUnsafe().getLong(address + Long.BYTES * 2);
-        final long d = Unsafe.getUnsafe().getLong(address + Long.BYTES * 3);
-        Numbers.appendLong256(a, b, c, d, sink);
+        Numbers.appendLong256FromUnsafe(addressOfColumn(columnIndex), sink);
     }
 
     @Override
@@ -276,7 +352,7 @@ final class OrderedMapFixedSizeRecord implements OrderedMapRecord {
 
     @Override
     public short getShort(int columnIndex) {
-        return Unsafe.getUnsafe().getShort(addressOfColumn(columnIndex));
+        return Unsafe.getShort(addressOfColumn(columnIndex));
     }
 
     @Override
@@ -291,7 +367,7 @@ final class OrderedMapFixedSizeRecord implements OrderedMapRecord {
 
     @Override
     public MapValue getValue() {
-        return value.of(keyAddress, valueAddress, limit, false);
+        return value.of(keyAddress, valueAddress, false);
     }
 
     @Override
@@ -303,11 +379,6 @@ final class OrderedMapFixedSizeRecord implements OrderedMapRecord {
     public void of(long address) {
         this.keyAddress = address;
         this.valueAddress = address + keySize;
-    }
-
-    @Override
-    public void setLimit(long limit) {
-        this.limit = limit;
     }
 
     @Override

@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,6 +24,7 @@
 
 package io.questdb.mp;
 
+import io.questdb.std.Os;
 import org.jetbrains.annotations.NotNull;
 
 public abstract class AbstractQueueConsumerJob<T> implements Job {
@@ -36,17 +37,28 @@ public abstract class AbstractQueueConsumerJob<T> implements Job {
     }
 
     @Override
-    public boolean run(int workerId, @NotNull RunStatus runStatus) {
+    public boolean run(@NotNull WorkerContext workerContext) {
         if (!canRun()) {
             return false;
         }
-        final long cursor = subSeq.next();
-        return cursor == -2 || (cursor > -1 && doRun(workerId, cursor, runStatus));
+        while (true) {
+            final long cursor = subSeq.next();
+            if (cursor == -1) {
+                return false;
+            }
+            if (cursor > -1) {
+                // Hand the whole context to doRun: it pulls carrierId() only if it
+                // needs the pool-local slot, and reads isTerminating() off the same
+                // WorkerContext object.
+                return doRun(cursor, workerContext);
+            }
+            Os.pause();
+        }
     }
 
     protected boolean canRun() {
         return true;
     }
 
-    protected abstract boolean doRun(int workerId, long cursor, RunStatus runStatus);
+    protected abstract boolean doRun(long cursor, WorkerContext workerContext);
 }

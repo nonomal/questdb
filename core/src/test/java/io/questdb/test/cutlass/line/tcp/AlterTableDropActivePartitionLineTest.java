@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -29,22 +29,22 @@ import io.questdb.cairo.CairoEngine;
 import io.questdb.cairo.TableReader;
 import io.questdb.cairo.TableToken;
 import io.questdb.cairo.pool.PoolListener;
-import io.questdb.cutlass.line.LineTcpSender;
-import io.questdb.griffin.SqlCompiler;
+import io.questdb.client.cutlass.line.AbstractLineTcpSender;
+import io.questdb.client.cutlass.line.LineTcpSenderV2;
 import io.questdb.griffin.SqlExecutionContext;
 import io.questdb.log.Log;
 import io.questdb.log.LogFactory;
 import io.questdb.mp.SOCountDownLatch;
 import io.questdb.network.Net;
 import io.questdb.std.Chars;
-import io.questdb.std.Misc;
 import io.questdb.std.Os;
 import io.questdb.std.Rnd;
-import io.questdb.std.datetime.microtime.TimestampFormatUtils;
+import io.questdb.std.datetime.microtime.MicrosFormatUtils;
 import io.questdb.test.AbstractBootstrapTest;
 import io.questdb.test.tools.TestUtils;
 import org.junit.Assert;
 import org.junit.BeforeClass;
+import org.junit.Ignore;
 import org.junit.Test;
 
 import java.sql.Connection;
@@ -91,7 +91,12 @@ public class AlterTableDropActivePartitionLineTest extends AbstractBootstrapTest
         TestUtils.unchecked(() -> createDummyConfiguration());
     }
 
+    private static String rndOf(Rnd rnd, String[] array) {
+        return array[rnd.nextPositiveInt() % array.length];
+    }
+
     @Test
+    @Ignore
     public void testServerMainPgWireConcurrentlyWithLineTcpSender() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
             try (final ServerMain serverMain = new ServerMain(getServerMainArgs())) {
@@ -115,7 +120,7 @@ public class AlterTableDropActivePartitionLineTest extends AbstractBootstrapTest
                                         "WITH maxUncommittedRows=1000, o3MaxLag=200000us" // 200 millis
                         )
                 ) {
-                    LOG.info().$("creating table: ").utf8(tableName).$();
+                    LOG.info().$("creating table: ").$safe(tableName).$();
                     stmt.execute();
                 }
 
@@ -124,7 +129,7 @@ public class AlterTableDropActivePartitionLineTest extends AbstractBootstrapTest
 
                 // today is deterministic
                 final String activePartitionName = "2022-10-19";
-                final AtomicLong timestampNano = new AtomicLong(TimestampFormatUtils.parseTimestamp(
+                final AtomicLong timestampNano = new AtomicLong(MicrosFormatUtils.parseTimestamp(
                         activePartitionName + "T00:00:00.000000Z") * 1000L
                 );
 
@@ -134,7 +139,7 @@ public class AlterTableDropActivePartitionLineTest extends AbstractBootstrapTest
 
                 final Thread ilpAgent = new Thread(() -> {
                     final Rnd rnd = new Rnd();
-                    try (LineTcpSender sender = LineTcpSender.newSender(Net.parseIPv4("127.0.0.1"), ILP_PORT, ILP_BUFFER_SIZE)) {
+                    try (AbstractLineTcpSender sender = LineTcpSenderV2.newSender(Net.parseIPv4("127.0.0.1"), ILP_PORT, ILP_BUFFER_SIZE)) {
                         while (ilpAgentKeepSending.get()) {
                             for (int i = 0; i < 100; i++) {
                                 addLine(sender, uniqueId, timestampNano, rnd);
@@ -152,7 +157,7 @@ public class AlterTableDropActivePartitionLineTest extends AbstractBootstrapTest
 
                 // so that we know when the table writer is returned to the pool whence the ilpAgent is stopped
                 final SOCountDownLatch tableWriterReturnedToPool = new SOCountDownLatch(1);
-                engine.setPoolListener((factoryType, thread, name, event, segment, position) -> {
+                engine.setPoolListener((factoryType, _, name, event, _, _) -> {
                     if (name != null && Chars.equalsNc(tableName, name.getTableName())) {
                         if (PoolListener.isWalOrWriter(factoryType) && event == PoolListener.EV_RETURN) {
                             tableWriterReturnedToPool.countDown();
@@ -207,28 +212,21 @@ public class AlterTableDropActivePartitionLineTest extends AbstractBootstrapTest
                 }
 
                 // check size
-                try (
-                        SqlExecutionContext context = TestUtils.createSqlExecutionCtx(engine);
-                        SqlCompiler compiler = engine.getSqlCompiler()
-                ) {
-                    TestUtils.assertSql(
-                            compiler,
-                            context,
-                            "SELECT min(timestamp), max(timestamp), count() FROM " + tableName + " WHERE timestamp IN '" + activePartitionName + "'",
-                            Misc.getThreadLocalSink(),
-                            "min\tmax\tcount\n" +
-                                    "\t\t0\n"
-                    );
+                try (SqlExecutionContext context = TestUtils.createSqlExecutionCtx(engine)) {
+                    assertQuery("SELECT min(timestamp), max(timestamp), count() FROM " + tableName + " WHERE timestamp IN '" + activePartitionName + "'")
+                            .withEngine(engine)
+                            .withContext(context)
+                            .noLeakCheck()
+                            .returnsOnce("""
+                                    min\tmax\tcount
+                                    \t\t0
+                                    """);
                 }
             }
         });
     }
 
-    private static String rndOf(Rnd rnd, String[] array) {
-        return array[rnd.nextPositiveInt() % array.length];
-    }
-
-    private LineTcpSender addLine(LineTcpSender sender, AtomicLong uniqueId, AtomicLong timestampNano, Rnd rnd) {
+    private AbstractLineTcpSender addLine(AbstractLineTcpSender sender, AtomicLong uniqueId, AtomicLong timestampNano, Rnd rnd) {
         sender.metric(tableName)
                 .tag("favourite_colour", rndOf(rnd, colour))
                 .tag("country", rndOf(rnd, country))

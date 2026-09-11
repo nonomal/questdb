@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -25,14 +25,10 @@
 package io.questdb.test;
 
 import io.questdb.ServerMain;
+import io.questdb.cairo.CairoEngine;
 import io.questdb.cairo.security.AllowAllSecurityContext;
-import io.questdb.cairo.sql.Record;
-import io.questdb.cairo.sql.RecordCursor;
-import io.questdb.cairo.sql.RecordCursorFactory;
 import io.questdb.griffin.SqlExecutionContext;
 import io.questdb.griffin.SqlExecutionContextImpl;
-import io.questdb.std.Os;
-import io.questdb.std.str.StringSink;
 import io.questdb.test.tools.TestUtils;
 import org.junit.Before;
 import org.junit.Test;
@@ -49,8 +45,6 @@ public class ServerMainCleanStartupTest extends AbstractBootstrapTest {
     public void testServerMainCleanStart() throws Exception {
         TestUtils.assertMemoryLeak(() -> {
 
-            StringSink sink = new StringSink();
-
             // create two tables:
             // 1. empty
             // 2. non-empty with a couple of translations
@@ -60,48 +54,44 @@ public class ServerMainCleanStartupTest extends AbstractBootstrapTest {
                     SqlExecutionContext sqlExecutionContext = new SqlExecutionContextImpl(serverMain.getEngine(), 1).with(AllowAllSecurityContext.INSTANCE)
             ) {
                 serverMain.start();
-                serverMain.getEngine().compile("create table x (a int, t timestamp) timestamp(t) partition by day wal", sqlExecutionContext);
-                serverMain.getEngine().compile("create table y (b int, t timestamp) timestamp(t) partition by day wal", sqlExecutionContext);
+                serverMain.getEngine().execute("create table x (a int, t timestamp) timestamp(t) partition by day wal", sqlExecutionContext);
+                serverMain.getEngine().execute("create table y (b int, t timestamp) timestamp(t) partition by day wal", sqlExecutionContext);
 
-                serverMain.getEngine().compile("insert into y values(100, 1)", sqlExecutionContext);
-                serverMain.getEngine().compile("insert into y values(200, 2)", sqlExecutionContext);
+                CairoEngine cairoEngine1 = serverMain.getEngine();
+                cairoEngine1.execute("insert into y values(100, 1)", sqlExecutionContext);
+                CairoEngine cairoEngine = serverMain.getEngine();
+                cairoEngine.execute("insert into y values(200, 2)", sqlExecutionContext);
 
-                // wait for the row count
-                try (RecordCursorFactory rfc = serverMain.getEngine().select("select count() from y", sqlExecutionContext)) {
-                    while (true) {
-                        try (RecordCursor cursor = rfc.getCursor(sqlExecutionContext)){
-                            Record rec = cursor.getRecord();
-                            if (cursor.hasNext()) {
-                                if (rec.getLong(0) == 2) {
-                                    break;
-                                }
-                            }
-                            Os.pause();
-                        }
-                    }
-                }
+                // wait for txns to be written
+                new QueryAssertion(serverMain.getEngine(), sqlExecutionContext, () -> {
+                }, "select wait_wal_table('y')")
+                        .noLeakCheck()
+                        .expectSize()
+                        .noMemoryUsageCheck()
+                        .returns("""
+                                wait_wal_table('y')
+                                true
+                                """);
 
                 // ensure transactions
-                TestUtils.assertSql(
-                        serverMain.getEngine(),
-                        sqlExecutionContext,
-                        "select * from wal_tables order by 1",
-                        sink,
-                        "name\tsuspended\twriterTxn\twriterLagTxnCount\tsequencerTxn\n" +
-                                "x\tfalse\t0\t0\t0\n" +
-                                "y\tfalse\t2\t0\t2\n"
-                );
+                new QueryAssertion(serverMain.getEngine(), sqlExecutionContext, () -> {
+                }, "select * from wal_tables order by 1")
+                        .noLeakCheck()
+                        .returns("""
+                                name\tsuspended\twriterTxn\tbufferedTxnSize\tsequencerTxn\terrorTag\terrorMessage\tmemoryPressure
+                                x\tfalse\t0\t0\t0\t\t\t0
+                                y\tfalse\t2\t0\t2\t\t\t0
+                                """);
 
 
-                TestUtils.assertSql(
-                        serverMain.getEngine(),
-                        sqlExecutionContext,
-                        "select table_name, ownership_reason from writer_pool where table_name in ('x','y') order by 1",
-                        sink,
-                        "table_name\townership_reason\n" +
-                                "x\t\n" +
-                                "y\t\n"
-                );
+                new QueryAssertion(serverMain.getEngine(), sqlExecutionContext, () -> {
+                }, "select table_name, ownership_reason from writer_pool where table_name in ('x','y') order by 1")
+                        .noLeakCheck()
+                        .noMemoryUsageCheck()
+                        .returns("""
+                                table_name\townership_reason
+                                y\t
+                                """);
 
             }
 
@@ -112,13 +102,11 @@ public class ServerMainCleanStartupTest extends AbstractBootstrapTest {
             ) {
                 serverMain.start();
 
-                TestUtils.assertSql(
-                        serverMain.getEngine(),
-                        sqlExecutionContext,
-                        "select table_name, ownership_reason from writer_pool where table_name in ('x','y') order by 1",
-                        sink,
-                        "table_name\townership_reason\n"
-                );
+                new QueryAssertion(serverMain.getEngine(), sqlExecutionContext, () -> {
+                }, "select table_name, ownership_reason from writer_pool where table_name in ('x','y') order by 1")
+                        .noLeakCheck()
+                        .noMemoryUsageCheck()
+                        .returns("table_name\townership_reason\n");
             }
         });
     }

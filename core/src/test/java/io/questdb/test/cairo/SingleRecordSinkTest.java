@@ -1,0 +1,595 @@
+/*+*****************************************************************************
+ *     ___                  _   ____  ____
+ *    / _ \ _   _  ___  ___| |_|  _ \| __ )
+ *   | | | | | | |/ _ \/ __| __| | | |  _ \
+ *   | |_| | |_| |  __/\__ \ |_| |_| | |_) |
+ *    \__\_\\__,_|\___||___/\__|____/|____/
+ *
+ *  Copyright (c) 2014-2019 Appsicle
+ *  Copyright (c) 2019-2026 QuestDB
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *
+ *  http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ *
+ ******************************************************************************/
+
+package io.questdb.test.cairo;
+
+import io.questdb.cairo.SingleRecordSink;
+import io.questdb.griffin.engine.LimitOverflowException;
+import io.questdb.std.BinarySequence;
+import io.questdb.std.Decimal128;
+import io.questdb.std.Decimal256;
+import io.questdb.std.Long256Impl;
+import io.questdb.std.MemoryTag;
+import io.questdb.std.Rnd;
+import io.questdb.std.str.Utf8Sequence;
+import io.questdb.std.str.Utf8String;
+import io.questdb.test.AbstractTest;
+import io.questdb.test.tools.TestUtils;
+import org.junit.Assert;
+import org.junit.Test;
+
+import static io.questdb.test.tools.TestUtils.assertMemoryLeak;
+
+public class SingleRecordSinkTest extends AbstractTest {
+    public static void runWithSink(WithNewSink code) throws Exception {
+        assertMemoryLeak(() -> {
+            try (SingleRecordSink sink = new SingleRecordSink(1024, MemoryTag.NATIVE_DEFAULT, "test sink", null)) {
+                code.runWithSink(sink);
+            }
+        });
+    }
+
+    public static void runWithSinks(WithNewSinks code, int maxHeap) throws Exception {
+        assertMemoryLeak(() -> {
+            try (SingleRecordSink left = new SingleRecordSink(maxHeap, MemoryTag.NATIVE_DEFAULT, "test sink", null);
+                 SingleRecordSink right = new SingleRecordSink(maxHeap, MemoryTag.NATIVE_DEFAULT, "test sink", null)) {
+                code.runWithSink(left, right);
+            }
+        });
+    }
+
+    public static void runWithSinks(WithNewSinks code) throws Exception {
+        runWithSinks(code, 1024);
+    }
+
+    @Test
+    public void testFuzz() throws Exception {
+        Rnd rnd = TestUtils.generateRandom(null);
+        testFuzz0(rnd, false);
+        testFuzz0(rnd, true);
+    }
+
+    @Test
+    public void testHeapAcceptsTargetEqualToMaxHeapSize() throws Exception {
+        // A 2052-byte budget is reached exactly: the heap doubles to 2048, and the 513th int makes
+        // target exactly 2052. That is the boundary of the throw predicate - a value that fits
+        // exactly must be accepted, so 513 ints fit rather than 512.
+        assertMemoryLeak(() -> {
+            try (SingleRecordSink sink = new SingleRecordSink(2052, MemoryTag.NATIVE_DEFAULT, "test sink", null)) {
+                for (int i = 0; i < 513; i++) {
+                    sink.putInt(i);
+                }
+                try {
+                    sink.putInt(513);
+                    Assert.fail("expected LimitOverflowException");
+                } catch (LimitOverflowException e) {
+                    TestUtils.assertContains(e.getFlyweightMessage(), "limit of 2052 memory exceeded in test sink");
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testHeapClampsToMaxHeapSize() throws Exception {
+        // A 3000-byte budget is not a power of two, while every doubling step is: the heap grows
+        // 4 -> 8 -> ... -> 2048 and then wants 4096. Rejecting there stranded a third of the
+        // configured budget at 512 ints; clamping to 3000 fits the 750 that actually do fit.
+        // The owner name also has to reach the message. This only covers that the sink interpolates
+        // the name its constructor was given; CachedWindowMemoryCapTest covers a factory-supplied
+        // one end to end.
+        assertMemoryLeak(() -> {
+            try (
+                    SingleRecordSink clamped = new SingleRecordSink(3000, MemoryTag.NATIVE_DEFAULT, "test sink", null);
+                    // 4096 is a power of two above the budget, so this one never clamps.
+                    SingleRecordSink reference = new SingleRecordSink(4096, MemoryTag.NATIVE_DEFAULT, "test sink", null)
+            ) {
+                for (int i = 0; i < 750; i++) {
+                    clamped.putInt(i);
+                    reference.putInt(i);
+                }
+                // Everything written into the clamped heap must survive its reallocs byte for byte.
+                Assert.assertTrue(clamped.memeq(reference));
+
+                try {
+                    clamped.putInt(750);
+                    Assert.fail("expected LimitOverflowException");
+                } catch (LimitOverflowException e) {
+                    TestUtils.assertContains(e.getFlyweightMessage(),
+                            "limit of 3000 memory exceeded in test sink");
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testMaxHeapSizeFlooredAtInitialCapacity() throws Exception {
+        // A *.max.pages of 0 gives a 0-byte budget, but reopen() allocates INITIAL_CAPACITY_BYTES
+        // regardless. Storing the budget verbatim left the sink holding 8 bytes it had no budget
+        // for: an 8-byte key succeeded against a declared 0-byte limit, and the overflow message
+        // then read "limit of 0" - neither what was configured nor what is actually allowed.
+        // Flooring the budget at the initial capacity makes the two agree.
+        //
+        // The message is asserted whole rather than by substring, which also pins the null arm of
+        // the config-key guard: the " (raise <key>)" suffix appears only when the owner names one,
+        // and deleting the guard outright would report "(raise null)" here. The ASOF and window
+        // owners pin the non-null arm end to end.
+        assertMemoryLeak(() -> {
+            try (SingleRecordSink sink = new SingleRecordSink(0, MemoryTag.NATIVE_DEFAULT, "test sink", null)) {
+                // Exactly the initial capacity, so this must fit rather than overflow.
+                sink.putLong(1);
+                try {
+                    sink.putLong(2);
+                    Assert.fail("expected LimitOverflowException");
+                } catch (LimitOverflowException e) {
+                    Assert.assertEquals("limit of 8 memory exceeded in test sink",
+                            e.getFlyweightMessage().toString());
+                }
+            }
+        });
+    }
+
+    @Test
+    public void testPutAfterCloseWithoutReopen() throws Exception {
+        // close() zeroes heapLimit along with heapStart, so a closed sink is indistinguishable
+        // from a freshly constructed one. heapLimit is an absolute address, not a size: leaving it
+        // behind makes checkCapacity() compare appendAddress 0 against the freed heap's end
+        // address, find room the sink does not own, skip resize() and write through address 0.
+        // Production owners all reopen() before their next put - the ASOF factories inside of(),
+        // the RANK window function through Reopenable.reopen() - so this pins the class invariant
+        // rather than a live code path.
+        assertMemoryLeak(() -> {
+            try (
+                    SingleRecordSink sink = new SingleRecordSink(1024, MemoryTag.NATIVE_DEFAULT, "test sink", null);
+                    // Never closed, so it stays in the pristine unallocated state the closed sink
+                    // has to match.
+                    SingleRecordSink reference = new SingleRecordSink(1024, MemoryTag.NATIVE_DEFAULT, "test sink", null)
+            ) {
+                // Grow the heap so that close() has a non-zero limit to leave behind.
+                for (int i = 0; i < 64; i++) {
+                    sink.putInt(i);
+                }
+                sink.close();
+
+                // skip() is the one RecordSinkSPI method that consults heapLimit without writing
+                // through appendAddress, so it reports the stale limit as a clean throw rather
+                // than a fault: a request no budget can satisfy has to reach resize() and be
+                // rejected there, which it only does once heapLimit reads 0.
+                try {
+                    sink.skip(Integer.MAX_VALUE);
+                    Assert.fail("expected LimitOverflowException");
+                } catch (LimitOverflowException e) {
+                    TestUtils.assertContains(e.getFlyweightMessage(), "limit of 1024 memory exceeded in test sink");
+                }
+
+                // resize() threw before skip() advanced anything, so the sink is still pristine and
+                // has to allocate rather than write through address 0, landing the value exactly
+                // where a never-opened sink would. This half also pins the alloc/free balance.
+                sink.putInt(7);
+                reference.putInt(7);
+                Assert.assertTrue(sink.memeq(reference));
+            }
+        });
+    }
+
+    @Test(expected = LimitOverflowException.class)
+    public void testPutIntExceedsMaxSize() throws Exception {
+        runWithSink(sink -> {
+            for (int i = 0; i < 300; i++) {
+                sink.putInt(i);
+            }
+        });
+    }
+
+    @Test
+    public void testPutVarcharErasesAsciiFlag() throws Exception {
+        // Two identical ASCII VARCHAR values with different isAscii() flags must
+        // produce the same serialized key, so memeq() returns true. Before the fix,
+        // the ASCII flag was preserved in the header, causing visually identical
+        // values to compare as unequal in ASOF JOIN key matching.
+        runWithSinks((sinkLeft, sinkRight) -> {
+            Utf8String withAscii = new Utf8String(new byte[]{'h', 'e', 'l', 'l', 'o'}, true);
+            Utf8String withoutAscii = new Utf8String(new byte[]{'h', 'e', 'l', 'l', 'o'}, false);
+
+            sinkLeft.putVarchar(withAscii);
+            sinkRight.putVarchar(withoutAscii);
+            Assert.assertTrue(sinkLeft.memeq(sinkRight));
+
+            // Sanity check: different values must still compare as unequal.
+            sinkLeft.clear();
+            sinkRight.clear();
+            sinkLeft.putVarchar(withAscii);
+            sinkRight.putVarchar(new Utf8String(new byte[]{'w', 'o', 'r', 'l', 'd'}, true));
+            Assert.assertFalse(sinkLeft.memeq(sinkRight));
+        });
+    }
+
+    @Test
+    public void testReleaseMemory() throws Exception {
+        runWithSink(sink -> {
+            sink.putInt(123);
+            sink.close();
+        });
+    }
+
+    @Test
+    public void testReleaseMemoryAfterResize() throws Exception {
+        runWithSink(sink -> {
+            for (int i = 0; i < 100; i++) {
+                sink.putInt(i);
+            }
+            sink.close();
+        });
+    }
+
+    @Test
+    public void testReopen() throws Exception {
+        runWithSinks((sinkLeft, sinkRight) -> {
+            sinkLeft.putInt(123);
+            sinkLeft.close();
+            sinkLeft.reopen();
+            sinkLeft.putInt(42);
+
+            sinkRight.putInt(321);
+            sinkRight.close();
+            sinkRight.reopen();
+            sinkRight.putInt(42);
+
+            Assert.assertTrue(sinkLeft.memeq(sinkRight));
+        });
+    }
+
+    @Test
+    public void testReopenAfterInstantiation() throws Exception {
+        runWithSinks((sinkLeft, sinkRight) -> {
+            sinkLeft.reopen();
+            sinkLeft.putInt(42);
+
+            sinkRight.reopen();
+            sinkRight.putInt(42);
+
+            Assert.assertTrue(sinkLeft.memeq(sinkRight));
+        });
+    }
+
+    private static void testFuzz0(Rnd rnd, boolean negativeCase) throws Exception {
+        runWithSinks((sinkLeft, sinkRight) -> {
+            // generate ops
+            int opsCount = rnd.nextInt(100) + 1; // at least one op
+            PUT_OP[] ops = new PUT_OP[opsCount];
+            for (int i = 0; i < opsCount; i++) {
+                int op = rnd.nextInt(PUT_OP.values().length);
+                ops[i] = PUT_OP.values()[op];
+            }
+            int badValueAt = -1;
+            if (negativeCase) {
+                badValueAt = rnd.nextInt(opsCount);
+            }
+
+            long seed0 = rnd.getSeed0();
+            long seed1 = rnd.getSeed1();
+
+            // populate left sink
+            rnd.reset(seed0, seed1);
+            for (int i = 0; i < opsCount; i++) {
+                ops[i].put(sinkLeft, rnd, false);
+            }
+
+            // populate right sink
+            rnd.reset(seed0, seed1);
+            for (int i = 0; i < opsCount; i++) {
+                ops[i].put(sinkRight, rnd, i == badValueAt);
+            }
+
+
+            Assert.assertTrue(sinkLeft.memeq(sinkRight) != negativeCase);
+        }, 1024 * 1024);
+    }
+
+    private enum PUT_OP {
+        PUT_INT,
+        PUT_LONG,
+        PUT_DOUBLE,
+        PUT_STR,
+        PUT_BIN,
+        PUT_BOOL,
+        PUT_BYTE,
+        PUT_CHAR,
+        PUT_DATE,
+        PUT_FLOAT,
+        PUT_IPV4,
+        PUT_LONG128,
+        PUT_SHORT,
+        PUT_TIMESTAMP,
+        PUT_VARCHAR,
+        PUT_LONG256_DIRECT,
+        PUT_LONG256_WRAPPED,
+        PUT_DECIMAL128,
+        PUT_DECIMAL256;
+
+        private void put(SingleRecordSink sink, Rnd rnd, boolean badValue) {
+            switch (this) {
+                case PUT_LONG256_WRAPPED:
+                    Long256Impl long256wrapper = new Long256Impl();
+                    long256wrapper.setAll(rnd.nextLong(), rnd.nextLong(), rnd.nextLong(), rnd.nextLong());
+
+                    if (badValue) {
+                        long seed0 = rnd.getSeed0();
+                        long seed1 = rnd.getSeed1();
+                        Long256Impl long256wrapperB = new Long256Impl();
+                        long256wrapperB.copyFrom(long256wrapper);
+                        do {
+                            long256wrapper.setAll(rnd.nextLong(), rnd.nextLong(), rnd.nextLong(), rnd.nextLong());
+                        } while (long256wrapper.equals(long256wrapperB));
+
+                        // reset seeds, as if we didn't generated the bad value
+                        rnd.reset(seed0, seed1);
+                    }
+                    sink.putLong256(long256wrapper);
+                    break;
+                case PUT_LONG256_DIRECT:
+                    long long256A = rnd.nextLong();
+                    long long256B = rnd.nextLong();
+                    long long256C = rnd.nextLong();
+                    long long256D = rnd.nextLong();
+
+                    if (badValue) {
+                        long long256A2 = long256A;
+                        long long256B2 = long256B;
+                        long long256C2 = long256C;
+                        long long256D2 = long256D;
+                        do {
+                            long256A = rnd.nextLong();
+                            long256B = rnd.nextLong();
+                            long256C = rnd.nextLong();
+                            long256D = rnd.nextLong();
+                        } while (long256A == long256A2 && long256B == long256B2 && long256C == long256C2 && long256D == long256D2);
+                    }
+                    sink.putLong256(rnd.nextLong(), rnd.nextLong(), rnd.nextLong(), rnd.nextLong());
+                    break;
+                case PUT_VARCHAR:
+                    boolean varcharNull = rnd.nextInt(5) == 0; // 20% chance of null
+                    if (varcharNull && !badValue) {
+                        sink.putVarchar((Utf8Sequence) null);
+                        break;
+                    }
+
+                    if (varcharNull) {
+                        long seed0 = rnd.getSeed0();
+                        long seed1 = rnd.getSeed1();
+                        sink.putVarchar(rnd.nextChars(10));
+                        rnd.reset(seed0, seed1);
+                        break;
+                    }
+
+                    CharSequence charSequence = rnd.nextChars(10);
+                    if (!badValue) {
+                        sink.putVarchar(charSequence);
+                    } else {
+                        long seed0 = rnd.getSeed0();
+                        long seed1 = rnd.getSeed1();
+
+                        CharSequence charSequenceB = String.valueOf(charSequence);
+                        do {
+                            charSequence = rnd.nextChars(10);
+                        } while (charSequence.equals(charSequenceB));
+                        sink.putVarchar(charSequence);
+                        rnd.reset(seed0, seed1);
+                    }
+                    break;
+                case PUT_TIMESTAMP:
+                    long rndTimestamp = rnd.nextLong();
+                    if (badValue) {
+                        rndTimestamp++;
+                    }
+                    sink.putTimestamp(rndTimestamp);
+                    break;
+                case PUT_SHORT:
+                    short rndShort = rnd.nextShort();
+                    if (badValue) {
+                        rndShort++;
+                    }
+                    sink.putShort(rndShort);
+                    break;
+                case PUT_LONG128:
+                    long rndLong128A = rnd.nextLong();
+                    long rndLong128B = rnd.nextLong();
+                    if (badValue) {
+                        rndLong128A++;
+                    }
+                    sink.putLong128(rndLong128A, rndLong128B);
+                    break;
+                case PUT_IPV4:
+                    int rndIPv4 = rnd.nextInt();
+                    if (badValue) {
+                        rndIPv4++;
+                    }
+                    sink.putIPv4(rndIPv4);
+                    break;
+                case PUT_FLOAT:
+                    float rndFloat = rnd.nextFloat();
+                    if (badValue) {
+                        rndFloat *= 2;
+                        rndFloat += 1;
+                    }
+                    sink.putFloat(rndFloat);
+                    break;
+                case PUT_DATE:
+                    long rndDate = rnd.nextLong();
+                    if (badValue) {
+                        rndDate++;
+                    }
+                    sink.putDate(rndDate);
+                    break;
+                case PUT_CHAR:
+                    char rndChar = rnd.nextChar();
+                    if (badValue) {
+                        rndChar++;
+                    }
+                    sink.putChar(rndChar);
+                    break;
+                case PUT_INT:
+                    int rndInt = rnd.nextInt();
+                    if (badValue) {
+                        rndInt++;
+                    }
+                    sink.putInt(rndInt);
+                    break;
+                case PUT_LONG:
+                    long rndLong = rnd.nextLong();
+                    if (badValue) {
+                        rndLong++;
+                    }
+                    sink.putLong(rndLong);
+                    break;
+                case PUT_DOUBLE:
+                    double rndDouble = rnd.nextDouble();
+                    if (badValue) {
+                        rndDouble *= 2;
+                        rndDouble += 1;
+                    }
+                    sink.putDouble(rndDouble);
+                    break;
+                case PUT_STR:
+                    boolean strNull = rnd.nextInt(5) == 0; // 20% chance of null
+                    if (strNull && !badValue) {
+                        sink.putStr(null);
+                        break;
+                    }
+                    if (strNull) {
+                        long seed0 = rnd.getSeed0();
+                        long seed1 = rnd.getSeed1();
+                        sink.putStr(rnd.nextChars(10));
+                        rnd.reset(seed0, seed1);
+                        break;
+                    }
+
+                    CharSequence str = rnd.nextChars(10);
+                    if (!badValue) {
+                        sink.putStr(str);
+                    } else {
+                        long seed0 = rnd.getSeed0();
+                        long seed1 = rnd.getSeed1();
+
+                        CharSequence strB = String.valueOf(str);
+                        do {
+                            str = rnd.nextChars(10);
+                        } while (str.equals(strB));
+                        sink.putStr(str);
+                        rnd.reset(seed0, seed1);
+                    }
+                    break;
+                case PUT_BOOL:
+                    boolean rndBool = rnd.nextBoolean();
+                    if (badValue) {
+                        rndBool = !rndBool;
+                    }
+                    sink.putBool(rndBool);
+                    break;
+                case PUT_BYTE:
+                    byte rndByte = rnd.nextByte();
+                    if (badValue) {
+                        rndByte++;
+                    }
+                    sink.putByte(rndByte);
+                    break;
+                case PUT_BIN:
+                    boolean binNull = rnd.nextInt(5) == 0; // 20% chance of null
+                    if (binNull && !badValue) {
+                        sink.putBin(null);
+                        break;
+                    }
+
+
+                    int len = rnd.nextInt(10);
+                    BinarySequence seq;
+                    long s0 = 0;
+                    long s1 = 0;
+                    if (!badValue) {
+                        seq = new BinarySequence() {
+                            @Override
+                            public byte byteAt(long index) {
+                                return rnd.nextByte();
+                            }
+
+                            @Override
+                            public long length() {
+                                return len;
+                            }
+                        };
+                    } else {
+                        for (int i = 0; i < len; i++) {
+                            rnd.nextByte();
+                        }
+                        s0 = rnd.getSeed0();
+                        s1 = rnd.getSeed1();
+                        seq = new BinarySequence() {
+                            @Override
+                            public byte byteAt(long index) {
+                                return rnd.nextByte();
+                            }
+
+                            @Override
+                            public long length() {
+                                return len + 1;
+                            }
+                        };
+                    }
+                    sink.putBin(seq);
+                    if (badValue) {
+                        rnd.reset(s0, s1);
+                    }
+                    break;
+                case PUT_DECIMAL128:
+                    long rndDecimal128Hi = rnd.nextPositiveLong() % Decimal128.MAX_VALUE.getHigh();
+                    long rndDecimal128Lo = rnd.nextLong();
+                    if (badValue) {
+                        rndDecimal128Hi++;
+                    }
+                    sink.putDecimal128(new Decimal128(rndDecimal128Hi, rndDecimal128Lo, 0));
+                    break;
+                case PUT_DECIMAL256:
+                    long rndDecimal256HH = rnd.nextPositiveLong() % Decimal256.MAX_VALUE.getHh();
+                    long rndDecimal256HL = rnd.nextLong();
+                    long rndDecimal256LH = rnd.nextLong();
+                    long rndDecimal256LL = rnd.nextLong();
+                    if (badValue) {
+                        rndDecimal256HH++;
+                    }
+                    var decimal256 = new Decimal256(rndDecimal256HH, rndDecimal256HL, rndDecimal256LH, rndDecimal256LL, 0);
+                    sink.putDecimal256(decimal256);
+                    break;
+                default:
+                    throw new UnsupportedOperationException();
+            }
+        }
+    }
+
+    interface WithNewSink {
+        void runWithSink(SingleRecordSink sink);
+    }
+
+    interface WithNewSinks {
+        void runWithSink(SingleRecordSink left, SingleRecordSink right);
+    }
+}

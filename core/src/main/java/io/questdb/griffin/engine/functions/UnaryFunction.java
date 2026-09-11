@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -31,21 +31,32 @@ import io.questdb.griffin.SqlException;
 import io.questdb.griffin.SqlExecutionContext;
 
 public interface UnaryFunction extends Function {
+
     @Override
     default void close() {
         getArg().close();
     }
 
+    @Override
+    default void cursorClosed() {
+        getArg().cursorClosed();
+    }
+
+    /**
+     * Returns the single argument of this unary function.
+     *
+     * @return the function argument
+     */
     Function getArg();
+
+    @Override
+    default int getComplexity() {
+        return getArg().getComplexity();
+    }
 
     @Override
     default void init(SymbolTableSource symbolTableSource, SqlExecutionContext executionContext) throws SqlException {
         getArg().init(symbolTableSource, executionContext);
-    }
-
-    @Override
-    default void initCursor() {
-        getArg().initCursor();
     }
 
     @Override
@@ -54,8 +65,33 @@ public interface UnaryFunction extends Function {
     }
 
     @Override
-    default boolean isReadThreadSafe() {
-        return getArg().isReadThreadSafe();
+    default boolean isEquivalentTo(Function other) {
+        if (other == this) {
+            return true;
+        }
+        if (other instanceof UnaryFunction that) {
+            return getArg().isEquivalentTo(that.getArg());
+        }
+        return false;
+    }
+
+    @Override
+    default boolean isNonDeterministic() {
+        return getArg().isNonDeterministic();
+    }
+
+    @Override
+    default boolean isRandom() {
+        return getArg().isRandom();
+    }
+
+    // Within-execution stability composes independently of determinism: an arg may be
+    // non-deterministic yet stable (bind variable, now()), or appear deterministic through
+    // isNonDeterministic() yet be unstable (a cursor arg wrapping an rnd_* projection).
+    // Deriving this from !isNonDeterministic() would get both cases wrong.
+    @Override
+    default boolean isStableWithinExecution() {
+        return getArg().isStableWithinExecution();
     }
 
     @Override
@@ -64,8 +100,30 @@ public interface UnaryFunction extends Function {
     }
 
     @Override
+    default boolean isThreadSafe() {
+        return getArg().isThreadSafe();
+    }
+
+    @Override
+    default void offerStateTo(Function that) {
+        if (that instanceof UnaryFunction other) {
+            getArg().offerStateTo(other.getArg());
+        }
+    }
+
+    @Override
+    default boolean shouldMemoize() {
+        return getArg().shouldMemoize();
+    }
+
+    @Override
     default boolean supportsParallelism() {
         return getArg().supportsParallelism();
+    }
+
+    @Override
+    default boolean supportsRandomAccess() {
+        return getArg().supportsRandomAccess();
     }
 
     @Override

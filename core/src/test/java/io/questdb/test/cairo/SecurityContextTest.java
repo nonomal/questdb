@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -26,31 +26,40 @@ package io.questdb.test.cairo;
 
 import io.questdb.cairo.SecurityContext;
 import io.questdb.cairo.TableToken;
+import io.questdb.cairo.TableUtils;
 import io.questdb.cairo.security.AllowAllSecurityContext;
 import io.questdb.cairo.security.DenyAllSecurityContext;
 import io.questdb.cairo.security.ReadOnlySecurityContext;
+import io.questdb.cairo.view.ViewDefinition;
 import io.questdb.std.LongList;
 import io.questdb.std.ObjHashSet;
 import io.questdb.std.ObjList;
-import org.junit.Assert;
 import org.junit.Test;
 
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 
-public class SecurityContextTest {
+import static org.junit.Assert.*;
+
+public class
+
+
+SecurityContextTest {
     private static final Object[] NO_PARAM_ARGS = {};
     private static final ObjList<CharSequence> columns = new ObjList<>();
     private static final LongList permissions = new LongList();
     private final static String tableName = "tab";
     private static final Object[] THREE_PARAM_ARGS = {permissions, tableName, columns};
-    private static final TableToken userTableToken = new TableToken(tableName, tableName, 0, false, false, false);
+    private static final TableToken userTableToken = new TableToken(tableName, tableName, null, 0, false, false, false);
     private static final Object[] ONE_PARAM_ARGS = {userTableToken};
     private static final Object[] TWO_PARAM_ARGS = {userTableToken, columns};
 
     @Test
     public void testAllowAllSecurityContext() throws InvocationTargetException, IllegalAccessException {
-        SecurityContext sc = AllowAllSecurityContext.INSTANCE;
+        final SecurityContext sc = AllowAllSecurityContext.INSTANCE;
+        assertTrue(sc.isSystemAdmin());
+        assertTrue(sc.isQueryCancellationAllowed());
+        assertFalse(sc.isExternal());
         for (Method method : SecurityContext.class.getMethods()) {
             String name = method.getName();
             if (name.startsWith("authorize")) {
@@ -64,6 +73,12 @@ public class SecurityContextTest {
                             method.invoke(sc, sc);
                         } else if (name.equals("authorizeTableBackup")) {
                             method.invoke(sc, new ObjHashSet<CharSequence>());
+                        } else if (name.equals("authorizeTableCreate")) {
+                            method.invoke(sc, TableUtils.TABLE_KIND_REGULAR_TABLE);
+                        } else if (name.equals("authorizeSelect") && parameters[0] == ViewDefinition.class) {
+                            final ViewDefinition viewDefinition = new ViewDefinition();
+                            viewDefinition.init(userTableToken, tableName, 0L);
+                            method.invoke(sc, viewDefinition);
                         } else {
                             method.invoke(sc, ONE_PARAM_ARGS);
                         }
@@ -83,7 +98,10 @@ public class SecurityContextTest {
 
     @Test
     public void testDenyAllSecurityContext() throws IllegalAccessException {
-        SecurityContext sc = DenyAllSecurityContext.INSTANCE;
+        final SecurityContext sc = DenyAllSecurityContext.INSTANCE;
+        assertTrue(sc.isSystemAdmin());
+        assertFalse(sc.isQueryCancellationAllowed());
+        assertFalse(sc.isExternal());
         for (Method method : SecurityContext.class.getMethods()) {
             String name = method.getName();
             if (name.startsWith("authorize")) {
@@ -92,32 +110,36 @@ public class SecurityContextTest {
                     switch (parameters.length) {
                         case 0:
                             method.invoke(sc, NO_PARAM_ARGS);
-                            Assert.fail();
+                            fail();
                             break;
                         case 1:
                             if (name.equals("authorizeCopyCancel")) {
                                 method.invoke(sc, sc);
-                            } else if (name.equals("authorizeTableBackup")) {
-                                method.invoke(sc, new ObjHashSet<CharSequence>());
+                            } else if (name.equals("authorizeTableCreate")) {
+                                method.invoke(sc, TableUtils.TABLE_KIND_REGULAR_TABLE);
+                            } else if (name.equals("authorizeSelect") && parameters[0] == ViewDefinition.class) {
+                                final ViewDefinition viewDefinition = new ViewDefinition();
+                                viewDefinition.init(userTableToken, tableName, 0L);
+                                method.invoke(sc, viewDefinition);
                             } else {
                                 method.invoke(sc, ONE_PARAM_ARGS);
                             }
-                            Assert.fail();
+                            fail();
                             break;
                         case 2:
                             method.invoke(sc, TWO_PARAM_ARGS);
-                            Assert.fail();
+                            fail();
                             break;
                         case 3:
                             method.invoke(sc, THREE_PARAM_ARGS);
-                            Assert.fail();
+                            fail();
                         default:
                             throw new IndexOutOfBoundsException();
                     }
                 } catch (IllegalArgumentException iae) {
                     throw new RuntimeException("Call failed for " + method, iae);
                 } catch (InvocationTargetException err) {
-                    Assert.assertTrue(err.getTargetException().getMessage().contains("permission denied"));
+                    assertTrue(err.getTargetException().getMessage().contains("permission denied"));
                 }
             }
         }
@@ -125,7 +147,10 @@ public class SecurityContextTest {
 
     @Test
     public void testReadOnlySecurityContext() throws IllegalAccessException {
-        SecurityContext sc = ReadOnlySecurityContext.INSTANCE;
+        final SecurityContext sc = ReadOnlySecurityContext.INSTANCE;
+        assertTrue(sc.isSystemAdmin());
+        assertFalse(sc.isQueryCancellationAllowed());
+        assertFalse(sc.isExternal());
         for (Method method : SecurityContext.class.getMethods()) {
             String name = method.getName();
             if (name.startsWith("authorize")) {
@@ -134,36 +159,41 @@ public class SecurityContextTest {
                     switch (parameters.length) {
                         case 0:
                             method.invoke(sc, NO_PARAM_ARGS);
-                            if (name.startsWith("authorizeAdminAction")
+                            if (name.startsWith("authorizeSystemAdmin") || name.equals("authorizeSqlEngineAdmin") || name.equals("authorizeSettings")
                                     || name.equals("authorizeHttp") || name.equals("authorizePGWire") || name.equals("authorizeLineTcp")) {
                                 continue;
                             }
-                            Assert.fail();
+                            fail();
                             break;
                         case 1:
                             if (name.equals("authorizeCopyCancel")) {
                                 method.invoke(sc, sc);
                             } else if (name.equals("authorizeTableBackup")) {
                                 method.invoke(sc, new ObjHashSet<CharSequence>());
+                            } else if (name.equals("authorizeTableCreate")) {
+                                method.invoke(sc, TableUtils.TABLE_KIND_REGULAR_TABLE);
+                            } else if (name.equals("authorizeSelect") && parameters[0] == ViewDefinition.class) {
+                                final ViewDefinition viewDefinition = new ViewDefinition();
+                                viewDefinition.init(userTableToken, tableName, 0L);
+                                method.invoke(sc, viewDefinition);
                             } else {
                                 method.invoke(sc, ONE_PARAM_ARGS);
                             }
-                            if (name.startsWith("authorizeShow")
-                                    || name.startsWith("authorizeSelect")) {
+                            if (name.startsWith("authorizeShow") || name.startsWith("authorizeSelect")) {
                                 continue;
                             }
-                            Assert.fail();
+                            fail();
                             break;
                         case 2:
                             method.invoke(sc, TWO_PARAM_ARGS);
                             if (name.equals("authorizeSelect")) {
                                 continue;
                             }
-                            Assert.fail();
+                            fail();
                             break;
                         case 3:
                             method.invoke(sc, THREE_PARAM_ARGS);
-                            Assert.fail();
+                            fail();
                             break;
                         default:
                             throw new IndexOutOfBoundsException();
@@ -171,7 +201,7 @@ public class SecurityContextTest {
                 } catch (IllegalArgumentException iae) {
                     throw new RuntimeException("Call failed for " + method, iae);
                 } catch (InvocationTargetException err) {
-                    Assert.assertTrue(err.getTargetException().getMessage().contains("permission denied"));
+                    assertTrue(err.getTargetException().getMessage().contains("permission denied"));
                 }
             }
         }

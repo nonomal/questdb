@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -35,12 +35,9 @@ public class ShowServerVersionTest extends AbstractCairoTest {
     public void testShowServerVersion() throws Exception {
         final String expected = "server_version\n" +
                 SERVER_VERSION + "\n";
-        assertQuery(
-                expected,
-                "show server_version",
-                null,
-                false,
-                true
-        );
+        assertQuery("show server_version")
+                .noRandomAccess()
+                .expectSize()
+                .returns(expected);
     }
 }

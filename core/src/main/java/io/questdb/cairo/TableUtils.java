@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -25,36 +25,87 @@
 package io.questdb.cairo;
 
 import io.questdb.MessageBus;
-import io.questdb.cairo.map.Map;
-import io.questdb.cairo.map.MapKey;
-import io.questdb.cairo.map.MapValue;
-import io.questdb.cairo.sql.Record;
-import io.questdb.cairo.sql.*;
+import io.questdb.Telemetry;
+import io.questdb.TelemetryEvent;
+import io.questdb.TelemetryOrigin;
+import io.questdb.cairo.file.BlockFileWriter;
+import io.questdb.cairo.lv.LiveViewDefinition;
+import io.questdb.cairo.lv.LiveViewState;
+import io.questdb.cairo.mv.MatViewDefinition;
+import io.questdb.cairo.mv.MatViewState;
+import io.questdb.cairo.sql.Function;
+import io.questdb.cairo.sql.RecordMetadata;
+import io.questdb.cairo.sql.SymbolTable;
+import io.questdb.cairo.sql.TableMetadata;
+import io.questdb.cairo.sql.TableRecordMetadata;
+import io.questdb.cairo.view.ViewDefinition;
 import io.questdb.cairo.vm.Vm;
-import io.questdb.cairo.vm.api.*;
+import io.questdb.cairo.vm.api.MemoryA;
+import io.questdb.cairo.vm.api.MemoryCMR;
+import io.questdb.cairo.vm.api.MemoryMA;
+import io.questdb.cairo.vm.api.MemoryMAR;
+import io.questdb.cairo.vm.api.MemoryMARW;
+import io.questdb.cairo.vm.api.MemoryMR;
+import io.questdb.cairo.vm.api.MemoryMW;
+import io.questdb.cairo.vm.api.MemoryR;
 import io.questdb.griffin.AnyRecordMetadata;
 import io.questdb.griffin.FunctionParser;
 import io.questdb.griffin.SqlException;
 import io.questdb.griffin.SqlExecutionContext;
-import io.questdb.griffin.engine.join.LongChain;
+import io.questdb.griffin.engine.table.parquet.MappedMemoryPartitionDescriptor;
+import io.questdb.griffin.engine.table.parquet.ParquetCompression;
+import io.questdb.griffin.engine.table.parquet.ParquetPartitionDecoder;
+import io.questdb.griffin.engine.table.parquet.PartitionDescriptor;
+import io.questdb.griffin.engine.table.parquet.PartitionEncoder;
+import io.questdb.griffin.engine.table.parquet.PartitionUpdater;
 import io.questdb.griffin.model.ExpressionNode;
-import io.questdb.griffin.model.QueryModel;
+import io.questdb.griffin.model.IQueryModel;
 import io.questdb.log.Log;
 import io.questdb.log.LogFactory;
+import io.questdb.log.LogRecord;
 import io.questdb.mp.MPSequence;
-import io.questdb.std.*;
+import io.questdb.std.Chars;
+import io.questdb.std.Decimals;
+import io.questdb.std.DirectIntList;
+import io.questdb.std.Files;
+import io.questdb.std.FilesFacade;
+import io.questdb.std.IntIntHashMap;
+import io.questdb.std.IntList;
+import io.questdb.std.LowerCaseCharSequenceIntHashMap;
+import io.questdb.std.MemoryTag;
+import io.questdb.std.Misc;
+import io.questdb.std.Numbers;
+import io.questdb.std.NumericException;
+import io.questdb.std.ObjList;
+import io.questdb.std.Os;
+import io.questdb.std.Unsafe;
+import io.questdb.std.Vect;
 import io.questdb.std.datetime.millitime.MillisecondClock;
-import io.questdb.std.str.*;
+import io.questdb.std.str.CharSink;
+import io.questdb.std.str.LPSZ;
+import io.questdb.std.str.Path;
+import io.questdb.std.str.Utf8Sequence;
+import io.questdb.std.str.Utf8s;
 import io.questdb.tasks.O3PartitionPurgeTask;
+import io.questdb.tasks.TelemetryTask;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
+import static io.questdb.ParanoiaState.VM_PARANOIA_MODE;
 import static io.questdb.cairo.MapWriter.createSymbolMapFiles;
+import static io.questdb.cairo.pool.AbstractMultiTenantPool.NO_LOCK_REASON;
 import static io.questdb.cairo.wal.WalUtils.CONVERT_FILE_NAME;
+import static io.questdb.tasks.TableWriterTask.CMD_STORAGE_POLICY;
+import static io.questdb.tasks.TableWriterTask.getCommandName;
 
 public final class TableUtils {
     public static final int ANY_TABLE_VERSION = -1;
     public static final String ATTACHABLE_DIR_MARKER = ".attachable";
+    public static final String CHECKPOINT_DIRECTORY = ".checkpoint";
+    public static final String CHECKPOINT_LEGACY_META_FILE_NAME = "_snapshot";
+    public static final String CHECKPOINT_LEGACY_META_FILE_NAME_TXT = "_snapshot.txt";
+    public static final String CHECKPOINT_META_FILE_NAME = "_checkpoint_meta.d";
+    public static final String CHECKPOINT_SEQ_TXN_FILE_NAME = "_txn";
     public static final long COLUMN_NAME_TXN_NONE = -1L;
     public static final String COLUMN_VERSION_FILE_NAME = "_cv";
     public static final String DEFAULT_PARTITION_NAME = "default";
@@ -63,13 +114,18 @@ public final class TableUtils {
     public static final String FILE_SUFFIX_D = ".d";
     public static final String FILE_SUFFIX_I = ".i";
     public static final int INITIAL_TXN = 0;
+    public static final String LEGACY_CHECKPOINT_DIRECTORY = "snapshot";
     public static final int LONGS_PER_TX_ATTACHED_PARTITION = 4;
     public static final int LONGS_PER_TX_ATTACHED_PARTITION_MSB = Numbers.msb(LONGS_PER_TX_ATTACHED_PARTITION);
     public static final long META_COLUMN_DATA_SIZE = 32;
     public static final String META_FILE_NAME = "_meta";
+    public static final short META_FORMAT_MINOR_VERSION_LATEST = 2;
+    public static final short META_FORMAT_MINOR_VERSION_PARQUET_ENCODING_CONFIG = 1;
+    public static final short META_FORMAT_MINOR_VERSION_TABLE_FORMAT = 2;
+    public static final short META_FORMAT_MINOR_VERSION_TTL = 1;
     public static final long META_OFFSET_COLUMN_TYPES = 128;
     public static final long META_OFFSET_COUNT = 0;
-    public static final long META_OFFSET_MAX_UNCOMMITTED_ROWS = 20; // LONG
+    public static final long META_OFFSET_MAX_UNCOMMITTED_ROWS = 20; // INT
     public static final long META_OFFSET_METADATA_VERSION = 32; // LONG
     public static final long META_OFFSET_O3_MAX_LAG = 24; // LONG
     // INT - symbol map count, this is a variable part of transaction file
@@ -79,38 +135,47 @@ public final class TableUtils {
     public static final long META_OFFSET_TIMESTAMP_INDEX = 8;
     public static final long META_OFFSET_VERSION = 12;
     public static final long META_OFFSET_WAL_ENABLED = 40; // BOOLEAN
+    public static final long META_OFFSET_META_FORMAT_MINOR_VERSION = META_OFFSET_WAL_ENABLED + 1; // INT
+    public static final long META_OFFSET_TTL_HOURS_OR_MONTHS = META_OFFSET_META_FORMAT_MINOR_VERSION + 4; // INT
+    public static final long META_OFFSET_TABLE_FORMAT = META_OFFSET_TTL_HOURS_OR_MONTHS + 4; // INT
     public static final String META_PREV_FILE_NAME = "_meta.prev";
-    /**
-     * TXN file structure
-     * struct {
-     * long txn;
-     * long transient_row_count; // rows count in last partition
-     * long fixed_row_count; // row count in table excluding count in last partition
-     * long max_timestamp; // last timestamp written to table
-     * long struct_version; // data structure version; whenever columns added or removed this version changes.
-     * long partition_version; // version that increments whenever non-current partitions are modified/added/removed
-     * long txn_check; // same as txn - sanity check for concurrent reads and writes
-     * int  map_writer_count; // symbol writer count
-     * int  map_writer_position[map_writer_count]; // position of each of map writers
-     * }
-     * <p>
-     * TableUtils.resetTxn() writes to this file, it could be using different offsets, beware
-     */
-
     public static final String META_SWAP_FILE_NAME = "_meta.swp";
-    public static final int MIN_INDEX_VALUE_BLOCK_SIZE = Numbers.ceilPow2(4);
+    public static final int MIN_INDEX_VALUE_BLOCK_SIZE = Numbers.ceilPow2(2);
+    // 24-byte header left empty for possible future use
+    // in case we decide to support ALTER MAT VIEW, and modify mat view metadata
     public static final int NULL_LEN = -1;
-    public static final String SNAPSHOT_META_FILE_NAME = "_snapshot";
-    public static final String SNAPSHOT_META_FILE_NAME_TXT = "_snapshot.txt";
+    public static final String PARQUET_METADATA_FILE_NAME = "_pm";
+    public static final String PARQUET_METADATA_STAGING_FILE_NAME = "_pm.staging";
+    public static final String PARQUET_PARTITION_NAME = "data.parquet";
+    public static final String PARQUET_PARTITION_STAGING_NAME = "data.parquet.staging";
+    public static final String PARTITION_LAST_SQUASH_TIMESTAMP_FILE = ".squash_ts";
+    public static final String RESTORE_FROM_CHECKPOINT_TRIGGER_FILE_NAME = "_restore";
     public static final String SYMBOL_KEY_REMAP_FILE_SUFFIX = ".r";
     public static final char SYSTEM_TABLE_NAME_SUFFIX = '~';
+    // Writer lock reason used by internal system jobs (partition/posting-seal purge,
+    // CSV copy status) when they acquire a TableWriter on behalf of the engine itself.
+    public static final String SYSTEM_WRITER_LOCK_REASON = "QuestDB system";
     public static final int TABLE_DOES_NOT_EXIST = 1;
     public static final int TABLE_EXISTS = 0;
+    public static final int TABLE_FORMAT_NATIVE = 0;
+    public static final int TABLE_FORMAT_PARQUET = 1;
+    // Regular data table kind
+    public static final int TABLE_KIND_REGULAR_TABLE = 0;
+    // Parquet export table kind - allows table creation in read-only mode for parquet exports
+    public static final int TABLE_KIND_TEMP_PARQUET_EXPORT = 2;
     public static final String TABLE_NAME_FILE = "_name";
     public static final int TABLE_RESERVED = 2;
+    public static final int TABLE_TYPE_LIVE_VIEW = 4;
+    public static final int TABLE_TYPE_MAT = 2;
     public static final int TABLE_TYPE_NON_WAL = 0;
+    public static final int TABLE_TYPE_VIEW = 3;
     public static final int TABLE_TYPE_WAL = 1;
     public static final String TAB_INDEX_FILE_NAME = "_tab_index.d";
+    // Dot-prefixed db-root staging dir for ALTER TABLE ... REBASE WAL (mirrors ".download"/".checkpoint").
+    // The startup table-dir scans only consider immediate db-root children that are complete tables and
+    // never recurse, so the in-progress clone built inside here is invisible until renamed into place.
+    public static final String REBASE_TMP_DIR = ".rebase";
+    public static final String TODO_FILE_NAME = "_todo_";
     /**
      * TXN file structure
      * struct {
@@ -127,8 +192,6 @@ public final class TableUtils {
      * <p>
      * TableUtils.resetTxn() writes to this file, it could be using different offsets, beware
      */
-
-    public static final String TODO_FILE_NAME = "_todo_";
     public static final String TXN_FILE_NAME = "_txn";
     public static final String TXN_SCOREBOARD_FILE_NAME = "_txn_scoreboard";
     // transaction file structure
@@ -162,11 +225,37 @@ public final class TableUtils {
     // @formatter:on
     public static final int TX_RECORD_HEADER_SIZE = (int) TX_OFFSET_MAP_WRITER_COUNT_32 + Integer.BYTES;
     public static final String UPGRADE_FILE_NAME = "_upgrade.d";
+    public static final String WAL_2_TABLE_RESUME_REASON = "Resume WAL Data Application";
+    public static final String WAL_2_TABLE_WRITE_REASON = "WAL Data Application";
     static final int COLUMN_VERSION_FILE_HEADER_SIZE = 40;
+    // Column flag bit layout (on-disk in _meta).
+    // Bits 0, 2, 3 match the pre-posting-index layout, so tables written by
+    // older versions keep meaning when read by new binaries, and tables
+    // written by this version that have no POSTING/COVERING columns are
+    // bit-identical to the old layout (downgrade-safe when no new features
+    // are used).
+    //
+    //   bit 0: INDEXED                 (legacy META_FLAG_BIT_INDEXED)
+    //   bit 1: IS_POSTING              (0 = BITMAP, 1 = posting variant)
+    //   bit 2: SYMBOL_CACHE            (legacy)
+    //   bit 3: DEDUP_KEY               (legacy)
+    //   bit 4: POSTING_VARIANT low     (2-bit variant selector, bits 4-5)
+    //   bit 5: POSTING_VARIANT high
+    //   bit 6: COVERING
+    //
+    // Posting variant encoding (bits 4-5, valid only when IS_POSTING=1):
+    //   00 = POSTING (adaptive)
+    //   01 = POSTING_DELTA
+    //   10 = POSTING_EF
+    //   11 = reserved
     static final int META_FLAG_BIT_INDEXED = 1;
-    static final int META_FLAG_BIT_SEQUENTIAL = 1 << 1;
-    static final int META_FLAG_BIT_SYMBOL_CACHE = META_FLAG_BIT_SEQUENTIAL << 1;
-    static final int META_FLAG_BIT_DEDUP_KEY = META_FLAG_BIT_SYMBOL_CACHE << 1;
+    static final int META_FLAG_BIT_IS_POSTING = 1 << 1;
+    static final int META_FLAG_BIT_SYMBOL_CACHE = 1 << 2;
+    static final int META_FLAG_BIT_DEDUP_KEY = 1 << 3;
+    static final int META_FLAG_BIT_POSTING_VARIANT_LO = 1 << 4;
+    static final int META_FLAG_BIT_POSTING_VARIANT_HI = 1 << 5;
+    static final int META_FLAG_BIT_COVERING = 1 << 6;
+    static final int META_FLAG_POSTING_VARIANT_MASK = META_FLAG_BIT_POSTING_VARIANT_LO | META_FLAG_BIT_POSTING_VARIANT_HI;
     static final byte TODO_RESTORE_META = 2;
     static final byte TODO_TRUNCATE = 1;
     private static final int EMPTY_TABLE_LAG_CHECKSUM = calculateTxnLagChecksum(0, 0, 0, Long.MAX_VALUE, Long.MIN_VALUE, 0);
@@ -175,25 +264,50 @@ public final class TableUtils {
     private static final int MAX_SYMBOL_CAPACITY = Numbers.ceilPow2(Integer.MAX_VALUE);
     private static final int MAX_SYMBOL_CAPACITY_CACHED = Numbers.ceilPow2(30_000_000);
     private static final int MIN_SYMBOL_CAPACITY = 2;
+    // Bit layout for the packed per-column parquet encoding config (32-bit integer).
+    // Must stay in sync with the Rust constants in parquet_write/schema.rs.
+    private static final int PARQUET_CONFIG_BLOOM_FILTER_FLAG = 1 << 25;
+    private static final int PARQUET_CONFIG_COMPRESSION_MASK = 0xFF;
+    private static final int PARQUET_CONFIG_COMPRESSION_SHIFT = 8;
+    private static final int PARQUET_CONFIG_ENCODING_MASK = 0xFF;
+    private static final int PARQUET_CONFIG_EXPLICIT_FLAG = 1 << 24;
+    private static final int PARQUET_CONFIG_LEVEL_MASK = 0xFF;
+    private static final int PARQUET_CONFIG_LEVEL_SHIFT = 16;
 
     private TableUtils() {
     }
 
-    public static void allocateDiskSpace(FilesFacade ff, int fd, long size) {
+    public static void allocateDiskSpace(FilesFacade ff, long fd, long size) {
         if (ff.length(fd) < size && !ff.allocate(fd, size)) {
             throw CairoException.critical(ff.errno()).put("No space left [size=").put(size).put(", fd=").put(fd).put(']');
         }
     }
 
-    public static void allocateDiskSpaceToPage(FilesFacade ff, int fd, long size) {
+    public static void allocateDiskSpaceToPage(FilesFacade ff, long fd, long size) {
         size = Files.ceilPageSize(size);
         allocateDiskSpace(ff, fd, size);
     }
 
-    public static int calculateTxRecordSize(int bytesSymbols, int bytesPartitions) {
-        return TX_RECORD_HEADER_SIZE + Integer.BYTES + bytesSymbols + Integer.BYTES + bytesPartitions;
+    public static int calculateMetaFormatMinorVersionField(long metadataVersion, int columnCount) {
+        // Metadata Format Minor Version field is 2 shorts:
+        // - Low short is a checksum that changes with every update to _meta
+        // - High short is TableUtils.META_FORMAT_MINOR_VERSION_LATEST
+        // When reading the Metadata Format Minor Version field from the metadata record, use the checksum
+        // to decide whether to trust the version stored in this field.
+        return Numbers.encodeLowHighShorts(
+                checksumForMetaFormatMinorVersionField(metadataVersion, columnCount),
+                META_FORMAT_MINOR_VERSION_LATEST
+        );
     }
 
+    public static int calculateTxRecordSize(int bytesSymbols, int bytesPartitions) {
+        // Note that 32 bit symbol length is included in TX_RECORD_HEADER_SIZE,
+        // hence the record size is head + symbol sizes + 32bit partition count + bytes to store partitions
+        return TX_RECORD_HEADER_SIZE + bytesSymbols + Integer.BYTES + bytesPartitions;
+    }
+
+    // the mig methods are deliberately standalone so that between old versions
+    // does not regress if the main code changes
     public static int calculateTxnLagChecksum(long txn, long seqTxn, int lagRowCount, long lagMinTimestamp, long lagMaxTimestamp, int lagTxnCount) {
         long checkSum = lagMinTimestamp;
         checkSum = checkSum * 31 + lagMaxTimestamp;
@@ -201,26 +315,41 @@ public final class TableUtils {
         checkSum = checkSum * 31 + seqTxn;
         checkSum = checkSum * 31 + lagRowCount;
         checkSum = checkSum * 31 + lagTxnCount;
+        //noinspection UseHashCodeMethodInspection
         return (int) (checkSum ^ (checkSum >>> 32));
     }
 
-    public static int changeColumnTypeInMetadata(CharSequence columnName, int newType, LowerCaseCharSequenceIntHashMap columnNameIndexMap, ObjList<TableColumnMetadata> columnMetadata) {
+    public static int changeColumnTypeInMetadata(
+            CharSequence columnName,
+            int columnType,
+            int symbolCapacity,
+            boolean symbolCacheFlag,
+            byte indexType,
+            int indexValueBlockCapacity,
+            LowerCaseCharSequenceIntHashMap columnNameIndexMap,
+            ObjList<TableColumnMetadata> columnMetadata
+    ) {
         int existingIndex = columnNameIndexMap.get(columnName);
         if (existingIndex < 0) {
             throw CairoException.nonCritical().put("cannot change type, column '").put(columnName).put("' does not exist");
         }
-        String columnNameStr = columnMetadata.getQuick(existingIndex).getName();
+        TableColumnMetadata existingMeta = columnMetadata.getQuick(existingIndex);
+        String columnNameStr = existingMeta.getColumnName();
         int columnIndex = columnMetadata.size();
         columnMetadata.add(
                 new TableColumnMetadata(
                         columnNameStr,
-                        newType,
-                        false,
-                        0,
+                        columnType,
+                        indexType,
+                        indexValueBlockCapacity,
                         false,
                         null,
                         columnIndex,
-                        false
+                        false,
+                        existingIndex + 1, // replacing column index by convention can be 0 if not in use
+                        symbolCacheFlag,
+                        symbolCapacity,
+                        existingMeta.getOriginalWriterIndex()
                 )
         );
         columnMetadata.getQuick(existingIndex).markDeleted();
@@ -239,9 +368,64 @@ public final class TableUtils {
     public static long checkMemSize(MemoryMR metaMem, long minSize) {
         final long memSize = metaMem.size();
         if (memSize < minSize) {
-            throw CairoException.critical(0).put("File is too small, size=").put(memSize).put(", required=").put(minSize);
+            throw CairoException.fileTooSmall(memSize, minSize);
         }
         return memSize;
+    }
+
+    public static boolean checkStoragePolicyTtl(
+            TxReader txReader,
+            TimestampDriver timestampDriver,
+            long partitionTimestamp,
+            long maxTimestamp,
+            int ttl
+    ) {
+        assert ttl != 0 : "ttl cannot be 0, invalid value";
+        // Storage policies measure age from the partition's own floor (its start), not its
+        // ceiling like table TTL does. This shifts every threshold forward by one partition
+        // width relative to table TTL. For an interval up to one partition width, that means a
+        // partition becomes eligible as soon as the next (active) partition begins; for larger
+        // intervals it simply becomes eligible one partition width sooner than table TTL would.
+        final long partitionFloor = txReader.getPartitionFloor(partitionTimestamp);
+        return isOlderThanTtl(timestampDriver, partitionFloor, maxTimestamp, ttl);
+    }
+
+    public static boolean checkTtl(
+            TxReader txReader,
+            TimestampDriver timestampDriver,
+            long partitionTimestamp,
+            long maxTimestamp,
+            int ttl
+    ) {
+        assert ttl != 0 : "ttl cannot be 0, invalid value";
+        // Table TTL measures age from the partition ceiling (the start of the next logical
+        // partition), so a partition expires only once even its newest possible record is
+        // older than the TTL.
+        final long partitionCeiling = txReader.getNextLogicalPartitionTimestamp(partitionTimestamp);
+        return isOlderThanTtl(timestampDriver, partitionCeiling, maxTimestamp, ttl);
+    }
+
+    public static short checksumForMetaFormatMinorVersionField(long metadataVersion, int columnCount) {
+        int metaVersionInt = Numbers.decodeLowInt(metadataVersion) ^ Numbers.decodeHighInt(metadataVersion);
+        int checksumInt = 13 * metaVersionInt + 37 * columnCount;
+        short checksum = (short) (Numbers.decodeLowShort(checksumInt) ^ Numbers.decodeHighShort(checksumInt));
+        if (checksum == 0) {
+            checksum = -1337;
+        }
+        return checksum;
+    }
+
+    public static void cleanupDirQuiet(FilesFacade ff, Utf8Sequence dir, Log log) {
+        try {
+            Path dirPath = Path.getThreadLocal(dir);
+            if (ff.exists(dirPath.slash$())) {
+                if (!ff.rmdir(dirPath)) {
+                    log.error().$("error during temp directory cleanup [path=").$(dir).$(" errno=").$(ff.errno()).$(']').$();
+                }
+            }
+        } catch (Throwable e) {
+            log.error().$("error during temp directory cleanup [path=").$(dir).$(" error=").$(e).$(']').$();
+        }
     }
 
     public static int compressColumnCount(RecordMetadata metadata) {
@@ -254,25 +438,6 @@ public final class TableUtils {
         return count;
     }
 
-    public static long computeCursorSizeFromMap(RecordCursor masterCursor, Map map, RecordSink keySink) {
-        final Record masterRecord = masterCursor.getRecord();
-        long size = 0;
-        try {
-            masterCursor.toTop();
-            while (masterCursor.hasNext()) {
-                MapKey key = map.withKey();
-                key.put(masterRecord, keySink);
-                MapValue value = key.findValue();
-                if (value != null) {
-                    size += value.getLong(2);
-                }
-            }
-            return size;
-        } finally {
-            masterCursor.toTop();
-        }
-    }
-
     public static void createColumnVersionFile(MemoryMARW mem) {
         // Create page of 0s for Column Version file "_cv"
         mem.extend(COLUMN_VERSION_FILE_HEADER_SIZE);
@@ -282,7 +447,7 @@ public final class TableUtils {
 
     public static void createConvertFile(FilesFacade ff, Path path, byte walFlag) {
         long addr = 0;
-        int fd = -1;
+        long fd = -1;
         try {
             fd = ff.openRW(path.concat(CONVERT_FILE_NAME).$(), CairoConfiguration.O_NONE);
             if (fd < 1) {
@@ -292,7 +457,7 @@ public final class TableUtils {
             if (addr < 1) {
                 throw CairoException.critical(ff.errno()).put("Could not allocate 1 byte");
             }
-            Unsafe.getUnsafe().putByte(addr, walFlag);
+            Unsafe.putByte(addr, walFlag);
             ff.write(fd, addr, Byte.BYTES, 0);
         } finally {
             if (addr > 0) {
@@ -305,7 +470,7 @@ public final class TableUtils {
     @NotNull
     public static Function createCursorFunction(
             FunctionParser functionParser,
-            @NotNull QueryModel model,
+            @NotNull IQueryModel model,
             @NotNull SqlExecutionContext executionContext
     ) throws SqlException {
         final ExpressionNode tableNameExpr = model.getTableNameExpr();
@@ -321,31 +486,16 @@ public final class TableUtils {
         return function;
     }
 
-    public static void createTable(
-            CairoConfiguration configuration,
-            MemoryMARW memory,
-            Path path,
-            TableStructure structure,
-            int tableId,
-            CharSequence dirName
-    ) {
-        createTable(configuration, memory, path, structure, ColumnType.VERSION, tableId, dirName);
-    }
-
-    public static void createTable(
-            CairoConfiguration configuration,
-            TableStructure structure,
-            int tableId,
-            CharSequence dirName
-    ) {
-        try (Path path = new Path(); MemoryMARW mem = Vm.getMARWInstance()) {
-            createTable(configuration, mem, path, structure, ColumnType.VERSION, tableId, dirName);
+    public static void createDirsOrFail(FilesFacade ff, Path path, int mkDirMode) {
+        if (ff.mkdirs(path.slash(), mkDirMode) != 0) {
+            throw CairoException.critical(ff.errno()).put("could not create directories [file=").put(path).put(']');
         }
     }
 
     public static void createTable(
             CairoConfiguration configuration,
             MemoryMARW memory,
+            @Nullable Telemetry<TelemetryTask> telemetry,
             Path path,
             TableStructure structure,
             int tableVersion,
@@ -353,14 +503,15 @@ public final class TableUtils {
             CharSequence dirName
     ) {
         final FilesFacade ff = configuration.getFilesFacade();
-        final CharSequence root = configuration.getRoot();
+        final CharSequence root = configuration.getDbRoot();
         final int mkDirMode = configuration.getMkDirMode();
-        createTable(ff, root, mkDirMode, memory, path, structure, tableVersion, tableId, dirName);
+        createTable(ff, root, telemetry, mkDirMode, memory, path, structure, tableVersion, tableId, dirName);
     }
 
     public static void createTable(
             FilesFacade ff,
             CharSequence root,
+            @Nullable Telemetry<TelemetryTask> telemetry,
             int mkDirMode,
             MemoryMARW memory,
             Path path,
@@ -369,12 +520,13 @@ public final class TableUtils {
             int tableId,
             CharSequence dirName
     ) {
-        createTable(ff, root, mkDirMode, memory, path, dirName, structure, tableVersion, tableId);
+        createTable(ff, root, telemetry, mkDirMode, memory, path, dirName, structure, tableVersion, tableId);
     }
 
     public static void createTable(
             FilesFacade ff,
             CharSequence root,
+            @Nullable Telemetry<TelemetryTask> telemetry,
             int mkDirMode,
             TableStructure structure,
             int tableVersion,
@@ -383,15 +535,16 @@ public final class TableUtils {
     ) {
         try (
                 Path path = new Path();
-                MemoryMARW mem = Vm.getMARWInstance()
+                MemoryMARW mem = Vm.getCMARWInstance()
         ) {
-            createTable(ff, root, mkDirMode, mem, path, dirName, structure, tableVersion, tableId);
+            createTable(ff, root, telemetry, mkDirMode, mem, path, dirName, structure, tableVersion, tableId);
         }
     }
 
     public static void createTable(
             FilesFacade ff,
             CharSequence root,
+            @Nullable Telemetry<TelemetryTask> telemetry,
             int mkDirMode,
             MemoryMARW memory,
             Path path,
@@ -400,99 +553,38 @@ public final class TableUtils {
             int tableVersion,
             int tableId
     ) {
-        LOG.debug().$("create table [name=").utf8(tableDir).I$();
-        path.of(root).concat(tableDir).$();
-        if (ff.isDirOrSoftLinkDir(path.$())) {
-            throw CairoException.critical(ff.errno()).put("table directory already exists [path=").put(path).put(']');
-        }
-        int rootLen = path.size();
-        try {
-            if (ff.mkdirs(path.slash(), mkDirMode) != 0) {
-                throw CairoException.critical(ff.errno()).put("could not create [dir=").put(path.trimTo(rootLen).$()).put(']');
-            }
-            createTableFiles(ff, memory, path, rootLen, tableDir, structure, tableVersion, tableId);
-        } finally {
-            path.trimTo(rootLen);
-        }
+        createTableOrViewOrMatView(ff, root, mkDirMode, telemetry, memory, null, path, tableDir, structure, tableVersion, tableId);
     }
 
-    public static void createTableFiles(
-            FilesFacade ff,
-            MemoryMARW memory,
-            Path path,
-            int rootLen,
-            CharSequence tableDir,
-            TableStructure structure,
-            int tableVersion,
-            int tableId
-    ) {
-        createTableFiles(ff, memory, path, rootLen, tableDir, structure, tableVersion, tableId, TXN_FILE_NAME);
+    public static void createTableNameFile(MemoryMAR mem, CharSequence charSequence) {
+        mem.putStr(charSequence);
+        mem.putByte((byte) 0);
+        mem.sync(false);
+        mem.close(true, Vm.TRUNCATE_TO_POINTER);
     }
 
-    public static void createTableFiles(
-            FilesFacade ff,
-            MemoryMARW memory,
-            Path path,
-            int rootLen,
-            CharSequence tableDir,
-            TableStructure structure,
-            int tableVersion,
-            int tableId,
-            CharSequence txnFileName
-    ) {
-        final int dirFd = !ff.isRestrictedFileSystem() ? TableUtils.openRO(ff, path.trimTo(rootLen).$(), LOG) : 0;
-        try (MemoryMARW mem = memory) {
-            mem.smallFile(ff, path.trimTo(rootLen).concat(META_FILE_NAME).$(), MemoryTag.MMAP_DEFAULT);
-            mem.jumpTo(0);
-            final int count = structure.getColumnCount();
-            path.trimTo(rootLen);
-            writeMetadata(structure, tableVersion, tableId, mem);
-            mem.sync(false);
-
-            // create symbol maps
-            int symbolMapCount = 0;
-            for (int i = 0; i < count; i++) {
-                if (ColumnType.isSymbol(structure.getColumnType(i))) {
-                    createSymbolMapFiles(
-                            ff,
-                            mem,
-                            path.trimTo(rootLen),
-                            structure.getColumnName(i),
-                            COLUMN_NAME_TXN_NONE,
-                            structure.getSymbolCapacity(i),
-                            structure.getSymbolCacheFlag(i)
-                    );
-                    symbolMapCount++;
-                }
-            }
-            mem.smallFile(ff, path.trimTo(rootLen).concat(COLUMN_VERSION_FILE_NAME).$(), MemoryTag.MMAP_DEFAULT);
-            createColumnVersionFile(mem);
-            mem.sync(false);
-            mem.close();
-
-            resetTodoLog(ff, path, rootLen, mem);
-            // allocate txn scoreboard
-            path.trimTo(rootLen).concat(TXN_SCOREBOARD_FILE_NAME).$();
-
-            mem.smallFile(ff, path.trimTo(rootLen).concat(TABLE_NAME_FILE).$(), MemoryTag.MMAP_DEFAULT);
-            createTableNameFile(mem, getTableNameFromDirName(tableDir));
-
-            // Create TXN file last, it's used to determine if table exists
-            mem.smallFile(ff, path.trimTo(rootLen).concat(txnFileName).$(), MemoryTag.MMAP_DEFAULT);
-            createTxn(mem, symbolMapCount, 0L, 0L, INITIAL_TXN, 0L, 0L, 0L, 0L);
-            mem.sync(false);
-        } finally {
-            if (dirFd > 0) {
-                ff.fsyncAndClose(dirFd);
-            }
-        }
-    }
-
-    public static void createTableInVolume(
+    public static void createTableOrMatViewInVolume(
             FilesFacade ff,
             CharSequence root,
+            @Nullable Telemetry<TelemetryTask> telemetry,
             int mkDirMode,
             MemoryMARW memory,
+            Path path,
+            CharSequence tableDir,
+            TableStructure structure,
+            int tableVersion,
+            int tableId
+    ) {
+        createTableOrMatViewInVolume(ff, root, telemetry, mkDirMode, memory, null, path, tableDir, structure, tableVersion, tableId);
+    }
+
+    public static void createTableOrMatViewInVolume(
+            FilesFacade ff,
+            CharSequence root,
+            @Nullable Telemetry<TelemetryTask> telemetry,
+            int mkDirMode,
+            MemoryMARW memory,
+            @Nullable BlockFileWriter blockFileWriter,
             Path path,
             CharSequence tableDir,
             TableStructure structure,
@@ -521,17 +613,165 @@ public final class TableUtils {
                 }
                 throw CairoException.critical(ff.errno()).put("could not create soft link [src=").put(path.trimTo(rootLen).$()).put(", tableDir=").put(tableDir).put(']');
             }
-            createTableFiles(ff, memory, path, rootLen, tableDir, structure, tableVersion, tableId);
+            createTableOrViewOrMatViewFiles(ff, memory, blockFileWriter, telemetry, path, rootLen, tableDir, structure, tableVersion, tableId);
         } finally {
             path.trimTo(rootLen);
         }
     }
 
-    public static void createTableNameFile(MemoryMAR mem, CharSequence charSequence) {
-        mem.putStr(charSequence);
-        mem.putByte((byte) 0);
-        mem.sync(false);
-        mem.close(true, Vm.TRUNCATE_TO_POINTER);
+    public static void createTableOrViewOrMatView(
+            FilesFacade ff,
+            CharSequence root,
+            int mkDirMode,
+            @Nullable Telemetry<TelemetryTask> telemetry,
+            MemoryMARW memory,
+            @Nullable BlockFileWriter blockFileWriter,
+            Path path,
+            CharSequence tableDir,
+            TableStructure structure,
+            int tableVersion,
+            int tableId
+    ) {
+        LOG.debug().$("create table [name=").$safe(tableDir).I$();
+        path.of(root).concat(tableDir).$();
+        if (ff.isDirOrSoftLinkDir(path.$())) {
+            throw CairoException.critical(ff.errno()).put("table directory already exists [path=").put(path).put(']');
+        }
+        int rootLen = path.size();
+        boolean dirCreated = false;
+        try {
+            if (ff.mkdirs(path.slash(), mkDirMode) != 0) {
+                throw CairoException.critical(ff.errno()).put("could not create [dir=").put(path.trimTo(rootLen).$()).put(']');
+            }
+            dirCreated = true;
+            createTableOrViewOrMatViewFiles(ff, memory, blockFileWriter, telemetry, path, rootLen, tableDir, structure, tableVersion, tableId);
+        } catch (Throwable e) {
+            if (dirCreated) {
+                ff.rmdir(path.trimTo(rootLen).slash());
+            }
+            throw e;
+        } finally {
+            path.trimTo(rootLen);
+        }
+    }
+
+    public static void createTableOrViewOrMatViewFiles(
+            FilesFacade ff,
+            MemoryMARW memory,
+            @Nullable BlockFileWriter blockFileWriter,
+            @Nullable Telemetry<TelemetryTask> telemetry,
+            Path path,
+            int rootLen,
+            CharSequence tableDir,
+            TableStructure structure,
+            int tableVersion,
+            int tableId
+    ) {
+        createTableOrViewOrMatViewFiles(ff, memory, blockFileWriter, telemetry, path, rootLen, tableDir, structure, tableVersion, tableId, TXN_FILE_NAME);
+    }
+
+    public static void createTableOrViewOrMatViewFiles(
+            FilesFacade ff,
+            MemoryMARW memory,
+            @Nullable BlockFileWriter blockFileWriter,
+            @Nullable Telemetry<TelemetryTask> telemetry,
+            Path path,
+            int rootLen,
+            CharSequence tableDir,
+            TableStructure structure,
+            int tableVersion,
+            int tableId,
+            CharSequence txnFileName
+    ) {
+        final long dirFd = !ff.isRestrictedFileSystem() ? TableUtils.openRONoCache(ff, path.trimTo(rootLen).$(), LOG) : 0;
+        try (MemoryMARW mem = memory) {
+            mem.smallFile(ff, path.trimTo(rootLen).concat(META_FILE_NAME).$(), MemoryTag.MMAP_DEFAULT);
+            mem.jumpTo(0);
+            path.trimTo(rootLen);
+            writeMetadata(structure, tableVersion, tableId, mem);
+            mem.sync(false);
+
+            // create symbol maps
+            int symbolMapCount = 0;
+            // Plain VIEWs read from their base table, so they don't own their own
+            // symbol maps or _cv. Live views are physical WAL-backed tables that
+            // own their data and DO need both, even though isLiveView() is true.
+            if (!structure.isView()) {
+                for (int i = 0, n = structure.getColumnCount(); i < n; i++) {
+                    int columnType = structure.getColumnType(i);
+                    if (ColumnType.isSymbol(columnType)) {
+                        createSymbolMapFiles(
+                                ff,
+                                mem,
+                                path.trimTo(rootLen),
+                                structure.getColumnName(i),
+                                COLUMN_NAME_TXN_NONE,
+                                structure.getSymbolCapacity(i),
+                                structure.getSymbolCacheFlag(i)
+                        );
+                        symbolMapCount++;
+                    }
+
+                    if (telemetry != null) {
+                        if (ColumnType.isTimestampNano(columnType)) {
+                            TelemetryTask.store(telemetry, TelemetryOrigin.NO_MATTERS, TelemetryEvent.USE_TIMESTAMP_NANOS);
+                        } else if (ColumnType.isArray(columnType)) {
+                            TelemetryTask.store(telemetry, TelemetryOrigin.NO_MATTERS, TelemetryEvent.USE_ARRAY);
+                        }
+                    }
+                }
+
+
+                mem.smallFile(ff, path.trimTo(rootLen).concat(COLUMN_VERSION_FILE_NAME).$(), MemoryTag.MMAP_DEFAULT);
+                createColumnVersionFile(mem);
+                mem.sync(false);
+                mem.close();
+
+                resetTodoLog(ff, path, rootLen, mem);
+                // allocate txn scoreboard
+                path.trimTo(rootLen).concat(TXN_SCOREBOARD_FILE_NAME).$();
+            }
+
+            mem.smallFile(ff, path.trimTo(rootLen).concat(TABLE_NAME_FILE).$(), MemoryTag.MMAP_DEFAULT);
+            createTableNameFile(mem, getTableNameFromDirName(tableDir));
+
+            if (structure.isView()) {
+                assert blockFileWriter != null;
+                try (BlockFileWriter writer = blockFileWriter) {
+                    writer.of(path.trimTo(rootLen).concat(ViewDefinition.VIEW_DEFINITION_FILE_NAME).$());
+                    ViewDefinition.append(structure.getViewDefinition(), writer);
+                }
+            }
+            if (structure.isMatView()) {
+                assert blockFileWriter != null;
+                try (BlockFileWriter writer = blockFileWriter) {
+                    writer.of(path.trimTo(rootLen).concat(MatViewDefinition.MAT_VIEW_DEFINITION_FILE_NAME).$());
+                    MatViewDefinition.append(structure.getMatViewDefinition(), writer);
+                }
+            }
+            // _lv must land BEFORE _txn, like _view and _mv above. _txn is what exists() keys on,
+            // so writing _lv after it leaves a crash window whose directory looks like a plain WAL
+            // table: the loader types it TABLE (no _lv), and it squats the view's name. It also
+            // makes the "missing _lv means CREATE crashed" reap unreachable for its stated cause,
+            // while leaving it live for the opposite one - dropping a committed view whose _lv was
+            // lost, data included.
+            if (structure.isLiveView()) {
+                assert blockFileWriter != null;
+                try (BlockFileWriter writer = blockFileWriter) {
+                    writer.of(path.trimTo(rootLen).concat(LiveViewDefinition.LIVE_VIEW_DEFINITION_FILE_NAME).$());
+                    LiveViewDefinition.append(structure.getLiveViewDefinition(), writer);
+                }
+            }
+
+            // Create TXN file last, it is used to determine if table exists
+            mem.smallFile(ff, path.trimTo(rootLen).concat(txnFileName).$(), MemoryTag.MMAP_DEFAULT);
+            createTxn(mem, symbolMapCount, 0L, 0L, INITIAL_TXN, 0L, 0L, 0L, 0L);
+            mem.sync(false);
+        } finally {
+            if (dirFd > 0) {
+                ff.fsyncAndClose(dirFd);
+            }
+        }
     }
 
     public static void createTxn(
@@ -563,7 +803,7 @@ public final class TableUtils {
         txMem.setTruncateSize(TX_BASE_HEADER_SIZE + TX_RECORD_HEADER_SIZE);
     }
 
-    public static LPSZ dFile(Path path, CharSequence columnName, long columnTxn) {
+    public static LPSZ dFile(Path path, @NotNull CharSequence columnName, long columnTxn) {
         path.concat(columnName).put(FILE_SUFFIX_D);
         if (columnTxn > COLUMN_NAME_TXN_NONE) {
             path.put('.').put(columnTxn);
@@ -573,6 +813,40 @@ public final class TableUtils {
 
     public static LPSZ dFile(Path path, CharSequence columnName) {
         return dFile(path, columnName, COLUMN_NAME_TXN_NONE);
+    }
+
+    /**
+     * Derives the dense descriptor indexes of columns carrying the bloom-filter flag
+     * (bit 25, set by {@link #packParquetConfig}) in their per-column parquet encoding
+     * config, appending them to {@code indexes}.
+     * <p>
+     * The index space is the parquet encoder's dense column list: deleted columns are
+     * skipped, so the produced indexes line up with the columns added to the
+     * {@link io.questdb.griffin.engine.table.parquet.PartitionDescriptor PartitionDescriptor}
+     * by both {@link #produceParquetFromNative} (CONVERT) and
+     * {@code O3PartitionJob.writeFreshParquetFromO3} (fresh O3 partitions). The Rust encoder
+     * reads bloom columns solely from this explicit list, never from the per-column config,
+     * so every encoder path that wants config-driven bloom filters must build the list here.
+     * <p>
+     * Like {@link #parseBloomFilterColumnIndexes}, this method only appends; the caller clears
+     * {@code indexes} first when a fresh result is required.
+     *
+     * @param metadata table metadata whose per-column parquet encoding config flags are inspected
+     * @param indexes  reusable DirectIntList that receives the flagged columns' dense indexes
+     */
+    public static void deriveBloomFilterColumnIndexes(RecordMetadata metadata, DirectIntList indexes) {
+        final int columnCount = metadata.getColumnCount();
+        int descriptorIndex = 0;
+        for (int i = 0; i < columnCount; i++) {
+            final int columnType = metadata.getColumnType(i);
+            if (columnType <= 0) {
+                continue; // skip deleted columns
+            }
+            if (isParquetConfigBloomFilter(metadata.getColumnMetadata(i).getParquetEncodingConfig())) {
+                indexes.add(descriptorIndex);
+            }
+            descriptorIndex++;
+        }
     }
 
     public static long estimateAvgRecordSize(RecordMetadata metadata) {
@@ -605,21 +879,27 @@ public final class TableUtils {
         if (address == 0) {
             return;
         }
-        Unsafe.free(address, Unsafe.getUnsafe().getInt(address), MemoryTag.NATIVE_TABLE_READER);
+        Unsafe.free(address, Unsafe.getInt(address), MemoryTag.NATIVE_TABLE_READER);
     }
 
-    public static int getColumnCount(MemoryMR metaMem, long offset) {
+    public static int getColumnCount(Utf8Sequence metaPath, MemoryMR metaMem, long offset) {
         final int columnCount = metaMem.getInt(offset);
         if (columnCount < 0) {
-            throw validationException(metaMem).put("Incorrect columnCount: ").put(columnCount);
+            throw validationException().put("incorrect columnCount [path=")
+                    .put(metaPath)
+                    .put(", columnCount=").put(columnCount)
+                    .put(']');
         }
         return columnCount;
     }
 
-    public static CharSequence getColumnName(MemoryMR metaMem, long memSize, long offset, int columnIndex) {
+    public static CharSequence getColumnName(Utf8Sequence metaPath, MemoryMR metaMem, long memSize, long offset, int columnIndex) {
         final int strLength = getInt(metaMem, memSize, offset);
         if (strLength == TableUtils.NULL_LEN) {
-            throw validationException(metaMem).put("NULL column name at [").put(columnIndex).put(']');
+            throw validationException()
+                    .put("NULL column name [path=").put(metaPath)
+                    .put(", columnIndex=").put(columnIndex)
+                    .put(']');
         }
         return getCharSequence(metaMem, memSize, offset, strLength);
     }
@@ -632,19 +912,39 @@ public final class TableUtils {
         return metaMem.getInt(META_OFFSET_COLUMN_TYPES + columnIndex * META_COLUMN_DATA_SIZE);
     }
 
-    public static int getColumnType(MemoryMR metaMem, long memSize, long offset, int columnIndex) {
-        final int type = getInt(metaMem, memSize, offset);
-        if (type >= 0 && ColumnType.sizeOf(type) == -1) {
-            throw validationException(metaMem).put("Invalid column type ").put(type).put(" at [").put(columnIndex).put(']');
+    public static int getColumnType(Utf8Sequence metaPath, MemoryMR metaMem, long memSize, long offset, int columnIndex) {
+        final int columnType = getInt(metaMem, memSize, offset);
+        if (columnType >= 0 && ColumnType.sizeOf(columnType) == -1) {
+            throw validationException()
+                    .put("invalid column type [path=").put(metaPath)
+                    .put(", columnType=").put(columnType)
+                    .put(", columnIndex=").put(columnIndex)
+                    .put(']');
         }
-        return type;
+        return columnType;
     }
 
-    public static int getInt(MemoryMR metaMem, long memSize, long offset) {
+    public static int getInt(MemoryR metaMem, long memSize, long offset) {
         if (memSize < offset + Integer.BYTES) {
-            throw CairoException.critical(0).put("File is too small, size=").put(memSize).put(", required=").put(offset + Integer.BYTES);
+            throw CairoException.fileTooSmall(memSize, offset + Integer.BYTES);
         }
         return metaMem.getInt(offset);
+    }
+
+    public static long getMaxTimestamp(
+            TxReader txReader,
+            TimestampDriver timestampDriver,
+            long wallClockMicros,
+            boolean wallClockEnabled
+    ) {
+        long maxTimestamp = txReader.getMaxTimestamp();
+        // When wall clock mode is enabled (default), use the minimum of maxTimestamp and current wall clock time.
+        // This prevents accidental data loss when future timestamps are inserted into a table with TTL enabled.
+        if (wallClockEnabled) {
+            final long wallClockTimestamp = timestampDriver.fromMicros(wallClockMicros);
+            maxTimestamp = Math.min(maxTimestamp, wallClockTimestamp);
+        }
+        return maxTimestamp;
     }
 
     public static int getMaxUncommittedRows(TableRecordMetadata metadata, CairoEngine engine) {
@@ -656,42 +956,46 @@ public final class TableUtils {
         }
     }
 
-    public static long getNullLong(int columnType, @SuppressWarnings("unused") int longIndex) {
+    public static long getNullLong(int columnType, int longIndex) {
         // In theory, we can have a column type where `NULL` value will be different `LONG` values,
         // then this should return different values on longIndex. At the moment there are no such types.
-        switch (ColumnType.tagOf(columnType)) {
-            case ColumnType.BOOLEAN:
-            case ColumnType.BYTE:
-            case ColumnType.CHAR:
-            case ColumnType.SHORT:
-                return 0L;
-            case ColumnType.SYMBOL:
-                return Numbers.encodeLowHighInts(SymbolTable.VALUE_IS_NULL, 0);
-            case ColumnType.FLOAT:
-                return Float.floatToIntBits(Float.NaN);
-            case ColumnType.DOUBLE:
-                return Double.doubleToLongBits(Double.NaN);
-            case ColumnType.LONG256:
-            case ColumnType.INT:
-            case ColumnType.LONG:
-            case ColumnType.DATE:
-            case ColumnType.TIMESTAMP:
-            case ColumnType.LONG128:
-            case ColumnType.UUID:
-                // Long128 and UUID are null when all 2 longs are NaNs
+        return switch (ColumnType.tagOf(columnType)) {
+            case ColumnType.BOOLEAN, ColumnType.BYTE, ColumnType.CHAR, ColumnType.SHORT -> 0L;
+            case ColumnType.SYMBOL -> Numbers.encodeLowHighInts(SymbolTable.VALUE_IS_NULL, SymbolTable.VALUE_IS_NULL);
+            case ColumnType.FLOAT ->
+                    Numbers.encodeLowHighInts(Float.floatToIntBits(Float.NaN), Float.floatToIntBits(Float.NaN));
+            case ColumnType.DOUBLE -> Double.doubleToLongBits(Double.NaN);
+            case ColumnType.INT -> Numbers.encodeLowHighInts(Numbers.INT_NULL, Numbers.INT_NULL);
+            case ColumnType.LONG256, ColumnType.LONG, ColumnType.DATE, ColumnType.TIMESTAMP, ColumnType.LONG128,
+                 ColumnType.UUID, ColumnType.INTERVAL ->
+                // Long128, UUID, and INTERVAL are null when all 2 longs are NaNs
                 // Long256 is null when all 4 longs are NaNs
-                return Numbers.LONG_NULL;
-            case ColumnType.GEOBYTE:
-            case ColumnType.GEOLONG:
-            case ColumnType.GEOSHORT:
-            case ColumnType.GEOINT:
-                return GeoHashes.NULL;
-            case ColumnType.IPv4:
-                return Numbers.IPv4_NULL;
-            default:
+                    Numbers.LONG_NULL;
+            case ColumnType.GEOBYTE, ColumnType.GEOLONG, ColumnType.GEOSHORT, ColumnType.GEOINT -> GeoHashes.NULL;
+            case ColumnType.IPv4 -> Numbers.IPv4_NULL;
+            case ColumnType.VARCHAR, ColumnType.BINARY, ColumnType.ARRAY -> NULL_LEN;
+            case ColumnType.STRING -> Numbers.encodeLowHighInts(NULL_LEN, NULL_LEN);
+            case ColumnType.DECIMAL8 -> Decimals.DECIMAL8_NULL;
+            case ColumnType.DECIMAL16 -> Decimals.DECIMAL16_NULL;
+            case ColumnType.DECIMAL32 -> Decimals.DECIMAL32_NULL;
+            case ColumnType.DECIMAL64 -> Decimals.DECIMAL64_NULL;
+            case ColumnType.DECIMAL128 -> {
+                if (longIndex == 0) {
+                    yield Decimals.DECIMAL128_HI_NULL;
+                }
+                yield Decimals.DECIMAL128_LO_NULL;
+            }
+            case ColumnType.DECIMAL256 -> switch (longIndex) {
+                case 0 -> Decimals.DECIMAL256_HH_NULL;
+                case 1 -> Decimals.DECIMAL256_HL_NULL;
+                case 2 -> Decimals.DECIMAL256_LH_NULL;
+                default -> Decimals.DECIMAL256_LL_NULL;
+            };
+            default -> {
                 assert false : "Invalid column type: " + columnType;
-                return 0;
-        }
+                yield 0;
+            }
+        };
     }
 
     public static long getO3MaxLag(TableRecordMetadata metadata, CairoEngine engine) {
@@ -706,6 +1010,40 @@ public final class TableUtils {
         }
         // Does not have effect for WAL enabled tables
         return 0;
+    }
+
+    /**
+     * Extracts the compression codec id (bits 8-15) from a packed Parquet config.
+     */
+    public static int getParquetConfigCompression(int packed) {
+        return (packed >> PARQUET_CONFIG_COMPRESSION_SHIFT) & PARQUET_CONFIG_COMPRESSION_MASK;
+    }
+
+    /**
+     * Extracts the compression level (bits 16-23) from a packed Parquet config.
+     * The raw value uses +1 encoding: 0 = not set, 1 = level 0, 2 = level 1, etc.
+     * Callers that display the level to the user should subtract 1 from non-zero values.
+     */
+    public static int getParquetConfigCompressionLevel(int packed) {
+        return (packed >> PARQUET_CONFIG_LEVEL_SHIFT) & PARQUET_CONFIG_LEVEL_MASK;
+    }
+
+    /**
+     * Extracts the encoding id (bits 0-7) from a packed Parquet config.
+     * The id corresponds to a {@code ParquetEncoding.ENCODING_*} constant.
+     */
+    public static int getParquetConfigEncoding(int packed) {
+        return packed & PARQUET_CONFIG_ENCODING_MASK;
+    }
+
+    /**
+     * Reads the packed Parquet encoding config for a column from table metadata memory.
+     * See {@link #packParquetConfig(int, int, int, boolean)} for the bit layout.
+     */
+    public static int getParquetEncodingConfig(MemoryR metaMem, int columnIndex) {
+        // type(4) + flags(8) + indexBlockCapacity(4) + symbolCapacity(4)
+        final long META_COLUMN_PARQUET_ENCODING_CONFIG_OFFSET = 20;
+        return metaMem.getInt(META_OFFSET_COLUMN_TYPES + columnIndex * META_COLUMN_DATA_SIZE + META_COLUMN_PARQUET_ENCODING_CONFIG_OFFSET);
     }
 
     public static int getPartitionBy(TableRecordMetadata metadata, CairoEngine engine) {
@@ -725,15 +1063,38 @@ public final class TableUtils {
         return getSymbolWriterIndexOffset(symbolWriterCount);
     }
 
+    /**
+     * Returns the root of the replacing chain that starts at {@code writerIndex}. Every hop moves
+     * to a lower column, so the walk always ends.
+     */
+    public static int getReplacingChainHead(MemoryR metaMem, int writerIndex) {
+        int origWriterIndex = writerIndex;
+        int ri = getReplacingColumnIndex(metaMem, writerIndex);
+        while (ri >= 0) {
+            origWriterIndex = ri;
+            ri = getReplacingColumnIndex(metaMem, ri);
+        }
+        return origWriterIndex;
+    }
+
+    /**
+     * Returns the column that {@code columnIndex} replaces, or -1 for none. Stored 1-based, 0 means
+     * none.
+     * <p>
+     * Old versions left these bytes unwritten, so an old {@code _meta} can hold junk here. A real
+     * replacing column is always added after the column it replaces, and that column is left marked
+     * deleted. Anything else is junk and reads as -1. This also keeps the chain walks in bounds and
+     * loop free.
+     */
     public static int getReplacingColumnIndex(MemoryR metaMem, int columnIndex) {
-        return metaMem.getInt(META_OFFSET_COLUMN_TYPES + columnIndex * META_COLUMN_DATA_SIZE + 4 + 8 + 4 + 8) - 1;
+        int replacingIndex = metaMem.getInt(META_OFFSET_COLUMN_TYPES + columnIndex * META_COLUMN_DATA_SIZE + 4 + 8 + 4 + 8) - 1;
+        if (replacingIndex < 0 || replacingIndex >= columnIndex || getColumnType(metaMem, replacingIndex) > -1) {
+            return -1;
+        }
+        return replacingIndex;
     }
 
-    public static int getReplacingColumnIndexRaw(MemoryR metaMem, int columnIndex) {
-        return metaMem.getInt(META_OFFSET_COLUMN_TYPES + columnIndex * META_COLUMN_DATA_SIZE + 4 + 8 + 4 + 8);
-    }
-
-    public static int getSymbolCapacity(MemoryMR metaMem, int columnIndex) {
+    public static int getSymbolCapacity(MemoryR metaMem, int columnIndex) {
         return metaMem.getInt(META_OFFSET_COLUMN_TYPES + columnIndex * META_COLUMN_DATA_SIZE + 4 + 8 + 4);
     }
 
@@ -757,6 +1118,16 @@ public final class TableUtils {
         return dirName;
     }
 
+    public static int getTableIdFromTableDir(CharSequence dirName) throws NumericException {
+        int suffixIndex = Chars.indexOf(dirName, SYSTEM_TABLE_NAME_SUFFIX);
+        if (suffixIndex == -1) {
+            throw NumericException.instance()
+                    .put("cannot parse table id from table dir name [dirName=").put(dirName)
+                    .put(']');
+        }
+        return Numbers.parseInt(dirName, suffixIndex + 1, dirName.length());
+    }
+
     public static CharSequence getTableNameFromDirName(CharSequence privateName) {
         int suffixIndex = Chars.indexOf(privateName, SYSTEM_TABLE_NAME_SUFFIX);
         if (suffixIndex == -1) {
@@ -765,29 +1136,59 @@ public final class TableUtils {
         return Chars.toString(privateName).substring(0, suffixIndex);
     }
 
-    public static int getTimestampIndex(MemoryMR metaMem, long offset, int columnCount) {
+    public static int getTimestampIndex(Utf8Sequence metaPath, MemoryMR metaMem, long offset, int columnCount) {
         final int timestampIndex = metaMem.getInt(offset);
         if (timestampIndex < -1 || timestampIndex >= columnCount) {
-            throw validationException(metaMem).put("Timestamp index is outside of range, timestampIndex=").put(timestampIndex);
+            throw validationException()
+                    .put("timestamp index is outside of range, [path=").put(metaPath)
+                    .put(", timestampIndex=").put(timestampIndex)
+                    .put(", columnCount=").put(columnCount)
+                    .put(']');
         }
         return timestampIndex;
     }
 
-    public static void handleMetadataLoadException(CharSequence tableName, long deadline, CairoException ex, MillisecondClock millisecondClock, long spinLockTimeout) {
+    public static int getTimestampType(TableStructure structure) {
+        int timestampIndex = structure.getTimestampIndex();
+        if (timestampIndex < 0) {
+            return ColumnType.NULL;
+        }
+        return structure.getColumnType(timestampIndex);
+    }
+
+    public static void handleMetadataLoadException(
+            TableToken tableToken,
+            long deadline,
+            CairoException ex,
+            MillisecondClock millisecondClock,
+            long spinLockTimeout
+    ) {
         // This is temporary solution until we can get multiple version of metadata not overwriting each other
-        if (ex.errnoReadPathDoesNotExist()) {
+        if (ex.isFileCannotRead()) {
             if (millisecondClock.getTicks() < deadline) {
-                LOG.info().$("error reloading metadata [table=").utf8(tableName)
+                LOG.info().$("error reloading metadata [table=").$(tableToken)
+                        .$(", msg=").$safe(ex.getFlyweightMessage())
                         .$(", errno=").$(ex.getErrno())
-                        .$(", error=").utf8(ex.getFlyweightMessage()).I$();
+                        .I$();
                 Os.pause();
             } else {
-                LOG.error().$("metadata read timeout [timeout=").$(spinLockTimeout).utf8("ms]").$();
-                throw CairoException.critical(ex.getErrno()).put("Metadata read timeout. Last error: ").put(ex.getFlyweightMessage());
+                throw CairoException.critical(ex.getErrno()).put("Metadata read timeout [src=writer, timeout=").put(spinLockTimeout).put("ms, err=").put(ex.getFlyweightMessage()).put(']');
             }
         } else {
             throw ex;
         }
+    }
+
+    /**
+     * Returns true when the meta file's minor version is at least
+     * {@link #META_FORMAT_MINOR_VERSION_PARQUET_ENCODING_CONFIG}, i.e. the per-column parquet
+     * encoding config field at column-entry offset 20 can be read without picking up stale
+     * bytes from older meta layouts. Spelled separately from {@link #isMetaFormatUpToDate}
+     * because a future bump of {@code META_FORMAT_MINOR_VERSION_LATEST} must not silently
+     * invalidate this field for 9.3.4 / 9.3.5 tables that legitimately have it set.
+     */
+    public static boolean hasParquetEncodingConfig(MemoryR metaMem) {
+        return isMetaFormatAtLeast(metaMem, META_FORMAT_MINOR_VERSION_PARQUET_ENCODING_CONFIG);
     }
 
     public static LPSZ iFile(Path path, CharSequence columnName, long columnTxn) {
@@ -802,12 +1203,92 @@ public final class TableUtils {
         return iFile(path, columnName, COLUMN_NAME_TXN_NONE);
     }
 
-    public static boolean isPendingRenameTempTableName(String tableName, CharSequence tempTablePrefix) {
-        return Chars.startsWith(tableName, tempTablePrefix);
+    /**
+     * Check is table name does not start with temp table prefix. Usually in case
+     * of table renames, table name can have temp prefix.
+     *
+     * @param tableName       name of the table
+     * @param tempTablePrefix the temp prefix
+     * @return true if table name is not pending table rename.
+     */
+    public static boolean isFinalTableName(String tableName, CharSequence tempTablePrefix) {
+        return !Chars.startsWith(tableName, tempTablePrefix);
     }
 
-    public static boolean isSymbolCached(MemoryMR metaMem, int columnIndex) {
+    public static boolean isLiveViewDefinitionFileExists(CairoConfiguration configuration, Path path, CharSequence dirName) {
+        FilesFacade ff = configuration.getFilesFacade();
+        path.of(configuration.getDbRoot()).concat(dirName).concat(LiveViewDefinition.LIVE_VIEW_DEFINITION_FILE_NAME);
+        return ff.exists(path.$());
+    }
+
+    public static boolean isLiveViewDropSentinelFileExists(CairoConfiguration configuration, Path path, CharSequence dirName) {
+        FilesFacade ff = configuration.getFilesFacade();
+        path.of(configuration.getDbRoot()).concat(dirName).concat(LiveViewDefinition.LIVE_VIEW_DROP_SENTINEL_FILE_NAME);
+        return ff.exists(path.$());
+    }
+
+    public static boolean isLiveViewStateFileExists(CairoConfiguration configuration, Path path, CharSequence dirName) {
+        FilesFacade ff = configuration.getFilesFacade();
+        path.of(configuration.getDbRoot()).concat(dirName).concat(LiveViewState.LIVE_VIEW_STATE_FILE_NAME);
+        return ff.exists(path.$());
+    }
+
+    public static boolean isMatViewDefinitionFileExists(CairoConfiguration configuration, Path path, CharSequence dirName) {
+        FilesFacade ff = configuration.getFilesFacade();
+        path.of(configuration.getDbRoot()).concat(dirName).concat(MatViewDefinition.MAT_VIEW_DEFINITION_FILE_NAME);
+        return ff.exists(path.$());
+    }
+
+    public static boolean isMatViewStateFileExists(CairoConfiguration configuration, Path path, CharSequence dirName) {
+        FilesFacade ff = configuration.getFilesFacade();
+        path.of(configuration.getDbRoot()).concat(dirName).concat(MatViewState.MAT_VIEW_STATE_FILE_NAME);
+        return ff.exists(path.$());
+    }
+
+    /*
+     * Checks that the minor version of the metadata format is up to date, i.e., at least the value
+     * of the TableUtils.META_FORMAT_MINOR_VERSION_LATEST constant.
+     *
+     * Metadata Format Minor Version field encodes 2 shorts:
+     * - Low short is a checksum that changes with every update to the metadata record
+     * - High short is set to TableUtils.META_FORMAT_MINOR_VERSION_LATEST
+     *
+     * The Metadata Format Minor Version field was not present in the initial version of the metadata format. This is
+     * why we need the checksum: when it doesn't match, we can't trust the version stored in it, and should assume
+     * the QuestDB version that wrote the metadata predates its introduction.
+     *
+     * Table storage itself is forward- and backward-compatible, so it's safe to read regardless of this version.
+     */
+    public static boolean isMetaFormatUpToDate(MemoryR metaMem) {
+        return isMetaFormatAtLeast(metaMem, META_FORMAT_MINOR_VERSION_LATEST);
+    }
+
+    /**
+     * Returns true when bit 25 (the bloom filter flag) is set, meaning
+     * this column should have a bloom filter written when converted to parquet.
+     */
+    public static boolean isParquetConfigBloomFilter(int packed) {
+        return (packed & PARQUET_CONFIG_BLOOM_FILTER_FLAG) != 0;
+    }
+
+    /**
+     * Returns true when bit 24 (the explicit flag) is set, meaning the user
+     * explicitly configured encoding/compression for this column via ALTER TABLE.
+     */
+    public static boolean isParquetConfigExplicit(int packed) {
+        return (packed & PARQUET_CONFIG_EXPLICIT_FLAG) != 0;
+    }
+
+    public static boolean isSymbolCached(MemoryR metaMem, int columnIndex) {
         return (getColumnFlags(metaMem, columnIndex) & META_FLAG_BIT_SYMBOL_CACHE) != 0;
+    }
+
+    public static boolean isUnsolicitedTableLock(String lockReason) {
+        //noinspection StringEquality
+        return lockReason != NO_LOCK_REASON
+                && !WAL_2_TABLE_WRITE_REASON.equals(lockReason)
+                && !WAL_2_TABLE_RESUME_REASON.equals(lockReason)
+                && !getCommandName(CMD_STORAGE_POLICY).equals(lockReason);
     }
 
     public static boolean isValidColumnName(CharSequence columnName, int fsFileNameLimit) {
@@ -919,43 +1400,57 @@ public final class TableUtils {
         return length > 0 && tableName.charAt(0) != ' ' && tableName.charAt(length - 1) != ' ';
     }
 
+    public static boolean isViewDefinitionFileExists(CairoConfiguration configuration, Path path, CharSequence dirName) {
+        FilesFacade ff = configuration.getFilesFacade();
+        path.of(configuration.getDbRoot()).concat(dirName).concat(ViewDefinition.VIEW_DEFINITION_FILE_NAME);
+        return ff.exists(path.$());
+    }
+
     public static int lengthOf(@Nullable CharSequence columnValue) {
         return columnValue != null ? columnValue.length() : NULL_LEN;
     }
 
-    public static int lock(FilesFacade ff, LPSZ path, boolean verbose) {
+    public static long lock(FilesFacade ff, LPSZ path, boolean logError) {
+        return lock(ff, path, logError, false);
+    }
+
+    public static long lock(FilesFacade ff, LPSZ path, boolean verbose, boolean logDebug) {
         // workaround for https://github.com/docker/for-mac/issues/7004
+        boolean withLogging = verbose || logDebug;
         if (Files.VIRTIO_FS_DETECTED) {
             if (!ff.touch(path)) {
-                if (verbose) {
-                    LOG.error().$("cannot touch '").$(path).$("' to lock [errno=").$(ff.errno()).I$();
+                if (withLogging) {
+                    LogRecord log = logDebug ? LOG.debug() : LOG.error();
+                    log.$("cannot touch '").$(path).$("' to lock [errno=").$(ff.errno()).I$();
                 }
                 return -1;
             }
         }
 
-        int fd = ff.openRW(path, CairoConfiguration.O_NONE);
+        long fd = ff.openRWNoCache(path, CairoConfiguration.O_NONE);
         if (fd == -1) {
-            if (verbose) {
-                LOG.error().$("cannot open '").$(path).$("' to lock [errno=").$(ff.errno()).I$();
+            if (withLogging) {
+                LogRecord log = logDebug ? LOG.debug() : LOG.error();
+                log.$("cannot open '").$(path).$("' to lock [errno=").$(ff.errno()).I$();
             }
             return -1;
         }
         if (ff.lock(fd) != 0) {
-            if (verbose) {
-                LOG.error().$("cannot lock '").$(path).$("' [errno=").$(ff.errno()).$(", fd=").$(fd).I$();
+            if (withLogging) {
+                LogRecord log = logDebug ? LOG.debug() : LOG.error();
+                log.$("cannot lock '").$(path).$("' [errno=").$(ff.errno()).$(", fd=").$(fd).I$();
             }
             ff.close(fd);
             return -1;
         }
 
-        if (verbose) {
+        if (withLogging) {
             LOG.debug().$("locked '").$(path).$("' [fd=").$(fd).I$();
         }
         return fd;
     }
 
-    public static int lock(FilesFacade ff, LPSZ path) {
+    public static long lock(FilesFacade ff, LPSZ path) {
         return lock(ff, path, true);
     }
 
@@ -963,15 +1458,15 @@ public final class TableUtils {
         return path.put(".lock").$();
     }
 
-    public static long mapAppendColumnBuffer(FilesFacade ff, int fd, long offset, long size, boolean rw, int memoryTag) {
-        assert !Vm.PARANOIA_MODE || ff.length(fd) >= offset + size : "mmap ro buffer is beyond EOF";
+    public static long mapAppendColumnBuffer(FilesFacade ff, long fd, long offset, long size, boolean rw, int memoryTag) {
+        assert !VM_PARANOIA_MODE || ff.length(fd) >= offset + size : "mmap ro buffer is beyond EOF";
 
         // Linux requires the mmap offset to be page aligned
         long alignedOffset = Files.floorPageSize(offset);
         long alignedExtraLen = offset - alignedOffset;
         long mapAddr = rw ?
                 mapRWNoAlloc(ff, fd, size + alignedExtraLen, alignedOffset, memoryTag) :
-                mapRO(ff, fd, size + alignedExtraLen, alignedOffset, memoryTag);
+                TableUtils.mapRO(ff, fd, size + alignedExtraLen, alignedOffset, memoryTag);
         ff.madvise(mapAddr, size + alignedExtraLen, rw ? Files.POSIX_MADV_RANDOM : Files.POSIX_MADV_SEQUENTIAL);
         return mapAddr + alignedExtraLen;
     }
@@ -979,11 +1474,22 @@ public final class TableUtils {
     public static void mapAppendColumnBufferRelease(FilesFacade ff, long address, long offset, long size, int memoryTag) {
         long alignedOffset = Files.floorPageSize(offset);
         long alignedExtraLen = offset - alignedOffset;
-        ff.munmap(address - alignedExtraLen, size + alignedExtraLen, memoryTag);
+        long adjustedAddress = address - alignedExtraLen;
+        assert adjustedAddress > 0 : "address <= alignedExtraLen";
+        ff.munmap(adjustedAddress, size + alignedExtraLen, memoryTag);
     }
 
-    public static long mapRO(FilesFacade ff, int fd, long size, int memoryTag) {
-        return mapRO(ff, fd, size, 0, memoryTag);
+    public static long mapRO(FilesFacade ff, long fd, long size, int memoryTag) {
+        return TableUtils.mapRO(ff, fd, size, 0, memoryTag);
+    }
+
+    public static long mapRO(FilesFacade ff, LPSZ path, Log log, long size, int memoryTag) {
+        final long fd = openRO(ff, path, log);
+        try {
+            return mapRO(ff, fd, size, memoryTag);
+        } finally {
+            ff.close(fd);
+        }
     }
 
     /**
@@ -991,14 +1497,14 @@ public final class TableUtils {
      * <p>
      * Important note. Linux requires the offset to be page aligned.
      *
-     * @param ff        files facade, - intermediary to allow intercepting calls to the OS.
+     * @param ff        files facade - intermediary to allow intercepting calls to the OS.
      * @param fd        file descriptor, previously provided by one of openFile() functions
      * @param size      size of the mapped file region
      * @param offset    offset in file to begin mapping
      * @param memoryTag bucket to trace memory allocation calls
      * @return read-only memory address
      */
-    public static long mapRO(FilesFacade ff, int fd, long size, long offset, int memoryTag) {
+    public static long mapRO(FilesFacade ff, long fd, long size, long offset, int memoryTag) {
         assert fd != -1;
         assert offset % Files.PAGE_SIZE == 0;
         final long address = ff.mmap(fd, size, offset, Files.MAP_RO, memoryTag);
@@ -1015,7 +1521,39 @@ public final class TableUtils {
         return address;
     }
 
-    public static long mapRW(FilesFacade ff, int fd, long size, int memoryTag) {
+    /**
+     * Maps a file in read-only mode without using the MmapCache.
+     * Useful for streaming reads where we want each mapping to be independent.
+     */
+    public static long mapRONoCache(FilesFacade ff, long fd, long size, int memoryTag) {
+        assert fd != -1;
+        final long address = ff.mmapNoCache(fd, size, 0, Files.MAP_RO, memoryTag);
+        if (address == FilesFacade.MAP_FAILED) {
+            throw CairoException.critical(ff.errno())
+                    .put("could not mmap (no cache) ")
+                    .put(" [size=").put(size)
+                    .put(", fd=").put(fd)
+                    .put(", memUsed=").put(Unsafe.getMemUsed())
+                    .put(", fileLen=").put(ff.length(fd))
+                    .put(']');
+        }
+        return address;
+    }
+
+    /**
+     * Maps a file in read-only mode without using the MmapCache.
+     * Opens the file, maps it, and closes the fd.
+     */
+    public static long mapRONoCache(FilesFacade ff, LPSZ path, Log log, long size, int memoryTag) {
+        final long fd = openRO(ff, path, log);
+        try {
+            return mapRONoCache(ff, fd, size, memoryTag);
+        } finally {
+            ff.close(fd);
+        }
+    }
+
+    public static long mapRW(FilesFacade ff, long fd, long size, int memoryTag) {
         return mapRW(ff, fd, size, 0, memoryTag);
     }
 
@@ -1031,7 +1569,7 @@ public final class TableUtils {
      * @param memoryTag bucket to trace memory allocation calls
      * @return read-write memory address
      */
-    public static long mapRW(FilesFacade ff, int fd, long size, long offset, int memoryTag) {
+    public static long mapRW(FilesFacade ff, long fd, long size, long offset, int memoryTag) {
         assert fd != -1;
         assert offset % Files.PAGE_SIZE == 0;
         allocateDiskSpace(ff, fd, size + offset);
@@ -1050,9 +1588,9 @@ public final class TableUtils {
      * @param memoryTag bucket to trace memory allocation calls
      * @return read-write memory address
      */
-    public static long mapRWNoAlloc(FilesFacade ff, int fd, long size, long offset, int memoryTag) {
+    public static long mapRWNoAlloc(FilesFacade ff, long fd, long size, long offset, int memoryTag) {
         long addr = ff.mmap(fd, size, offset, Files.MAP_RW, memoryTag);
-        if (addr > -1) {
+        if (addr != FilesFacade.MAP_FAILED) {
             return addr;
         }
         int errno = ff.errno();
@@ -1062,18 +1600,9 @@ public final class TableUtils {
         throw CairoException.critical(ff.errno()).put("No space left [size=").put(size).put(", fd=").put(fd).put(']');
     }
 
-    public static long mapRWOrClose(FilesFacade ff, int fd, long size, int memoryTag) {
-        try {
-            return TableUtils.mapRW(ff, fd, size, memoryTag);
-        } catch (CairoException e) {
-            ff.close(fd);
-            throw e;
-        }
-    }
-
     public static long mremap(
             FilesFacade ff,
-            int fd,
+            long fd,
             long prevAddress,
             long prevSize,
             long newSize,
@@ -1085,7 +1614,7 @@ public final class TableUtils {
 
     public static long mremap(
             FilesFacade ff,
-            int fd,
+            long fd,
             long prevAddress,
             long prevSize,
             long newSize,
@@ -1103,6 +1632,29 @@ public final class TableUtils {
             throw CairoException.critical(errno).put("could not remap file [previousSize=").put(prevSize)
                     .put(", newSize=").put(newSize)
                     .put(", offset=").put(offset)
+                    .put(", fd=").put(fd)
+                    .put(']');
+        }
+        return page;
+    }
+
+    /**
+     * Remap memory without using the MmapCache. Useful for streaming reads.
+     */
+    public static long mremapNoCache(
+            FilesFacade ff,
+            long fd,
+            long prevAddress,
+            long prevSize,
+            long newSize,
+            int mapMode,
+            int memoryTag
+    ) {
+        final long page = ff.mremapNoCache(fd, prevAddress, prevSize, newSize, 0L, mapMode, memoryTag);
+        if (page == FilesFacade.MAP_FAILED) {
+            int errno = ff.errno();
+            throw CairoException.critical(errno).put("could not remap file (no cache) [previousSize=").put(prevSize)
+                    .put(", newSize=").put(newSize)
                     .put(", fd=").put(fd)
                     .put(']');
         }
@@ -1128,11 +1680,20 @@ public final class TableUtils {
         path.put("-x-").put(txn);
     }
 
-    public static int openFileRWOrFail(FilesFacade ff, LPSZ path, long opts) {
+    public static long openAppend(FilesFacade ff, LPSZ path, Log log) {
+        final long fd = ff.openAppend(path);
+        if (fd > -1) {
+            log.debug().$("open [file=").$(path).$(", fd=").$(fd).I$();
+            return fd;
+        }
+        throw CairoException.critical(ff.errno()).put("could not open append [file=").put(path).put(']');
+    }
+
+    public static long openFileRWOrFail(FilesFacade ff, LPSZ path, int opts) {
         return openRW(ff, path, LOG, opts);
     }
 
-    public static int openRO(FilesFacade ff, Path path, CharSequence fileName, Log log) {
+    public static long openRO(FilesFacade ff, Path path, CharSequence fileName, Log log) {
         final int rootLen = path.size();
         path.concat(fileName);
         try {
@@ -1142,17 +1703,44 @@ public final class TableUtils {
         }
     }
 
-    public static int openRO(FilesFacade ff, LPSZ path, Log log) {
-        final int fd = ff.openRO(path);
+    public static long openRO(FilesFacade ff, LPSZ path, Log log) {
+        final long fd = ff.openRO(path);
         if (fd > -1) {
             log.debug().$("open [file=").$(path).$(", fd=").$(fd).I$();
             return fd;
         }
-        throw CairoException.critical(ff.errno()).put("could not open read-only [file=").put(path).put(']');
+        int errno = ff.errno();
+        if (Files.isErrnoFileCannotRead(errno)) {
+            throw CairoException.critical(errno).put("could not open, file does not exist: ").put(path).put(']');
+        }
+        throw CairoException.critical(errno).put("could not open read-only [file=").put(path).put(']');
     }
 
-    public static int openRW(FilesFacade ff, LPSZ path, Log log, long opts) {
-        final int fd = ff.openRW(path, opts);
+    public static long openRONoCache(FilesFacade ff, Path path, CharSequence fileName, Log log) {
+        final int rootLen = path.size();
+        path.concat(fileName);
+        try {
+            return TableUtils.openRONoCache(ff, path.$(), log);
+        } finally {
+            path.trimTo(rootLen);
+        }
+    }
+
+    public static long openRONoCache(FilesFacade ff, LPSZ path, Log log) {
+        final long fd = ff.openRONoCache(path);
+        if (fd > -1) {
+            log.debug().$("open [file=").$(path).$(", fd=").$(fd).I$();
+            return fd;
+        }
+        int errno = ff.errno();
+        if (Files.isErrnoFileCannotRead(errno)) {
+            throw CairoException.critical(errno).put("could not open, file does not exist: ").put(path).put(']');
+        }
+        throw CairoException.critical(errno).put("could not open read-only [file=").put(path).put(']');
+    }
+
+    public static long openRW(FilesFacade ff, LPSZ path, Log log, int opts) {
+        final long fd = ff.openRW(path, opts);
         if (fd > -1) {
             log.debug().$("open [file=").$(path).$(", fd=").$(fd).I$();
             return fd;
@@ -1180,67 +1768,587 @@ public final class TableUtils {
         memory.close(true, Vm.TRUNCATE_TO_POINTER);
     }
 
-    public static void populateRecordHashMap(
-            SqlExecutionCircuitBreaker circuitBreaker,
-            RecordCursor cursor,
-            Map map,
-            RecordSink recordSink,
-            RecordChain chain
-    ) {
-        final Record record = cursor.getRecord();
-        while (cursor.hasNext()) {
-            circuitBreaker.statefulThrowExceptionIfTripped();
+    /**
+     * Packs per-column Parquet encoding, compression codec, and compression level
+     * into a single 32-bit integer. Layout:
+     * <ul>
+     *   <li>bits 0-7: encoding id ({@code ParquetEncoding.ENCODING_*})</li>
+     *   <li>bits 8-15: compression codec id ({@code ParquetCompression} constants)</li>
+     *   <li>bits 16-23: compression level with +1 encoding (0 = not set, 1 = level 0, 2 = level 1, etc.)</li>
+     *   <li>bit 24: explicit flag (always set by this method)</li>
+     *   <li>bit 25: bloom filter flag</li>
+     * </ul>
+     * A packed value of 0 means "use defaults for everything".
+     * Both compression and level use +1 encoding so that 0 can serve as a "not set" sentinel
+     * while still allowing the user to specify level 0 (e.g., gzip store mode).
+     */
+    public static int packParquetConfig(int encoding, int compression, int level, boolean bloomFilter) {
+        int config = (encoding & PARQUET_CONFIG_ENCODING_MASK)
+                | ((compression & PARQUET_CONFIG_COMPRESSION_MASK) << PARQUET_CONFIG_COMPRESSION_SHIFT)
+                | ((level & PARQUET_CONFIG_LEVEL_MASK) << PARQUET_CONFIG_LEVEL_SHIFT)
+                | PARQUET_CONFIG_EXPLICIT_FLAG;
+        if (bloomFilter) {
+            config |= PARQUET_CONFIG_BLOOM_FILTER_FLAG;
+        }
+        return config;
+    }
 
-            MapKey key = map.withKey();
-            key.put(record, recordSink);
-            MapValue value = key.createValue();
-            if (value.isNew()) {
-                long offset = chain.put(record, -1);
-                value.putLong(0, offset);
-                value.putLong(1, offset);
-                value.putLong(2, 1);
-            } else {
-                value.putLong(1, chain.put(record, value.getLong(1)));
-                value.addLong(2, 1);
+    public static void parseBloomFilterColumnIndexes(RecordMetadata metadata, CharSequence bloomFilterColumns, DirectIntList indexes) {
+        int start = 0;
+        int len = bloomFilterColumns.length();
+        for (int i = 0; i <= len; i++) {
+            if (i == len || bloomFilterColumns.charAt(i) == ',') {
+                int nameStart = start;
+                int nameEnd = i;
+                while (nameStart < nameEnd && Character.isWhitespace(bloomFilterColumns.charAt(nameStart))) {
+                    nameStart++;
+                }
+                while (nameEnd > nameStart && Character.isWhitespace(bloomFilterColumns.charAt(nameEnd - 1))) {
+                    nameEnd--;
+                }
+                if (nameStart < nameEnd) {
+                    CharSequence columnName = bloomFilterColumns.subSequence(nameStart, nameEnd);
+                    int metadataIndex = metadata.getColumnIndexQuiet(columnName);
+                    if (metadataIndex >= 0 && metadata.getColumnType(metadataIndex) > 0) {
+                        int descriptorIndex = 0;
+                        for (int j = 0; j < metadataIndex; j++) {
+                            if (metadata.getColumnType(j) > 0) {
+                                descriptorIndex++;
+                            }
+                        }
+                        boolean isDuplicate = false;
+                        for (long k = 0, sz = indexes.size(); k < sz; k++) {
+                            if (indexes.get(k) == descriptorIndex) {
+                                isDuplicate = true;
+                                break;
+                            }
+                        }
+                        if (!isDuplicate) {
+                            indexes.add(descriptorIndex);
+                        }
+                    } else {
+                        throw CairoException.nonCritical().put("bloom_filter_columns contains non-existent column: ").put(columnName);
+                    }
+                }
+                start = i + 1;
             }
         }
     }
 
-    public static void populateRowIDHashMap(
-            SqlExecutionCircuitBreaker circuitBreaker,
-            RecordCursor cursor,
-            Map keyMap,
-            RecordSink recordSink,
-            LongChain rowIDChain
+    /**
+     * Produces a Parquet file from a native partition. Core method used by both TableReader and TableWriter callers.
+     *
+     * @param path                Path to the native partition directory (will be modified during execution)
+     * @param other               Path for the output parquet file (will be modified during execution)
+     * @param pathSize            Root path size for restoring paths after modifications
+     * @param partitionTimestamp  Timestamp of the partition
+     * @param partitionNameTxn    Partition name txn for the native source partition
+     * @param parquetNameTxn      Partition name txn for the parquet destination (may differ from partitionNameTxn
+     *                            when the partition version is upgraded during conversion)
+     * @param tableName           Name of the table
+     * @param partitionRowCount   Number of rows in the partition
+     * @param metadata            Table metadata
+     * @param columnVersionReader Column version reader (or writer, which extends reader)
+     * @param symbolTableProvider Symbol table provider
+     * @param configuration       Cairo configuration for parquet encoder options
+     * @param bloomFilterColumns  Comma-separated column names for bloom filters, or null
+     * @param bloomFilterFpp      Bloom filter false-positive probability, or NaN for default
+     * @param bloomFilterIndexes  Reusable DirectIntList for bloom filter column indexes. Must be non-null;
+     *                            callers should keep a single instance and pass it on every call to avoid
+     *                            per-invocation allocation. The function clears it on entry and leaves the
+     *                            allocation for the caller to free.
+     * @return The length of the produced Parquet file
+     */
+    public static long produceParquetFromNative(
+            Path path,
+            Path other,
+            int pathSize,
+            long partitionTimestamp,
+            long partitionNameTxn,
+            long parquetNameTxn,
+            String tableName,
+            long partitionRowCount,
+            TableMetadata metadata,
+            ColumnVersionReader columnVersionReader,
+            SymbolTableProvider symbolTableProvider,
+            CairoConfiguration configuration,
+            @Nullable CharSequence bloomFilterColumns,
+            double bloomFilterFpp,
+            DirectIntList bloomFilterIndexes,
+            long squashTracker,
+            long seqTxn
     ) {
-        final Record record = cursor.getRecord();
-        while (cursor.hasNext()) {
-            circuitBreaker.statefulThrowExceptionIfTripped();
+        final FilesFacade ff = configuration.getFilesFacade();
+        final int partitionBy = metadata.getPartitionBy();
+        final int timestampType = metadata.getTimestampType();
 
-            MapKey key = keyMap.withKey();
-            key.put(record, recordSink);
-            MapValue value = key.createValue();
-            if (value.isNew()) {
-                final long offset = rowIDChain.put(record.getRowId(), -1);
-                value.putLong(0, offset);
-                value.putLong(1, offset);
-                value.putLong(2, 1);
-            } else {
-                value.putLong(1, rowIDChain.put(record.getRowId(), value.getLong(1)));
-                value.addLong(2, 1);
+        setPathForNativePartition(path.trimTo(pathSize), timestampType, partitionBy, partitionTimestamp, partitionNameTxn);
+        if (!ff.exists(path.$())) {
+            throw CairoException.nonCritical().put("partition directory does not exist [path=").put(path).put(']');
+        }
+        final int partitionDirLen = path.size();
+        final int pathRootSize = configuration.getDbRoot().length();
+
+        setPathForParquetPartition(other.trimTo(pathSize), timestampType, partitionBy, partitionTimestamp, parquetNameTxn);
+        if (ff.exists(other.$())) {
+            LOG.info().$("parquet for native partition already present [path=").$substr(pathRootSize, path).I$();
+            return ff.length(other.$());
+        }
+
+        LOG.info().$("producing parquet for native partition [path=").$substr(pathRootSize, path).I$();
+        final int memoryTag = MemoryTag.MMAP_PARQUET_PARTITION_CONVERTER;
+        long parquetMetaFd = -1;
+        try {
+            try (PartitionDescriptor partitionDescriptor = new MappedMemoryPartitionDescriptor(ff)) {
+                final int readerTimestampIndex = metadata.getTimestampIndex();
+                // PartitionDescriptor.timestampIndex must be the writer column index (columnId),
+                // not the dense reader index, because the Rust encoder matches it against columnId values.
+                final int timestampIndex = readerTimestampIndex >= 0
+                        ? metadata.getColumnMetadata(readerTimestampIndex).getWriterIndex()
+                        : -1;
+                partitionDescriptor.of(tableName, partitionRowCount, timestampIndex);
+
+                final boolean useMetadataBloomFilters = bloomFilterColumns == null || bloomFilterColumns.isEmpty();
+                final int columnCount = metadata.getColumnCount();
+                for (int columnIndex = 0; columnIndex < columnCount; columnIndex++) {
+                    final int columnType = metadata.getColumnType(columnIndex);
+                    if (columnType <= 0) {
+                        continue; // skip deleted columns
+                    }
+
+                    final String columnName = metadata.getColumnName(columnIndex);
+                    final TableColumnMetadata tableColumnMetadata = metadata.getColumnMetadata(columnIndex);
+
+                    // Store the original writer index in the parquet file so that a later
+                    // parquet->native conversion can match columns by their original id even
+                    // after a column-type conversion has re-keyed the column.
+                    final int columnId = tableColumnMetadata.getOriginalWriterIndex();
+                    // _cv entries (name txn, column top, symbol table name txn) are keyed by the
+                    // current writer index, which diverges from the dense metadata index once a
+                    // column is dropped or re-keyed by ALTER COLUMN TYPE. Mirror TableReader.
+                    final int writerIndex = tableColumnMetadata.getWriterIndex();
+
+                    final int versionRecordIndex = columnVersionReader.getRecordIndex(partitionTimestamp, writerIndex);
+                    long columnNameTxn = columnVersionReader.getColumnNameTxnByIndex(versionRecordIndex);
+                    if (columnNameTxn == -1) {
+                        columnNameTxn = columnVersionReader.getDefaultColumnNameTxn(writerIndex);
+                    }
+                    final long columnTop = columnVersionReader.getColumnTopByIndexOrDefault(versionRecordIndex, partitionTimestamp, writerIndex, -1L);
+                    final long columnRowCount = (columnTop != -1) ? partitionRowCount - columnTop : 0;
+                    final int parquetEncodingConfig = tableColumnMetadata.getParquetEncodingConfig();
+
+                    if (columnRowCount > 0) {
+                        if (ColumnType.isSymbol(columnType)) {
+                            int encodeColumnType = columnType;
+                            if (!symbolTableProvider.containsNullValue(columnIndex)) {
+                                encodeColumnType |= Integer.MIN_VALUE;
+                            }
+
+                            partitionDescriptor.addColumn(
+                                    columnName,
+                                    encodeColumnType,
+                                    columnId,
+                                    columnTop,
+                                    parquetEncodingConfig
+                            );
+
+                            final long columnSize = columnRowCount * ColumnType.sizeOf(columnType);
+                            final long columnAddr = mapRONoCache(ff, dFile(path.trimTo(partitionDirLen), columnName, columnNameTxn), LOG, columnSize, memoryTag);
+                            partitionDescriptor.setColumnAddr(columnAddr, columnSize);
+                            ff.madvise(columnAddr, columnSize, Files.POSIX_MADV_SEQUENTIAL);
+
+                            // root symbol files use separate txn
+                            final long symbolTableNameTxn = columnVersionReader.getSymbolTableNameTxn(writerIndex);
+
+                            offsetFileName(path.trimTo(pathSize), columnName, symbolTableNameTxn);
+                            if (!ff.exists(path.$())) {
+                                LOG.error().$(path).$(" is not found").$();
+                                throw CairoException.fileNotFound().put("offset file does not exist: ").put(path);
+                            }
+
+                            final long fileLength = ff.length(path.$());
+                            if (fileLength < SymbolMapWriter.HEADER_SIZE) {
+                                LOG.error().$(path).$(", symbol file is too small [fileLength=").$(fileLength).$(']').$();
+                                throw CairoException.critical(0).put("SymbolMap is too short: ").put(path);
+                            }
+
+                            final int symbolCount = symbolTableProvider.getSymbolCount(columnIndex);
+                            final long offsetsMemSize = SymbolMapWriter.keyToOffset(symbolCount + 1);
+                            final long symbolOffsetsAddr = mapRONoCache(ff, path.$(), LOG, offsetsMemSize, memoryTag);
+                            partitionDescriptor.setSymbolOffsetsAddr(symbolOffsetsAddr + SymbolMapWriter.HEADER_SIZE, symbolCount);
+                            ff.madvise(symbolOffsetsAddr, offsetsMemSize, Files.POSIX_MADV_SEQUENTIAL);
+
+                            final LPSZ charFileName = charFileName(path.trimTo(pathSize), columnName, symbolTableNameTxn);
+                            final long columnSecondarySize = ff.length(charFileName);
+                            final long columnSecondaryAddr = mapRONoCache(ff, charFileName, LOG, columnSecondarySize, memoryTag);
+                            partitionDescriptor.setSecondaryColumnAddr(columnSecondaryAddr, columnSecondarySize);
+                            ff.madvise(columnSecondaryAddr, columnSecondarySize, Files.POSIX_MADV_SEQUENTIAL);
+
+                            // recover the partition path
+                            setPathForNativePartition(path.trimTo(pathSize), timestampType, partitionBy, partitionTimestamp, partitionNameTxn);
+                        } else if (ColumnType.isVarSize(columnType)) {
+                            partitionDescriptor.addColumn(columnName, columnType, columnId, columnTop, parquetEncodingConfig);
+
+                            final ColumnTypeDriver columnTypeDriver = ColumnType.getDriver(columnType);
+                            final long auxVectorSize = columnTypeDriver.getAuxVectorSize(columnRowCount);
+                            final long auxVectorAddr = mapRONoCache(ff, iFile(path.trimTo(partitionDirLen), columnName, columnNameTxn), LOG, auxVectorSize, memoryTag);
+                            ff.madvise(auxVectorAddr, auxVectorSize, Files.POSIX_MADV_SEQUENTIAL);
+                            partitionDescriptor.setSecondaryColumnAddr(auxVectorAddr, auxVectorSize);
+
+                            final long dataSize = columnTypeDriver.getDataVectorSizeAt(auxVectorAddr, columnRowCount - 1);
+                            if (dataSize < columnTypeDriver.getDataVectorMinEntrySize() || dataSize >= (1L << 40)) {
+                                LOG.critical().$("Invalid var len column size [column=").$safe(columnName)
+                                        .$(", size=").$(dataSize)
+                                        .$(", path=").$(path)
+                                        .I$();
+                                throw CairoException.critical(0).put("Invalid column size [column=").put(path)
+                                        .put(", size=").put(dataSize)
+                                        .put(']');
+                            }
+
+                            final long dataAddr;
+                            if (dataSize > 0) {
+                                dataAddr = mapRONoCache(ff, dFile(path.trimTo(partitionDirLen), columnName, columnNameTxn), LOG, dataSize, memoryTag);
+                                ff.madvise(dataAddr, dataSize, Files.POSIX_MADV_SEQUENTIAL);
+                            } else {
+                                dataAddr = 0;
+                            }
+                            partitionDescriptor.setColumnAddr(dataAddr, dataSize);
+                        } else {
+                            final long mapBytes = columnRowCount * ColumnType.sizeOf(columnType);
+                            final long fixedAddr = mapRONoCache(ff, dFile(path.trimTo(partitionDirLen), columnName, columnNameTxn), LOG, mapBytes, memoryTag);
+                            ff.madvise(fixedAddr, mapBytes, Files.POSIX_MADV_SEQUENTIAL);
+                            partitionDescriptor.addColumn(
+                                    columnName,
+                                    columnType,
+                                    columnId,
+                                    columnTop,
+                                    fixedAddr,
+                                    mapBytes,
+                                    0,
+                                    0,
+                                    0,
+                                    0,
+                                    parquetEncodingConfig
+                            );
+                        }
+                    } else {
+                        // no rows in column
+                        partitionDescriptor.addColumn(
+                                columnName,
+                                columnType,
+                                columnId,
+                                partitionRowCount,
+                                parquetEncodingConfig
+                        );
+                    }
+                }
+
+                final int compressionCodec = configuration.getPartitionEncoderParquetCompressionCodec();
+                final int compressionLevel = configuration.getPartitionEncoderParquetCompressionLevel();
+                final int rowGroupSize = configuration.getPartitionEncoderParquetRowGroupSize();
+                final int dataPageSize = configuration.getPartitionEncoderParquetDataPageSize();
+                final boolean statisticsEnabled = configuration.isPartitionEncoderParquetStatisticsEnabled();
+                final boolean rawArrayEncoding = configuration.isPartitionEncoderParquetRawArrayEncoding();
+                final int parquetVersion = configuration.getPartitionEncoderParquetVersion();
+                final double minCompressionRatio = configuration.getPartitionEncoderParquetMinCompressionRatio();
+
+                long bloomFilterColumnIndexesPtr = 0;
+                int bloomFilterColumnCount = 0;
+                double fpp = Double.isNaN(bloomFilterFpp) ? configuration.getPartitionEncoderParquetBloomFilterFpp() : bloomFilterFpp;
+
+                // Open _pm file for the Rust encoder to write simultaneously.
+                setPathForParquetPartitionMetadata(other.trimTo(pathSize), timestampType, partitionBy, partitionTimestamp, parquetNameTxn);
+                parquetMetaFd = TableUtils.openRW(ff, other.$(), LOG, configuration.getWriterFileOpenOpts());
+
+                bloomFilterIndexes.clear();
+                if (useMetadataBloomFilters) {
+                    // Derive bloom filter columns from per-column metadata flags
+                    deriveBloomFilterColumnIndexes(metadata, bloomFilterIndexes);
+                } else {
+                    // Explicit bloom_filter_columns override from CONVERT PARTITION WITH clause
+                    parseBloomFilterColumnIndexes(metadata, bloomFilterColumns, bloomFilterIndexes);
+                }
+                if (bloomFilterIndexes.size() > 0) {
+                    bloomFilterColumnIndexesPtr = bloomFilterIndexes.getAddress();
+                    bloomFilterColumnCount = (int) bloomFilterIndexes.size();
+                }
+
+                // Restore parquet file path for encoding.
+                setPathForParquetPartition(other.trimTo(pathSize), timestampType, partitionBy, partitionTimestamp, parquetNameTxn);
+
+                PartitionEncoder.encodeWithOptions(
+                        partitionDescriptor,
+                        other,
+                        ParquetCompression.packCompressionCodecLevel(compressionCodec, compressionLevel),
+                        statisticsEnabled,
+                        rawArrayEncoding,
+                        rowGroupSize,
+                        dataPageSize,
+                        parquetVersion,
+                        bloomFilterColumnIndexesPtr,
+                        bloomFilterColumnCount,
+                        fpp,
+                        minCompressionRatio,
+                        Files.toOsFd(parquetMetaFd),
+                        squashTracker,
+                        seqTxn
+                );
+                // Persist _pm before the caller commits _txn. _txn field 3 will reference
+                // a parquet_meta_file_size that resolves only if the _pm bytes survive a
+                // crash. fsync the parent dir too because _pm is a brand-new file in a
+                // brand-new partition directory.
+                final int commitMode = configuration.getCommitMode();
+                if (commitMode != CommitMode.NOSYNC) {
+                    ff.fsync(parquetMetaFd);
+                    if (!Os.isWindows()) {
+                        setPathForParquetPartitionMetadata(other.trimTo(pathSize), timestampType, partitionBy, partitionTimestamp, parquetNameTxn);
+                        // Drop the trailing /_pm component to fsync the partition dir itself.
+                        other.parent();
+                        final long dirFd = TableUtils.openRONoCache(ff, other.$(), LOG);
+                        if (dirFd != -1) {
+                            ff.fsyncAndClose(dirFd);
+                        }
+                    }
+                }
+                setPathForParquetPartition(other.trimTo(pathSize), timestampType, partitionBy, partitionTimestamp, parquetNameTxn);
+                return ff.length(other.$());
+            }
+        } catch (CairoException e) {
+            LOG.error().$("could not convert partition to parquet [table=").$(tableName)
+                    .$(", error=").$safe(e.getMessage()).I$();
+
+            // Rollback: remove the partial data.parquet AND its _pm sidecar, never the parent
+            // directory. Callers that allocate a fresh parquet-only directory handle that
+            // directory's cleanup in their own outer catch. Leaving _pm behind orphans a
+            // _pm-only partition dir that cold storage's structural scans misread as
+            // parquet-local/cold. Close the _pm fd first so the removal succeeds on Windows,
+            // and clear the handle so the finally does not double-close it.
+            if (parquetMetaFd > -1) {
+                ff.close(parquetMetaFd);
+                parquetMetaFd = -1;
+            }
+            setPathForParquetPartitionMetadata(other.trimTo(pathSize), timestampType, partitionBy, partitionTimestamp, parquetNameTxn);
+            if (ff.exists(other.$()) && !ff.removeQuiet(other.$())) {
+                LOG.error().$("could not remove parquet _pm on rollback [path=").$(other).I$();
+            }
+            setPathForParquetPartition(other.trimTo(pathSize), timestampType, partitionBy, partitionTimestamp, parquetNameTxn);
+            if (ff.exists(other.$()) && !ff.removeQuiet(other.$())) {
+                LOG.error().$("could not remove parquet file on rollback [path=").$(other).I$();
+            }
+            throw e;
+        } finally {
+            path.trimTo(pathSize);
+            other.trimTo(pathSize);
+            if (parquetMetaFd > -1) {
+                ff.close(parquetMetaFd);
             }
         }
     }
 
-    public static int readIntOrFail(FilesFacade ff, int fd, long offset, long tempMem8b, Path path) {
+    /**
+     * Produces a staged current-schema parquet file from a committed local parquet partition.
+     * The source is resolved through its {@code _pm} sidecar at {@code sourceParquetFileSize};
+     * the output is written as sibling staging files in the same partition directory and is
+     * not authoritative until a writer-side guarded publish installs it.
+     */
+    public static long produceParquetFromParquetWithConversions(
+            Path path,
+            Path other,
+            int pathSize,
+            long partitionTimestamp,
+            long partitionNameTxn,
+            long sourceParquetFileSize,
+            CharSequence candidateParquetFileName,
+            CharSequence candidateParquetMetaFileName,
+            TableMetadata metadata,
+            ColumnVersionReader columnVersionReader,
+            SymbolTableProvider symbolTableProvider,
+            CairoConfiguration configuration,
+            ParquetConversionContext conversionContext,
+            long seqTxn
+    ) {
+        final FilesFacade ff = configuration.getFilesFacade();
+        final int partitionBy = metadata.getPartitionBy();
+        final int timestampType = metadata.getTimestampType();
+        final int timestampIndex = metadata.getTimestampIndex();
+        final int compressionCodec = configuration.getPartitionEncoderParquetCompressionCodec();
+        final int compressionLevel = configuration.getPartitionEncoderParquetCompressionLevel();
+        final int rowGroupSize = configuration.getPartitionEncoderParquetRowGroupSize();
+        final int dataPageSize = configuration.getPartitionEncoderParquetDataPageSize();
+        final boolean statisticsEnabled = configuration.isPartitionEncoderParquetStatisticsEnabled();
+        final boolean rawArrayEncoding = configuration.isPartitionEncoderParquetRawArrayEncoding();
+        final double bloomFilterFpp = configuration.getPartitionEncoderParquetBloomFilterFpp();
+        final double minCompressionRatio = configuration.getPartitionEncoderParquetMinCompressionRatio();
+
+        long parquetMetaAddr = 0;
+        long parquetMetaSize = 0;
+        long parquetAddr = 0;
+        long mappedParquetSize = 0;
+        long readerFd = -1;
+        long writerFd = -1;
+        long parquetMetaFd = -1;
+        int readerFdOs;
+        int writerFdOs = -1;
+        int parquetMetaFdOs = -1;
+        conversionContext.clear();
+        final ParquetMetaFileReader parquetMetaReader = conversionContext.getParquetMetaReader();
+        final ParquetPartitionDecoder decoder = conversionContext.getPartitionDecoder(configuration);
+        final PartitionUpdater partitionUpdater = conversionContext.getPartitionUpdater();
+
+        try {
+            setPathForNativePartition(path.trimTo(pathSize), timestampType, partitionBy, partitionTimestamp, partitionNameTxn);
+            final int partitionDirLen = path.size();
+            path.concat(PARQUET_METADATA_FILE_NAME).$();
+            parquetMetaAddr = ParquetMetaFileReader.openAndMapRO(ff, path.$(), parquetMetaReader);
+            if (parquetMetaAddr == 0) {
+                throw CairoException.critical(ff.errno())
+                        .put("could not open source parquet metadata [path=").put(path).put(']');
+            }
+            parquetMetaSize = parquetMetaReader.getFileSize();
+            if (!parquetMetaReader.resolveFooter(sourceParquetFileSize)) {
+                throw CairoException.critical(0)
+                        .put("_pm tail does not match source parquet file size [path=").put(path)
+                        .put(", parquetFileSize=").put(sourceParquetFileSize).put(']');
+            }
+            final long sourceParquetSize = parquetMetaReader.getParquetFileSize();
+            path.trimTo(partitionDirLen).concat(PARQUET_PARTITION_NAME).$();
+            parquetAddr = mapRO(ff, path.$(), LOG, sourceParquetSize, MemoryTag.MMAP_PARQUET_PARTITION_DECODER);
+            mappedParquetSize = sourceParquetSize;
+            decoder.of(parquetMetaReader, parquetAddr, sourceParquetSize, MemoryTag.NATIVE_PARQUET_PARTITION_UPDATER);
+
+            setPathForNativePartition(other.trimTo(pathSize), timestampType, partitionBy, partitionTimestamp, partitionNameTxn);
+            other.concat(candidateParquetFileName).$();
+            ff.removeQuiet(other.$());
+            writerFd = openRW(ff, other.$(), LOG, configuration.getWriterFileOpenOpts());
+            writerFdOs = Files.detach(writerFd);
+            writerFd = -1;
+
+            other.trimTo(partitionDirLen).concat(candidateParquetMetaFileName).$();
+            ff.removeQuiet(other.$());
+            parquetMetaFd = openRW(ff, other.$(), LOG, configuration.getWriterFileOpenOpts());
+            parquetMetaFdOs = Files.detach(parquetMetaFd);
+            parquetMetaFd = -1;
+
+            readerFd = openRONoCache(ff, path.$(), LOG);
+            readerFdOs = Files.detach(readerFd);
+            readerFd = -1;
+
+            // JNI adopts all three detached descriptors before it can fail
+            // (for example while validating compression or parsing the source).
+            // Disown them on the Java side before crossing that ownership
+            // boundary so the finally block cannot close recycled OS fd numbers.
+            final int adoptedReaderFdOs = readerFdOs;
+            final int adoptedWriterFdOs = writerFdOs;
+            final int adoptedParquetMetaFdOs = parquetMetaFdOs;
+            writerFdOs = parquetMetaFdOs = -1;
+            partitionUpdater.of(
+                    path.$(),
+                    adoptedReaderFdOs,
+                    sourceParquetSize,
+                    adoptedWriterFdOs,
+                    0,
+                    timestampIndex,
+                    ParquetCompression.packCompressionCodecLevel(compressionCodec, compressionLevel),
+                    statisticsEnabled,
+                    rawArrayEncoding,
+                    rowGroupSize,
+                    dataPageSize,
+                    bloomFilterFpp,
+                    minCompressionRatio,
+                    adoptedParquetMetaFdOs,
+                    0,
+                    0,
+                    -1,
+                    seqTxn
+            );
+
+            final int columnCount = metadata.getColumnCount();
+            ParquetRowGroupMaterializer.setTargetSchema(
+                    conversionContext,
+                    partitionUpdater,
+                    metadata,
+                    symbolTableProvider
+            );
+
+            final ParquetMetaFileReader sourceMeta = decoder.metadata();
+            final IntIntHashMap parquetColIdToIdx = conversionContext.getParquetColIdToIdx();
+            for (int i = 0, n = sourceMeta.getColumnCount(); i < n; i++) {
+                parquetColIdToIdx.put(sourceMeta.getColumnId(i), i);
+            }
+            final IntList tableToParquetIdx = conversionContext.getTableToParquetIdx(columnCount);
+            for (int i = 0; i < columnCount; i++) {
+                if (metadata.getColumnType(i) < 0) {
+                    continue;
+                }
+                tableToParquetIdx.setQuick(i, parquetColIdToIdx.get(metadata.getColumnMetadata(i).getOriginalWriterIndex()));
+            }
+
+            for (int rowGroupIndex = 0, rowGroupCount = sourceMeta.getRowGroupCount(); rowGroupIndex < rowGroupCount; rowGroupIndex++) {
+                ParquetRowGroupMaterializer.materializeChangedColumns(
+                        conversionContext,
+                        decoder,
+                        partitionUpdater,
+                        rowGroupIndex,
+                        metadata,
+                        columnVersionReader,
+                        partitionTimestamp,
+                        tableToParquetIdx,
+                        symbolTableProvider
+                );
+            }
+
+            final long resultParquetSize = partitionUpdater.updateFileMetadata();
+            partitionUpdater.commitParquetMeta(configuration.getCommitMode() != CommitMode.NOSYNC);
+            return resultParquetSize;
+        } catch (Throwable th) {
+            // Close Rust-owned descriptors before removing candidates, especially on Windows.
+            conversionContext.releaseResources();
+            setPathForNativePartition(other.trimTo(pathSize), timestampType, partitionBy, partitionTimestamp, partitionNameTxn);
+            final int partitionDirLen = other.size();
+            other.concat(candidateParquetFileName);
+            ff.removeQuiet(other.$());
+            other.trimTo(partitionDirLen).concat(candidateParquetMetaFileName);
+            ff.removeQuiet(other.$());
+            if (th instanceof CairoException) {
+                throw (CairoException) th;
+            }
+            if (th instanceof Error) {
+                throw (Error) th;
+            }
+            throw CairoException.critical(0).put("could not produce parquet from parquet [error=").put(th.getMessage()).put(']');
+        } finally {
+            conversionContext.releaseResources();
+            parquetMetaReader.clear();
+            path.trimTo(pathSize);
+            other.trimTo(pathSize);
+            ff.close(readerFd);
+            ff.close(writerFd);
+            ff.close(parquetMetaFd);
+            if (writerFdOs != -1) {
+                Files.closeDetached(writerFdOs);
+            }
+            if (parquetMetaFdOs != -1) {
+                Files.closeDetached(parquetMetaFdOs);
+            }
+            if (parquetMetaAddr != 0) {
+                ff.munmap(parquetMetaAddr, parquetMetaSize, MemoryTag.MMAP_PARQUET_METADATA_READER);
+            }
+            if (parquetAddr != 0) {
+                ff.munmap(parquetAddr, mappedParquetSize, MemoryTag.MMAP_PARQUET_PARTITION_DECODER);
+            }
+        }
+    }
+
+    public static int readIntOrFail(FilesFacade ff, long fd, long offset, long tempMem8b, Path path) {
         if (ff.read(fd, tempMem8b, Integer.BYTES, offset) != Integer.BYTES) {
             throw CairoException.critical(ff.errno()).put("Cannot read: ").put(path);
         }
-        return Unsafe.getUnsafe().getInt(tempMem8b);
+        return Unsafe.getInt(tempMem8b);
     }
 
     public static long readLongAtOffset(FilesFacade ff, LPSZ path, long tempMem8b, long offset) {
-        final int fd = TableUtils.openRO(ff, path, LOG);
+        final long fd = TableUtils.openRO(ff, path, LOG);
         try {
             return readLongOrFail(ff, fd, offset, tempMem8b, path);
         } finally {
@@ -1248,18 +2356,18 @@ public final class TableUtils {
         }
     }
 
-    public static long readLongOrFail(FilesFacade ff, int fd, long offset, long tempMem8b, @Nullable LPSZ path) {
+    public static long readLongOrFail(FilesFacade ff, long fd, long offset, long tempMem8b, @Nullable LPSZ path) {
         if (ff.read(fd, tempMem8b, Long.BYTES, offset) != Long.BYTES) {
             if (path != null) {
                 throw CairoException.critical(ff.errno()).put("could not read long [path=").put(path).put(", fd=").put(fd).put(", offset=").put(offset);
             }
             throw CairoException.critical(ff.errno()).put("could not read long [fd=").put(fd).put(", offset=").put(offset);
         }
-        return Unsafe.getUnsafe().getLong(tempMem8b);
+        return Unsafe.getLong(tempMem8b);
     }
 
     public static String readTableName(Path path, int rootLen, MemoryCMR mem, FilesFacade ff) {
-        int fd = -1;
+        long fd = -1;
         try {
             path.concat(TableUtils.TABLE_NAME_FILE);
             LPSZ $path = path.$();
@@ -1289,7 +2397,7 @@ public final class TableUtils {
     }
 
     public static String readText(FilesFacade ff, LPSZ path1) {
-        int fd = ff.openRO(path1);
+        long fd = ff.openRO(path1);
         long bytes = 0;
         long length = 0;
         if (fd > -1) {
@@ -1327,12 +2435,6 @@ public final class TableUtils {
         deletedMeta.markDeleted();
     }
 
-    public static void removeOrException(FilesFacade ff, int fd, LPSZ path) {
-        if (ff.exists(path) && !ff.closeRemove(fd, path)) {
-            throw CairoException.critical(ff.errno()).put("Cannot remove ").put(path);
-        }
-    }
-
     public static void renameColumnInMetadata(
             CharSequence columnName,
             CharSequence newName,
@@ -1344,7 +2446,7 @@ public final class TableUtils {
             throw CairoException.critical(0).put("Column not found: ").put(columnName);
         }
         final String newNameStr = newName.toString();
-        columnMetadata.getQuick(columnIndex).setName(newNameStr);
+        columnMetadata.getQuick(columnIndex).rename(newNameStr);
 
         columnNameIndexMap.removeEntry(columnName);
         columnNameIndexMap.put(newNameStr, columnIndex);
@@ -1360,10 +2462,10 @@ public final class TableUtils {
         mem.smallFile(ff, path.trimTo(rootLen).concat(TODO_FILE_NAME).$(), MemoryTag.MMAP_DEFAULT);
         mem.jumpTo(0);
         mem.putLong(24, 0); // txn check
-        Unsafe.getUnsafe().storeFence();
+        Unsafe.storeFence();
         mem.putLong(8, 0); // hashLo
         mem.putLong(16, 0); // hashHi
-        Unsafe.getUnsafe().storeFence();
+        Unsafe.storeFence();
         mem.putLong(0, 0); // txn
         mem.putLong(32, 0); // count
         mem.jumpTo(40);
@@ -1444,8 +2546,7 @@ public final class TableUtils {
             // This is unlucky, sequences have changed while we were reading transaction data
             // We must discard and try again
             if (clock.getTicks() > deadline) {
-                LOG.error().$("tx read timeout [timeout=").$(spinLockTimeout).utf8("ms]").$();
-                throw CairoException.critical(0).put("Transaction read timeout");
+                throw CairoException.critical(0).put("Transaction read timeout [src=writer, timeout=").put(spinLockTimeout).put("ms]");
             }
 
             LOG.debug().$("loaded __dirty__ txn, version ").$(txReader.getVersion()).$();
@@ -1453,13 +2554,13 @@ public final class TableUtils {
         }
     }
 
-    public static boolean schedulePurgeO3Partitions(MessageBus messageBus, TableToken tableName, int partitionBy) {
+    public static boolean schedulePurgeO3Partitions(MessageBus messageBus, TableToken tableName, int timestampType, int partitionBy) {
         final MPSequence seq = messageBus.getO3PurgeDiscoveryPubSeq();
         while (true) {
             long cursor = seq.next();
             if (cursor > -1) {
                 O3PartitionPurgeTask task = messageBus.getO3PurgeDiscoveryQueue().get(cursor);
-                task.of(tableName, partitionBy);
+                task.of(tableName, timestampType, partitionBy);
                 seq.done(cursor);
                 return true;
             } else if (cursor == -1) {
@@ -1521,41 +2622,122 @@ public final class TableUtils {
                 // Long128 and UUID are null when all 2 longs are NaNs
                 Vect.setMemoryLong(addr, Numbers.LONG_NULL, count * 2);
                 break;
+            case ColumnType.INTERVAL:
+                Vect.setMemoryLong(addr, Numbers.LONG_NULL, count * 2);
+                break;
+            case ColumnType.DECIMAL8:
+                Vect.memset(addr, count, Decimals.DECIMAL8_NULL);
+                break;
+            case ColumnType.DECIMAL16:
+                Vect.setMemoryShort(addr, Decimals.DECIMAL16_NULL, count);
+                break;
+            case ColumnType.DECIMAL32:
+                Vect.setMemoryInt(addr, Decimals.DECIMAL32_NULL, count);
+                break;
+            case ColumnType.DECIMAL64:
+                Vect.setMemoryLong(addr, Decimals.DECIMAL64_NULL, count);
+                break;
+            case ColumnType.DECIMAL128:
+                Vect.setMemoryLong128(addr, Decimals.DECIMAL128_HI_NULL, Decimals.DECIMAL128_LO_NULL, count);
+                break;
+            case ColumnType.DECIMAL256:
+                Vect.setMemoryLong256(addr, Decimals.DECIMAL256_HH_NULL, Decimals.DECIMAL256_HL_NULL,
+                        Decimals.DECIMAL256_LH_NULL, Decimals.DECIMAL256_LL_NULL, count);
+                break;
             default:
                 break;
         }
     }
 
     /**
-     * Sets the path to the directory of a partition taking into account the timestamp, the partitioning scheme
+     * Sets the path to the directory of a native partition taking into account the timestamp, the partitioning scheme
      * and the partition version.
      *
-     * @param path        Set to the root directory for a table, this will be updated to the root directory of the partition
-     * @param partitionBy Partitioning scheme
-     * @param timestamp   A timestamp in the partition
-     * @param nameTxn     Partition txn suffix
+     * @param path          Set to the root directory for a table, this will be updated to the root directory of the partition
+     * @param timestampType type (resolution) of the timestamp column
+     * @param partitionBy   Partitioning scheme
+     * @param timestamp     A timestamp in the partition
+     * @param nameTxn       Partition txn suffix
      */
-    public static void setPathForPartition(Path path, int partitionBy, long timestamp, long nameTxn) {
-        setSinkForPartition(path.slash(), partitionBy, timestamp, nameTxn);
+    public static void setPathForNativePartition(Path path, int timestampType, int partitionBy, long timestamp, long nameTxn) {
+        setSinkForNativePartition(path.slash(), timestampType, partitionBy, timestamp, nameTxn);
     }
 
     /**
-     * Sets the sink to the directory of a partition taking into account the timestamp, the partitioning scheme
+     * Sets the path to the file of a Parquet partition taking into account the timestamp, the partitioning scheme
      * and the partition version.
      *
-     * @param sink        Set to the root directory for a table, this will be updated to the root directory of the partition
-     * @param partitionBy Partitioning scheme
-     * @param timestamp   A timestamp in the partition
-     * @param nameTxn     Partition txn suffix
+     * @param path          Set to the root directory for a table, this will be updated to the file of the partition
+     * @param timestampType type (resolution) of the timestamp column
+     * @param partitionBy   Partitioning scheme
+     * @param timestamp     A timestamp in the partition
+     * @param nameTxn       Partition txn suffix
      */
-    public static void setSinkForPartition(CharSink<?> sink, int partitionBy, long timestamp, long nameTxn) {
-        PartitionBy.setSinkForPartition(sink, partitionBy, timestamp);
+    public static void setPathForParquetPartition(Path path, int timestampType, int partitionBy, long timestamp, long nameTxn) {
+        setSinkForNativePartition(path.slash(), timestampType, partitionBy, timestamp, nameTxn);
+        path.concat(PARQUET_PARTITION_NAME);
+    }
+
+    /**
+     * Sets the path to the metadata file of a Parquet partition taking into account the timestamp, the partitioning
+     * scheme and the partition version.
+     *
+     * @param path          Set to the root directory for a table, this will be updated to the metadata file of the partition
+     * @param timestampType type (resolution) of the timestamp column
+     * @param partitionBy   Partitioning scheme
+     * @param timestamp     A timestamp in the partition
+     * @param nameTxn       Partition txn suffix
+     */
+    public static void setPathForParquetPartitionMetadata(Path path, int timestampType, int partitionBy, long timestamp, long nameTxn) {
+        setSinkForNativePartition(path.slash(), timestampType, partitionBy, timestamp, nameTxn);
+        path.concat(PARQUET_METADATA_FILE_NAME);
+    }
+
+    /**
+     * Sets the sink to the directory of a native partition taking into account the timestamp, the partitioning scheme
+     * and the partition version.
+     *
+     * @param sink          Set to the root directory for a table, this will be updated to the root directory of the partition
+     * @param timestampType type (resolution) of the timestamp column
+     * @param partitionBy   Partitioning scheme
+     * @param timestamp     A timestamp in the partition
+     * @param nameTxn       Partition txn suffix
+     */
+    public static void setSinkForNativePartition(CharSink<?> sink, int timestampType, int partitionBy, long timestamp, long nameTxn) {
+        PartitionBy.setSinkForPartition(sink, timestampType, partitionBy, timestamp);
         if (nameTxn > -1L) {
             sink.put('.').put(nameTxn);
         }
     }
 
+    public static void setTxReaderPath(@NotNull TxReader reader, @NotNull Path path, int timestampType, int partitionBy) {
+        reader.ofRO(path.concat(TXN_FILE_NAME).$(), timestampType, partitionBy);
+    }
+
+    /**
+     * Maps a table type code stored in {@code tables.d} onto its token type.
+     * <p>
+     * Unknown codes throw rather than falling back to {@link TableToken.Type#TABLE}. A newer binary
+     * can write a type this one does not know, and every view kind is implicitly WAL: silently
+     * degrading such an entry to a plain non-WAL table hands out a {@code TableWriter} where a
+     * {@code WalWriter} is required, which corrupts the directory. Refusing to load the entry is
+     * recoverable by upgrading the binary again; the corruption is not.
+     */
+    public static TableToken.Type tableTypeOf(int tableType) {
+        return switch (tableType) {
+            case TABLE_TYPE_NON_WAL, TABLE_TYPE_WAL -> TableToken.Type.TABLE;
+            case TABLE_TYPE_LIVE_VIEW -> TableToken.Type.LIVE_VIEW;
+            case TABLE_TYPE_MAT -> TableToken.Type.MAT_VIEW;
+            case TABLE_TYPE_VIEW -> TableToken.Type.VIEW;
+            default -> throw CairoException.critical(0)
+                    .put("unknown table type in name registry, table was created by a newer version [type=")
+                    .put(tableType)
+                    .put(']');
+        };
+    }
+
     public static int toIndexKey(int symbolKey) {
+        assert symbolKey != Integer.MAX_VALUE;
         return symbolKey == SymbolTable.VALUE_IS_NULL ? 0 : symbolKey + 1;
     }
 
@@ -1569,26 +2751,34 @@ public final class TableUtils {
     }
 
     public static void validateMeta(
+            Utf8Sequence metaPath,
             MemoryMR metaMem,
             LowerCaseCharSequenceIntHashMap nameIndex,
             int expectedVersion
     ) {
         try {
             final long memSize = checkMemSize(metaMem, META_OFFSET_COLUMN_TYPES);
-            validateMetaVersion(metaMem, META_OFFSET_VERSION, expectedVersion);
-            final int columnCount = getColumnCount(metaMem, META_OFFSET_COUNT);
+            validateMetaVersion(metaPath, metaMem, META_OFFSET_VERSION, expectedVersion);
+            final int columnCount = getColumnCount(metaPath, metaMem, META_OFFSET_COUNT);
 
             long offset = getColumnNameOffset(columnCount);
             if (memSize < offset) {
-                throw validationException(metaMem).put("File is too small, column types are missing ").put(memSize);
+                throw validationException()
+                        .put("file is too small, column types are missing [path=").put(metaPath)
+                        .put(", memSize=").put(memSize)
+                        .put(']');
             }
 
             // validate designated timestamp column
-            final int timestampIndex = getTimestampIndex(metaMem, META_OFFSET_TIMESTAMP_INDEX, columnCount);
+            final int timestampIndex = getTimestampIndex(metaPath, metaMem, META_OFFSET_TIMESTAMP_INDEX, columnCount);
             if (timestampIndex != -1) {
                 final int timestampType = getColumnType(metaMem, timestampIndex);
                 if (!ColumnType.isTimestamp(timestampType)) {
-                    throw validationException(metaMem).put("Timestamp column must be TIMESTAMP, but found ").put(ColumnType.nameOf(timestampType));
+                    throw validationException()
+                            .put("timestamp column must be TIMESTAMP [path=").put(metaPath)
+                            .put(", columnType=").put(ColumnType.nameOf(timestampType))
+                            .put(", columnIndex=").put(timestampIndex)
+                            .put(']');
                 }
             }
 
@@ -1596,22 +2786,28 @@ public final class TableUtils {
             for (int i = 0; i < columnCount; i++) {
                 final int type = Math.abs(getColumnType(metaMem, i));
                 if (ColumnType.sizeOf(type) == -1) {
-                    throw validationException(metaMem).put("Invalid column type ").put(type).put(" at [").put(i).put(']');
-                }
-
-                if (isColumnDedupKey(metaMem, i)) {
-                    if (ColumnType.isVarSize(type)) {
-                        throw validationException(metaMem).put("DEDUPLICATION KEY flag is only supported for fixed size column types").put(" at [").put(i).put(']');
-                    }
+                    throw validationException()
+                            .put("invalid column type [path=").put(metaPath)
+                            .put(", columnType=").put(type)
+                            .put(", columnIndex=").put(i)
+                            .put(']');
                 }
 
                 if (isColumnIndexed(metaMem, i)) {
                     if (!ColumnType.isSymbol(type)) {
-                        throw validationException(metaMem).put("Index flag is only supported for SYMBOL").put(" at [").put(i).put(']');
+                        throw validationException()
+                                .put("index flag is only supported for SYMBOL column type [path=").put(metaPath)
+                                .put(", columnType=").put(ColumnType.nameOf(type))
+                                .put(", columnIndex=").put(i)
+                                .put(']');
                     }
 
                     if (getIndexBlockCapacity(metaMem, i) < 2) {
-                        throw validationException(metaMem).put("Invalid index value block capacity ").put(getIndexBlockCapacity(metaMem, i)).put(" at [").put(i).put(']');
+                        throw validationException()
+                                .put("invalid index value block capacity [path=").put(metaPath)
+                                .put(", indexBlockCapacity=").put(getIndexBlockCapacity(metaMem, i))
+                                .put(", columnIndex=").put(i)
+                                .put(']');
                     }
                 }
             }
@@ -1620,11 +2816,15 @@ public final class TableUtils {
             int denseCount = 0;
             if (nameIndex != null) {
                 for (int i = 0; i < columnCount; i++) {
-                    final CharSequence name = getColumnName(metaMem, memSize, offset, i);
-                    if (getColumnType(metaMem, i) < 0 || nameIndex.put(name, denseCount++)) {
-                        offset += Vm.getStorageLength(name);
+                    final CharSequence columnName = getColumnName(metaPath, metaMem, memSize, offset, i);
+                    if (getColumnType(metaMem, i) < 0 || nameIndex.put(columnName, denseCount++)) {
+                        offset += Vm.getStorageLength(columnName);
                     } else {
-                        throw validationException(metaMem).put("Duplicate column [name=").put(name).put("] at ").put(i);
+                        throw validationException()
+                                .put("duplicate column [path=").put(metaPath)
+                                .put(", columnName=").put(columnName)
+                                .put(", columnIndex=").put(i)
+                                .put(']');
                     }
                 }
             }
@@ -1636,13 +2836,10 @@ public final class TableUtils {
         }
     }
 
-    public static void validateMetaVersion(MemoryMR metaMem, long metaVersionOffset, int expectedVersion) {
+    public static void validateMetaVersion(Utf8Sequence metaPath, MemoryMR metaMem, long metaVersionOffset, int expectedVersion) {
         final int metaVersion = metaMem.getInt(metaVersionOffset);
         if (expectedVersion != metaVersion) {
-            throw validationException(metaMem)
-                    .put("Metadata version does not match runtime version [expected=").put(expectedVersion)
-                    .put(", actual=").put(metaVersion)
-                    .put(']');
+            throw CairoException.metadataVersionMismatch(metaPath, expectedVersion, metaVersion);
         }
     }
 
@@ -1655,18 +2852,25 @@ public final class TableUtils {
         }
     }
 
-    public static void validateSymbolCapacityCached(boolean cache, int symbolCapacity, int cacheKeywordPosition) throws SqlException {
-        if (cache && symbolCapacity > MAX_SYMBOL_CAPACITY_CACHED) {
+    public static void validateSymbolCapacityCached(boolean isCached, int symbolCapacity, int cacheKeywordPosition) throws SqlException {
+        if (isCached && symbolCapacity > MAX_SYMBOL_CAPACITY_CACHED) {
             throw SqlException.$(cacheKeywordPosition, "max cached symbol capacity is ").put(MAX_SYMBOL_CAPACITY_CACHED);
         }
     }
 
-    public static CairoException validationException(MemoryMR mem) {
-        return CairoException.critical(CairoException.METADATA_VALIDATION).put("Invalid metadata at fd=").put(mem.getFd()).put(". ");
+    public static CairoException validationException() {
+        return CairoException.critical(CairoException.METADATA_VALIDATION);
     }
 
-    public static void writeIntOrFail(FilesFacade ff, int fd, long offset, int value, long tempMem8b, Path path) {
-        Unsafe.getUnsafe().putInt(tempMem8b, value);
+    public static CairoException validationException(MemoryR mem) {
+        if (mem instanceof MemoryMR) {
+            return CairoException.critical(CairoException.METADATA_VALIDATION).put("Invalid metadata at fd=").put(((MemoryMR) mem).getFd()).put(". ");
+        }
+        return CairoException.critical(CairoException.METADATA_VALIDATION).put("Invalid metadata. ");
+    }
+
+    public static void writeIntOrFail(FilesFacade ff, long fd, long offset, int value, long tempMem8b, Path path) {
+        Unsafe.putInt(tempMem8b, value);
         if (ff.write(fd, tempMem8b, Integer.BYTES, offset) != Integer.BYTES) {
             throw CairoException.critical(ff.errno())
                     .put("could not write 8 bytes [path=").put(path)
@@ -1677,8 +2881,43 @@ public final class TableUtils {
         }
     }
 
-    public static void writeLongOrFail(FilesFacade ff, int fd, long offset, long value, long tempMem8b, Path path) {
-        Unsafe.getUnsafe().putLong(tempMem8b, value);
+    /**
+     * Writes the durable {@code _lv.drop} sentinel into the live view's directory and fsyncs it
+     * before returning. Idempotent: a repeated DROP that finds an existing sentinel re-opens, fsyncs
+     * and closes - the file's existence is the signal, not its contents. Failure throws
+     * {@link CairoException} with the path, so a caller that stamps the sentinel first aborts before
+     * any teardown and leaves the view queryable.
+     * <p>
+     * Unlike the checkpoint segment writers, this deliberately does NOT tmp+rename. Recovery keys off
+     * existence alone, so a zero-byte or partially written {@code _lv.drop} still correctly triggers
+     * the reap branch in {@code CairoEngine.buildViewGraphs}; a tmp+rename scheme would instead lose a
+     * crash-before-rename drop intent. Existence-only is the stronger durability contract here, not an
+     * oversight.
+     * <p>
+     * What the fsync does NOT cover: the sentinel's parent directory entry. POSIX does not make a
+     * newly linked name durable until the containing directory is itself fsynced, and
+     * {@link FilesFacade} has no directory-fsync primitive (nothing in the engine does this today).
+     * So the guarantee this call actually provides is ordering across a PROCESS crash, not across a
+     * power loss: after a power loss the sentinel can be absent even though the drop had already
+     * begun, and the startup loader then sees a directory holding an {@code _lv} with no
+     * {@code _lv.drop} and re-registers it as a healthy live view. Callers should read the "durable"
+     * in the surrounding comments as that weaker property.
+     */
+    public static void writeLiveViewDropSentinel(CairoConfiguration configuration, TableToken token) {
+        final FilesFacade ff = configuration.getFilesFacade();
+        try (Path path = new Path()) {
+            path.of(configuration.getDbRoot()).concat(token).concat(LiveViewDefinition.LIVE_VIEW_DROP_SENTINEL_FILE_NAME).$();
+            long fd = openFileRWOrFail(ff, path.$(), configuration.getWriterFileOpenOpts());
+            try {
+                ff.fsync(fd);
+            } finally {
+                ff.close(fd);
+            }
+        }
+    }
+
+    public static void writeLongOrFail(FilesFacade ff, long fd, long offset, long value, long tempMem8b, Path path) {
+        Unsafe.putLong(tempMem8b, value);
         if (ff.write(fd, tempMem8b, Long.BYTES, offset) != Long.BYTES) {
             throw CairoException.critical(ff.errno())
                     .put("could not write 8 bytes [path=").put(path)
@@ -1695,28 +2934,25 @@ public final class TableUtils {
         mem.putInt(tableStruct.getPartitionBy());
         int timestampIndex = tableStruct.getTimestampIndex();
         assert timestampIndex == -1 ||
-                (timestampIndex >= 0 && timestampIndex < count && tableStruct.getColumnType(timestampIndex) == ColumnType.TIMESTAMP);
+                (timestampIndex >= 0 && timestampIndex < count && ColumnType.isTimestamp(tableStruct.getColumnType(timestampIndex)))
+                : String.format("timestampIndex %d count %d columnType %d", timestampIndex, count, tableStruct.getColumnType(timestampIndex));
         mem.putInt(timestampIndex);
         mem.putInt(tableVersion);
         mem.putInt(tableId);
         mem.putInt(tableStruct.getMaxUncommittedRows());
         mem.putLong(tableStruct.getO3MaxLag());
-        mem.putLong(0); // Structure version.
-        mem.putInt(tableStruct.isWalEnabled() ? 1 : 0);
-        mem.jumpTo(TableUtils.META_OFFSET_COLUMN_TYPES);
+        mem.putLong(0); // Metadata version.
+        mem.putBool(tableStruct.isWalEnabled());
+        mem.putInt(TableUtils.calculateMetaFormatMinorVersionField(0, count));
+        mem.putInt(tableStruct.getTtlHoursOrMonths());
+        mem.putInt(tableStruct.getTableFormat());
 
+        mem.jumpTo(TableUtils.META_OFFSET_COLUMN_TYPES);
         assert count > 0;
 
         for (int i = 0; i < count; i++) {
             mem.putInt(tableStruct.getColumnType(i));
-            long flags = 0;
-            if (tableStruct.isIndexed(i)) {
-                flags |= META_FLAG_BIT_INDEXED;
-            }
-
-            if (tableStruct.isSequential(i)) {
-                flags |= META_FLAG_BIT_SEQUENTIAL;
-            }
+            long flags = encodeIndexTypeFlags(tableStruct.getIndexType(i));
 
             if (tableStruct.getSymbolCacheFlag(i)) {
                 flags |= META_FLAG_BIT_SYMBOL_CACHE;
@@ -1726,15 +2962,30 @@ public final class TableUtils {
                 flags |= META_FLAG_BIT_DEDUP_KEY;
             }
 
+            if (tableStruct.isCovering(i)) {
+                flags |= META_FLAG_BIT_COVERING;
+            }
+
             mem.putLong(flags);
             mem.putInt(tableStruct.getIndexBlockCapacity(i));
             mem.putInt(tableStruct.getSymbolCapacity(i));
+            mem.putInt(tableStruct.getParquetEncodingConfig(i));
             // reserved
-            mem.skip(12);
+            mem.skip(8);
         }
 
         for (int i = 0; i < count; i++) {
             mem.putStr(tableStruct.getColumnName(i));
+        }
+
+        for (int i = 0; i < count; i++) {
+            IntList coveringIndices = tableStruct.getCoveringColumnIndices(i);
+            if (coveringIndices != null && coveringIndices.size() > 0) {
+                mem.putInt(coveringIndices.size());
+                for (int ci = 0, cn = coveringIndices.size(); ci < cn; ci++) {
+                    mem.putInt(coveringIndices.getQuick(ci));
+                }
+            }
         }
     }
 
@@ -1753,13 +3004,44 @@ public final class TableUtils {
     private static CharSequence getCharSequence(MemoryMR metaMem, long memSize, long offset, int strLength) {
         if (strLength < 1 || strLength > 255) {
             // EXT4 and many others do not allow file name length > 255 bytes
-            throw validationException(metaMem).put("String length of ").put(strLength).put(" is invalid at offset ").put(offset);
+            throw validationException().put("String length of ").put(strLength).put(" is invalid at offset ").put(offset);
         }
         final long storageLength = Vm.getStorageLength(strLength);
         if (offset + storageLength > memSize) {
-            throw CairoException.critical(0).put("File is too small, size=").put(memSize).put(", required=").put(offset + storageLength);
+            throw CairoException.fileTooSmall(memSize, offset + storageLength);
         }
         return metaMem.getStrA(offset);
+    }
+
+    static boolean isMetaFormatAtLeast(MemoryR metaMem, short minorVersion) {
+        int metaFormatMinorVersionField = metaMem.getInt(META_OFFSET_META_FORMAT_MINOR_VERSION);
+        short savedChecksum = Numbers.decodeLowShort(metaFormatMinorVersionField);
+        short actualChecksum = checksumForMetaFormatMinorVersionField(
+                metaMem.getLong(TableUtils.META_OFFSET_METADATA_VERSION),
+                metaMem.getInt(TableUtils.META_OFFSET_COUNT)
+        );
+        short savedMetaFormatMinorVersion = Numbers.decodeHighShort(metaFormatMinorVersionField);
+        return savedChecksum == actualChecksum && savedMetaFormatMinorVersion >= minorVersion;
+    }
+
+    private static boolean isOlderThanTtl(TimestampDriver timestampDriver, long partitionBoundary, long maxTimestamp, int ttl) {
+        // TTL < 0 means it's in months
+        if (ttl <= 0) {
+            return timestampDriver.monthsBetween(partitionBoundary, maxTimestamp) >= -ttl;
+        }
+        // The parser admits hour counts far past what a nanosecond timestamp can express:
+        // CommonUtils.toHoursOrMonths range-checks DAYS and WEEKS but passes the HOUR unit
+        // through untouched, and PartitionBy.validateTtlGranularity waives granularity for
+        // PARTITION BY HOUR, so anything up to TTL 2_147_483_647 HOURS reaches here - against this
+        // driver's getMaxUnitValue('h') of 2_562_047. fromHours() multiplies unchecked, so the
+        // product wraps: TTL 106_752 DAYS, the smallest DAYS value that trips it, gives
+        // 2_562_048 * 3_600_000_000_000 = Long.MAX_VALUE + 763_145_224_193 -> a negative span
+        // that every partition compares older than, dropping the whole table on the next
+        // commit. A TTL the timestamp type cannot express must expire nothing instead.
+        if (ttl > timestampDriver.getMaxUnitValue('h')) {
+            return false;
+        }
+        return maxTimestamp - partitionBoundary >= timestampDriver.fromHours(ttl);
     }
 
     // Utility method for debugging. This method is not used in production.
@@ -1767,7 +3049,7 @@ public final class TableUtils {
     static boolean assertTimestampInOrder(long srcTimestampAddr, long srcDataMax) {
         long prev = Long.MIN_VALUE;
         for (long i = 0; i < srcDataMax; i++) {
-            long newTs = Unsafe.getUnsafe().getLong(srcTimestampAddr + i * Long.BYTES);
+            long newTs = Unsafe.getLong(srcTimestampAddr + i * Long.BYTES);
             if (newTs < prev) {
                 return false;
             }
@@ -1776,30 +3058,160 @@ public final class TableUtils {
         return true;
     }
 
-    static void createDirsOrFail(FilesFacade ff, Path path, int mkDirMode) {
-        if (ff.mkdirs(path, mkDirMode) != 0) {
-            throw CairoException.critical(ff.errno()).put("could not create directories [file=").put(path).put(']');
+    /**
+     * Creates a column list from the metadata file. Each entry of the list is a struct, but
+     * Java doesn't support structs you may say! Yes, this is open-array struct, 3 elements per entry.
+     * - writer index (will explain what this is later)
+     * - column name offset - pointer at the beginning of the string list
+     * - symbol map index
+     * <p>
+     * This list will be dense, e.g., it will not have deleted columns, not will it have extra columns that
+     * have changed types. The type change is what makes this loading tricky. When a column type is changed, a new
+     * entry is added to the metadata file on the disk. This new entry will reference the old column (type change) via
+     * replace index, which is also written to the file.
+     * <p>
+     * When we read the file from disk, we don't need the "old" columns in the output. For this reason, as we read
+     * new columns from the file, we might go back to the columns we already read, and replace them.
+     * <p>
+     * Writer index is the index of the column in the metadata file. The metadata file has "sparse" column list,
+     * writer index refers to this sparse list.
+     *
+     * @param metaMem     the memory mapped metadata file
+     * @param columnCount the column count in the file
+     * @param targetList  the destination list (out parameter)
+     */
+    static void buildColumnListFromMetadataFile(MemoryR metaMem, int columnCount, IntList targetList) {
+        int nameOffset = (int) TableUtils.getColumnNameOffset(columnCount);
+        targetList.clear();
+
+        int denseSymbolIndex = 0;
+        for (int i = 0; i < columnCount; i++) {
+            int strLen = TableUtils.getInt(metaMem, metaMem.size(), nameOffset);
+            if (strLen == TableUtils.NULL_LEN) {
+                throw validationException(metaMem).put("NULL column name at [").put(i).put(']');
+            }
+            if (strLen < 1 || strLen > 255) {
+                // EXT4 and many others do not allow file name length > 255 bytes
+                throw validationException(metaMem).put("String length of ").put(strLen).put(" is invalid at offset ").put(nameOffset);
+            }
+            int nameLen = (int) Vm.getStorageLength(strLen);
+            int replacingColumnIndex = TableUtils.getReplacingColumnIndex(metaMem, i);
+            boolean isSymbol = ColumnType.isSymbol(TableUtils.getColumnType(metaMem, i));
+
+            if (replacingColumnIndex > -1) {
+                // Find the slot where the replaced column currently lives.
+                // For a chain A→B→C, when C replaces B, B may already have been
+                // moved into A's slot by a prior replacement, and slot B holds a
+                // dead marker of the form (-prevReplacingIndex - 1). Decode the
+                // marker to hop directly to the next slot in the chain: the
+                // column that ended up at slot prevReplacingIndex is the one we
+                // need to follow. Continue until the slot is live (non-negative
+                // writer index); that slot holds the column we want to overwrite.
+                // This is O(chain length) instead of O(N) scan per replacement.
+                // replacingColumnIndex is below i and every hop goes lower, so the walk ends.
+                int targetSlot = replacingColumnIndex;
+                int marker = targetList.getQuick(3 * targetSlot);
+                while (marker < 0) {
+                    targetSlot = -marker - 1;
+                    marker = targetList.getQuick(3 * targetSlot);
+                }
+
+                // Replace the column index at the found slot
+                targetList.set(3 * targetSlot, i);
+                targetList.set(3 * targetSlot + 1, nameOffset);
+                targetList.set(3 * targetSlot + 2, isSymbol ? denseSymbolIndex : -1);
+
+                targetList.add(-replacingColumnIndex - 1);
+                targetList.add(0);
+                targetList.add(0);
+
+            } else {
+                targetList.add(i);
+                targetList.add(nameOffset);
+                targetList.add(isSymbol ? denseSymbolIndex : -1);
+            }
+            nameOffset += nameLen;
+            if (isSymbol) {
+                denseSymbolIndex++;
+            }
         }
+    }
+
+    /**
+     * Decodes the index type from the column flags long. See the comment on
+     * META_FLAG_BIT_INDEXED for the bit layout.
+     */
+    static byte decodeIndexTypeFlags(long flags) {
+        if ((flags & META_FLAG_BIT_INDEXED) == 0) {
+            return IndexType.NONE;
+        }
+        if ((flags & META_FLAG_BIT_IS_POSTING) == 0) {
+            return IndexType.BITMAP;
+        }
+        long variant = flags & META_FLAG_POSTING_VARIANT_MASK;
+        if (variant == 0) {
+            return IndexType.POSTING;
+        }
+        if (variant == META_FLAG_BIT_POSTING_VARIANT_LO) {
+            return IndexType.POSTING_DELTA;
+        }
+        if (variant == META_FLAG_BIT_POSTING_VARIANT_HI) {
+            return IndexType.POSTING_EF;
+        }
+        throw CairoException.critical(0).put("unknown posting index variant in column metadata [flags=").put(flags).put(']');
+    }
+
+    /**
+     * Encodes the index type into flag bits for storage. See the comment on
+     * META_FLAG_BIT_INDEXED for the bit layout.
+     */
+    static long encodeIndexTypeFlags(byte indexType) {
+        return switch (indexType) {
+            case IndexType.NONE -> 0;
+            case IndexType.BITMAP -> META_FLAG_BIT_INDEXED;
+            case IndexType.POSTING -> META_FLAG_BIT_INDEXED | META_FLAG_BIT_IS_POSTING;
+            case IndexType.POSTING_DELTA ->
+                    META_FLAG_BIT_INDEXED | META_FLAG_BIT_IS_POSTING | META_FLAG_BIT_POSTING_VARIANT_LO;
+            case IndexType.POSTING_EF ->
+                    META_FLAG_BIT_INDEXED | META_FLAG_BIT_IS_POSTING | META_FLAG_BIT_POSTING_VARIANT_HI;
+            default -> throw CairoException.critical(0).put("unknown index type [type=").put(indexType).put(']');
+        };
     }
 
     static long getColumnFlags(MemoryR metaMem, int columnIndex) {
         return metaMem.getLong(META_OFFSET_COLUMN_TYPES + columnIndex * META_COLUMN_DATA_SIZE + 4);
     }
 
+    static byte getColumnIndexType(MemoryR metaMem, int columnIndex) {
+        return decodeIndexTypeFlags(getColumnFlags(metaMem, columnIndex));
+    }
+
     static int getIndexBlockCapacity(MemoryR metaMem, int columnIndex) {
         return metaMem.getInt(META_OFFSET_COLUMN_TYPES + columnIndex * META_COLUMN_DATA_SIZE + 4 + 8);
     }
 
-    static boolean isColumnDedupKey(MemoryMR metaMem, int columnIndex) {
+    static int getTableFormat(MemoryR metaMem) {
+        return isMetaFormatAtLeast(metaMem, META_FORMAT_MINOR_VERSION_TABLE_FORMAT)
+                ? metaMem.getInt(TableUtils.META_OFFSET_TABLE_FORMAT)
+                : TABLE_FORMAT_NATIVE;
+    }
+
+    static int getTtlHoursOrMonths(MemoryR metaMem) {
+        return isMetaFormatAtLeast(metaMem, META_FORMAT_MINOR_VERSION_TTL)
+                ? metaMem.getInt(TableUtils.META_OFFSET_TTL_HOURS_OR_MONTHS)
+                : 0;
+    }
+
+    static boolean isColumnCovering(MemoryR metaMem, int columnIndex) {
+        return (getColumnFlags(metaMem, columnIndex) & META_FLAG_BIT_COVERING) != 0;
+    }
+
+    static boolean isColumnDedupKey(MemoryR metaMem, int columnIndex) {
         return (getColumnFlags(metaMem, columnIndex) & META_FLAG_BIT_DEDUP_KEY) != 0;
     }
 
     static boolean isColumnIndexed(MemoryR metaMem, int columnIndex) {
-        return (getColumnFlags(metaMem, columnIndex) & META_FLAG_BIT_INDEXED) != 0;
-    }
-
-    static boolean isSequential(MemoryR metaMem, int columnIndex) {
-        return (getColumnFlags(metaMem, columnIndex) & META_FLAG_BIT_SEQUENTIAL) != 0;
+        return getColumnIndexType(metaMem, columnIndex) != IndexType.NONE;
     }
 
     static int openMetaSwapFile(FilesFacade ff, MemoryMA mem, Path path, int rootLen, int retryCount) {
@@ -1822,6 +3234,7 @@ public final class TableUtils {
                         // right, cannot open file for some reason?
                         LOG.error()
                                 .$("could not open swap [file=").$(path)
+                                .$(", msg=").$safe(e.getFlyweightMessage())
                                 .$(", errno=").$(e.getErrno())
                                 .I$();
                     }
@@ -1838,20 +3251,82 @@ public final class TableUtils {
         }
     }
 
-    static void openMetaSwapFileByIndex(FilesFacade ff, MemoryMA mem, Path path, int rootLen, int swapIndex) {
-        try {
-            path.concat(META_SWAP_FILE_NAME);
-            if (swapIndex > 0) {
-                path.put('.').put(swapIndex);
-            }
-            mem.smallFile(ff, path.$(), MemoryTag.MMAP_DEFAULT);
-        } finally {
-            path.trimTo(rootLen);
+    public interface FailureCloseable {
+        void close(long prevSize);
+    }
+
+    public interface SymbolTableProvider {
+        boolean containsNullValue(int columnIndex);
+
+        int getSymbolCount(int columnIndex);
+
+        MemoryR getSymbolOffsetsMemory(int columnIndex);
+
+        MemoryR getSymbolValuesMemory(int columnIndex);
+    }
+
+    public static class SymbolTableProviderFromReader implements SymbolTableProvider {
+        private TableReader reader;
+
+        public void clear() {
+            reader = null;
+        }
+
+        @Override
+        public boolean containsNullValue(int columnIndex) {
+            return reader.getSymbolMapReader(columnIndex).containsNullValue();
+        }
+
+        @Override
+        public int getSymbolCount(int columnIndex) {
+            return reader.getSymbolMapReader(columnIndex).getSymbolCount();
+        }
+
+        @Override
+        public MemoryR getSymbolOffsetsMemory(int columnIndex) {
+            return reader.getSymbolMapReader(columnIndex).getSymbolOffsetsColumn();
+        }
+
+        @Override
+        public MemoryR getSymbolValuesMemory(int columnIndex) {
+            return reader.getSymbolMapReader(columnIndex).getSymbolValuesColumn();
+        }
+
+        public void of(TableReader reader) {
+            this.reader = reader;
         }
     }
 
-    public interface FailureCloseable {
-        void close(long prevSize);
+    public static class SymbolTableProviderFromWriter implements SymbolTableProvider {
+        private TableWriter writer;
+
+        public void clear() {
+            writer = null;
+        }
+
+        @Override
+        public boolean containsNullValue(int columnIndex) {
+            return writer.getSymbolMapWriter(columnIndex).getNullFlag();
+        }
+
+        @Override
+        public int getSymbolCount(int columnIndex) {
+            return writer.getSymbolMapWriter(columnIndex).getSymbolCount();
+        }
+
+        @Override
+        public MemoryR getSymbolOffsetsMemory(int columnIndex) {
+            return writer.getSymbolMapWriter(columnIndex).getSymbolOffsetsMemory();
+        }
+
+        @Override
+        public MemoryR getSymbolValuesMemory(int columnIndex) {
+            return writer.getSymbolMapWriter(columnIndex).getSymbolValuesMemory();
+        }
+
+        public void of(TableWriter writer) {
+            this.writer = writer;
+        }
     }
 
     static {

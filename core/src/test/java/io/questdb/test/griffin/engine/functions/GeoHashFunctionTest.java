@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -28,7 +28,6 @@ import io.questdb.cairo.ColumnType;
 import io.questdb.cairo.GeoHashes;
 import io.questdb.cairo.sql.Record;
 import io.questdb.griffin.engine.functions.GeoByteFunction;
-import io.questdb.std.str.StringSink;
 import org.junit.Assert;
 import org.junit.Test;
 
@@ -41,7 +40,7 @@ public class GeoHashFunctionTest {
         }
 
         @Override
-        public boolean isReadThreadSafe() {
+        public boolean isThreadSafe() {
             return true;
         }
     };
@@ -49,6 +48,11 @@ public class GeoHashFunctionTest {
     @Test(expected = UnsupportedOperationException.class)
     public void testChar() {
         Assert.assertEquals('a', nullFunction.getChar(null));
+    }
+
+    @Test(expected = UnsupportedOperationException.class)
+    public void testGetArray() {
+        nullFunction.getArray(null);
     }
 
     @Test(expected = UnsupportedOperationException.class)
@@ -74,6 +78,36 @@ public class GeoHashFunctionTest {
     @Test(expected = UnsupportedOperationException.class)
     public void testGetDate() {
         nullFunction.getDate(null);
+    }
+
+    @Test(expected = UnsupportedOperationException.class)
+    public void testGetDecimal128() {
+        nullFunction.getDecimal128(null, null);
+    }
+
+    @Test(expected = UnsupportedOperationException.class)
+    public void testGetDecimal16() {
+        nullFunction.getDecimal16(null);
+    }
+
+    @Test(expected = UnsupportedOperationException.class)
+    public void testGetDecimal256() {
+        nullFunction.getDecimal256(null, null);
+    }
+
+    @Test(expected = UnsupportedOperationException.class)
+    public void testGetDecimal32() {
+        nullFunction.getDecimal32(null);
+    }
+
+    @Test(expected = UnsupportedOperationException.class)
+    public void testGetDecimal64() {
+        nullFunction.getDecimal64(null);
+    }
+
+    @Test(expected = UnsupportedOperationException.class)
+    public void testGetDecimal8() {
+        nullFunction.getDecimal8(null);
     }
 
     @Test(expected = UnsupportedOperationException.class)
@@ -119,13 +153,6 @@ public class GeoHashFunctionTest {
     @Test
     public void testGetStrIntoSink1() {
         Assert.assertEquals(GeoHashes.NULL, nullFunction.getGeoByte(null));
-        StringSink sink = new StringSink();
-        try {
-            nullFunction.getStr(null, sink);
-            Assert.fail();
-        } catch (UnsupportedOperationException e) {
-            // Good
-        }
     }
 
     @Test(expected = UnsupportedOperationException.class)

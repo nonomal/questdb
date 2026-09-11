@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -31,25 +31,17 @@ public class PgRolesFunctionFactoryTest extends AbstractCairoTest {
 
     @Test
     public void testPgRolesFunc() throws Exception {
-        assertQuery(
-                "rolname\trolsuper\trolinherit\trolcreaterole\trolcreatedb\trolcanlogin\trolreplication\trolconnlimit\trolpassword\trolvaliduntil\trolbypassrls\trolconfig\toid\n",
-                "pg_roles;",
-                null,
-                null,
-                false,
-                true
-        );
+        assertQuery("pg_roles;")
+                .ddl(null)
+                .expectSize()
+                .returns("rolname\trolsuper\trolinherit\trolcreaterole\trolcreatedb\trolcanlogin\trolreplication\trolconnlimit\trolpassword\trolvaliduntil\trolbypassrls\trolconfig\toid\n");
     }
 
     @Test
     public void testPrefixedPgRolesFunc() throws Exception {
-        assertQuery(
-                "rolname\trolsuper\trolinherit\trolcreaterole\trolcreatedb\trolcanlogin\trolreplication\trolconnlimit\trolpassword\trolvaliduntil\trolbypassrls\trolconfig\toid\n",
-                "pg_catalog.pg_roles;",
-                null,
-                null,
-                false,
-                true
-        );
+        assertQuery("pg_catalog.pg_roles;")
+                .ddl(null)
+                .expectSize()
+                .returns("rolname\trolsuper\trolinherit\trolcreaterole\trolcreatedb\trolcanlogin\trolreplication\trolconnlimit\trolpassword\trolvaliduntil\trolbypassrls\trolconfig\toid\n");
     }
 }

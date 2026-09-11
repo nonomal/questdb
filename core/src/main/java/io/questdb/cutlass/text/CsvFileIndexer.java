@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -26,8 +26,9 @@ package io.questdb.cutlass.text;
 
 import io.questdb.cairo.CairoConfiguration;
 import io.questdb.cairo.CairoException;
-import io.questdb.cairo.PartitionBy;
+import io.questdb.cairo.ColumnType;
 import io.questdb.cairo.TableUtils;
+import io.questdb.cairo.TimestampDriver;
 import io.questdb.cairo.sql.ExecutionCircuitBreaker;
 import io.questdb.cairo.vm.MemoryPMARImpl;
 import io.questdb.cairo.vm.Vm;
@@ -35,15 +36,30 @@ import io.questdb.cutlass.text.types.TimestampAdapter;
 import io.questdb.cutlass.text.types.TypeManager;
 import io.questdb.log.Log;
 import io.questdb.log.LogFactory;
-import io.questdb.std.*;
+import io.questdb.std.Decimal256;
+import io.questdb.std.Files;
+import io.questdb.std.FilesFacade;
+import io.questdb.std.LongList;
+import io.questdb.std.LongObjHashMap;
+import io.questdb.std.MemoryTag;
+import io.questdb.std.Misc;
+import io.questdb.std.Mutable;
+import io.questdb.std.ObjList;
+import io.questdb.std.SwarUtils;
+import io.questdb.std.Unsafe;
+import io.questdb.std.Vect;
 import io.questdb.std.datetime.DateFormat;
-import io.questdb.std.datetime.microtime.Timestamps;
-import io.questdb.std.datetime.millitime.DateFormatUtils;
-import io.questdb.std.str.*;
+import io.questdb.std.str.DirectUtf16Sink;
+import io.questdb.std.str.DirectUtf8Sink;
+import io.questdb.std.str.DirectUtf8String;
+import io.questdb.std.str.LPSZ;
+import io.questdb.std.str.Path;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
 import java.io.Closeable;
+
+import static io.questdb.std.datetime.DateLocaleFactory.EN_LOCALE;
 
 
 /**
@@ -91,7 +107,7 @@ public class CsvFileIndexer implements Closeable, Mutable {
     private int errorCount = 0;
     private boolean failOnTsError;
     // input file descriptor (cached between initial boundary scan & indexing phases)
-    private int fd = -1;
+    private long fd = -1;
     private long fieldHi;
     private int fieldIndex;
     // these two are pointers either into file read buffer or roll buffer
@@ -113,7 +129,7 @@ public class CsvFileIndexer implements Closeable, Mutable {
     private long offset;
     private DateFormat partitionDirFormatMethod;
     // used to map timestamp to output file
-    private PartitionBy.PartitionFloorMethod partitionFloorMethod;
+    private TimestampDriver.TimestampFloorMethod partitionFloorMethod;
     // work dir path
     private Path path;
     private boolean rollBufferUnusable = false;
@@ -121,6 +137,7 @@ public class CsvFileIndexer implements Closeable, Mutable {
     private long sortBufferPtr;
     // adapter used to parse timestamp column
     private TimestampAdapter timestampAdapter;
+    private TimestampDriver timestampDriver;
     // position of timestamp column in csv (0-based)
     private int timestampIndex;
     private long timestampValue;
@@ -133,7 +150,7 @@ public class CsvFileIndexer implements Closeable, Mutable {
             int utf8SinkSize = textConfiguration.getUtf8SinkSize();
             this.utf16Sink = new DirectUtf16Sink(utf8SinkSize);
             this.utf8Sink = new DirectUtf8Sink(utf8SinkSize);
-            this.typeManager = new TypeManager(textConfiguration, utf16Sink, utf8Sink);
+            this.typeManager = new TypeManager(textConfiguration, utf16Sink, utf8Sink, new Decimal256());
             this.ff = configuration.getFilesFacade();
             this.dirMode = configuration.getMkDirMode();
             this.inputRoot = configuration.getSqlCopyInputRoot();
@@ -294,7 +311,7 @@ public class CsvFileIndexer implements Closeable, Mutable {
         //  allowing for importing 256TB big files with rows up to 65kB long
         long lengthAndOffset = (length << 48 | lineStartOffset);
         long partitionKey = partitionFloorMethod.floor(timestampValue);
-        long mapKey = partitionKey / Timestamps.HOUR_MICROS; //remove trailing zeros to avoid excessive collisions in hashmap
+        long mapKey = timestampDriver.toHours(partitionKey); //remove trailing zeros to avoid excessive collisions in hashmap
 
         final IndexOutputFile target;
         int keyIndex = outputFileLookupMap.keyIndex(mapKey);
@@ -321,6 +338,7 @@ public class CsvFileIndexer implements Closeable, Mutable {
             CharSequence inputFileName,
             CharSequence importRoot,
             int index,
+            int timestampType,
             int partitionBy,
             byte columnDelimiter,
             int timestampIndex,
@@ -331,8 +349,9 @@ public class CsvFileIndexer implements Closeable, Mutable {
     ) {
         this.inputFileName = inputFileName;
         this.importRoot = importRoot;
-        this.partitionFloorMethod = PartitionBy.getPartitionFloorMethod(partitionBy);
-        this.partitionDirFormatMethod = PartitionBy.getPartitionDirFormatMethod(partitionBy);
+        this.timestampDriver = ColumnType.getTimestampDriver(timestampType);
+        this.partitionFloorMethod = timestampDriver.getPartitionFloorMethod(partitionBy);
+        this.partitionDirFormatMethod = timestampDriver.getPartitionDirFormatMethod(partitionBy);
         this.offset = 0;
         this.columnDelimiter = columnDelimiter;
         this.columnDelimiterMask = SwarUtils.broadcast(columnDelimiter);
@@ -361,7 +380,7 @@ public class CsvFileIndexer implements Closeable, Mutable {
         }
     }
 
-    public void sort(int srcFd, long srcSize) {
+    public void sort(long srcFd, long srcSize) {
         if (srcSize < 1) {
             return;
         }
@@ -445,7 +464,7 @@ public class CsvFileIndexer implements Closeable, Mutable {
 
     private Path getPartitionIndexDir(long partitionKey) {
         path.of(importRoot).slash();
-        partitionDirFormatMethod.format(partitionKey, DateFormatUtils.EN_LOCALE, null, path);
+        partitionDirFormatMethod.format(partitionKey, EN_LOCALE, null, path);
         return path;
     }
 
@@ -493,7 +512,7 @@ public class CsvFileIndexer implements Closeable, Mutable {
 
         while (ptr < hi) {
             if (!rollBufferUnusable && !useFieldRollBuf && !delayedOutQuote && ptr < hi - 7) {
-                long word = Unsafe.getUnsafe().getLong(ptr);
+                long word = Unsafe.getLong(ptr);
                 long zeroBytesWord = SwarUtils.markZeroBytes(word ^ MASK_NEW_LINE)
                         | SwarUtils.markZeroBytes(word ^ MASK_CR)
                         | SwarUtils.markZeroBytes(word ^ MASK_QUOTE)
@@ -509,7 +528,7 @@ public class CsvFileIndexer implements Closeable, Mutable {
                 }
             }
 
-            final byte b = Unsafe.getUnsafe().getByte(ptr++);
+            final byte b = Unsafe.getByte(ptr++);
             if (rollBufferUnusable) {
                 eol(ptr, b);
                 continue;
@@ -552,16 +571,43 @@ public class CsvFileIndexer implements Closeable, Mutable {
     }
 
     private void parseTimestamp() {
+        final long timestamp;
         try {
-            timestampValue = timestampAdapter.getTimestamp(timestampField);
+            timestamp = timestampAdapter.getTimestamp(timestampField);
         } catch (Exception e) {
             if (failOnTsError) {
                 throw TextException.$("could not parse timestamp [line=").put(lineNumber).put(", column=").put(timestampIndex).put(']');
-            } else {
-                LOG.error().$("could not parse timestamp [line=").$(lineNumber).$(", column=").$(timestampIndex).I$();
+            }
+            LOG.error().$("could not parse timestamp [line=").$(lineNumber).$(", column=").$(timestampIndex).I$();
+            errorCount++;
+            return;
+        }
+
+        // TableWriter.newRow() refuses a designated timestamp outside the column's bounds with a
+        // CairoException the partition import phase cannot tell from an infrastructure failure,
+        // so a single such row used to fail the whole import whatever the atomicity. A numeric
+        // timestamp bypasses the date parser's year check and is how such a value gets this far.
+        // Refuse it here, where the atomicity policy applies to the row the way it does to an
+        // unparsable one. indexLine() drops a Long.MIN_VALUE (NULL) timestamp on its own.
+        if (timestamp != Long.MIN_VALUE) {
+            try {
+                timestampDriver.validateBounds(timestamp);
+            } catch (CairoException e) {
+                if (failOnTsError) {
+                    throw TextException.$("designated timestamp out of bounds [line=").put(lineNumber)
+                            .put(", column=").put(timestampIndex)
+                            .put(", msg=").put(e.getFlyweightMessage())
+                            .put(']');
+                }
+                LOG.error().$("designated timestamp out of bounds [line=").$(lineNumber)
+                        .$(", column=").$(timestampIndex)
+                        .$(", msg=").$safe(e.getFlyweightMessage())
+                        .I$();
                 errorCount++;
+                return;
             }
         }
+        timestampValue = timestamp;
     }
 
     @NotNull
@@ -583,7 +629,7 @@ public class CsvFileIndexer implements Closeable, Mutable {
 
     private void putToRollBuf(byte c) {
         if (fitsInBuffer((int) (fieldRollBufCur - fieldRollBufPtr + 1L))) {
-            Unsafe.getUnsafe().putByte(fieldRollBufCur++, c);
+            Unsafe.putByte(fieldRollBufCur++, c);
         }
     }
 
@@ -686,8 +732,7 @@ public class CsvFileIndexer implements Closeable, Mutable {
             this.indexChunkSize = 0;
             this.chunkNumber = 0;
             this.dataSize = 0;
-            this.memory = new MemoryPMARImpl(configuration.getCommitMode());
-
+            this.memory = new MemoryPMARImpl(configuration);
             nextChunk(ff, path);
         }
 

@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -36,11 +36,13 @@ import io.questdb.griffin.SqlExecutionContext;
 import io.questdb.griffin.engine.functions.BooleanFunction;
 import io.questdb.griffin.engine.functions.MultiArgFunction;
 import io.questdb.griffin.engine.functions.UnaryFunction;
+import io.questdb.griffin.engine.functions.conditional.CaseCommon;
 import io.questdb.griffin.engine.functions.constants.BooleanConstant;
 import io.questdb.std.CharSequenceHashSet;
 import io.questdb.std.Chars;
 import io.questdb.std.IntList;
 import io.questdb.std.ObjList;
+import io.questdb.std.Transient;
 
 public class InStrFunctionFactory implements FunctionFactory {
 
@@ -52,8 +54,8 @@ public class InStrFunctionFactory implements FunctionFactory {
     @Override
     public Function newInstance(
             int position,
-            ObjList<Function> args,
-            IntList argPositions,
+            @Transient ObjList<Function> args,
+            @Transient IntList argPositions,
             CairoConfiguration configuration,
             SqlExecutionContext sqlExecutionContext
     ) throws SqlException {
@@ -62,6 +64,17 @@ public class InStrFunctionFactory implements FunctionFactory {
             return BooleanConstant.FALSE;
         }
 
+        // try to append cast to STR for first argument
+        args.setQuick(
+                0,
+                CaseCommon.getCastFunction(
+                        args.getQuick(0),
+                        argPositions.getQuick(0),
+                        ColumnType.STRING,
+                        configuration,
+                        sqlExecutionContext
+                )
+        );
         boolean allConst = true;
         for (int i = 1; i < n; i++) {
             Function func = args.getQuick(i);
@@ -103,6 +116,11 @@ public class InStrFunctionFactory implements FunctionFactory {
         return new RuntimeConstFunc(new ObjList<>(args), positions);
     }
 
+    @Override
+    public boolean variadicTypeSupportUndefinedBindVariables(ObjList<Function> args) {
+        return args.size() > 2;
+    }
+
     private static void parseToString(ObjList<Function> args, IntList argPositions, CharSequenceHashSet set) throws SqlException {
         set.clear();
         final int n = args.size();
@@ -116,7 +134,8 @@ public class InStrFunctionFactory implements FunctionFactory {
                     set.add(Chars.toString(func.getStrA(null)));
                     break;
                 case ColumnType.CHAR:
-                    set.add(String.valueOf(func.getChar(null)));
+                    char c = func.getChar(null);
+                    set.add(c != 0 ? String.valueOf(c) : null);
                     break;
                 default:
                     throw SqlException.position(argPositions.getQuick(i)).put("cannot compare STRING with type ").put(ColumnType.nameOf(func.getType()));
@@ -161,7 +180,7 @@ public class InStrFunctionFactory implements FunctionFactory {
         }
 
         @Override
-        public ObjList<Function> getArgs() {
+        public ObjList<Function> args() {
             return args;
         }
 

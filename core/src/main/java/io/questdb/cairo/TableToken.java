@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,15 +24,34 @@
 
 package io.questdb.cairo;
 
+import io.questdb.std.Chars;
 import io.questdb.std.str.CharSink;
 import io.questdb.std.str.DirectUtf8Sequence;
 import io.questdb.std.str.GcUtf8String;
 import io.questdb.std.str.Sinkable;
 import org.jetbrains.annotations.NotNull;
+import org.jetbrains.annotations.Nullable;
+import org.jetbrains.annotations.TestOnly;
 
+/**
+ * Stands for a WAL table, or a non-WAL table, or a view, a materialized view or a
+ * live view - {@link Type} names which. Constructors take the {@link Type} rather
+ * than a set of booleans so that a token cannot silently lose its kind: the
+ * boolean form could not spell {@link Type#LIVE_VIEW} and defaulted such a token
+ * to {@link Type#TABLE}, which is what every registry guard keys on.
+ */
 public class TableToken implements Sinkable {
+    // Test-only: builds an isWal=false LV token. Production live views are WAL
+    // tables, so use the engine's lock/registration path to mint a real LV token.
+    @TestOnly
+    public static TableToken liveViewToken(@NotNull String name, int tableId) {
+        return new TableToken(name, new GcUtf8String(name), null, tableId, Type.LIVE_VIEW, false, false, false, false);
+    }
+
+    private final String dbLogName;
     @NotNull
     private final GcUtf8String dirName;
+    private final boolean dirNameSameAsTableName;
     private final boolean isProtected;
     private final boolean isPublic;
     private final boolean isSystem;
@@ -40,23 +59,30 @@ public class TableToken implements Sinkable {
     private final int tableId;
     @NotNull
     private final String tableName;
+    private final Type type;
 
-    public TableToken(@NotNull String tableName, @NotNull String dirName, int tableId, boolean isWal, boolean isSystem, boolean isProtected) {
-        this(tableName, new GcUtf8String(dirName), tableId, isWal, isSystem, isProtected, false);
+    public TableToken(@NotNull String tableName, @NotNull String dirName, @Nullable String dbLogName, int tableId, boolean isWal, boolean isSystem, boolean isProtected) {
+        this(tableName, new GcUtf8String(dirName), dbLogName, tableId, Type.TABLE, isWal, isSystem, isProtected, false);
     }
 
-    public TableToken(@NotNull String tableName, @NotNull String dirName, int tableId, boolean isWal, boolean isSystem, boolean isProtected, boolean isPublic) {
-        this(tableName, new GcUtf8String(dirName), tableId, isWal, isSystem, isProtected, isPublic);
+    public TableToken(@NotNull String tableName, @NotNull String dirName, @Nullable String dbLogName, int tableId, Type type, boolean isWal, boolean isSystem, boolean isProtected, boolean isPublic) {
+        this(tableName, new GcUtf8String(dirName), dbLogName, tableId, type, isWal, isSystem, isProtected, isPublic);
     }
 
-    private TableToken(@NotNull String tableName, @NotNull GcUtf8String dirName, int tableId, boolean isWal, boolean isSystem, boolean isProtected, boolean isPublic) {
+    private TableToken(@NotNull String tableName, @NotNull GcUtf8String dirName, @Nullable String dbLogName, int tableId, Type type, boolean isWal, boolean isSystem, boolean isProtected, boolean isPublic) {
         this.tableName = tableName;
         this.dirName = dirName;
         this.tableId = tableId;
+        this.type = type;
         this.isWal = isWal;
         this.isSystem = isSystem;
         this.isProtected = isProtected;
         this.isPublic = isPublic;
+        this.dbLogName = dbLogName;
+        String dirNameString = dirName.toString();
+        this.dirNameSameAsTableName = Chars.startsWith(dirNameString, tableName) &&
+                (dirNameString.length() == tableName.length() ||
+                        (dirNameString.length() > tableName.length() && dirNameString.charAt(tableName.length()) == '~'));
     }
 
     @Override
@@ -71,6 +97,9 @@ public class TableToken implements Sinkable {
         TableToken that = (TableToken) o;
 
         if (tableId != that.tableId) {
+            return false;
+        }
+        if (type != that.type) {
             return false;
         }
         if (isWal != that.isWal) {
@@ -116,9 +145,21 @@ public class TableToken implements Sinkable {
         return tableName;
     }
 
+    public Type getType() {
+        return type;
+    }
+
     @Override
     public int hashCode() {
         return tableId;
+    }
+
+    public boolean isLiveView() {
+        return type == Type.LIVE_VIEW;
+    }
+
+    public boolean isMatView() {
+        return type == Type.MAT_VIEW;
     }
 
     public boolean isProtected() {
@@ -133,17 +174,30 @@ public class TableToken implements Sinkable {
         return isSystem;
     }
 
+    public boolean isView() {
+        return type == Type.VIEW;
+    }
+
     public boolean isWal() {
         return isWal;
     }
 
     public TableToken renamed(String newName) {
-        return new TableToken(newName, dirName, tableId, isWal, isSystem, isProtected, isPublic);
+        return new TableToken(newName, dirName, dbLogName, tableId, type, isWal, isSystem, isProtected, isPublic);
     }
 
     @Override
     public void toSink(@NotNull CharSink<?> sink) {
-        sink.put(tableName);
+        if (dbLogName != null) {
+            sink.put(dbLogName).put('/');
+        }
+        if (dirNameSameAsTableName) {
+            sink.put(dirName);
+        } else {
+            sink.put("TableToken{tableName=").put(tableName)
+                    .put(", dirName=").put(dirName)
+                    .put('}');
+        }
     }
 
     @Override
@@ -152,8 +206,40 @@ public class TableToken implements Sinkable {
                 "tableName=" + tableName +
                 ", dirName=" + dirName +
                 ", tableId=" + tableId +
+                ", isView=" + isView() +
+                ", isMatView=" + isMatView() +
+                ", isLiveView=" + isLiveView() +
                 ", isWal=" + isWal +
                 ", isSystem=" + isSystem +
+                ", isProtected=" + isProtected +
+                ", isPublic=" + isPublic +
                 '}';
+    }
+
+    public enum Type {
+        TABLE("table", false),
+        VIEW("view", true),
+        MAT_VIEW("materialized view", true),
+        LIVE_VIEW("live view", true);
+
+        private final boolean isImplicitlyWal;
+        private final String keyword;
+
+        Type(String keyword, boolean isImplicitlyWal) {
+            this.keyword = keyword;
+            this.isImplicitlyWal = isImplicitlyWal;
+        }
+
+        /**
+         * Returns true for table types that are always treated as WAL
+         * in the table name registry, regardless of the stored WAL flag.
+         */
+        public boolean isImplicitlyWal() {
+            return isImplicitlyWal;
+        }
+
+        public String keyword() {
+            return keyword;
+        }
     }
 }

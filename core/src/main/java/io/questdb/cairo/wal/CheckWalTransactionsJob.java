@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,7 +24,13 @@
 
 package io.questdb.cairo.wal;
 
-import io.questdb.cairo.*;
+import io.questdb.cairo.CairoEngine;
+import io.questdb.cairo.CairoException;
+import io.questdb.cairo.TableToken;
+import io.questdb.cairo.TableUtils;
+import io.questdb.cairo.TxReader;
+import io.questdb.cairo.sql.TableMetadata;
+import io.questdb.cairo.sql.TableReferenceOutOfDateException;
 import io.questdb.cairo.wal.seq.SeqTxnTracker;
 import io.questdb.cairo.wal.seq.TableSequencerAPI;
 import io.questdb.mp.SynchronizedJob;
@@ -46,28 +52,33 @@ public class CheckWalTransactionsJob extends SynchronizedJob {
     private final ObjHashSet<TableToken> tableTokenBucket = new ObjHashSet<>();
     // Empty list means that all tables should be checked.
     private final TxReader txReader;
-    private long lastRunMs;
     private long lastProcessedCount = 0;
+    private long lastRunMs;
+    private boolean notificationQueueIsFull = false;
     private Path threadLocalPath;
 
     public CheckWalTransactionsJob(CairoEngine engine) {
         this.engine = engine;
         this.ff = engine.getConfiguration().getFilesFacade();
         txReader = new TxReader(engine.getConfiguration().getFilesFacade());
-        dbRoot = engine.getConfiguration().getRoot();
+        dbRoot = engine.getConfiguration().getDbRoot();
         millisecondClock = engine.getConfiguration().getMillisecondClock();
         spinLockTimeout = engine.getConfiguration().getSpinLockTimeout();
-        checkNotifyOutstandingTxnInWalRef = (tableToken, txn, txn2) -> checkNotifyOutstandingTxnInWal(txn, txn2);
+        checkNotifyOutstandingTxnInWalRef = (tableId, token, txn) -> checkNotifyOutstandingTxnInWal(token, txn);
         checkInterval = engine.getConfiguration().getSequencerCheckInterval();
         lastRunMs = millisecondClock.getTicks();
     }
 
-    public void checkMissingWalTransactions() {
+    private void checkMissingWalTransactions() {
         threadLocalPath = Path.PATH.get().of(dbRoot);
         engine.getTableSequencerAPI().forAllWalTables(tableTokenBucket, true, checkNotifyOutstandingTxnInWalRef);
     }
 
-    public void checkNotifyOutstandingTxnInWal(@NotNull TableToken tableToken, long seqTxn) {
+    protected void checkNotifyOutstandingTxnInWal(@NotNull TableToken tableToken, long seqTxn) {
+        if (notificationQueueIsFull) {
+            return;
+        }
+
         if (
                 seqTxn < 0 && TableUtils.exists(
                         ff,
@@ -77,24 +88,31 @@ public class CheckWalTransactionsJob extends SynchronizedJob {
                 ) == TableUtils.TABLE_EXISTS
         ) {
             // Dropped table
-            engine.notifyWalTxnCommitted(tableToken);
+            notificationQueueIsFull = !engine.notifyWalTxnCommitted(tableToken);
         } else {
             if (engine.getTableSequencerAPI().isTxnTrackerInitialised(tableToken)) {
                 if (engine.getTableSequencerAPI().notifyOnCheck(tableToken, seqTxn)) {
-                    engine.notifyWalTxnCommitted(tableToken);
+                    notificationQueueIsFull = !engine.notifyWalTxnCommitted(tableToken);
                 }
             } else {
                 LPSZ txnPath = threadLocalPath.trimTo(dbRoot.length()).concat(tableToken).concat(TableUtils.TXN_FILE_NAME).$();
                 if (ff.exists(txnPath)) {
-                    try (TxReader txReader = this.txReader.ofRO(txnPath, PartitionBy.NONE)) {
+                    try (
+                            TableMetadata tableMetadata = engine.getTableMetadata(tableToken);
+                            TxReader txReader = this.txReader.ofRO(txnPath, tableMetadata.getTimestampType(), tableMetadata.getPartitionBy())
+                    ) {
                         TableUtils.safeReadTxn(this.txReader, millisecondClock, spinLockTimeout);
                         if (engine.getTableSequencerAPI().initTxnTracker(tableToken, txReader.getSeqTxn(), seqTxn)) {
-                            engine.notifyWalTxnCommitted(tableToken);
+                            long floorSeqTxn = engine.getTableSequencerAPI().getTxnTracker(tableToken).getSeqTxn();
+                            engine.getRecentWriteTracker().setFloorSeqTxn(tableToken, floorSeqTxn);
+                            notificationQueueIsFull = !engine.notifyWalTxnCommitted(tableToken);
                         }
                     } catch (CairoException e) {
-                       if (!e.errnoReadPathDoesNotExist()) {
-                           throw e;
-                       } // race, table is dropped, ApplyWal2TableJob is already deleting the files
+                        if (!e.isFileCannotRead()) {
+                            throw e;
+                        } // race, table is dropped, ApplyWal2TableJob is already deleting the files
+                    } catch (TableReferenceOutOfDateException ignore) {
+                        // ignore, table was deleted if we got this exception on a table token
                     }
                 } // else table is dropped, ApplyWal2TableJob already is deleting the files
             }
@@ -104,27 +122,34 @@ public class CheckWalTransactionsJob extends SynchronizedJob {
     @Override
     public boolean runSerially() {
         long unpublishedWalTxnCount = engine.getUnpublishedWalTxnCount();
-        if (unpublishedWalTxnCount == lastProcessedCount) {
+        if (unpublishedWalTxnCount == lastProcessedCount || notificationQueueIsFull) {
+            // when notification queue was full last run, re-evaluate tables after a timeout
             final long t = millisecondClock.getTicks();
             if (lastRunMs + checkInterval < t) {
                 lastRunMs = t;
-                checkSequencerTrackers();
+                notificationQueueIsFull = !republishNotificationsFromTrackers();
             }
             return false;
         }
         checkMissingWalTransactions();
         lastProcessedCount = unpublishedWalTxnCount;
-        return true;
+        return !notificationQueueIsFull;
     }
 
-    private void checkSequencerTrackers() {
+    private boolean republishNotificationsFromTrackers() {
         engine.getTableTokens(tableTokenBucket, false);
         for (int i = 0, n = tableTokenBucket.size(); i < n; i++) {
             TableToken tableToken = tableTokenBucket.get(i);
+            if (engine.isWalApplySuspended(tableToken)) {
+                continue;
+            }
             SeqTxnTracker tracker = engine.getTableSequencerAPI().getTxnTracker(tableToken);
             if (!tracker.isSuspended() && tracker.getWriterTxn() < tracker.getSeqTxn()) {
-                engine.notifyWalTxnCommitted(tableToken);
+                if (!engine.notifyWalTxnCommitted(tableToken)) {
+                    return false;
+                }
             }
         }
+        return true;
     }
 }

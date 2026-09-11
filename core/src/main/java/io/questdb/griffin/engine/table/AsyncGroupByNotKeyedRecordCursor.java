@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,71 +24,61 @@
 
 package io.questdb.griffin.engine.table;
 
-import io.questdb.cairo.CairoConfiguration;
-import io.questdb.cairo.CairoException;
+import io.questdb.cairo.sql.NoRandomAccessRecordCursor;
 import io.questdb.cairo.sql.Record;
-import io.questdb.cairo.sql.*;
-import io.questdb.cairo.sql.async.PageFrameReduceTask;
-import io.questdb.cairo.sql.async.PageFrameSequence;
+import io.questdb.cairo.sql.RecordCursor;
+import io.questdb.cairo.sql.SqlExecutionCircuitBreaker;
+import io.questdb.cairo.sql.SymbolTable;
+import io.questdb.cairo.sql.VirtualRecord;
+import io.questdb.cairo.sql.async.UnorderedPageFrameSequence;
 import io.questdb.griffin.SqlException;
 import io.questdb.griffin.SqlExecutionContext;
 import io.questdb.griffin.engine.functions.GroupByFunction;
 import io.questdb.griffin.engine.functions.SymbolFunction;
-import io.questdb.griffin.engine.groupby.*;
-import io.questdb.log.Log;
-import io.questdb.log.LogFactory;
+import io.questdb.griffin.engine.groupby.GroupByFunctionsUpdater;
+import io.questdb.griffin.engine.groupby.GroupByUtils;
+import io.questdb.griffin.engine.groupby.SimpleMapValue;
 import io.questdb.std.Misc;
 import io.questdb.std.ObjList;
-import io.questdb.std.Os;
 
 class AsyncGroupByNotKeyedRecordCursor implements NoRandomAccessRecordCursor {
-
-    private static final Log LOG = LogFactory.getLog(AsyncGroupByNotKeyedRecordCursor.class);
-    private final GroupByAllocator allocator;
     private final ObjList<GroupByFunction> groupByFunctions;
     private final VirtualRecord recordA;
-    private int frameLimit;
-    private PageFrameSequence<AsyncGroupByNotKeyedAtom> frameSequence;
+    private SqlExecutionCircuitBreaker circuitBreaker;
+    private UnorderedPageFrameSequence<AsyncGroupByNotKeyedAtom> frameSequence;
+    private boolean isExhausted;
     private boolean isOpen;
     private boolean isValueBuilt;
-    private int recordsRemaining = 1;
 
-    public AsyncGroupByNotKeyedRecordCursor(
-            CairoConfiguration configuration,
-            ObjList<GroupByFunction> groupByFunctions
-    ) {
-        this.allocator = GroupByAllocatorFactory.createThreadSafeAllocator(configuration);
+    public AsyncGroupByNotKeyedRecordCursor(ObjList<GroupByFunction> groupByFunctions) {
         this.groupByFunctions = groupByFunctions;
-        GroupByUtils.setAllocator(groupByFunctions, allocator);
         this.recordA = new VirtualRecord(groupByFunctions);
-        this.isOpen = true;
+        // Start closed so the first of() runs atom.reopen(), which opens the lazy
+        // (openOnInit=false) allocators and binds the per-query tracker before any
+        // allocation. Skipping reopen() on the first cursor would leave the allocator's
+        // chunk index unallocated.
+        this.isOpen = false;
     }
 
     @Override
     public void calculateSize(SqlExecutionCircuitBreaker circuitBreaker, Counter counter) {
-        if (recordsRemaining > 0) {
-            counter.add(recordsRemaining);
-            recordsRemaining = 0;
+        if (!isExhausted) {
+            counter.inc();
+            isExhausted = true;
         }
     }
 
     @Override
     public void close() {
         if (isOpen) {
-            isOpen = false;
-            Misc.free(allocator);
-            Misc.clearObjList(groupByFunctions);
-
-            if (frameSequence != null) {
-                LOG.debug()
-                        .$("closing [shard=").$(frameSequence.getShard())
-                        .$(", frameCount=").$(frameLimit)
-                        .I$();
-
-                if (frameLimit > -1) {
+            try {
+                if (frameSequence != null) {
                     frameSequence.await();
+                    frameSequence.reset();
                 }
-                frameSequence.clear();
+            } finally {
+                Misc.clearObjList(groupByFunctions);
+                isOpen = false;
             }
         }
     }
@@ -105,15 +95,28 @@ class AsyncGroupByNotKeyedRecordCursor implements NoRandomAccessRecordCursor {
 
     @Override
     public boolean hasNext() {
+        if (isExhausted) {
+            return false;
+        }
+        buildValueConditionally();
+        isExhausted = true;
+        return true;
+    }
+
+    void buildValueConditionally() {
         if (!isValueBuilt) {
             buildValue();
         }
-        return recordsRemaining-- > 0;
     }
 
     @Override
     public SymbolTable newSymbolTable(int columnIndex) {
         return ((SymbolFunction) groupByFunctions.getQuick(columnIndex)).newSymbolTable();
+    }
+
+    @Override
+    public long preComputedStateSize() {
+        return RecordCursor.fromBool(isValueBuilt);
     }
 
     @Override
@@ -123,7 +126,7 @@ class AsyncGroupByNotKeyedRecordCursor implements NoRandomAccessRecordCursor {
 
     @Override
     public void toTop() {
-        recordsRemaining = 1;
+        isExhausted = false;
         GroupByUtils.toTop(groupByFunctions);
         if (frameSequence != null) {
             frameSequence.getAtom().toTop();
@@ -131,55 +134,11 @@ class AsyncGroupByNotKeyedRecordCursor implements NoRandomAccessRecordCursor {
     }
 
     private void buildValue() {
-        if (frameLimit == -1) {
-            frameSequence.prepareForDispatch();
-            frameLimit = frameSequence.getFrameCount() - 1;
-        }
-
-        int frameIndex = -1;
-        boolean allFramesActive = true;
-        try {
-            do {
-                final long cursor = frameSequence.next();
-                if (cursor > -1) {
-                    PageFrameReduceTask task = frameSequence.getTask(cursor);
-                    LOG.debug()
-                            .$("collected [shard=").$(frameSequence.getShard())
-                            .$(", frameIndex=").$(task.getFrameIndex())
-                            .$(", frameCount=").$(frameSequence.getFrameCount())
-                            .$(", active=").$(frameSequence.isActive())
-                            .$(", cursor=").$(cursor)
-                            .I$();
-                    if (task.hasError()) {
-                        throw CairoException.nonCritical().put(task.getErrorMsg());
-                    }
-
-                    allFramesActive &= frameSequence.isActive();
-                    frameIndex = task.getFrameIndex();
-
-                    frameSequence.collect(cursor, false);
-                } else if (cursor == -2) {
-                    break; // No frames to filter.
-                } else {
-                    Os.pause();
-                }
-            } while (frameIndex < frameLimit);
-        } catch (Throwable e) {
-            LOG.error().$("group by error [ex=").$(e).I$();
-            if (e instanceof CairoException) {
-                CairoException ce = (CairoException) e;
-                if (ce.isInterruption()) {
-                    throwTimeoutException();
-                } else {
-                    throw ce;
-                }
-            }
-            throw CairoException.nonCritical().put(e.getMessage());
-        }
-
-        if (!allFramesActive) {
-            throwTimeoutException();
-        }
+        // Consult the breaker before dispatching frames, so an empty base scan still observes cancellation.
+        circuitBreaker.statefulThrowExceptionIfTrippedTimeThrottled();
+        frameSequence.prepareForDispatch();
+        frameSequence.getAtom().getFilterContext().initMemoryPools(frameSequence.getPageFrameAddressCache(), frameSequence.getMemoryTracker());
+        frameSequence.dispatchAndAwait();
 
         // Merge the values.
         final AsyncGroupByNotKeyedAtom atom = frameSequence.getAtom();
@@ -202,25 +161,21 @@ class AsyncGroupByNotKeyedRecordCursor implements NoRandomAccessRecordCursor {
         isValueBuilt = true;
     }
 
-    private void throwTimeoutException() {
-        if (frameSequence.getCancelReason() == SqlExecutionCircuitBreaker.STATE_CANCELLED) {
-            throw CairoException.queryCancelled();
-        } else {
-            throw CairoException.queryTimedOut();
-        }
-    }
-
-    void of(PageFrameSequence<AsyncGroupByNotKeyedAtom> frameSequence, SqlExecutionContext executionContext) throws SqlException {
+    void of(UnorderedPageFrameSequence<AsyncGroupByNotKeyedAtom> frameSequence, SqlExecutionContext executionContext) throws SqlException {
+        final AsyncGroupByNotKeyedAtom atom = frameSequence.getAtom();
+        // Assign before reopen() so close() can drain a partially reopened atom on a breach.
+        this.frameSequence = frameSequence;
         if (!isOpen) {
             isOpen = true;
+            atom.reopen();
         }
-        this.frameSequence = frameSequence;
-        final AsyncGroupByNotKeyedAtom atom = frameSequence.getAtom();
+        this.circuitBreaker = executionContext.getCircuitBreaker();
+        this.isValueBuilt = false;
         recordA.of(atom.getOwnerMapValue());
-        atom.setAllocator(allocator);
-        Function.init(groupByFunctions, frameSequence.getSymbolTableSource(), executionContext);
-        isValueBuilt = false;
-        frameLimit = -1;
+        // The atom's init() has already initialized the owner group by functions (this cursor's
+        // groupByFunctions) and donated their state to the per-worker clones. Re-initializing them
+        // here would re-run stateful initialization, such as a cursor comparison re-executing its
+        // scalar sub-query, and could diverge from the state the workers observe.
         toTop();
     }
 }

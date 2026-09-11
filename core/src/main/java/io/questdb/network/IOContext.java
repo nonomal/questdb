@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -25,22 +25,28 @@
 package io.questdb.network;
 
 import io.questdb.log.Log;
-import io.questdb.metrics.LongGauge;
 import io.questdb.std.Mutable;
 import io.questdb.std.QuietCloseable;
+import io.questdb.std.Unsafe;
 import org.jetbrains.annotations.NotNull;
 
 public abstract class IOContext<T extends IOContext<T>> implements Mutable, QuietCloseable {
+    private static final long DISCONNECTING_OFFSET = Unsafe.getFieldOffset(IOContext.class, "disconnecting");
     protected final Socket socket;
-    private final LongGauge connectionCountGauge;
     protected long heartbeatId = -1;
+    // 0 while this lease of the context is live, flipped to 1 by the single caller that claims the
+    // disconnect. of() resets it at every checkout so each connection starts unclaimed.
+    private volatile int disconnecting = 0;
     private int disconnectReason;
-    // keep dispatcher private to avoid context scheduling itself multiple times
-    private IODispatcher<T> dispatcher;
+    private volatile boolean initialized = false;
 
-    protected IOContext(SocketFactory socketFactory, NetworkFacade nf, Log log, LongGauge connectionCountGauge) {
+    // IMPORTANT: Keep subclass constructors lightweight!
+    // Under high load, new context objects are created for each accepted connection.
+    // Since connection acceptance runs on a single thread, slow constructors can
+    // significantly degrade performance and throttle incoming connections.
+    // To avoid this, defer context initialization to the doInit() method.
+    protected IOContext(@NotNull SocketFactory socketFactory, NetworkFacade nf, Log log) {
         this.socket = socketFactory.newInstance(nf, log);
-        this.connectionCountGauge = connectionCountGauge;
     }
 
     @Override
@@ -48,31 +54,9 @@ public abstract class IOContext<T extends IOContext<T>> implements Mutable, Quie
         _clear();
     }
 
-    public void clearSuspendEvent() {
-        // no-op
-    }
-
     @Override
     public void close() {
         _clear();
-    }
-
-    public int getDisconnectReason() {
-        return disconnectReason;
-    }
-
-
-    public PeerIsSlowToReadException registerDispatcherWrite() {
-        return PeerIsSlowToReadException.INSTANCE;
-    }
-
-    public HeartBeatException registerDispatcherHeartBeat() {
-        return HeartBeatException.INSTANCE;
-    }
-
-    public ServerDisconnectException registerDispatcherDisconnect(int reason) {
-        disconnectReason = reason;
-        return ServerDisconnectException.INSTANCE;
     }
 
     public long getAndResetHeartbeatId() {
@@ -81,11 +65,11 @@ public abstract class IOContext<T extends IOContext<T>> implements Mutable, Quie
         return id;
     }
 
-    public PeerIsSlowToWriteException registerDispatcherRead() {
-        return PeerIsSlowToWriteException.INSTANCE;
+    public int getDisconnectReason() {
+        return disconnectReason;
     }
 
-    public int getFd() {
+    public long getFd() {
         return socket != null ? socket.getFd() : -1;
     }
 
@@ -93,15 +77,11 @@ public abstract class IOContext<T extends IOContext<T>> implements Mutable, Quie
         return socket;
     }
 
-    public SuspendEvent getSuspendEvent() {
-        return null;
-    }
-
-    /**
-     * @throws io.questdb.cairo.CairoException if initialization fails
-     */
-    public void init() {
-        // no-op
+    public final void init() throws TlsSessionInitFailedException {
+        if (!initialized) {
+            doInit();
+            initialized = true;
+        }
     }
 
     public boolean invalid() {
@@ -109,27 +89,65 @@ public abstract class IOContext<T extends IOContext<T>> implements Mutable, Quie
     }
 
     @SuppressWarnings("unchecked")
-    public T of(int fd, @NotNull IODispatcher<T> dispatcher) {
-        if (fd != -1) {
-            connectionCountGauge.inc();
-        }
+    public final T of(long fd) {
+        disconnecting = 0;
         socket.of(fd);
-        this.dispatcher = dispatcher;
         return (T) this;
+    }
+
+    public ServerDisconnectException registerDispatcherDisconnect(int reason) {
+        disconnectReason = reason;
+        return ServerDisconnectException.INSTANCE;
+    }
+
+    public HeartBeatException registerDispatcherHeartBeat() {
+        return HeartBeatException.INSTANCE;
+    }
+
+    public PeerIsSlowToWriteException registerDispatcherRead() {
+        return PeerIsSlowToWriteException.INSTANCE;
+    }
+
+    public PeerIsSlowToReadException registerDispatcherWrite() {
+        return PeerIsSlowToReadException.INSTANCE;
     }
 
     public void setHeartbeatId(long heartbeatId) {
         this.heartbeatId = heartbeatId;
     }
 
+    /**
+     * Atomically claims this context for disconnect. Returns {@code true} for the single caller that
+     * wins the claim and must free it; {@code false} for any other caller, which must leave it alone.
+     * This makes {@link AbstractIODispatcher#doDisconnect} idempotent when two threads reach it for the
+     * same context concurrently -- e.g. {@code close()}'s pendingHeartbeats sweep racing a worker's
+     * post-close {@code disconnect()}/{@code registerChannel()} -- so the context is freed exactly once.
+     * The claim is reset per lease in {@link #of(long)}.
+     */
+    public boolean tryDisconnect() {
+        return Unsafe.cas(this, DISCONNECTING_OFFSET, 0, 1);
+    }
+
     private void _clear() {
-        if (socket.getFd() != -1) {
-            connectionCountGauge.dec();
-        }
         heartbeatId = -1;
         socket.close();
-        dispatcher = null;
         disconnectReason = -1;
-        clearSuspendEvent();
+        initialized = false;
+    }
+
+    /**
+     * Initializes the state of the context object.
+     * <p>
+     * Override this method to perform any setup required.
+     * Note that this method is called once per connection, but not on the thread
+     * that accepts connections. Instead, it is invoked when the first I/O event
+     * is dispatched for this context.
+     * <p>
+     * Avoid placing initialization logic in the context's constructor, as it may
+     * negatively impact the database's ability to accept new connections under high load.
+     *
+     * @throws io.questdb.cairo.CairoException if initialization fails
+     */
+    protected void doInit() throws TlsSessionInitFailedException {
     }
 }

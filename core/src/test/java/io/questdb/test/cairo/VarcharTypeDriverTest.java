@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -29,8 +29,6 @@ import io.questdb.cairo.CairoConfiguration;
 import io.questdb.cairo.VarcharTypeDriver;
 import io.questdb.cairo.vm.MemoryCMARWImpl;
 import io.questdb.cairo.vm.Vm;
-import io.questdb.cairo.vm.api.MemoryAR;
-import io.questdb.cairo.vm.api.MemoryARW;
 import io.questdb.cairo.vm.api.MemoryCARW;
 import io.questdb.cairo.vm.api.MemoryCMARW;
 import io.questdb.std.*;
@@ -45,6 +43,56 @@ import static io.questdb.cairo.VarcharTypeDriver.VARCHAR_AUX_WIDTH_BYTES;
 import static io.questdb.cairo.VarcharTypeDriver.VARCHAR_MAX_BYTES_FULLY_INLINED;
 
 public class VarcharTypeDriverTest extends AbstractTest {
+
+    @Test
+    public void testAppendPlainEmptyNonAsciiVarchar() throws Exception {
+        // An empty varchar is ASCII by definition, but the Utf8Sequence contract lets a producer
+        // report isAscii() == false for it. In the single-vector "plain" format the length prefix
+        // encodes the ASCII flag in its top bit, so an empty non-ASCII value used to write a 0
+        // header -- which getPlainValue rejects via "assert header != 0" (it is the NULL / empty
+        // sentinel). The value must round-trip as an empty ASCII varchar instead.
+        TestUtils.assertMemoryLeak(() -> {
+            try (MemoryCARW dataMem = Vm.getCARWInstance(1024, Integer.MAX_VALUE, MemoryTag.NATIVE_DEFAULT)) {
+                Utf8Sequence emptyNonAscii = new Utf8String(new byte[0], false);
+                Assert.assertEquals(0, emptyNonAscii.size());
+                Assert.assertFalse(emptyNonAscii.isAscii());
+
+                VarcharTypeDriver.appendPlainValue(dataMem, emptyNonAscii);
+
+                // The header must be non-zero, otherwise getPlainValue mistakes it for a missing entry.
+                Assert.assertNotEquals(0, dataMem.getInt(0));
+
+                Utf8Sequence read = VarcharTypeDriver.getPlainValue(dataMem, 0);
+                Assert.assertNotNull(read);
+                Assert.assertEquals(0, read.size());
+                Assert.assertTrue(read.isAscii());
+            }
+        });
+    }
+
+    @Test
+    public void testAppendPlainValueAddressEmptyNonAsciiVarchar() throws Exception {
+        // Same empty => ASCII invariant for the address-based appendPlainValue(long, value, false)
+        // overload used by RecordChain: an empty non-ASCII value must write a non-zero header, not 0.
+        TestUtils.assertMemoryLeak(() -> {
+            try (MemoryCARW dataMem = Vm.getCARWInstance(1024, Integer.MAX_VALUE, MemoryTag.NATIVE_DEFAULT)) {
+                long addr = dataMem.appendAddressFor(16);
+                Utf8Sequence emptyNonAscii = new Utf8String(new byte[0], false);
+                Assert.assertEquals(0, emptyNonAscii.size());
+                Assert.assertFalse(emptyNonAscii.isAscii());
+
+                VarcharTypeDriver.appendPlainValue(addr, emptyNonAscii, false);
+
+                // The header must be non-zero, otherwise the asserting getPlainValue overload rejects it.
+                Assert.assertNotEquals(0, Unsafe.getInt(addr));
+
+                Utf8Sequence read = VarcharTypeDriver.getPlainValue(addr, new DirectUtf8String());
+                Assert.assertNotNull(read);
+                Assert.assertEquals(0, read.size());
+                Assert.assertTrue(read.isAscii());
+            }
+        });
+    }
 
     @Test
     public void testGetDataVectorSize() throws Exception {
@@ -109,10 +157,10 @@ public class VarcharTypeDriverTest extends AbstractTest {
             final int auxLoBase = 3;
             for (int n = auxLoBase; n < 50; n++) {
                 try (
-                        MemoryARW auxMemA = Vm.getARWInstance(16 * 1024 * 1024, Integer.MAX_VALUE, MemoryTag.NATIVE_DEFAULT);
-                        MemoryAR dataMemA = Vm.getARWInstance(16 * 1024 * 1024, Integer.MAX_VALUE, MemoryTag.NATIVE_DEFAULT);
-                        MemoryARW auxMemB = Vm.getARWInstance(16 * 1024 * 1024, Integer.MAX_VALUE, MemoryTag.NATIVE_DEFAULT);
-                        MemoryAR dataMemB = Vm.getARWInstance(16 * 1024 * 1024, Integer.MAX_VALUE, MemoryTag.NATIVE_DEFAULT)
+                        MemoryCARW auxMemA = Vm.getCARWInstance(16 * 1024 * 1024, Integer.MAX_VALUE, MemoryTag.NATIVE_DEFAULT);
+                        MemoryCARW dataMemA = Vm.getCARWInstance(16 * 1024 * 1024, Integer.MAX_VALUE, MemoryTag.NATIVE_DEFAULT);
+                        MemoryCARW auxMemB = Vm.getCARWInstance(16 * 1024 * 1024, Integer.MAX_VALUE, MemoryTag.NATIVE_DEFAULT);
+                        MemoryCARW dataMemB = Vm.getCARWInstance(16 * 1024 * 1024, Integer.MAX_VALUE, MemoryTag.NATIVE_DEFAULT)
                 ) {
                     final int len = n % 16;
                     final int auxLo = n % auxLoBase;
@@ -169,10 +217,10 @@ public class VarcharTypeDriverTest extends AbstractTest {
             final int auxLoBase = 3;
             for (int n = auxLoBase; n < 50; n++) {
                 try (
-                        MemoryARW auxMemA = Vm.getARWInstance(16 * 1024 * 1024, Integer.MAX_VALUE, MemoryTag.NATIVE_DEFAULT);
-                        MemoryAR dataMemA = Vm.getARWInstance(16 * 1024 * 1024, Integer.MAX_VALUE, MemoryTag.NATIVE_DEFAULT);
-                        MemoryARW auxMemB = Vm.getARWInstance(16 * 1024 * 1024, Integer.MAX_VALUE, MemoryTag.NATIVE_DEFAULT);
-                        MemoryAR dataMemB = Vm.getARWInstance(16 * 1024 * 1024, Integer.MAX_VALUE, MemoryTag.NATIVE_DEFAULT)
+                        MemoryCARW auxMemA = Vm.getCARWInstance(16 * 1024 * 1024, Integer.MAX_VALUE, MemoryTag.NATIVE_DEFAULT);
+                        MemoryCARW dataMemA = Vm.getCARWInstance(16 * 1024 * 1024, Integer.MAX_VALUE, MemoryTag.NATIVE_DEFAULT);
+                        MemoryCARW auxMemB = Vm.getCARWInstance(16 * 1024 * 1024, Integer.MAX_VALUE, MemoryTag.NATIVE_DEFAULT);
+                        MemoryCARW dataMemB = Vm.getCARWInstance(16 * 1024 * 1024, Integer.MAX_VALUE, MemoryTag.NATIVE_DEFAULT)
                 ) {
                     final int auxLo = n % auxLoBase;
                     final int shift = -42;

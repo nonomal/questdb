@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -39,7 +39,22 @@ public interface TernaryFunction extends Function {
         getRight().close();
     }
 
+    @Override
+    default void cursorClosed() {
+        getLeft().cursorClosed();
+        getCenter().cursorClosed();
+        getRight().cursorClosed();
+    }
+
     Function getCenter();
+
+    @Override
+    default int getComplexity() {
+        return Function.addComplexity(
+                getLeft().getComplexity(),
+                Function.addComplexity(getCenter().getComplexity(), getRight().getComplexity())
+        );
+    }
 
     Function getLeft();
 
@@ -53,20 +68,41 @@ public interface TernaryFunction extends Function {
     }
 
     @Override
-    default void initCursor() {
-        getLeft().initCursor();
-        getCenter().initCursor();
-        getRight().initCursor();
-    }
-
-    @Override
     default boolean isConstant() {
         return getLeft().isConstant() && getCenter().isConstant() && getRight().isConstant();
     }
 
     @Override
-    default boolean isReadThreadSafe() {
-        return getLeft().isReadThreadSafe() && getCenter().isReadThreadSafe() && getRight().isReadThreadSafe();
+    default boolean isEquivalentTo(Function other) {
+        if (other == this) {
+            return true;
+        }
+        if (other instanceof TernaryFunction that) {
+            return getLeft().isEquivalentTo(that.getLeft())
+                    && getCenter().isEquivalentTo(that.getCenter())
+                    && getRight().isEquivalentTo(that.getRight());
+        }
+        return false;
+    }
+
+    @Override
+    default boolean isNonDeterministic() {
+        return getLeft().isNonDeterministic() || getCenter().isNonDeterministic() || getRight().isNonDeterministic();
+    }
+
+    @Override
+    default boolean isRandom() {
+        return getLeft().isRandom() || getCenter().isRandom() || getRight().isRandom();
+    }
+
+    // Within-execution stability composes independently of determinism: an arg may be
+    // non-deterministic yet stable (bind variable, now()), or appear deterministic through
+    // isNonDeterministic() yet be unstable (a cursor arg wrapping an rnd_* projection).
+    @Override
+    default boolean isStableWithinExecution() {
+        return getLeft().isStableWithinExecution()
+                && getCenter().isStableWithinExecution()
+                && getRight().isStableWithinExecution();
     }
 
     @Override
@@ -83,8 +119,32 @@ public interface TernaryFunction extends Function {
     }
 
     @Override
+    default boolean isThreadSafe() {
+        return getLeft().isThreadSafe() && getCenter().isThreadSafe() && getRight().isThreadSafe();
+    }
+
+    @Override
+    default void offerStateTo(Function that) {
+        if (that instanceof TernaryFunction other) {
+            getLeft().offerStateTo(other.getLeft());
+            getCenter().offerStateTo(other.getCenter());
+            getRight().offerStateTo(other.getRight());
+        }
+    }
+
+    @Override
+    default boolean shouldMemoize() {
+        return getLeft().shouldMemoize() || getCenter().shouldMemoize() || getRight().shouldMemoize();
+    }
+
+    @Override
     default boolean supportsParallelism() {
         return getLeft().supportsParallelism() && getCenter().supportsParallelism() && getRight().supportsParallelism();
+    }
+
+    @Override
+    default boolean supportsRandomAccess() {
+        return getLeft().supportsRandomAccess() && getRight().supportsRandomAccess() && getCenter().supportsRandomAccess();
     }
 
     @Override

@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -38,17 +38,24 @@ public class O3PartitionTask {
     private AtomicInteger columnCounter;
     private ObjList<MemoryMA> columns;
     private long dedupColSinkAddr;
+    private boolean isParquet;
     private boolean last;
     private long maxTimestamp; // table's max timestamp
     private long newPartitionSize;
     private O3Basket o3Basket;
     private ReadOnlyObjList<? extends MemoryCR> o3Columns;
+    private long o3TimestampHi;
+    private long o3TimestampLo;
     private long oldPartitionSize;
     private long oooTimestampMin;
     private int partitionBy;
     private long partitionTimestamp;
     private long partitionUpdateSinkAddr;
     private Path pathToTable;
+    // WAL apply-time seqTxn that scheduled this task. Threaded into the
+    // parquet writer so the produced _pm's SEQ_TXN section identifies
+    // the WAL transaction that produced it.
+    private long seqTxn;
     private long sortedTimestampsAddr;
     private long srcDataMax;
     private long srcNameTxn;
@@ -86,6 +93,14 @@ public class O3PartitionTask {
         return o3Columns;
     }
 
+    public long getO3TimestampHi() {
+        return o3TimestampHi;
+    }
+
+    public long getO3TimestampLo() {
+        return o3TimestampLo;
+    }
+
     public long getOldPartitionSize() {
         return oldPartitionSize;
     }
@@ -108,6 +123,10 @@ public class O3PartitionTask {
 
     public Path getPathToTable() {
         return pathToTable;
+    }
+
+    public long getSeqTxn() {
+        return seqTxn;
     }
 
     public long getSortedTimestampsAddr() {
@@ -146,6 +165,10 @@ public class O3PartitionTask {
         return last;
     }
 
+    public boolean isParquet() {
+        return isParquet;
+    }
+
     public void of(
             Path path,
             int partitionBy,
@@ -161,6 +184,7 @@ public class O3PartitionTask {
             long srcNameTxn,
             boolean last,
             long txn,
+            long seqTxn,
             long sortedTimestampsAddr,
             TableWriter tableWriter,
             AtomicInteger columnCounter,
@@ -168,10 +192,14 @@ public class O3PartitionTask {
             long newPartitionSize,
             long oldPartitionSize,
             long partitionUpdateSinkAddr,
-            long dedupColSinkAddr
+            long dedupColSinkAddr,
+            boolean isParquet,
+            long o3TimestampLo,
+            long o3TimestampHi
     ) {
         this.pathToTable = path;
         this.txn = txn;
+        this.seqTxn = seqTxn;
         this.srcOooLo = srcOooLo;
         this.srcOooHi = srcOooHi;
         this.srcOooMax = srcOooMax;
@@ -192,5 +220,8 @@ public class O3PartitionTask {
         this.oldPartitionSize = oldPartitionSize;
         this.partitionUpdateSinkAddr = partitionUpdateSinkAddr;
         this.dedupColSinkAddr = dedupColSinkAddr;
+        this.isParquet = isParquet;
+        this.o3TimestampLo = o3TimestampLo;
+        this.o3TimestampHi = o3TimestampHi;
     }
 }

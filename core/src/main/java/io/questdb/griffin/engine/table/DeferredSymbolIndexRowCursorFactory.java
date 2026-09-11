@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,20 +24,21 @@
 
 package io.questdb.griffin.engine.table;
 
-import io.questdb.cairo.BitmapIndexReader;
 import io.questdb.cairo.EmptyRowCursor;
-import io.questdb.cairo.TableReader;
 import io.questdb.cairo.TableUtils;
-import io.questdb.cairo.sql.DataFrame;
+import io.questdb.cairo.idx.IndexReader;
 import io.questdb.cairo.sql.Function;
+import io.questdb.cairo.sql.PageFrame;
+import io.questdb.cairo.sql.PageFrameCursor;
+import io.questdb.cairo.sql.PageFrameMemory;
 import io.questdb.cairo.sql.RowCursor;
 import io.questdb.cairo.sql.SymbolTable;
 import io.questdb.griffin.PlanSink;
 import io.questdb.griffin.SqlException;
 import io.questdb.griffin.SqlExecutionContext;
+import io.questdb.std.Misc;
 
 public class DeferredSymbolIndexRowCursorFactory implements FunctionBasedRowCursorFactory {
-    private final boolean cachedIndexReaderCursor;
     private final int columnIndex;
     private final int indexDirection;
     private final Function symbol;
@@ -46,25 +47,28 @@ public class DeferredSymbolIndexRowCursorFactory implements FunctionBasedRowCurs
     public DeferredSymbolIndexRowCursorFactory(
             int columnIndex,
             Function symbol,
-            boolean cachedIndexReaderCursor,
             int indexDirection
     ) {
         this.columnIndex = columnIndex;
         this.symbolKey = SymbolTable.VALUE_NOT_FOUND;
         this.symbol = symbol;
-        this.cachedIndexReaderCursor = cachedIndexReaderCursor;
         this.indexDirection = indexDirection;
     }
 
     @Override
-    public RowCursor getCursor(DataFrame dataFrame) {
+    public void close() {
+        Misc.free(symbol);
+    }
+
+    @Override
+    public RowCursor getCursor(PageFrame pageFrame, PageFrameMemory pageFrameMemory) {
         if (symbolKey == SymbolTable.VALUE_NOT_FOUND) {
             return EmptyRowCursor.INSTANCE;
         }
 
-        return dataFrame
-                .getBitmapIndexReader(columnIndex, indexDirection)
-                .getCursor(cachedIndexReaderCursor, symbolKey, dataFrame.getRowLo(), dataFrame.getRowHi() - 1);
+        return pageFrame
+                .getIndexReader(columnIndex, indexDirection)
+                .getCursor(symbolKey, pageFrame.getPartitionLo(), pageFrame.getPartitionHi() - 1);
     }
 
     @Override
@@ -73,13 +77,20 @@ public class DeferredSymbolIndexRowCursorFactory implements FunctionBasedRowCurs
     }
 
     @Override
-    public void init(TableReader tableReader, SqlExecutionContext sqlExecutionContext) throws SqlException {
-        symbol.init(tableReader, sqlExecutionContext);
+    public void init(PageFrameCursor pageFrameCursor, SqlExecutionContext sqlExecutionContext) throws SqlException {
+        symbol.init(pageFrameCursor, sqlExecutionContext);
     }
 
     @Override
     public boolean isEntity() {
         return false;
+    }
+
+    // Stable within the execution iff the deferred symbol key function is stable (literal/bind yes,
+    // rnd_* no); the key is resolved against the execution-fixed symbol table on every open.
+    @Override
+    public boolean isStableWithinExecution() {
+        return symbol == null || symbol.isStableWithinExecution();
     }
 
     @Override
@@ -88,8 +99,8 @@ public class DeferredSymbolIndexRowCursorFactory implements FunctionBasedRowCurs
     }
 
     @Override
-    public void prepareCursor(TableReader tableReader) {
-        int symbolKey = tableReader.getSymbolMapReader(columnIndex).keyOf(symbol.getSymbol(null));
+    public void prepareCursor(PageFrameCursor pageFrameCursor) {
+        int symbolKey = pageFrameCursor.getSymbolTable(columnIndex).keyOf(symbol.getSymbol(null));
         this.symbolKey = symbolKey != SymbolTable.VALUE_NOT_FOUND
                 ? TableUtils.toIndexKey(symbolKey)
                 : SymbolTable.VALUE_NOT_FOUND;
@@ -97,7 +108,7 @@ public class DeferredSymbolIndexRowCursorFactory implements FunctionBasedRowCurs
 
     @Override
     public void toPlan(PlanSink sink) {
-        sink.type("Index ").type(BitmapIndexReader.nameOf(indexDirection)).type(" scan").meta("on").putBaseColumnName(columnIndex);
+        sink.type("Index ").type(IndexReader.nameOf(indexDirection)).type(" scan").meta("on").putBaseColumnName(columnIndex);
         sink.meta("deferred").val("true");
         sink.attr("filter").putBaseColumnName(columnIndex).val('=').val(symbol);
     }

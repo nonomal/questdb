@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -25,23 +25,29 @@
 package io.questdb.griffin;
 
 import io.questdb.griffin.model.ExpressionNode;
-import io.questdb.griffin.model.QueryModel;
+import io.questdb.griffin.model.IQueryModel;
+import io.questdb.std.IntStack;
 
 import java.util.ArrayDeque;
 import java.util.Deque;
 
-final class ExpressionTreeBuilder implements ExpressionParserListener {
+public final class ExpressionTreeBuilder implements ExpressionParserListener {
 
-    private final Deque<QueryModel> modelStack = new ArrayDeque<>();
-    private final Deque<ExpressionNode> stack = new ArrayDeque<>();
-    private QueryModel model;
+    private final Deque<ExpressionNode> argStack = new ArrayDeque<>();
+    private final IntStack argStackBottomStack = new IntStack();
+    private final Deque<IQueryModel> modelStack = new ArrayDeque<>();
+    // parseExpr() is reentrant; nested parses must not consume outer operands.
+    private int argStackBottom;
+    private IQueryModel model;
+    // > 0 while parsing a join ON clause; blocks unsupported ON-clause sub-queries.
+    private int subQueryBlockDepth;
 
     @Override
     public void onNode(ExpressionNode node) throws SqlException {
 
         if (node.type == ExpressionNode.QUERY && node.queryModel == null) {
             // this is a validation request
-            if (model == null) {
+            if (model == null || subQueryBlockDepth > 0) {
                 throw SqlException.$(node.position, "query is not allowed here");
             }
             return;
@@ -55,42 +61,68 @@ final class ExpressionTreeBuilder implements ExpressionParserListener {
             case 0:
                 break;
             case 1:
-                node.rhs = stack.poll();
+                node.rhs = pollArg();
                 break;
             case 2:
-                node.rhs = stack.poll();
-                node.lhs = stack.poll();
+                node.rhs = pollArg();
+                node.lhs = pollArg();
                 break;
             default:
                 for (int i = 0; i < node.paramCount; i++) {
-                    node.args.add(stack.poll());
+                    node.args.add(pollArg());
                 }
                 break;
         }
-        stack.push(node);
+        argStack.push(node);
     }
 
-    ExpressionNode poll() {
-        return stack.poll();
+    public ExpressionNode poll() {
+        return argStack.size() > argStackBottom ? argStack.poll() : null;
+    }
+
+    void popArgStackBottom() {
+        argStackBottom = argStackBottomStack.notEmpty() ? argStackBottomStack.pop() : 0;
+        if (subQueryBlockDepth > 0) {
+            subQueryBlockDepth--;
+        }
     }
 
     void popModel() {
         this.model = modelStack.poll();
+        this.argStackBottom = argStackBottomStack.notEmpty() ? argStackBottomStack.pop() : 0;
     }
 
-    void pushModel(QueryModel model) {
+    // Brackets a join ON-clause parse: raises the arg-stack floor so the reentrant parse
+    // cannot poll the enclosing expression's operands, and blocks ON-clause sub-queries
+    // (unsupported) even when an outer model is in scope. Leaves the current model in place.
+    void pushArgStackBottom() {
+        argStackBottomStack.push(argStackBottom);
+        argStackBottom = argStack.size();
+        subQueryBlockDepth++;
+    }
+
+    void pushModel(IQueryModel model) {
         if (this.model != null) {
             modelStack.push(this.model);
         }
+        argStackBottomStack.push(argStackBottom);
+        argStackBottom = argStack.size();
         this.model = model;
     }
 
     void reset() {
-        stack.clear();
+        argStack.clear();
+        argStackBottom = 0;
+        argStackBottomStack.clear();
         modelStack.clear();
+        subQueryBlockDepth = 0;
     }
 
     int size() {
-        return stack.size();
+        return argStack.size() - argStackBottom;
+    }
+
+    private ExpressionNode pollArg() {
+        return argStack.size() > argStackBottom ? argStack.poll() : null;
     }
 }

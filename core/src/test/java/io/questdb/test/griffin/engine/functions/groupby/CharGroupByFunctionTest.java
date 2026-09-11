@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -37,23 +37,43 @@ public class CharGroupByFunctionTest extends AbstractCairoTest {
     public void testNonNull() throws Exception {
         assertMemoryLeak(() -> {
             sqlExecutionContext.setRandom(new Rnd());
-            ddl("create table tab as ( select rnd_char() ch from long_sequence(100) )");
+            execute("create table tab as ( select rnd_char() ch from long_sequence(100) )");
 
-            assertSql("min\n" +
-                    "B\n", "select min(ch) from tab"
-            );
+            assertQuery("select min(ch) from tab")
+                    .noLeakCheck()
+                    .noRandomAccess()
+                    .expectSize()
+                    .returns("""
+                            min
+                            B
+                            """);
 
-            assertSql("max\n" +
-                    "Z\n", "select max(ch) from tab"
-            );
+            assertQuery("select max(ch) from tab")
+                    .noLeakCheck()
+                    .noRandomAccess()
+                    .expectSize()
+                    .returns("""
+                            max
+                            Z
+                            """);
 
-            assertSql("first\n" +
-                    "V\n", "select first(ch) from tab"
-            );
+            assertQuery("select first(ch) from tab")
+                    .noLeakCheck()
+                    .noRandomAccess()
+                    .expectSize()
+                    .returns("""
+                            first
+                            V
+                            """);
 
-            assertSql("last\n" +
-                    "J\n", "select last(ch) from tab"
-            );
+            assertQuery("select last(ch) from tab")
+                    .noLeakCheck()
+                    .noRandomAccess()
+                    .expectSize()
+                    .returns("""
+                            last
+                            J
+                            """);
         });
     }
 
@@ -64,17 +84,34 @@ public class CharGroupByFunctionTest extends AbstractCairoTest {
             tm.timestamp("ts").col("ch", ColumnType.CHAR);
             createPopulateTable(tm, 100, "2020-01-01", 2);
 
-            String expected = "ts\tmin\tmax\tfirst\tlast\tcount\n" +
-                    "2020-01-01T00:28:47.990000Z\t\u0001\t3\t\u0001\t3\t51\n" +
-                    "2020-01-02T00:28:47.990000Z\t4\td\t4\td\t49\n";
-            assertSql(expected, "select ts, min(ch), max(ch), first(ch), last(ch), count() from tab sample by d align to first observation");
-            assertSql("ts\tmin\tmax\tfirst\tlast\tcount\n" +
-                    "2020-01-01T00:00:00.000000Z\t\u0001\t2\t\u0001\t2\t50\n" +
-                    "2020-01-02T00:00:00.000000Z\t3\td\t3\td\t50\n", "select ts, min(ch), max(ch), first(ch), last(ch), count() from tab sample by d");
-            assertSql("ts\tmin\tmax\tfirst\tlast\tcount\n" +
-                    "2020-01-01T00:00:00.000000Z\t\u0001\t2\t\u0001\t2\t50\n" +
-                    "2020-01-02T00:00:00.000000Z\t3\td\t3\td\t50\n", "select ts, min(ch), max(ch), first(ch), last(ch), count() from tab sample by d align to calendar"
-            );
+            String expected = """
+                    ts\tmin\tmax\tfirst\tlast\tcount
+                    2020-01-01T00:28:47.990000Z\t\u0001\t3\t\u0001\t3\t51
+                    2020-01-02T00:28:47.990000Z\t4\td\t4\td\t49
+                    """;
+            assertQuery("select ts, min(ch), max(ch), first(ch), last(ch), count() from tab sample by d align to first observation")
+                    .noLeakCheck()
+                    .timestamp("ts")
+                    .noRandomAccess()
+                    .returns(expected);
+            assertQuery("select ts, min(ch), max(ch), first(ch), last(ch), count() from tab sample by d")
+                    .noLeakCheck()
+                    .timestamp("ts")
+                    .expectSize()
+                    .returns("""
+                            ts\tmin\tmax\tfirst\tlast\tcount
+                            2020-01-01T00:00:00.000000Z\t\u0001\t2\t\u0001\t2\t50
+                            2020-01-02T00:00:00.000000Z\t3\td\t3\td\t50
+                            """);
+            assertQuery("select ts, min(ch), max(ch), first(ch), last(ch), count() from tab sample by d align to calendar")
+                    .noLeakCheck()
+                    .timestamp("ts")
+                    .expectSize()
+                    .returns("""
+                            ts\tmin\tmax\tfirst\tlast\tcount
+                            2020-01-01T00:00:00.000000Z\t\u0001\t2\t\u0001\t2\t50
+                            2020-01-02T00:00:00.000000Z\t3\td\t3\td\t50
+                            """);
         });
     }
 }

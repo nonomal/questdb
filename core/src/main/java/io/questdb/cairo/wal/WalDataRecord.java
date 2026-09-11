@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -26,12 +26,19 @@ package io.questdb.cairo.wal;
 
 import io.questdb.cairo.GeoHashes;
 import io.questdb.cairo.VarcharTypeDriver;
+import io.questdb.cairo.arr.ArrayView;
+import io.questdb.cairo.arr.BorrowedArray;
 import io.questdb.cairo.sql.Record;
+import io.questdb.cairo.vm.api.MemoryCR;
 import io.questdb.std.BinarySequence;
+import io.questdb.std.Decimal128;
+import io.questdb.std.Decimal256;
+import io.questdb.std.Decimals;
 import io.questdb.std.Long128;
 import io.questdb.std.Long256;
 import io.questdb.std.Rows;
 import io.questdb.std.str.CharSink;
+import io.questdb.std.str.DirectString;
 import io.questdb.std.str.Sinkable;
 import io.questdb.std.str.Utf8Sequence;
 import org.jetbrains.annotations.NotNull;
@@ -40,8 +47,21 @@ import org.jetbrains.annotations.Nullable;
 import static io.questdb.cairo.wal.WalReader.getPrimaryColumnIndex;
 
 public class WalDataRecord implements Record, Sinkable {
+    private final BorrowedArray array = new BorrowedArray();
+    private final DirectString symViewA = new DirectString();
+    private final DirectString symViewB = new DirectString();
     private WalReader reader;
     private long recordIndex = 0;
+
+    @Override
+    public ArrayView getArray(int col, int columnType) {
+        final int absoluteColumnIndex = getPrimaryColumnIndex(col);
+        MemoryCR auxMem = reader.getColumn(absoluteColumnIndex + 1);
+        MemoryCR dataMem = reader.getColumn(absoluteColumnIndex);
+
+        array.of(columnType, auxMem.addressOf(0), auxMem.addressHi(), dataMem.addressOf(0), dataMem.addressHi(), recordIndex);
+        return array;
+    }
 
     @Override
     public BinarySequence getBin(int col) {
@@ -76,6 +96,56 @@ public class WalDataRecord implements Record, Sinkable {
         final long offset = recordIndex * Character.BYTES;
         final int absoluteColumnIndex = getPrimaryColumnIndex(col);
         return reader.getColumn(absoluteColumnIndex).getChar(offset);
+    }
+
+    @Override
+    public void getDecimal128(int col, Decimal128 sink) {
+        final long offset = recordIndex * 2 * Long.BYTES;
+        final int absoluteColumnIndex = getPrimaryColumnIndex(col);
+        if (offset < 0) {
+            sink.ofRawNull();
+        } else {
+            reader.getColumn(absoluteColumnIndex).getDecimal128(offset, sink);
+        }
+    }
+
+    @Override
+    public short getDecimal16(int col) {
+        final long offset = recordIndex * Short.BYTES;
+        final int absoluteColumnIndex = getPrimaryColumnIndex(col);
+        return offset < 0 ? Decimals.DECIMAL16_NULL : reader.getColumn(absoluteColumnIndex).getShort(offset);
+    }
+
+    @Override
+    public void getDecimal256(int col, Decimal256 sink) {
+        final long offset = recordIndex * 4 * Long.BYTES;
+        final int absoluteColumnIndex = getPrimaryColumnIndex(col);
+        if (offset < 0) {
+            sink.ofRawNull();
+        } else {
+            reader.getColumn(absoluteColumnIndex).getDecimal256(offset, sink);
+        }
+    }
+
+    @Override
+    public int getDecimal32(int col) {
+        final long offset = recordIndex * Integer.BYTES;
+        final int absoluteColumnIndex = getPrimaryColumnIndex(col);
+        return offset < 0 ? Decimals.DECIMAL32_NULL : reader.getColumn(absoluteColumnIndex).getInt(offset);
+    }
+
+    @Override
+    public long getDecimal64(int col) {
+        final long offset = recordIndex * Long.BYTES;
+        final int absoluteColumnIndex = getPrimaryColumnIndex(col);
+        return offset < 0 ? Decimals.DECIMAL64_NULL : reader.getColumn(absoluteColumnIndex).getLong(offset);
+    }
+
+    @Override
+    public byte getDecimal8(int col) {
+        final long offset = recordIndex;
+        final int absoluteColumnIndex = getPrimaryColumnIndex(col);
+        return offset < 0 ? Decimals.DECIMAL8_NULL : reader.getColumn(absoluteColumnIndex).getByte(offset);
     }
 
     // only for tests
@@ -223,12 +293,12 @@ public class WalDataRecord implements Record, Sinkable {
 
     @Override
     public CharSequence getSymA(int col) {
-        return reader.getSymbolValue(col, getInt(col));
+        return reader.getSymbolValue(col, getInt(col), symViewA);
     }
 
     @Override
     public CharSequence getSymB(int col) {
-        return getSymA(col);
+        return reader.getSymbolValue(col, getInt(col), symViewB);
     }
 
     @Override
@@ -245,7 +315,9 @@ public class WalDataRecord implements Record, Sinkable {
     public @Nullable Utf8Sequence getVarcharA(int col) {
         final int absoluteColumnIndex = getPrimaryColumnIndex(col);
         return VarcharTypeDriver.getSplitValue(
-                reader.getColumn(absoluteColumnIndex + 1), reader.getColumn(absoluteColumnIndex), recordIndex,
+                reader.getColumn(absoluteColumnIndex + 1),
+                reader.getColumn(absoluteColumnIndex),
+                recordIndex,
                 1
         );
     }
@@ -254,7 +326,9 @@ public class WalDataRecord implements Record, Sinkable {
     public @Nullable Utf8Sequence getVarcharB(int col) {
         final int absoluteColumnIndex = getPrimaryColumnIndex(col);
         return VarcharTypeDriver.getSplitValue(
-                reader.getColumn(absoluteColumnIndex + 1), reader.getColumn(absoluteColumnIndex), recordIndex,
+                reader.getColumn(absoluteColumnIndex + 1),
+                reader.getColumn(absoluteColumnIndex),
+                recordIndex,
                 2
         );
     }

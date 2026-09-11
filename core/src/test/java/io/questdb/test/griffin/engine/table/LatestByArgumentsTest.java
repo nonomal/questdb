@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -43,9 +43,7 @@ public class LatestByArgumentsTest {
             LatestByArguments.setRowsCapacity(address, 4);
             LatestByArguments.setRowsSize(address, 5);
             LatestByArguments.setFilteredSize(address, 6);
-            LatestByArguments.setHashesAddress(address, 7);
 
-            assertEquals(7, LatestByArguments.getHashesAddress(address));
             assertEquals(6, LatestByArguments.getFilteredSize(address));
             assertEquals(5, LatestByArguments.getRowsSize(address));
             assertEquals(4, LatestByArguments.getRowsCapacity(address));
@@ -69,12 +67,10 @@ public class LatestByArgumentsTest {
                 LatestByArguments.setRowsCapacity(address, 4);
                 LatestByArguments.setRowsSize(address, 5);
                 LatestByArguments.setFilteredSize(address, 6);
-                LatestByArguments.setHashesAddress(address, 7);
             }
 
             for (int i = 0; i < elements; ++i) {
                 final long address = baseAddress + i * LatestByArguments.MEMORY_SIZE;
-                assertEquals(7, LatestByArguments.getHashesAddress(address));
                 assertEquals(6, LatestByArguments.getFilteredSize(address));
                 assertEquals(5, LatestByArguments.getRowsSize(address));
                 assertEquals(4, LatestByArguments.getRowsCapacity(address));

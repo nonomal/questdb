@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -30,6 +30,7 @@ import io.questdb.cairo.TableToken;
 public interface PoolListener {
     short EV_CREATE = 10;
     short EV_CREATE_EX = 14;
+    short EV_DROPPED = 27;
     short EV_EXPIRE = 17;
     short EV_EX_RESEND = 21;
     short EV_FULL = 25;
@@ -46,14 +47,14 @@ public interface PoolListener {
     short EV_RETURN = 1;
     short EV_UNEXPECTED_CLOSE = 3;
     short EV_UNLOCKED = 8;
-    byte SRC_SEQUENCER_METADATA = 3;
     byte SRC_READER = 2;
+    byte SRC_SEQUENCER_METADATA = 3;
     byte SRC_SQL_COMPILER = 6;
+    byte SRC_TABLE_METADATA = 7;
     byte SRC_TABLE_REGISTRY = 5;
+    byte SRC_VIEW_WAL_WRITER = 8;
     byte SRC_WAL_WRITER = 4;
     byte SRC_WRITER = 1;
-
-    byte SRC_TABLE_METADATA = 7;
 
     static boolean isWalOrWriter(byte factoryType) {
         return factoryType == PoolListener.SRC_WRITER || factoryType == PoolListener.SRC_WAL_WRITER;

@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,24 +24,25 @@
 
 package io.questdb.test.griffin.engine.groupby;
 
+import io.questdb.griffin.engine.groupby.FastGroupByAllocator;
 import io.questdb.griffin.engine.groupby.GroupByAllocator;
-import io.questdb.griffin.engine.groupby.GroupByAllocatorArena;
 import io.questdb.griffin.engine.groupby.StableAwareStringHolder;
 import io.questdb.std.Chars;
 import io.questdb.std.Numbers;
 import io.questdb.std.Rnd;
+import io.questdb.std.str.DirectString;
 import io.questdb.std.str.DirectUtf16Sink;
-import io.questdb.std.str.StableDirectString;
 import io.questdb.test.AbstractCairoTest;
 import io.questdb.test.tools.TestUtils;
 import org.junit.Assert;
 import org.junit.Test;
 
 public class StableAwareStringHolderTest extends AbstractCairoTest {
+
     @Test
     public void testClearAndSet() throws Exception {
         assertMemoryLeak(() -> {
-            try (GroupByAllocator allocator = new GroupByAllocatorArena(64, Numbers.SIZE_1GB)) {
+            try (GroupByAllocator allocator = new FastGroupByAllocator(64, Numbers.SIZE_1GB)) {
                 StableAwareStringHolder holder = new StableAwareStringHolder();
                 holder.setAllocator(allocator);
                 holder.clearAndSet("foobar");
@@ -56,11 +57,11 @@ public class StableAwareStringHolderTest extends AbstractCairoTest {
     @Test
     public void testClearAndSetDirect() throws Exception {
         assertMemoryLeak(() -> {
-            try (GroupByAllocator allocator = new GroupByAllocatorArena(64, Numbers.SIZE_1GB);
-                 DirectUtf16Sink directCharSequence = new DirectUtf16Sink(16);
+            try (GroupByAllocator allocator = new FastGroupByAllocator(64, Numbers.SIZE_1GB);
+                 DirectUtf16Sink directCharSequence = new DirectUtf16Sink(16)
             ) {
                 directCharSequence.put("barbaz");
-                StableDirectString stableDirectString = new StableDirectString();
+                DirectString stableDirectString = new DirectString(() -> true);
                 stableDirectString.of(directCharSequence.lo(), directCharSequence.hi());
                 StableAwareStringHolder holder = new StableAwareStringHolder();
                 holder.setAllocator(allocator);
@@ -68,12 +69,12 @@ public class StableAwareStringHolderTest extends AbstractCairoTest {
                 // store a non-stable char sequence
                 holder.of(0).clearAndSet("foobar");
                 TestUtils.assertEquals("foobar", holder);
-                long foobarPtr = holder.ptr();
+                long foobarPtr = holder.colouredPtr();
 
                 // store a direct char sequence into a new location
                 holder.of(0).clearAndSet(stableDirectString);
                 TestUtils.assertEquals("barbaz", holder);
-                long barbazPtr = holder.ptr();
+                long barbazPtr = holder.colouredPtr();
 
                 // store a direct char sequence into the original location of the non-direct string
                 holder.of(foobarPtr).clearAndSet(stableDirectString);
@@ -97,13 +98,13 @@ public class StableAwareStringHolderTest extends AbstractCairoTest {
     @Test
     public void testClearAndSetDirect_fuzzed() throws Exception {
         assertMemoryLeak(() -> {
-            try (GroupByAllocator allocator = new GroupByAllocatorArena(64, Numbers.SIZE_1GB);
+            try (GroupByAllocator allocator = new FastGroupByAllocator(64, Numbers.SIZE_1GB);
                  DirectUtf16Sink directCharSequence = new DirectUtf16Sink(16)
             ) {
                 StableAwareStringHolder holder = new StableAwareStringHolder();
                 holder.setAllocator(allocator);
                 Rnd rnd = TestUtils.generateRandom(null);
-                StableDirectString stableDirectString = new StableDirectString();
+                DirectString stableDirectString = new DirectString(() -> true);
                 for (int i = 0; i < 1_000; i++) {
                     boolean useDirect = rnd.nextBoolean();
                     int len = rnd.nextPositiveInt() % 100;
@@ -130,7 +131,7 @@ public class StableAwareStringHolderTest extends AbstractCairoTest {
     public void testPutCharSequence() throws Exception {
         final int N = 1000;
         assertMemoryLeak(() -> {
-            try (GroupByAllocator allocator = new GroupByAllocatorArena(64, Numbers.SIZE_1GB)) {
+            try (GroupByAllocator allocator = new FastGroupByAllocator(64, Numbers.SIZE_1GB)) {
                 StableAwareStringHolder holder = new StableAwareStringHolder();
                 holder.setAllocator(allocator);
                 Assert.assertEquals(0, holder.length());

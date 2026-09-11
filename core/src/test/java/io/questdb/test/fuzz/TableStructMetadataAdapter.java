@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -92,6 +92,7 @@ public class TableStructMetadataAdapter implements TableStructure {
 
     @Override
     public boolean getSymbolCacheFlag(int columnIndex) {
+        // todo: we cache by default by this might not be true for every fuzz test
         return ColumnType.isSymbol(metadata.getColumnType(columnIndex));
     }
 
@@ -112,17 +113,16 @@ public class TableStructMetadataAdapter implements TableStructure {
 
     @Override
     public boolean isDedupKey(int columnIndex) {
-        return false;
+        return metadata.isDedupKey(columnIndex);
     }
 
     @Override
-    public boolean isIndexed(int columnIndex) {
-        return ColumnType.isSymbol(metadata.getColumnType(columnIndex));
-    }
-
-    @Override
-    public boolean isSequential(int columnIndex) {
-        return true;
+    public byte getIndexType(int columnIndex) {
+        // Delegate to the actual table metadata so non-BITMAP index types
+        // (POSTING and its variants) survive round-trips through this adapter.
+        // Defaulting to BITMAP for any indexed symbol column would erase the
+        // POSTING type from the structure passed to ILP/copy paths.
+        return metadata.getColumnIndexType(columnIndex);
     }
 
     @Override

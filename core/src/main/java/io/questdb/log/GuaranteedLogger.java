@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -26,15 +26,15 @@ package io.questdb.log;
 
 import io.questdb.mp.RingQueue;
 import io.questdb.mp.Sequence;
-import io.questdb.std.datetime.microtime.MicrosecondClock;
+import io.questdb.std.datetime.Clock;
 
 /**
  * Same as #Logger but does not lose messages.
  */
-public final class GuaranteedLogger extends AbstractLogRecord  {
+public final class GuaranteedLogger extends AbstractLogRecord {
 
     GuaranteedLogger(
-            MicrosecondClock clock,
+            Clock clock,
             CharSequence name,
             RingQueue<LogRecordUtf8Sink> debugRing,
             Sequence debugSeq,

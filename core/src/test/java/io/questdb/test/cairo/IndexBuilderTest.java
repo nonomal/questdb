@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,14 +24,28 @@
 
 package io.questdb.test.cairo;
 
-import io.questdb.cairo.*;
+import io.questdb.PropertyKey;
+import io.questdb.cairo.CairoException;
+import io.questdb.cairo.ColumnType;
+import io.questdb.cairo.IndexBuilder;
+import io.questdb.cairo.IndexType;
+import io.questdb.cairo.PartitionBy;
+import io.questdb.cairo.RebuildColumnBase;
+import io.questdb.cairo.TableReader;
+import io.questdb.cairo.TableReaderMetadata;
+import io.questdb.cairo.TableToken;
+import io.questdb.cairo.TableUtils;
+import io.questdb.cairo.TableWriter;
+import io.questdb.cairo.idx.IndexReader;
+import io.questdb.cairo.idx.PostingIndexUtils;
 import io.questdb.cairo.sql.InvalidColumnException;
 import io.questdb.cairo.sql.RecordCursor;
 import io.questdb.cairo.sql.RecordCursorFactory;
 import io.questdb.griffin.SqlException;
 import io.questdb.std.Files;
 import io.questdb.std.FilesFacade;
-import io.questdb.std.datetime.microtime.Timestamps;
+import io.questdb.std.Rnd;
+import io.questdb.std.datetime.microtime.Micros;
 import io.questdb.std.str.LPSZ;
 import io.questdb.std.str.Path;
 import io.questdb.std.str.Utf8String;
@@ -45,13 +59,24 @@ import org.junit.Test;
 
 import java.util.concurrent.atomic.AtomicInteger;
 
+import static io.questdb.cairo.TableUtils.COLUMN_NAME_TXN_NONE;
+
 public class IndexBuilderTest extends AbstractCairoTest {
     private final IndexBuilder indexBuilder = new IndexBuilder(configuration);
     TableWriter tempWriter;
+    private byte indexType;
 
     @After
     public void cleanup() {
         indexBuilder.close();
+    }
+
+    @Override
+    public void setUp() {
+        Rnd rnd = TestUtils.generateRandom(LOG);
+        setProperty(PropertyKey.CAIRO_DEFAULT_SYMBOL_INDEX_TYPE, TestUtils.randomSymbolIndexTypeName(rnd));
+        super.setUp();
+        indexType = configuration.getDefaultSymbolIndexType();
     }
 
     @Test
@@ -59,7 +84,9 @@ public class IndexBuilderTest extends AbstractCairoTest {
         FilesFacade ff = new TestFilesFacadeImpl() {
             @Override
             public boolean removeQuiet(LPSZ path) {
-                if (Utf8s.endsWithAscii(path, ".v") || Utf8s.endsWithAscii(path, ".k")) {
+                if (Utf8s.endsWithAscii(path, ".v") || Utf8s.endsWithAscii(path, ".k")
+                        || Utf8s.endsWithAscii(path, ".pk") || Utf8s.containsAscii(path, ".pk.")
+                        || Utf8s.containsAscii(path, ".pv.")) {
                     return false;
                 }
                 return super.removeQuiet(path);
@@ -81,9 +108,10 @@ public class IndexBuilderTest extends AbstractCairoTest {
                 checkRebuildIndexes(
                         ff,
                         createTableSql,
-                        tablePath -> {
+                        _ -> {
                         },
-                        indexBuilder -> indexBuilder.reindexColumn(ff, "sym2"));
+                        indexBuilder -> indexBuilder.reindexColumn(ff, "sym2")
+                );
                 Assert.fail();
             } catch (CairoException ex) {
                 TestUtils.assertContains(ex.getFlyweightMessage(), "could not remove index file");
@@ -105,9 +133,9 @@ public class IndexBuilderTest extends AbstractCairoTest {
         checkRebuildIndexes(
                 ff,
                 createTableSql,
-                (tablePath) -> {
+                (_) -> {
                 },
-                IndexBuilder::rebuildAll
+                RebuildColumnBase::rebuildAll
         );
     }
 
@@ -134,8 +162,9 @@ public class IndexBuilderTest extends AbstractCairoTest {
         checkRebuildIndexes(
                 ff,
                 createAlterInsertSql,
-                tablePath -> removeFileAtPartition("sym2.k.1", PartitionBy.NONE, tablePath, 0, -1L),
-                indexBuilder -> indexBuilder.reindexColumn("sym2"));
+                tablePath -> removeKeyFileAtPartition("sym2", 1L, PartitionBy.NONE, tablePath, 0, -1L),
+                indexBuilder -> indexBuilder.reindexColumn("sym2")
+        );
     }
 
     @Test
@@ -153,13 +182,14 @@ public class IndexBuilderTest extends AbstractCairoTest {
             checkRebuildIndexes(
                     ff,
                     createAlterInsertSql,
-                    tablePath -> {
+                    _ -> {
                     },
-                    IndexBuilder::rebuildAll);
+                    RebuildColumnBase::rebuildAll
+            );
 
             engine.releaseAllWriters();
 
-            insert("insert into xxx values(500100000000L, 50001, 'D', 'I2')");
+            execute("insert into xxx values(500100000000L, 50001, 'D', 'I2')");
 
             int sym1D = countByFullScan("select * from xxx where sym1 = 'D'");
             Assert.assertEquals(1, sym1D);
@@ -183,10 +213,11 @@ public class IndexBuilderTest extends AbstractCairoTest {
                 ff,
                 createTableSql,
                 tablePath -> {
-                    removeFileAtPartition("sym1.v", PartitionBy.NONE, tablePath, 0, -1L);
-                    removeFileAtPartition("sym1.k", PartitionBy.NONE, tablePath, 0, -1L);
+                    removeValueFilesAtPartition(PartitionBy.NONE, tablePath);
+                    removeKeyFileAtPartition("sym1", COLUMN_NAME_TXN_NONE, PartitionBy.NONE, tablePath, 0, -1L);
                 },
-                indexBuilder -> indexBuilder.reindexColumn("sym1"));
+                indexBuilder -> indexBuilder.reindexColumn("sym1")
+        );
     }
 
     @Test
@@ -204,10 +235,10 @@ public class IndexBuilderTest extends AbstractCairoTest {
                 ff,
                 createTableSql,
                 (tablePath) -> {
-                    removeFileAtPartition("sym1.v", PartitionBy.DAY, tablePath, 0, -1L);
-                    removeFileAtPartition("sym2.k", PartitionBy.DAY, tablePath, 0, -1L);
+                    removeValueFilesAtPartition(PartitionBy.DAY, tablePath);
+                    removeKeyFileAtPartition("sym2", COLUMN_NAME_TXN_NONE, PartitionBy.DAY, tablePath, 0, -1L);
                 },
-                IndexBuilder::rebuildAll
+                RebuildColumnBase::rebuildAll
         );
     }
 
@@ -226,10 +257,10 @@ public class IndexBuilderTest extends AbstractCairoTest {
                 ff,
                 createTableSql,
                 (tablePath) -> {
-                    removeFileAtPartition("sym1.v", PartitionBy.NONE, tablePath, 0, -1L);
-                    removeFileAtPartition("sym2.k", PartitionBy.NONE, tablePath, 0, -1L);
+                    removeValueFilesAtPartition(PartitionBy.NONE, tablePath);
+                    removeKeyFileAtPartition("sym2", COLUMN_NAME_TXN_NONE, PartitionBy.NONE, tablePath, 0, -1L);
                 },
-                IndexBuilder::rebuildAll
+                RebuildColumnBase::rebuildAll
         );
     }
 
@@ -248,10 +279,10 @@ public class IndexBuilderTest extends AbstractCairoTest {
                 ff,
                 createTableSql,
                 (tablePath) -> {
-                    removeFileAtPartition("sym1.v", PartitionBy.NONE, tablePath, 0, -1L);
-                    removeFileAtPartition("sym2.k", PartitionBy.NONE, tablePath, 0, -1L);
+                    removeValueFilesAtPartition(PartitionBy.NONE, tablePath);
+                    removeKeyFileAtPartition("sym2", COLUMN_NAME_TXN_NONE, PartitionBy.NONE, tablePath, 0, -1L);
                 },
-                indexBuilder -> runReindexSql("REINDEX TABLE xxx LOCK EXCLUSIVE")
+                _ -> runReindexSql("REINDEX TABLE xxx LOCK EXCLUSIVE")
         );
     }
 
@@ -270,10 +301,11 @@ public class IndexBuilderTest extends AbstractCairoTest {
                 ff,
                 createTableSql,
                 tablePath -> {
-                    removeFileAtPartition("sym1.v", PartitionBy.DAY, tablePath, 0, -1L);
-                    removeFileAtPartition("sym1.k", PartitionBy.DAY, tablePath, 0, -1L);
+                    removeValueFilesAtPartition(PartitionBy.DAY, tablePath);
+                    removeKeyFileAtPartition("sym1", COLUMN_NAME_TXN_NONE, PartitionBy.DAY, tablePath, 0, -1L);
                 },
-                indexBuilder -> indexBuilder.reindexColumn("sym1"));
+                indexBuilder -> indexBuilder.reindexColumn("sym1")
+        );
     }
 
     @Test
@@ -291,10 +323,11 @@ public class IndexBuilderTest extends AbstractCairoTest {
                 ff,
                 createTableSql,
                 tablePath -> {
-                    removeFileAtPartition("sym1.v", PartitionBy.DAY, tablePath, 0, -1L);
-                    removeFileAtPartition("sym1.k", PartitionBy.DAY, tablePath, 0, -1L);
+                    removeValueFilesAtPartition(PartitionBy.DAY, tablePath);
+                    removeKeyFileAtPartition("sym1", COLUMN_NAME_TXN_NONE, PartitionBy.DAY, tablePath, 0, -1L);
                 },
-                indexBuilder -> indexBuilder.reindex("1970-01-01", "sym1"));
+                indexBuilder -> indexBuilder.reindex("1970-01-01", "sym1")
+        );
     }
 
     @Test
@@ -312,10 +345,11 @@ public class IndexBuilderTest extends AbstractCairoTest {
                 ff,
                 createTableSql,
                 tablePath -> {
-                    removeFileAtPartition("sym1.v", PartitionBy.DAY, tablePath, 0, -1L);
-                    removeFileAtPartition("sym1.k", PartitionBy.DAY, tablePath, 0, -1L);
+                    removeValueFilesAtPartition(PartitionBy.DAY, tablePath);
+                    removeKeyFileAtPartition("sym1", COLUMN_NAME_TXN_NONE, PartitionBy.DAY, tablePath, 0, -1L);
                 },
-                indexBuilder -> runReindexSql("REINDEX TABLE xxx COLUMN sym1 PARTITION '1970-01-01' LOCK EXCLUSIVE"));
+                _ -> runReindexSql("REINDEX TABLE xxx COLUMN sym1 PARTITION '1970-01-01' LOCK EXCLUSIVE")
+        );
     }
 
     @Test
@@ -341,8 +375,9 @@ public class IndexBuilderTest extends AbstractCairoTest {
         checkRebuildIndexes(
                 ff,
                 createAlterInsertSql,
-                tablePath -> removeFileAtPartition("sym2.k.1", PartitionBy.DAY, tablePath, Timestamps.DAY_MICROS * 11, 1L),
-                indexBuilder -> indexBuilder.reindexColumn("sym2"));
+                tablePath -> removeKeyFileAtPartition("sym2", 1L, PartitionBy.DAY, tablePath, Micros.DAY_MICROS * 11, 1L),
+                indexBuilder -> indexBuilder.reindexColumn("sym2")
+        );
     }
 
     @Test
@@ -363,7 +398,7 @@ public class IndexBuilderTest extends AbstractCairoTest {
                 checkRebuildIndexes(
                         ff,
                         createTableSql,
-                        tablePath -> tempWriter = TestUtils.getWriter(engine, "xxx"),
+                        _ -> tempWriter = TestUtils.getWriter(engine, "xxx"),
                         indexBuilder -> {
                             try {
                                 indexBuilder.reindexColumn("sym2");
@@ -373,7 +408,7 @@ public class IndexBuilderTest extends AbstractCairoTest {
                         });
                 Assert.fail();
             } catch (CairoException ex) {
-                TestUtils.assertContains(ex.getFlyweightMessage(), "Cannot lock table");
+                TestUtils.assertContains(ex.getFlyweightMessage(), "cannot lock table");
             }
         });
     }
@@ -394,9 +429,10 @@ public class IndexBuilderTest extends AbstractCairoTest {
             checkRebuildIndexes(
                     ff,
                     createTableSql,
-                    tablePath -> {
+                    _ -> {
                     },
-                    indexBuilder -> indexBuilder.reindexColumn("sym4"));
+                    indexBuilder -> indexBuilder.reindexColumn("sym4")
+            );
             Assert.fail();
         } catch (InvalidColumnException ignore) {
         }
@@ -404,12 +440,14 @@ public class IndexBuilderTest extends AbstractCairoTest {
 
     @Test
     public void testRebuildFailsWriteKFile() throws Exception {
+        final String keyFragment = isPostingDefault() ? "sym2.pk" : "sym2.k";
+        final int triggerCount = isPostingDefault() ? 1 : 29;
         AtomicInteger count = new AtomicInteger();
         FilesFacade ff = new TestFilesFacadeImpl() {
             @Override
-            public int openRW(LPSZ name, long opts) {
-                if (Utf8s.containsAscii(name, "sym2.k")) {
-                    if (count.incrementAndGet() == 29) {
+            public long openRW(LPSZ name, int opts) {
+                if (Utf8s.containsAscii(name, keyFragment)) {
+                    if (count.incrementAndGet() == triggerCount) {
                         return -1;
                     }
                 }
@@ -432,7 +470,7 @@ public class IndexBuilderTest extends AbstractCairoTest {
                 checkRebuildIndexes(
                         ff,
                         createTableSql,
-                        tablePath -> {
+                        _ -> {
                         },
                         indexBuilder -> indexBuilder.reindexColumn("sym2"));
                 Assert.fail();
@@ -444,12 +482,13 @@ public class IndexBuilderTest extends AbstractCairoTest {
 
     @Test
     public void testRebuildFailsWriteVFile() throws Exception {
-
+        final String valueFragment = isPostingDefault() ? "sym2.pv" : "sym2.v";
+        final int triggerCount = isPostingDefault() ? 1 : 17;
         AtomicInteger count = new AtomicInteger();
         FilesFacade ff = new TestFilesFacadeImpl() {
             @Override
             public boolean touch(LPSZ path) {
-                if (Utf8s.containsAscii(path, "sym2.v") && count.incrementAndGet() == 17) {
+                if (Utf8s.containsAscii(path, valueFragment) && count.incrementAndGet() == triggerCount) {
                     return false;
                 }
                 return Files.touch(path);
@@ -471,7 +510,7 @@ public class IndexBuilderTest extends AbstractCairoTest {
                 checkRebuildIndexes(
                         ff,
                         createTableSql,
-                        tablePath -> {
+                        _ -> {
                         },
                         indexBuilder -> indexBuilder.reindexColumn(ff, "sym2"));
                 Assert.fail();
@@ -483,6 +522,7 @@ public class IndexBuilderTest extends AbstractCairoTest {
 
     @Test
     public void testRebuildIndexCustomBlockSize() throws Exception {
+        indexType = IndexType.BITMAP;
         String createTableSql = "create table xxx as (" +
                 "select " +
                 "rnd_symbol('A', 'B', 'C') as sym1," +
@@ -496,8 +536,8 @@ public class IndexBuilderTest extends AbstractCairoTest {
                 ff,
                 createTableSql,
                 tablePath -> {
-                    removeFileAtPartition("sym1.v", PartitionBy.DAY, tablePath, 0, -1L);
-                    removeFileAtPartition("sym2.k", PartitionBy.DAY, tablePath, 0, -1L);
+                    removeValueFilesAtPartition(PartitionBy.DAY, tablePath);
+                    removeKeyFileAtPartition("sym2", COLUMN_NAME_TXN_NONE, PartitionBy.DAY, tablePath, 0, -1L);
                 },
                 indexBuilder -> indexBuilder.reindexAllInPartition("1970-01-01"));
 
@@ -510,11 +550,11 @@ public class IndexBuilderTest extends AbstractCairoTest {
                 Assert.assertTrue("Column sym2 must exist", columnIndex2 >= 0);
                 Assert.assertEquals(
                         511,
-                        reader.getBitmapIndexReader(0, columnIndex, BitmapIndexReader.DIR_FORWARD).getValueBlockCapacity()
+                        reader.getIndexReader(0, columnIndex, IndexReader.DIR_FORWARD).getValueBlockCapacity()
                 );
                 Assert.assertEquals(
                         1023,
-                        reader.getBitmapIndexReader(0, columnIndex2, BitmapIndexReader.DIR_FORWARD).getValueBlockCapacity()
+                        reader.getIndexReader(0, columnIndex2, IndexReader.DIR_FORWARD).getValueBlockCapacity()
                 );
             }
         });
@@ -535,9 +575,9 @@ public class IndexBuilderTest extends AbstractCairoTest {
                 ff,
                 createTableSql,
                 tablePath -> {
-                    removeFileAtPartition("sym1.v", PartitionBy.DAY, tablePath, 0, -1L);
-                    removeFileAtPartition("sym1.k", PartitionBy.DAY, tablePath, 0, -1L);
-                    removeFileAtPartition("sym2.k", PartitionBy.DAY, tablePath, 0, -1L);
+                    removeValueFilesAtPartition(PartitionBy.DAY, tablePath);
+                    removeKeyFileAtPartition("sym1", COLUMN_NAME_TXN_NONE, PartitionBy.DAY, tablePath, 0, -1L);
+                    removeKeyFileAtPartition("sym2", COLUMN_NAME_TXN_NONE, PartitionBy.DAY, tablePath, 0, -1L);
                 },
                 indexBuilder -> indexBuilder.reindexAllInPartition("1970-01-01"));
     }
@@ -558,9 +598,9 @@ public class IndexBuilderTest extends AbstractCairoTest {
             checkRebuildIndexes(
                     ff,
                     createTableSql,
-                    (tablePath) -> {
+                    (_) -> {
                     },
-                    IndexBuilder::rebuildAll
+                    RebuildColumnBase::rebuildAll
             );
             Assert.fail();
         } catch (CairoException ex) {
@@ -584,7 +624,7 @@ public class IndexBuilderTest extends AbstractCairoTest {
             checkRebuildIndexes(
                     ff,
                     createTableSql,
-                    tablePath -> {
+                    _ -> {
                     },
                     indexBuilder -> indexBuilder.reindexColumn("sym3"));
             Assert.fail();
@@ -594,7 +634,41 @@ public class IndexBuilderTest extends AbstractCairoTest {
     }
 
     @Test
+    public void testReindexLeavesParquetPartitionIndexIntact() throws Exception {
+        // A converted-to-parquet partition keeps its bitmap index local but has no
+        // local .d to rebuild it from. The guard must skip it during REINDEX so the
+        // existing index survives instead of being wiped and left empty.
+        ff = TestFilesFacadeImpl.INSTANCE;
+        assertMemoryLeak(() -> {
+            execute("CREATE TABLE xxx (ts TIMESTAMP, sym SYMBOL INDEX TYPE BITMAP, x LONG) " +
+                    "TIMESTAMP(ts) PARTITION BY DAY BYPASS WAL");
+            execute("INSERT INTO xxx VALUES " +
+                    "('2024-01-01T00:00:00','A',1)," +
+                    "('2024-01-01T06:00:00','B',2)," +
+                    "('2024-01-01T12:00:00','A',3)," +
+                    "('2024-01-01T18:00:00','C',4)," +
+                    "('2024-01-02T00:00:00','A',5)," +
+                    "('2024-01-02T06:00:00','B',6)");
+
+            // Convert the older, non-active partition to parquet.
+            execute("ALTER TABLE xxx CONVERT PARTITION TO PARQUET LIST '2024-01-01'");
+            engine.releaseAllWriters();
+
+            // Whole-table reindex must not throw or corrupt the parquet partition.
+            runReindexSql("REINDEX TABLE xxx COLUMN sym LOCK EXCLUSIVE");
+
+            // sym='A' spans the parquet partition (x=1,3) and the native one (x=5).
+            assertQuery("SELECT x FROM xxx WHERE sym = 'A' ORDER BY ts")
+                    .noLeakCheck()
+                    .inferRandomAccess()
+                    .sizeMayVary()
+                    .returns("x\n1\n3\n5\n");
+        });
+    }
+
+    @Test
     public void testReindexPartitionSqlSyntax() throws Exception {
+        indexType = IndexType.BITMAP;
         String createTableSql = "create table xxx as (" +
                 "select " +
                 "rnd_symbol('A', 'B', 'C') as sym1," +
@@ -608,10 +682,10 @@ public class IndexBuilderTest extends AbstractCairoTest {
                 ff,
                 createTableSql,
                 tablePath -> {
-                    removeFileAtPartition("sym1.v", PartitionBy.DAY, tablePath, 0, -1L);
-                    removeFileAtPartition("sym2.k", PartitionBy.DAY, tablePath, 0, -1L);
+                    removeValueFilesAtPartition(PartitionBy.DAY, tablePath);
+                    removeKeyFileAtPartition("sym2", COLUMN_NAME_TXN_NONE, PartitionBy.DAY, tablePath, 0, -1L);
                 },
-                indexBuilder -> runReindexSql("REINDEX TABLE xxx PARTITION '1970-01-01' LOCK EXCLUSIVE")
+                _ -> runReindexSql("REINDEX TABLE xxx PARTITION '1970-01-01' LOCK EXCLUSIVE")
         );
 
         assertMemoryLeak(() -> {
@@ -623,19 +697,166 @@ public class IndexBuilderTest extends AbstractCairoTest {
                 Assert.assertTrue("Column sym2 must exist", columnIndex2 >= 0);
                 Assert.assertEquals(
                         511,
-                        reader.getBitmapIndexReader(0, columnIndex, BitmapIndexReader.DIR_FORWARD).getValueBlockCapacity()
+                        reader.getIndexReader(0, columnIndex, IndexReader.DIR_FORWARD).getValueBlockCapacity()
                 );
                 Assert.assertEquals(
                         1023,
-                        reader.getBitmapIndexReader(0, columnIndex2, BitmapIndexReader.DIR_FORWARD).getValueBlockCapacity()
+                        reader.getIndexReader(0, columnIndex2, IndexReader.DIR_FORWARD).getValueBlockCapacity()
                 );
             }
         });
     }
 
+    @Test
+    public void testReindexRecreatesPostingCoveringSidecars() throws Exception {
+        // Regression test for #20: REINDEX must recreate the .pci and
+        // .pc<N>.*.* sidecar files for a POSTING+covering index. Without
+        // the fix, removeIndexFiles wipes the sidecars and seal recreates
+        // only .pk + .pv, leaving readers to silently fall back to the
+        // slower column-file read path on every covering query.
+        indexType = IndexType.POSTING;
+        ff = TestFilesFacadeImpl.INSTANCE;
+        assertMemoryLeak(() -> {
+            execute("CREATE TABLE t_reindex_cov (" +
+                    "ts TIMESTAMP, " +
+                    "sym SYMBOL INDEX TYPE POSTING INCLUDE (price), " +
+                    "price DOUBLE" +
+                    ") TIMESTAMP(ts) PARTITION BY DAY BYPASS WAL");
+            execute("INSERT INTO t_reindex_cov VALUES " +
+                    "('2024-01-01T00:00:00','A',10.0)," +
+                    "('2024-01-01T01:00:00','B',20.0)," +
+                    "('2024-01-01T02:00:00','A',30.0)");
+            engine.releaseAllWriters();
+
+            TableToken tok = engine.verifyTableName("t_reindex_cov");
+            try (Path part = new Path()) {
+                part.of(configuration.getDbRoot()).concat(tok).concat("2024-01-01");
+                String pciPath = io.questdb.std.str.Utf8s.stringFromUtf8Bytes(
+                        PostingIndexUtils.coverInfoFileName(part, "sym", COLUMN_NAME_TXN_NONE));
+
+                // Sanity: sidecars exist after the initial seal.
+                try (Path probe = new Path()) {
+                    Assert.assertTrue("setup: .pci must exist after initial seal",
+                            ff.exists(probe.of(pciPath).$()));
+                }
+
+                runReindexSql("REINDEX TABLE t_reindex_cov LOCK EXCLUSIVE");
+
+                // After REINDEX: .pci must exist again (regenerated by the
+                // seal-with-covering path). Without the fix, it was wiped by
+                // removeIndexFiles and never recreated, leaving covering
+                // queries to silently degrade to the column-file fallback.
+                try (Path probe = new Path()) {
+                    Assert.assertTrue(".pci must exist after REINDEX",
+                            ff.exists(probe.of(pciPath).$()));
+                }
+            }
+
+            // The covering query must still return correct rows.
+            assertQuery("SELECT price FROM t_reindex_cov WHERE sym = 'A' ORDER BY ts")
+                    .noLeakCheck()
+                    .expectSize()
+                    .noRandomAccess()
+                    .returns("price\n10.0\n30.0\n");
+        });
+    }
+
+    @Test
+    public void testReindexRejectsNamedParquetPartition() throws Exception {
+        // REINDEX of an explicitly named parquet partition is rejected rather than
+        // silently destroying an index that cannot be rebuilt from a local .d.
+        ff = TestFilesFacadeImpl.INSTANCE;
+        assertMemoryLeak(() -> {
+            execute("CREATE TABLE xxx (ts TIMESTAMP, sym SYMBOL INDEX TYPE BITMAP, x LONG) " +
+                    "TIMESTAMP(ts) PARTITION BY DAY BYPASS WAL");
+            execute("INSERT INTO xxx VALUES " +
+                    "('2024-01-01T00:00:00','A',1)," +
+                    "('2024-01-01T06:00:00','B',2)," +
+                    "('2024-01-02T00:00:00','A',3)");
+            execute("ALTER TABLE xxx CONVERT PARTITION TO PARQUET LIST '2024-01-01'");
+            engine.releaseAllWriters();
+
+            try {
+                execute("REINDEX TABLE xxx COLUMN sym PARTITION '2024-01-01' LOCK EXCLUSIVE");
+                Assert.fail("reindex of a parquet partition must be rejected");
+            } catch (CairoException e) {
+                TestUtils.assertContains(e.getFlyweightMessage(), "cannot reindex parquet partition");
+            }
+        });
+    }
+
+    @Test
+    public void testReindexWithCoveringColumnAddedLater() throws Exception {
+        // Red test for the cluster of bugs around column-added-later +
+        // POSTING covering index. Two distinct issues both fail this test:
+        //
+        // 1. IndexBuilder.java:263 propagates the -1 returned by
+        //    ColumnVersionReader.getColumnTop (per
+        //    ColumnVersionReader.java:148) without clamping. The peer code
+        //    at TableSnapshotRestore.java:686 clamps with Math.max(0, ...);
+        //    IndexBuilder must do the same.
+        //
+        // 2. PostingIndexWriter.writeNullSentinel(long addr, int valueSize,
+        //    int columnType) at PostingIndexWriter.java:1307 only branches
+        //    on GEO/IPv4/FLOAT/DOUBLE — every other type (INT, SHORT, BYTE,
+        //    SYMBOL, DECIMAL32, DECIMAL64, TIMESTAMP, DATE, ...) falls
+        //    through to the generic zero-fill. For widths < 8 bytes the
+        //    Long.MIN_VALUE overlay loop never runs, so an INT NULL is
+        //    sealed as four zero bytes, colliding with a valid INT value 0.
+        //    CursorPrinter has no way to detect NULL on read.
+        //
+        // Both bugs converge here: REINDEX walks the column-added-later
+        // partition, hits writeNullSentinel for the rows whose rowId is
+        // before columnTop, and the sidecar ends up holding zero where the
+        // column file would correctly read NULL via columnTop fallback.
+        // Covering and no_covering paths must agree.
+        indexType = IndexType.POSTING;
+        ff = TestFilesFacadeImpl.INSTANCE;
+        assertMemoryLeak(() -> {
+            // sym + price exist from table creation. qty is added later, so
+            // partition 2024-01-01 has rowId < colTop for qty (or -1 if the
+            // partition predates the column add entirely).
+            execute("CREATE TABLE t_reindex_top (" +
+                    "ts TIMESTAMP, " +
+                    "sym SYMBOL, " +
+                    "price DOUBLE" +
+                    ") TIMESTAMP(ts) PARTITION BY DAY BYPASS WAL");
+            execute("INSERT INTO t_reindex_top VALUES " +
+                    "('2024-01-01T00:00:00','A',10.0)," +
+                    "('2024-01-01T01:00:00','B',20.0)");
+            execute("ALTER TABLE t_reindex_top ADD COLUMN qty INT");
+            execute("INSERT INTO t_reindex_top VALUES " +
+                    "('2024-01-02T00:00:00','A',30.0,100)," +
+                    "('2024-01-02T01:00:00','B',40.0,200)");
+            execute("ALTER TABLE t_reindex_top ALTER COLUMN sym ADD INDEX TYPE POSTING INCLUDE (price, qty)");
+            engine.releaseAllWriters();
+
+            // Force the IndexBuilder path to walk both partitions, including
+            // the one where qty did not exist at row time.
+            runReindexSql("REINDEX TABLE t_reindex_top LOCK EXCLUSIVE");
+            engine.releaseAllReaders();
+
+            // Both paths must agree: the column-added-later rows render as
+            // NULL.
+            String expected = """
+                    qty
+                    null
+                    100
+                    """;
+            assertQuery("SELECT /*+ no_covering */ qty FROM t_reindex_top WHERE sym = 'A' ORDER BY ts")
+                    .noLeakCheck()
+                    .returns(expected);
+            assertQuery("SELECT qty FROM t_reindex_top WHERE sym = 'A' ORDER BY ts")
+                    .noLeakCheck()
+                    .expectSize()
+                    .noRandomAccess()
+                    .returns(expected);
+        });
+    }
+
     private static void runReindexSql(String query) {
         try {
-            ddl(query);
+            execute(query);
         } catch (SqlException ex) {
             LOG.error().$((Throwable) ex).I$();
             Assert.fail(ex.getMessage());
@@ -645,18 +866,18 @@ public class IndexBuilderTest extends AbstractCairoTest {
     private void checkRebuildIndexes(FilesFacade ff, String createTableSql, Action<String> changeTable, Action<IndexBuilder> rebuildIndexAction) throws Exception {
         assertMemoryLeak(ff, () -> {
             for (String sql : createTableSql.split(";")) {
-                ddl(sql);
+                execute(sql);
             }
             int sym1A = countByFullScan("select * from xxx where sym1 = 'A'");
             int sym1B = countByFullScan("select * from xxx where sym1 = 'B'");
             int sym1C = countByFullScan("select * from xxx where sym1 = 'C'");
-            ddl("create table copy as (select * from xxx)", sqlExecutionContext);
+            execute("create table copy as (select * from xxx)", sqlExecutionContext);
 
             engine.releaseAllReaders();
             engine.releaseAllWriters();
 
             TableToken xxx = engine.verifyTableName("xxx");
-            String tablePath = configuration.getRoot() + Files.SEPARATOR + xxx.getDirName();
+            String tablePath = configuration.getDbRoot() + Files.SEPARATOR + xxx.getDirName();
             changeTable.run(tablePath);
 
             indexBuilder.clear();
@@ -671,7 +892,7 @@ public class IndexBuilderTest extends AbstractCairoTest {
             Assert.assertEquals(sym1B, sym1B2);
             Assert.assertEquals(sym1C, sym1C2);
 
-            insert("insert into xxx select * from copy");
+            execute("insert into xxx select * from copy");
 
             int sym1A3 = countByFullScan("select * from xxx where sym1 = 'A'");
             int sym1B3 = countByFullScan("select * from xxx where sym1 = 'B'");
@@ -695,14 +916,58 @@ public class IndexBuilderTest extends AbstractCairoTest {
         return recordCount;
     }
 
+    private boolean isPostingDefault() {
+        return indexType != IndexType.BITMAP;
+    }
+
     private void removeFileAtPartition(String fileName, int partitionBy, String tablePath, long partitionTs, long partitionNameTxn) {
         try (Path path = new Path()) {
             path.concat(tablePath);
             path.put(Files.SEPARATOR);
-            TableUtils.setPathForPartition(path, partitionBy, partitionTs, partitionNameTxn);
+            TableUtils.setPathForNativePartition(path, ColumnType.TIMESTAMP, partitionBy, partitionTs, partitionNameTxn);
             path.concat(fileName);
             LOG.info().$("removing ").$(path).$();
-            Assert.assertTrue(Files.remove(path.$()));
+            Assert.assertTrue(TestUtils.remove(path.$()));
+        }
+    }
+
+    private void removeKeyFileAtPartition(String colName, long columnNameTxn, int partitionBy, String tablePath, long partitionTs, long partitionNameTxn) {
+        String ext = isPostingDefault() ? ".pk" : ".k";
+        String name = columnNameTxn == COLUMN_NAME_TXN_NONE
+                ? colName + ext
+                : colName + ext + "." + columnNameTxn;
+        removeFileAtPartition(name, partitionBy, tablePath, partitionTs, partitionNameTxn);
+    }
+
+    private void removeValueFilesAtPartition(int partitionBy, String tablePath) {
+        if (!isPostingDefault()) {
+            removeFileAtPartition("sym1.v", partitionBy, tablePath, 0, -1L);
+            return;
+        }
+        try (Path p = new Path()) {
+            p.concat(tablePath).put(Files.SEPARATOR);
+            TableUtils.setPathForNativePartition(p, ColumnType.TIMESTAMP, partitionBy, 0, -1L);
+            int plen = p.size();
+            FilesFacade facade = configuration.getFilesFacade();
+            AtomicInteger removed = new AtomicInteger();
+            PostingIndexUtils.scanSealedFiles(facade, p, plen, "sym1", new PostingIndexUtils.SealedFileVisitor() {
+                @Override
+                public void onCoverDataFile(int includeIdx, long postingColumnNameTxn, long coveredColumnNameTxn, long sealTxn) {
+                }
+
+                @Override
+                public void onValueFile(long postingColumnNameTxn, long sealTxn) {
+                    if (postingColumnNameTxn != TableUtils.COLUMN_NAME_TXN_NONE) {
+                        return;
+                    }
+                    LPSZ pv = PostingIndexUtils.valueFileName(p.trimTo(plen), "sym1", postingColumnNameTxn, sealTxn);
+                    LOG.info().$("removing ").$(pv).$();
+                    Assert.assertTrue(facade.removeQuiet(pv));
+                    p.trimTo(plen);
+                    removed.incrementAndGet();
+                }
+            });
+            Assert.assertTrue("expected at least one posting value file for " + "sym1", removed.get() > 0);
         }
     }
 

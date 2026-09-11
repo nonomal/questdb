@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -32,7 +32,7 @@ import java.lang.reflect.Method;
 import java.nio.ByteBuffer;
 
 public class HistogramTestUtils {
-    static DoubleHistogram constructDoubleHistogram(Class c, Object... constructorArgs) {
+    static DoubleHistogram constructDoubleHistogram(Class<?> c, Object... constructorArgs) {
         try {
             Class[] argTypes;
             if (constructorArgs.length == 1) {
@@ -65,7 +65,7 @@ public class HistogramTestUtils {
         }
     }
 
-    static AbstractHistogram constructHistogram(Class c, Object... constructorArgs) {
+    static AbstractHistogram constructHistogram(Class<?> c, Object... constructorArgs) {
         try {
             Class[] argTypes;
             if (constructorArgs.length == 1) {
@@ -94,7 +94,7 @@ public class HistogramTestUtils {
         }
     }
 
-    static DoubleHistogram decodeDoubleHistogramFromCompressedByteBuffer(Class c,
+    static DoubleHistogram decodeDoubleHistogramFromCompressedByteBuffer(Class<?> c,
                                                                          final ByteBuffer buffer,
                                                                          final long minBarForHighestTrackableValue) {
         try {
@@ -112,7 +112,7 @@ public class HistogramTestUtils {
         }
     }
 
-    static AbstractHistogram decodeFromCompressedByteBuffer(Class c,
+    static AbstractHistogram decodeFromCompressedByteBuffer(Class<?> c,
                                                             final ByteBuffer buffer,
                                                             final long minBarForHighestTrackableValue) {
         try {

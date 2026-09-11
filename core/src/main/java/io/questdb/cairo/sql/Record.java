@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,10 +24,20 @@
 
 package io.questdb.cairo.sql;
 
+import io.questdb.cairo.ColumnType;
 import io.questdb.cairo.TableUtils;
+import io.questdb.cairo.arr.ArrayView;
 import io.questdb.std.BinarySequence;
+import io.questdb.std.Decimal128;
+import io.questdb.std.Decimal256;
+import io.questdb.std.Interval;
 import io.questdb.std.Long256;
-import io.questdb.std.str.*;
+import io.questdb.std.Numbers;
+import io.questdb.std.str.CharSink;
+import io.questdb.std.str.MutableUtf16Sink;
+import io.questdb.std.str.Utf16Sink;
+import io.questdb.std.str.Utf8Sequence;
+import io.questdb.std.str.Utf8s;
 import org.jetbrains.annotations.Nullable;
 
 /**
@@ -48,14 +58,73 @@ public interface Record {
         if (vch == null) {
             return null;
         }
-        if (vch.isAscii()) {
-            return vch.asAsciiCharSequence();
-        }
-        sink.clear();
-        sink.put(vch);
-        return sink;
+        return Utf8s.utf8ToUtf16OrView(vch, sink);
     };
 
+    default ArrayView getArray(int col, int columnType) {
+        throw new UnsupportedOperationException();
+    }
+
+    /**
+     * Reads the length of one dimension of an array column, without materializing the array.
+     * Returns {@link Numbers#INT_NULL} when the array is null.
+     * <p>
+     * The default implementation is just for convenience, it does not implement the main
+     * optimization. That lives in {@link PageFrameMemoryRecord#getArrayDimLen}, which reads the
+     * shape header directly and bypasses the {@link ArrayView} setup.
+     *
+     * @param col        column index
+     * @param columnType encoded array column type
+     * @param dim        1-based dimension; the caller must have validated it against the column's
+     *                   dimensionality
+     */
+    default int getArrayDimLen(int col, int columnType, int dim) {
+        assert dim >= 1 && dim <= ColumnType.decodeArrayDimensionality(columnType);
+        ArrayView array = getArray(col, columnType);
+        // A record with no array to hand out returns a NULL ArrayView, never a Java null. Keeping
+        // that contract is the producer's job, not this method's: getArray() has callers that
+        // dereference the result on the spot - PGUtils and the generated record sinks - so a
+        // tolerance here would cover two callers and leave the rest to NPE.
+        assert array != null : "getArray() returned a Java null, expected a NULL ArrayView";
+        if (array.isNull()) {
+            return Numbers.INT_NULL;
+        }
+        return array.getDimLen(dim - 1);
+    }
+
+    /**
+     * Reads a single {@code double} from a 1D or 2D array column at the given
+     * 0-based indices. Returns {@link Double#NaN} when the array is null or an
+     * index is out of bounds.
+     * <p>
+     * The default implementation is just for convenience, it does not implement the
+     * main optimization. That lives in {@link PageFrameMemoryRecord#getArrayDouble1d2d},
+     * which completely bypasses the expensive {@link ArrayView} setup.
+     * <p>
+     * For 1D arrays, ignores {@code idx1}.
+     * <p>
+     * <strong>Do not call for 3D+ arrays!</strong>
+     *
+     * @param col        column index
+     * @param columnType encoded array column type (must be 1D or 2D)
+     * @param idx0       0-based index for dimension 0
+     * @param idx1       0-based index for dimension 1 (ignored for 1D)
+     */
+    default double getArrayDouble1d2d(int col, int columnType, int idx0, int idx1) {
+        ArrayView array = getArray(col, columnType);
+        // See getArrayDimLen() for why the producer, not this method, owns the no-Java-null contract.
+        assert array != null : "getArray() returned a Java null, expected a NULL ArrayView";
+        if (array.isNull() || idx0 >= array.getDimLen(0)) {
+            return Double.NaN;
+        }
+        if (array.getDimCount() == 1) {
+            return array.getDouble(idx0);
+        }
+        if (idx1 >= array.getDimLen(1)) {
+            return Double.NaN;
+        }
+        return array.getDouble(idx0 * array.getStride(0) + idx1);
+    }
 
     /**
      * Gets the value of a binary column by index
@@ -117,6 +186,53 @@ public interface Record {
         return getLong(col);
     }
 
+    default void getDecimal128(int col, Decimal128 sink) {
+        throw new UnsupportedOperationException();
+    }
+
+    /**
+     * Gets the 16-bit decimal value by index.
+     *
+     * @param col numeric index of the column
+     * @return 16-bit signed integer
+     */
+    default short getDecimal16(int col) {
+        throw new UnsupportedOperationException();
+    }
+
+    default void getDecimal256(int col, Decimal256 sink) {
+        throw new UnsupportedOperationException();
+    }
+
+    /**
+     * Gets the 32-bit decimal value by index.
+     *
+     * @param col numeric index of the column
+     * @return 32-bit signed integer
+     */
+    default int getDecimal32(int col) {
+        throw new UnsupportedOperationException();
+    }
+
+    /**
+     * Gets the 64-bit decimal value by index.
+     *
+     * @param col numeric index of the column
+     * @return 64-bit signed integer
+     */
+    default long getDecimal64(int col) {
+        throw new UnsupportedOperationException();
+    }
+
+    /**
+     * Gets the 8-bit decimal value by index.
+     *
+     * @param col numeric index of the column
+     * @return 8-bit signed integer
+     */
+    default byte getDecimal8(int col) {
+        throw new UnsupportedOperationException();
+    }
 
     /**
      * Gets the value of a double column by index
@@ -185,7 +301,6 @@ public interface Record {
      * @param col numeric index of the column
      * @return 32-bit integer
      */
-
     default int getIPv4(int col) {
         throw new UnsupportedOperationException();
     }
@@ -197,6 +312,10 @@ public interface Record {
      * @return 32-bit integer
      */
     default int getInt(int col) {
+        throw new UnsupportedOperationException();
+    }
+
+    default Interval getInterval(int col) {
         throw new UnsupportedOperationException();
     }
 
@@ -229,8 +348,11 @@ public interface Record {
     }
 
     /**
-     * Gets the value of a long256 column by index
-     * getLong256A used for A/B comparison with getLong256B to compare references
+     * Gets the value of a long256 column by index.
+     * getLong256A used for A/B comparison with getLong256B to compare references.
+     * <p>
+     * Important: record implementations must not reuse a single flyweight
+     * across all columns.
      *
      * @param col numeric index of the column
      * @return unsigned 256-bit integer
@@ -240,8 +362,11 @@ public interface Record {
     }
 
     /**
-     * Gets the value of a long256 column by index
-     * getLong256B used for A/B comparison with getLong256A to compare references
+     * Gets the value of a long256 column by index.
+     * getLong256B used for A/B comparison with getLong256A to compare references.
+     * <p>
+     * Important: record implementations must not reuse a single flyweight
+     * across all columns.
      *
      * @param col numeric index of the column
      * @return unsigned 256-bit integer
@@ -257,9 +382,8 @@ public interface Record {
      * @param col numeric index of the column
      * @return 64-bit integer
      */
-    @SuppressWarnings("unused")
     default long getLongIPv4(int col) {
-        throw new UnsupportedOperationException();
+        return Numbers.ipv4ToLong(getIPv4(col));
     }
 
     /**
@@ -292,34 +416,15 @@ public interface Record {
     }
 
     /**
-     * Reads bytes from string-specific storage and prints them into UTF16 encoded
-     * sink.
-     *
-     * @param col       numeric index of the column, 0-based
-     * @param utf16Sink the destination sink
-     */
-    default void getStr(int col, Utf16Sink utf16Sink) {
-        utf16Sink.put(getStrA(col));
-    }
-
-    /**
-     * Reads bytes from string-specific storage and prints them into UTF8 encoded
-     * sink.
-     *
-     * @param col      numeric index of the column, 0-based
-     * @param utf8Sink the destination sink
-     */
-    default void getStr(int col, Utf8Sink utf8Sink) {
-        utf8Sink.put(getStrA(col));
-    }
-
-    /**
      * Reads string-specific storage and presents the value as
      * UTF16-encoded sequence of bytes. It is a part of value comparison
      * system, which utilizes A and B objects to represent values of
      * multiple fields of the same record. Functions, such as "=" must
      * always compare getStrA(col) = getStrB(col) to make sure CharSequence
      * containers are not being spuriously reused.
+     * <p>
+     * Important: record implementations must not reuse a single flyweight
+     * across all columns.
      *
      * @param col numeric index of the column, 0-based
      * @return lightweight container that avoids creating copies of strings in
@@ -337,6 +442,9 @@ public interface Record {
      * multiple fields of the same record. Functions, such as "=" must
      * always compare getStrA(col) = getStrB(col) to make sure CharSequence
      * containers are not being spuriously reused.
+     * <p>
+     * Important: record implementations must not reuse a single flyweight
+     * across all columns.
      *
      * @param col numeric index of the column, 0-based
      * @return lightweight container that avoids creating copies of strings in
@@ -357,7 +465,10 @@ public interface Record {
     }
 
     /**
-     * Gets the value of a symbol column by index
+     * Gets the value of a symbol column by index.
+     * <p>
+     * Important: record implementations must not reuse a single flyweight
+     * across all columns.
      *
      * @param col numeric index of the column
      * @return symbol value as string
@@ -367,8 +478,11 @@ public interface Record {
     }
 
     /**
-     * Gets the string-based value of a symbol column by index
-     * getSymB used for A/B comparison with getSym to compare references
+     * Gets the string-based value of a symbol column by index.
+     * getSymB used for A/B comparison with getSym to compare references.
+     * <p>
+     * Important: record implementations must not reuse a single flyweight
+     * across all columns.
      *
      * @param col numeric index of the column
      * @return symbol value as string
@@ -397,17 +511,6 @@ public interface Record {
     }
 
     /**
-     * Reads bytes from varchar-specific storage and prints them into UTF8 encoded
-     * sink.
-     *
-     * @param col      numeric index of the column, 0-based
-     * @param utf8Sink the destination sink
-     */
-    default void getVarchar(int col, Utf8Sink utf8Sink) {
-        utf8Sink.put(getVarcharA(col));
-    }
-
-    /**
      * Reads bytes from varchar-specific storage and prints them into UTF16 encoded
      * sink.
      *
@@ -424,9 +527,10 @@ public interface Record {
      * system, which utilizes A and B objects to represent values of
      * multiple fields of the same record. Functions, such as "=" must
      * always compare getVarcharA(col) = getVarcharB(col) to make sure Utf8Sequence
-     * containers are not being spuriously reused. Also keep in mind that
-     * implementations are allowed to only have two utf8 containers, so methods such
-     * as getVarcharA() and getStrAsVarcharA() may use the same container.
+     * containers are not being spuriously reused.
+     * <p>
+     * Important: record implementations must not reuse a single flyweight
+     * across all columns.
      *
      * @param col numeric index of the column, 0-based
      * @return lightweight container that avoids creating copies of strings in
@@ -443,9 +547,10 @@ public interface Record {
      * system, which utilizes A and B objects to represent values of
      * multiple fields of the same record. Functions, such as "=" must
      * always compare getVarcharA(col) = getVarcharB(col) to make sure Utf8Sequence
-     * containers are not being spuriously reused. Also keep in mind that
-     * implementations are allowed to only have two utf8 containers, so methods such
-     * as getVarcharB() and getStrAsVarcharB() may use the same container.
+     * containers are not being spuriously reused.
+     * <p>
+     * Important: record implementations must not reuse a single flyweight
+     * across all columns.
      *
      * @param col numeric index of the column, 0-based
      * @return lightweight container that avoids creating copies of strings in

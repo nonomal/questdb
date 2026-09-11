@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -35,12 +35,15 @@ import java.lang.reflect.Modifier;
 import java.util.Arrays;
 import java.util.Comparator;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Map;
+import java.util.Set;
 
 import static io.questdb.griffin.SqlKeywords.*;
 
 public class SqlKeywordsTest {
-
+    // kept protected for ent tests
+    protected static final Set<String> excludedCases = new HashSet<>();
     protected static final Map<String, String> specialCases = new HashMap<>();
 
     @Test
@@ -164,6 +167,26 @@ public class SqlKeywordsTest {
     }
 
     @Test
+    public void testIsPublicKeyword() {
+        Assert.assertTrue(isPublicKeyword("public", 6));
+        Assert.assertFalse(isPublicKeyword("private", 6));
+        Assert.assertFalse(isPublicKeyword("foo", 3));
+        Assert.assertTrue(isPublicKeyword("public.foobar", 6));
+        Assert.assertFalse(isPublicKeyword("private.foobar", 6));
+    }
+
+    @Test
+    public void testIsWindowKeywordIsCaseInsensitive() {
+        Assert.assertTrue(isWindowKeyword("window"));
+        Assert.assertTrue(isWindowKeyword("WINDOW"));
+        Assert.assertTrue(isWindowKeyword("Window"));
+        Assert.assertTrue(isWindowKeyword("wINDOW"));
+        Assert.assertFalse(isWindowKeyword("windo"));
+        Assert.assertFalse(isWindowKeyword("windoww"));
+        Assert.assertFalse(isWindowKeyword("windox"));
+    }
+
+    @Test
     public void testLinear() {
         Assert.assertFalse(isLinearKeyword("12345"));
         Assert.assertFalse(isLinearKeyword("123456"));
@@ -190,7 +213,7 @@ public class SqlKeywordsTest {
         for (Method method : methods) {
             String name;
             int m = method.getModifiers() & Modifier.methodModifiers();
-            if (Modifier.isPublic(m) && Modifier.isStatic(m) && (name = method.getName()).startsWith("is")) {
+            if (Modifier.isPublic(m) && Modifier.isStatic(m) && (name = method.getName()).startsWith("is") && !excludedCases.contains(name)) {
                 String methodParam = specialCases.get(name);
                 if (methodParam == null) {
                     if (!name.endsWith("Keyword")) {
@@ -224,7 +247,23 @@ public class SqlKeywordsTest {
         specialCases.put("isEmptyAlias", "''");
         specialCases.put("isKeyword", "select");
         specialCases.put("isServerVersionKeyword", "server_version");
+        specialCases.put("isServerVersionNumKeyword", "server_version_num");
         specialCases.put("isUTC", "'UTC'");
         specialCases.put("isZeroOffset", "'00:00'");
+        specialCases.put("isJsonExtract", "json_extract");
+        specialCases.put("isRespectWord", "respect");
+        specialCases.put("isIgnoreWord", "ignore");
+        specialCases.put("isNullsWord", "nulls");
+        specialCases.put("isTimestampNsKeyword", "timestamp_ns");
+        specialCases.put("isDefaultTransactionReadOnly", "default_transaction_read_only");
+        specialCases.put("isExcluding", "excluding");
+        specialCases.put("isIncluding", "including");
+        specialCases.put("isComma", ",");
+        specialCases.put("isRightParen", ")");
+        specialCases.put("isCurrentTimestampKeyword", "current_timestamp");
+        specialCases.put("isBloomFilterKeyword", "bloom_filter");
+        specialCases.put("isBloomFilterColumnsKeyword", "bloom_filter_columns");
+
+        excludedCases.add("isPublicKeyword");
     }
 }

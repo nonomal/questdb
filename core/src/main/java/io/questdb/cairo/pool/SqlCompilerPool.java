@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -26,11 +26,24 @@ package io.questdb.cairo.pool;
 
 import io.questdb.cairo.CairoEngine;
 import io.questdb.cairo.TableToken;
-import io.questdb.griffin.*;
+import io.questdb.cairo.sql.RecordCursorFactory;
+import io.questdb.griffin.BatchCallback;
+import io.questdb.griffin.CompiledQuery;
+import io.questdb.griffin.ExpressionParserListener;
+import io.questdb.griffin.QueryBuilder;
+import io.questdb.griffin.SqlCompiler;
+import io.questdb.griffin.SqlException;
+import io.questdb.griffin.SqlExecutionContext;
+import io.questdb.griffin.engine.ops.Operation;
 import io.questdb.griffin.model.ExecutionModel;
 import io.questdb.griffin.model.ExpressionNode;
-import io.questdb.griffin.model.QueryModel;
+import io.questdb.griffin.model.IQueryModel;
+import io.questdb.griffin.model.InsertModel;
+import io.questdb.std.BytecodeAssembler;
 import io.questdb.std.Rnd;
+import io.questdb.std.str.CharSink;
+import org.jetbrains.annotations.NotNull;
+import org.jetbrains.annotations.Nullable;
 
 public final class SqlCompilerPool extends AbstractMultiTenantPool<SqlCompilerPool.C> {
     // The table tokens below are fake, only needed to satisfy the contract of the base class.
@@ -39,9 +52,9 @@ public final class SqlCompilerPool extends AbstractMultiTenantPool<SqlCompilerPo
     // It also should be kept in mind that some details of these fake tokens can make it into
     // logs, such as the directory names, and they do not (and really should not) exist on disk.
     private static final TableToken[] TOKENS = {
-            new TableToken("blue", "/compilers/blue/", 0, false, false, false),
-            new TableToken("red", "/compilers/red/", 0, false, false, false),
-            new TableToken("green", "/compilers/green/", 0, false, false, false)
+            new TableToken("blue", "/compilers/blue/", null, 0, false, false, false),
+            new TableToken("red", "/compilers/red/", null, 0, false, false, false),
+            new TableToken("green", "/compilers/green/", null, 0, false, false, false)
     };
     private final CairoEngine engine;
     private final Rnd rnd = new Rnd();
@@ -50,7 +63,7 @@ public final class SqlCompilerPool extends AbstractMultiTenantPool<SqlCompilerPo
         // Passing zero as TTL, because SqlCompiler instances are expected to be returned to the pool immediately
         // after usage. The `releaseInactive()` method is also overridden to return with hardcoded 'false' for the
         // same reason. It is not meant to be called.
-        super(engine.getConfiguration(), (engine.getConfiguration().getSqlCompilerPoolCapacity() / ENTRY_SIZE) + 1, 0L);
+        super(engine.getConfiguration(), (engine.getConfiguration().getSqlCompilerPoolCapacity() / engine.getConfiguration().getPoolSegmentSize()) + 1, 0L);
         this.engine = engine;
     }
 
@@ -74,11 +87,12 @@ public final class SqlCompilerPool extends AbstractMultiTenantPool<SqlCompilerPo
     }
 
     @Override
-    protected C newTenant(TableToken tableToken, Entry<C> entry, int index) {
+    protected C newTenant(TableToken tableToken, Entry<C> rootEntry, Entry<C> entry, int index, @Nullable ResourcePoolSupervisor<C> supervisor) {
         return new C(
                 engine.getSqlCompilerFactory().getInstance(engine),
                 this,
                 tableToken,
+                rootEntry,
                 entry,
                 index
         );
@@ -87,6 +101,7 @@ public final class SqlCompilerPool extends AbstractMultiTenantPool<SqlCompilerPo
     public static class C implements SqlCompiler, PoolTenant<C> {
         private final SqlCompiler delegate;
         private final int index;
+        private final Entry<C> rootEntry;
         private Entry<C> entry;
         private AbstractMultiTenantPool<C> pool;
         private TableToken tableToken;
@@ -95,12 +110,14 @@ public final class SqlCompilerPool extends AbstractMultiTenantPool<SqlCompilerPo
                 SqlCompiler delegate,
                 AbstractMultiTenantPool<C> pool,
                 TableToken tableToken,
+                Entry<C> rootEntry,
                 Entry<C> entry,
                 int index
         ) {
             this.delegate = delegate;
             this.pool = pool;
             this.tableToken = tableToken;
+            this.rootEntry = rootEntry;
             this.entry = entry;
             this.index = index;
         }
@@ -124,13 +141,47 @@ public final class SqlCompilerPool extends AbstractMultiTenantPool<SqlCompilerPo
         }
 
         @Override
-        public CompiledQuery compile(CharSequence s, SqlExecutionContext ctx) throws SqlException {
-            return delegate.compile(s, ctx);
+        public CompiledQuery compile(CharSequence sqlText, SqlExecutionContext ctx) throws SqlException {
+            return delegate.compile(sqlText, ctx);
         }
 
         @Override
-        public void compileBatch(CharSequence queryText, SqlExecutionContext sqlExecutionContext, BatchCallback batchCallback) throws Exception {
-            delegate.compileBatch(queryText, sqlExecutionContext, batchCallback);
+        public void compileBatch(CharSequence batchText, SqlExecutionContext sqlExecutionContext, BatchCallback batchCallback) throws Exception {
+            delegate.compileBatch(batchText, sqlExecutionContext, batchCallback);
+        }
+
+        @Override
+        public boolean execute(Operation op, SqlExecutionContext executionContext) throws SqlException {
+            return delegate.execute(op, executionContext);
+        }
+
+        @Override
+        public ExecutionModel generateExecutionModel(CharSequence sqlText, SqlExecutionContext executionContext) throws SqlException {
+            return delegate.generateExecutionModel(sqlText, executionContext);
+        }
+
+        @Override
+        public RecordCursorFactory generateSelectWithRetries(
+                IQueryModel queryModel,
+                @Nullable InsertModel insertModel,
+                SqlExecutionContext executionContext,
+                boolean generateProgressLogger
+        ) throws SqlException {
+            return delegate.generateSelectWithRetries(queryModel, insertModel, executionContext, generateProgressLogger);
+        }
+
+        @Override
+        public BytecodeAssembler getAsm() {
+            return delegate.getAsm();
+        }
+
+        public SqlCompiler getDelegate() {
+            return delegate;
+        }
+
+        @Override
+        public CairoEngine getEngine() {
+            return delegate.getEngine();
         }
 
         @Override
@@ -141,6 +192,11 @@ public final class SqlCompilerPool extends AbstractMultiTenantPool<SqlCompilerPo
         @Override
         public int getIndex() {
             return index;
+        }
+
+        @Override
+        public Entry<C> getRootEntry() {
+            return rootEntry;
         }
 
         @Override
@@ -155,12 +211,17 @@ public final class SqlCompilerPool extends AbstractMultiTenantPool<SqlCompilerPo
         }
 
         @Override
+        public ExpressionNode parseExpression(CharSequence expression) throws SqlException {
+            return delegate.parseExpression(expression);
+        }
+
+        @Override
         public QueryBuilder query() {
             return delegate.query();
         }
 
         @Override
-        public void refresh() {
+        public void refresh(ResourcePoolSupervisor<C> supervisor) {
             clear();
         }
 
@@ -175,18 +236,18 @@ public final class SqlCompilerPool extends AbstractMultiTenantPool<SqlCompilerPo
         }
 
         @Override
-        public ExecutionModel testCompileModel(CharSequence query, SqlExecutionContext executionContext) throws SqlException {
-            return delegate.testCompileModel(query, executionContext);
-        }
-
-        @Override
-        public ExpressionNode testParseExpression(CharSequence expression, QueryModel model) throws SqlException {
+        public ExpressionNode testParseExpression(CharSequence expression, IQueryModel model) throws SqlException {
             return delegate.testParseExpression(expression, model);
         }
 
         @Override
         public void testParseExpression(CharSequence expression, ExpressionParserListener listener) throws SqlException {
             delegate.testParseExpression(expression, listener);
+        }
+
+        @Override
+        public void toSink(@NotNull CharSink<?> sink) {
+            sink.put("SqlCompilerPool.C{index=").put(index).put(", tableToken=").put(tableToken).put('}');
         }
 
         @Override

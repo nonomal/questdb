@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -28,7 +28,7 @@ import io.questdb.cairo.CairoConfiguration;
 import io.questdb.cairo.TableToken;
 import io.questdb.std.FilesFacade;
 import io.questdb.std.Unsafe;
-import io.questdb.std.datetime.microtime.MicrosecondClock;
+import io.questdb.std.datetime.MicrosecondClock;
 import org.jetbrains.annotations.TestOnly;
 
 import java.io.Closeable;
@@ -44,7 +44,8 @@ public abstract class AbstractPool implements Closeable {
     private final long inactiveTtlUs;
     @SuppressWarnings({"FieldCanBeLocal", "FieldMayBeFinal"})
     private volatile int closed = FALSE;
-    private PoolListener eventListener;
+    // keep volatile to avoid races around listener clean up in tests
+    private volatile PoolListener eventListener;
 
     public AbstractPool(CairoConfiguration configuration, long inactiveTtlMillis) {
         this.configuration = configuration;
@@ -55,7 +56,7 @@ public abstract class AbstractPool implements Closeable {
 
     @Override
     public void close() {
-        if (Unsafe.getUnsafe().compareAndSwapInt(this, CLOSED, FALSE, TRUE)) {
+        if (Unsafe.cas(this, CLOSED, FALSE, TRUE)) {
             closePool();
         }
     }
@@ -78,7 +79,7 @@ public abstract class AbstractPool implements Closeable {
 
     @TestOnly
     public boolean reopen() {
-        return Unsafe.getUnsafe().compareAndSwapInt(this, CLOSED, TRUE, FALSE);
+        return Unsafe.cas(this, CLOSED, TRUE, FALSE);
     }
 
     public void setPoolListener(PoolListener eventListener) {
@@ -87,7 +88,7 @@ public abstract class AbstractPool implements Closeable {
 
     protected void closePool() {
         releaseAll(Long.MAX_VALUE);
-        notifyListener(Thread.currentThread().getId(), null, PoolListener.EV_POOL_CLOSED);
+        notifyListener(Thread.currentThread().threadId(), null, PoolListener.EV_POOL_CLOSED);
     }
 
     protected boolean isClosed() {

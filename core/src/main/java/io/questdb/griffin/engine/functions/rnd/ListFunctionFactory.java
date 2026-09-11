@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -25,9 +25,9 @@
 package io.questdb.griffin.engine.functions.rnd;
 
 import io.questdb.cairo.CairoConfiguration;
-import io.questdb.cairo.TableUtils;
 import io.questdb.cairo.sql.Function;
 import io.questdb.cairo.sql.Record;
+import io.questdb.cairo.sql.SymbolTable;
 import io.questdb.cairo.sql.SymbolTableSource;
 import io.questdb.griffin.FunctionFactory;
 import io.questdb.griffin.PlanSink;
@@ -36,9 +36,11 @@ import io.questdb.griffin.SqlExecutionContext;
 import io.questdb.griffin.engine.functions.SymbolFunction;
 import io.questdb.std.IntList;
 import io.questdb.std.ObjList;
+import io.questdb.std.Transient;
 import io.questdb.std.str.Sinkable;
 
 public class ListFunctionFactory implements FunctionFactory {
+
     @Override
     public String getSignature() {
         return "list(V)";
@@ -47,11 +49,14 @@ public class ListFunctionFactory implements FunctionFactory {
     @Override
     public Function newInstance(
             int position,
-            ObjList<Function> args,
-            IntList argPositions,
+            @Transient ObjList<Function> args,
+            @Transient IntList argPositions,
             CairoConfiguration configuration,
             SqlExecutionContext sqlExecutionContext
     ) throws SqlException {
+        if (args == null || args.size() == 0) {
+            throw SqlException.$(position, "no arguments provided");
+        }
         final ObjList<String> symbols = new ObjList<>(args.size());
         RndStringListFunctionFactory.copyConstants(args, argPositions, symbols);
         return new Func(symbols);
@@ -69,7 +74,8 @@ public class ListFunctionFactory implements FunctionFactory {
 
         @Override
         public int getInt(Record rec) {
-            return next();
+            final int key = next();
+            return symbols.getQuick(key) == null ? SymbolTable.VALUE_IS_NULL : key;
         }
 
         @Override
@@ -93,6 +99,24 @@ public class ListFunctionFactory implements FunctionFactory {
         }
 
         @Override
+        public boolean shouldMemoize() {
+            // Every accessor advances the cycle, so getInt() and getSymbol() on one row are two
+            // separate draws. Any consumer that reads both - an all-symbol UNION re-symbolises the
+            // column and then resolves a key against the row's own text - would otherwise see the
+            // key and the text describe different values. Memoizing pins one draw per row.
+            return true;
+        }
+
+        @Override
+        public boolean supportsKeyValueAccess() {
+            // The dictionary is a fixed list built once per cursor, so getInt() returns an index
+            // for a value, or VALUE_IS_NULL for a null slot, and valueOf() resolves it without
+            // touching text. A key consumer (QWP egress) should therefore take the key path and
+            // encode each distinct value once, not once per row.
+            return true;
+        }
+
+        @Override
         public void toPlan(PlanSink sink) {
             sink.val("list(").val((Sinkable) symbols).val(')');
         }
@@ -104,7 +128,11 @@ public class ListFunctionFactory implements FunctionFactory {
 
         @Override
         public CharSequence valueOf(int symbolKey) {
-            return symbols.getQuick(TableUtils.toIndexKey(symbolKey));
+            // Non-null keys are raw indexes into symbols, so valueOf indexes them directly.
+            // Routing through TableUtils.toIndexKey assumed a leading null slot that this list
+            // does not have, which returned the following value for every key and ran off the end
+            // of the list on the last one.
+            return symbolKey > -1 ? symbols.getQuick(symbolKey) : null;
         }
 
         private int next() {

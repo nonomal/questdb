@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,14 +24,13 @@
 
 package io.questdb.cairo;
 
-import io.questdb.std.ThreadLocal;
+import io.questdb.std.CarrierLocal;
 
 public class EntryUnavailableException extends CairoException {
-    private static final ThreadLocal<EntryUnavailableException> tlException = new ThreadLocal<>(EntryUnavailableException::new);
     private String reason;
 
     public static EntryUnavailableException instance(String reason) {
-        EntryUnavailableException ex = tlException.get();
+        EntryUnavailableException ex = new EntryUnavailableException();
         ex.message.clear();
         ex.errno = CairoException.NON_CRITICAL;
         ex.put("table busy [reason=").put(reason).put(']');

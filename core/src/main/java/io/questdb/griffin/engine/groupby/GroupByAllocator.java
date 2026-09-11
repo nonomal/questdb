@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,15 +24,20 @@
 
 package io.questdb.griffin.engine.groupby;
 
+import io.questdb.cairo.Reopenable;
+import io.questdb.std.MemoryTracker;
+import io.questdb.std.Mutable;
 import io.questdb.std.QuietCloseable;
+import org.jetbrains.annotations.Nullable;
 import org.jetbrains.annotations.TestOnly;
 
 /**
- * Specialized allocator used in GROUP BY functions.
+ * Specialized allocator used in GROUP BY functions. The allocator is closed
+ * after query execution.
  * <p>
  * Note: implementations are not necessarily thread-safe.
  */
-public interface GroupByAllocator extends QuietCloseable {
+public interface GroupByAllocator extends QuietCloseable, Mutable, Reopenable {
 
     /**
      * @return allocated chunks total (bytes).
@@ -48,4 +53,13 @@ public interface GroupByAllocator extends QuietCloseable {
     long malloc(long size);
 
     long realloc(long ptr, long oldSize, long newSize);
+
+    /**
+     * Binds the per-query native memory tracker. Must be called before the
+     * allocator hands out any data chunk so that the tracker observes the data
+     * chunks and the GROUP BY function state allocated through them. The
+     * internal chunk index stays on the global counter and is never bound here.
+     * A {@code null} tracker degrades to global-only accounting.
+     */
+    void setMemoryTracker(@Nullable MemoryTracker tracker);
 }

@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -27,6 +27,7 @@ package io.questdb.cairo;
 import io.questdb.cairo.sql.Record;
 import io.questdb.cairo.sql.RecordCursor;
 import io.questdb.cairo.sql.RecordCursorFactory;
+import io.questdb.cairo.sql.TableMetadata;
 import io.questdb.griffin.SqlCompiler;
 import io.questdb.griffin.SqlException;
 import io.questdb.griffin.SqlExecutionContextImpl;
@@ -35,8 +36,15 @@ import io.questdb.log.LogFactory;
 import io.questdb.mp.RingQueue;
 import io.questdb.mp.Sequence;
 import io.questdb.mp.SynchronizedJob;
-import io.questdb.std.*;
-import io.questdb.std.datetime.microtime.MicrosecondClock;
+import io.questdb.std.CharSequenceObjHashMap;
+import io.questdb.std.Chars;
+import io.questdb.std.LongList;
+import io.questdb.std.Misc;
+import io.questdb.std.Mutable;
+import io.questdb.std.Os;
+import io.questdb.std.Rows;
+import io.questdb.std.WeakMutableObjectPool;
+import io.questdb.std.datetime.Clock;
 import io.questdb.tasks.ColumnPurgeTask;
 import org.jetbrains.annotations.TestOnly;
 
@@ -56,14 +64,13 @@ public class ColumnPurgeJob extends SynchronizedJob implements Closeable {
     private static final int TABLE_NAME_COLUMN = 1;
     private static final int TABLE_TRUNCATE_VERSION = 4;
     private static final int UPDATE_TXN_COLUMN = 7;
-    private final MicrosecondClock clock;
+    private final Clock clock;
     private final RingQueue<ColumnPurgeTask> inQueue;
     private final Sequence inSubSequence;
     private final long retryDelay;
     private final long retryDelayLimit;
     private final double retryDelayMultiplier;
     private final PriorityQueue<ColumnPurgeRetryTask> retryQueue;
-    private final DatabaseSnapshotAgent snapshotAgent;
     private final TableToken tableToken;
     private ColumnPurgeOperator columnPurgeOperator;
     private int inErrorCount;
@@ -108,13 +115,16 @@ public class ColumnPurgeJob extends SynchronizedJob implements Closeable {
                                 "completed timestamp" + // 11
                                 ") timestamp(ts) partition by MONTH BYPASS WAL"
                         )
-                        .compile(sqlExecutionContext)
-                        .getTableToken();
+                        .createTable(sqlExecutionContext);
             }
 
-            this.writer = engine.getWriter(tableToken, "QuestDB system");
-            this.columnPurgeOperator = new ColumnPurgeOperator(configuration, this.writer, "completed");
-            this.snapshotAgent = engine.getSnapshotAgent();
+            this.writer = engine.getWriter(tableToken, TableUtils.SYSTEM_WRITER_LOCK_REASON);
+            this.columnPurgeOperator = new ColumnPurgeOperator(
+                    engine,
+                    this.writer,
+                    "completed",
+                    ColumnPurgeOperator.ScoreboardUseMode.BAU_QUEUE_PROCESSING
+            );
             processTableRecords(engine);
         } catch (Throwable th) {
             close();
@@ -215,8 +225,8 @@ public class ColumnPurgeJob extends SynchronizedJob implements Closeable {
                     .$(tableToken.getTableName())
                     .$("\" WHERE completed = null")
                     .compile(sqlExecutionContext).getRecordCursorFactory();
-        } catch (SqlException e) {
-            LOG.error().$("failed to reload column version purge tasks").$((Throwable) e).$();
+        } catch (Throwable e) {
+            LOG.error().$("failed to reload column version purge tasks").$(e).$();
             return;
         }
 
@@ -225,9 +235,20 @@ public class ColumnPurgeJob extends SynchronizedJob implements Closeable {
             assert recordCursorFactory.supportsUpdateRowId(tableToken);
             int count = 0;
 
-            try (RecordCursor records = recordCursorFactory.getCursor(sqlExecutionContext)) {
+            try (
+                    RecordCursor records = recordCursorFactory.getCursor(sqlExecutionContext);
+                    // this is a startup-only activity where we purge columns from the log table
+                    // to ensure purge operator does not have to deal with the complexity of switching operating
+                    // modes dynamically, we create a new instance specifically for startup.
+                    ColumnPurgeOperator columnPurgeOperator = new ColumnPurgeOperator(
+                            engine,
+                            this.writer,
+                            "completed",
+                            ColumnPurgeOperator.ScoreboardUseMode.STARTUP_ONLY
+                    )
+            ) {
                 Record rec = records.getRecord();
-                long lastTs = 0;
+                long lastTs = Long.MIN_VALUE;
                 ColumnPurgeRetryTask task = null;
 
                 CharSequenceObjHashMap<String> stringIntern = new CharSequenceObjHashMap<>();
@@ -239,7 +260,7 @@ public class ColumnPurgeJob extends SynchronizedJob implements Closeable {
                     if (ts != lastTs || task == null) {
                         if (task != null) {
                             if (taskInitialized) {
-                                columnPurgeOperator.purgeExclusive(task);
+                                columnPurgeOperator.purge(task);
                                 taskInitialized = false;
                             }
                         } else {
@@ -257,8 +278,23 @@ public class ColumnPurgeJob extends SynchronizedJob implements Closeable {
                         TableToken token = engine.getTableTokenByDirName(tableName);
 
                         if (token == null || token.getTableId() != tableId) {
-                            LOG.debug().$("table deleted, skipping [tableDir=").utf8(tableName).I$();
+                            LOG.debug().$("table deleted, skipping [tableDir=").$safe(tableName).I$();
+                            lastTs = Long.MIN_VALUE; // reset timestamp to force task initialization on the next iteration
                             continue;
+                        }
+                        int timestampType;
+                        byte indexType = IndexType.BITMAP; // default to BITMAP for backward compatibility
+                        // Read metadata from the user table being purged, not from the
+                        // purge-log table (this.tableToken). Reading the wrong token
+                        // makes timestampType and indexType reflect the log table's
+                        // schema, which silently breaks POSTING file cleanup after
+                        // a restart that replays in-flight purge tasks.
+                        try (TableMetadata metadata = engine.getTableMetadata(token)) {
+                            timestampType = metadata.getTimestampType();
+                            int columnIndex = metadata.getColumnIndexQuiet(columnName);
+                            if (columnIndex > -1) {
+                                indexType = metadata.getColumnIndexType(columnIndex);
+                            }
                         }
 
                         taskInitialized = true;
@@ -268,6 +304,8 @@ public class ColumnPurgeJob extends SynchronizedJob implements Closeable {
                                 tableId,
                                 truncateVersion,
                                 columnType,
+                                indexType,
+                                timestampType,
                                 partitionBy,
                                 updateTxn,
                                 retryDelay,
@@ -275,13 +313,13 @@ public class ColumnPurgeJob extends SynchronizedJob implements Closeable {
                         );
                     }
                     long columnVersion = rec.getLong(COLUMN_VERSION_COLUMN);
-                    long partitionTs = rec.getLong(PARTITION_TIMESTAMP_COLUMN);
+                    long partitionTs = task.getTimestampTypeDriver().fromMicros(rec.getLong(PARTITION_TIMESTAMP_COLUMN));
                     long partitionNameTxn = rec.getLong(PARTITION_NAME_COLUMN);
                     task.appendColumnInfo(columnVersion, partitionTs, partitionNameTxn, rec.getUpdateRowId());
                 }
                 if (task != null) {
                     if (taskInitialized) {
-                        columnPurgeOperator.purgeExclusive(task);
+                        columnPurgeOperator.purge(task);
                     }
                     taskPool.push(task);
                 }
@@ -334,7 +372,7 @@ public class ColumnPurgeJob extends SynchronizedJob implements Closeable {
                 LongList updatedColumnInfo = cleanTask.getUpdatedColumnInfo();
                 for (int i = 0, n = updatedColumnInfo.size(); i < n; i += ColumnPurgeTask.BLOCK_SIZE) {
                     TableWriter.Row row = writer.newRow(cleanTask.timestamp);
-                    row.putSym(TABLE_NAME_COLUMN, cleanTask.getTableName().getDirName());
+                    row.putSym(TABLE_NAME_COLUMN, cleanTask.getTableToken().getDirName());
                     row.putSym(COLUMN_NAME_COLUMN, cleanTask.getColumnName());
                     row.putInt(TABLE_ID_COLUMN, cleanTask.getTableId());
                     row.putLong(TABLE_TRUNCATE_VERSION, cleanTask.getTruncateVersion());
@@ -342,7 +380,9 @@ public class ColumnPurgeJob extends SynchronizedJob implements Closeable {
                     row.putInt(PARTITION_BY_COLUMN, cleanTask.getPartitionBy());
                     row.putLong(UPDATE_TXN_COLUMN, cleanTask.getUpdateTxn());
                     row.putLong(COLUMN_VERSION_COLUMN, updatedColumnInfo.getQuick(i + ColumnPurgeTask.OFFSET_COLUMN_VERSION));
-                    row.putTimestamp(PARTITION_TIMESTAMP_COLUMN, updatedColumnInfo.getQuick(i + ColumnPurgeTask.OFFSET_PARTITION_TIMESTAMP));
+                    // We always store `timestamp_micro` types in `column_versions_purge_log` to maintain uniformity in table output.
+                    // This doesn't result in any loss of precision when restore from table, as the `PARTITION BY` unit is larger than nanos (the nanosecond portion is always 0).
+                    row.putTimestamp(PARTITION_TIMESTAMP_COLUMN, cleanTask.getTimestampTypeDriver().toMicros(updatedColumnInfo.getQuick(i + ColumnPurgeTask.OFFSET_PARTITION_TIMESTAMP)));
                     row.putLong(PARTITION_NAME_COLUMN, updatedColumnInfo.getQuick(i + ColumnPurgeTask.OFFSET_PARTITION_NAME_TXN));
                     row.append();
                     updatedColumnInfo.setQuick(
@@ -363,10 +403,6 @@ public class ColumnPurgeJob extends SynchronizedJob implements Closeable {
     @Override
     protected boolean runSerially() {
         if (inErrorCount >= MAX_ERRORS) {
-            return false;
-        }
-        if (snapshotAgent.isInProgress()) {
-            // No deletion must happen while a snapshot is in-flight.
             return false;
         }
 
@@ -408,16 +444,18 @@ public class ColumnPurgeJob extends SynchronizedJob implements Closeable {
 
         public void of(
                 TableToken tableName,
-                CharSequence columnName,
+                String columnName,
                 int tableId,
                 long truncateVersion,
                 int columnType,
+                byte indexType,
+                int timestampType,
                 int partitionBy,
                 long updateTxn,
                 long retryDelay,
                 long microTime
         ) {
-            super.of(tableName, columnName, tableId, truncateVersion, columnType, partitionBy, updateTxn);
+            super.of(tableName, columnName, tableId, truncateVersion, columnType, indexType, timestampType, partitionBy, updateTxn);
             this.retryDelay = retryDelay;
             nextRunTimestamp = microTime;
         }

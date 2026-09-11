@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -83,6 +83,27 @@ public final class Uuid implements Sinkable {
                 || uuid.byteAt(FOURTH_DASH_POS) != '-') {
             throw NumericException.INSTANCE;
         }
+    }
+
+    // this method is used by RecordComparatorCompiler byte-code generator
+    public static int compare(long aHi, long aLo, long bHi, long bLo) {
+        // the impl intentionally uses unsigned comparisons
+        // note: there is a bug in OpenJDK impl: https://bugs.openjdk.org/browse/JDK-7025832
+        // so this method generates a different ordering than UUID compareTo() from JDK
+
+        // First, we need to check if either of the UUIDs is null
+        if (isNull(aLo, aHi)) {
+            return isNull(bLo, bHi) ? 0 : -1;
+        } else if (isNull(bLo, bHi)) {
+            return 1;
+        }
+
+        int compHi = Long.compareUnsigned(aHi, bHi);
+        if (compHi != 0) {
+            return compHi;
+        }
+
+        return Long.compareUnsigned(aLo, bLo);
     }
 
     /**

@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -25,14 +25,17 @@
 package io.questdb.test.griffin.engine.functions;
 
 import io.questdb.cairo.ImplicitCastException;
+import io.questdb.cairo.NanosTimestampDriver;
+import io.questdb.cairo.sql.Function;
 import io.questdb.cairo.sql.Record;
 import io.questdb.griffin.engine.functions.VarcharFunction;
+import io.questdb.griffin.engine.functions.cast.CastVarcharToSymbolFunctionFactory;
 import io.questdb.griffin.engine.functions.constants.VarcharConstant;
 import io.questdb.std.Numbers;
 import io.questdb.std.NumericException;
-import io.questdb.std.datetime.microtime.TimestampFormatUtils;
+import io.questdb.std.ObjList;
 import io.questdb.std.str.Utf8Sequence;
-import io.questdb.std.str.Utf8Sink;
+import io.questdb.std.str.Utf8String;
 import io.questdb.test.tools.TestUtils;
 import org.jetbrains.annotations.NotNull;
 import org.junit.Assert;
@@ -60,10 +63,6 @@ public class VarcharFunctionTest {
 
     private static final VarcharFunction function = new VarcharFunction() {
         @Override
-        public void getVarchar(Record rec, Utf8Sink utf8Sink) {
-        }
-
-        @Override
         public Utf8Sequence getVarcharA(Record rec) {
             return utf8Seq;
         }
@@ -73,6 +72,31 @@ public class VarcharFunctionTest {
             return utf8Seq;
         }
     };
+
+    @Test
+    public void testCastMalformedVarcharToSymbol() {
+        final Utf8Sequence malformed = new Utf8String(new byte[]{'1', (byte) 0xC3}, false);
+        final ObjList<Function> args = new ObjList<>();
+        args.add(new VarcharFunction() {
+            @Override
+            public Utf8Sequence getVarcharA(Record rec) {
+                return malformed;
+            }
+
+            @Override
+            public Utf8Sequence getVarcharB(Record rec) {
+                return malformed;
+            }
+
+            @Override
+            public boolean isConstant() {
+                return true;
+            }
+        });
+        try (Function cast = new CastVarcharToSymbolFunctionFactory().newInstance(0, args, null, null, null)) {
+            Assert.assertNull(cast.getSymbol(null));
+        }
+    }
 
     @Test
     public void testCastStrToChar() {
@@ -124,9 +148,9 @@ public class VarcharFunctionTest {
         }
     }
 
-    @Test(expected = UnsupportedOperationException.class)
+    @Test
     public void testCastToDate() {
-        new VarcharConstant("2021-09-10T10:12:33.887Z").getDate(null);
+        Assert.assertEquals(1631268753887L, new VarcharConstant("2021-09-10T10:12:33.887Z").getDate(null));
     }
 
     @Test
@@ -401,7 +425,7 @@ public class VarcharFunctionTest {
 
     @Test
     public void testCastToTimestamp() throws NumericException {
-        Assert.assertEquals(TimestampFormatUtils.parseTimestamp("2021-09-10T10:12:33.887889Z"), new VarcharConstant("2021-09-10T10:12:33.887889").getTimestamp(null));
+        Assert.assertEquals(NanosTimestampDriver.INSTANCE.parseFloorLiteral("2021-09-10T10:12:33.887889Z"), new VarcharConstant("2021-09-10T10:12:33.887889").getTimestamp(null));
     }
 
     @Test
@@ -410,7 +434,7 @@ public class VarcharFunctionTest {
             new VarcharConstant("").getTimestamp(null);
             Assert.fail();
         } catch (ImplicitCastException e) {
-            TestUtils.assertContains(e.getFlyweightMessage(), "inconvertible value: `` [VARCHAR -> TIMESTAMP]");
+            TestUtils.assertContains(e.getFlyweightMessage(), "inconvertible value: `` [VARCHAR -> TIMESTAMP_NS]");
         }
     }
 
@@ -440,6 +464,11 @@ public class VarcharFunctionTest {
     }
 
     @Test(expected = UnsupportedOperationException.class)
+    public void testGetArray() {
+        function.getArray(null);
+    }
+
+    @Test(expected = UnsupportedOperationException.class)
     public void testGetBin() {
         function.getBin(null);
     }
@@ -455,23 +484,33 @@ public class VarcharFunctionTest {
     }
 
     @Test(expected = UnsupportedOperationException.class)
-    public void testGetRecordCursorFactory() {
-        function.getRecordCursorFactory();
+    public void testGetDecimal128() {
+        function.getDecimal128(null, null);
     }
 
-    @Test
-    public void testGetStrLen() {
-        Assert.assertEquals(1, function.getStrLen(null));
+    @Test(expected = UnsupportedOperationException.class)
+    public void testGetDecimal16() {
+        function.getDecimal16(null);
     }
 
-    @Test
-    public void testGetSymbol() {
-        TestUtils.assertEquals("a", function.getSymbol(null));
+    @Test(expected = UnsupportedOperationException.class)
+    public void testGetDecimal256() {
+        function.getDecimal256(null, null);
     }
 
-    @Test
-    public void testGetSymbolB() {
-        TestUtils.assertEquals("a", function.getSymbolB(null));
+    @Test(expected = UnsupportedOperationException.class)
+    public void testGetDecimal32() {
+        function.getDecimal32(null);
+    }
+
+    @Test(expected = UnsupportedOperationException.class)
+    public void testGetDecimal64() {
+        function.getDecimal64(null);
+    }
+
+    @Test(expected = UnsupportedOperationException.class)
+    public void testGetDecimal8() {
+        function.getDecimal8(null);
     }
 
     @Test(expected = UnsupportedOperationException.class)
@@ -497,5 +536,44 @@ public class VarcharFunctionTest {
     @Test(expected = UnsupportedOperationException.class)
     public void testGetLong256B() {
         function.getLong256B(null);
+    }
+
+    @Test(expected = UnsupportedOperationException.class)
+    public void testGetRecordCursorFactory() {
+        function.getRecordCursorFactory();
+    }
+
+    @Test
+    public void testGetStrLen() {
+        Assert.assertEquals(1, function.getStrLen(null));
+    }
+
+    @Test
+    public void testGetStrRejectsMalformedUtf8() {
+        final Utf8Sequence malformed = new Utf8String(new byte[]{'1', (byte) 0xC3}, false);
+        final VarcharFunction malformedFunction = new VarcharFunction() {
+            @Override
+            public Utf8Sequence getVarcharA(Record rec) {
+                return malformed;
+            }
+
+            @Override
+            public Utf8Sequence getVarcharB(Record rec) {
+                return malformed;
+            }
+        };
+
+        Assert.assertNull(malformedFunction.getStrA(null));
+        Assert.assertNull(malformedFunction.getStrB(null));
+    }
+
+    @Test
+    public void testGetSymbol() {
+        TestUtils.assertEquals("a", function.getSymbol(null));
+    }
+
+    @Test
+    public void testGetSymbolB() {
+        TestUtils.assertEquals("a", function.getSymbolB(null));
     }
 }

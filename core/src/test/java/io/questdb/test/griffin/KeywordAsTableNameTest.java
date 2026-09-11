@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -30,67 +30,72 @@ import org.junit.Assert;
 import org.junit.Test;
 
 public class KeywordAsTableNameTest extends AbstractCairoTest {
+
     @Test
     public void testAlterTable() throws Exception {
         assertMemoryLeak(() -> {
-            ddl("create table \"table\" (a int)");
-            assertException("alter table table add column b float", 12, "table and column names that are SQL keywords have to be enclosed in double quotes, such as \"table\"");
-            assertSql(
-                    "column\ttype\tindexed\tindexBlockCapacity\tsymbolCached\tsymbolCapacity\tdesignated\tupsertKey\n" +
-                            "a\tINT\tfalse\t0\tfalse\t0\tfalse\tfalse\n",
-                    "table_columns('table')"
-            );
-            ddl("alter table \"table\" add column b float");
-            assertSql(
-                    "column\ttype\tindexed\tindexBlockCapacity\tsymbolCached\tsymbolCapacity\tdesignated\tupsertKey\n" +
-                            "a\tINT\tfalse\t0\tfalse\t0\tfalse\tfalse\n" +
-                            "b\tFLOAT\tfalse\t256\tfalse\t0\tfalse\tfalse\n",
-                    "table_columns('table')"
-            );
-        });
-    }
-
-    @Test
-    public void testVacuumTable() throws Exception {
-        assertMemoryLeak(() -> {
-            ddl("create table \"table\" (a int)");
-            assertException("vacuum table table", 13, "table and column names that are SQL keywords have to be enclosed in double quotes, such as \"table\"");
-            ddl("vacuum table \"table\"");
+            execute("create table \"table\" (a int)");
+            assertQuery("alter table table add column b float")
+                    .noLeakCheck()
+                    .fails(12, "table and column names that are SQL keywords have to be enclosed in double quotes, such as \"table\"");
+            assertQuery("table_columns('table')")
+                    .noLeakCheck()
+                    .noRandomAccess()
+                    .returns("""
+                            column\ttype\tindexed\tindexBlockCapacity\tsymbolCached\tsymbolCapacity\tsymbolTableSize\tdesignated\tupsertKey\tindexType\tindexInclude
+                            a\tINT\tfalse\t0\tfalse\t0\t0\tfalse\tfalse\t\t
+                            """);
+            execute("alter table \"table\" add column b float");
+            assertQuery("table_columns('table')")
+                    .noLeakCheck()
+                    .noRandomAccess()
+                    .returns("""
+                            column\ttype\tindexed\tindexBlockCapacity\tsymbolCached\tsymbolCapacity\tsymbolTableSize\tdesignated\tupsertKey\tindexType\tindexInclude
+                            a\tINT\tfalse\t0\tfalse\t0\t0\tfalse\tfalse\t\t
+                            b\tFLOAT\tfalse\t256\tfalse\t0\t0\tfalse\tfalse\t\t
+                            """);
         });
     }
 
     @Test
     public void testCreateTable() throws Exception {
         assertMemoryLeak(() -> {
-            assertException("create table from (a int)", 13, "table and column names that are SQL keywords have to be enclosed in double quotes, such as \"from\"");
-            ddl("create table \"from\" (a int)");
-            assertSql(
-                    "column\ttype\tindexed\tindexBlockCapacity\tsymbolCached\tsymbolCapacity\tdesignated\tupsertKey\n" +
-                            "a\tINT\tfalse\t0\tfalse\t0\tfalse\tfalse\n",
-                    "table_columns('from')"
-            );
+            assertQuery("create table from (a int)")
+                    .fails(13, "table and column names that are SQL keywords have to be enclosed in double quotes, such as \"from\"");
+            execute("create table \"from\" (a int)");
+            assertQuery("table_columns('from')")
+                    .noLeakCheck()
+                    .noRandomAccess()
+                    .returns("""
+                            column\ttype\tindexed\tindexBlockCapacity\tsymbolCached\tsymbolCapacity\tsymbolTableSize\tdesignated\tupsertKey\tindexType\tindexInclude
+                            a\tINT\tfalse\t0\tfalse\t0\t0\tfalse\tfalse\t\t
+                            """);
         });
     }
 
     @Test
     public void testCreateTableColumn() throws Exception {
         assertMemoryLeak(() -> {
-            assertException("create table a (from int)", 16, "table and column names that are SQL keywords have to be enclosed in double quotes, such as \"from\"");
-            ddl("create table a (\"from\" int)");
-            assertSql(
-                    "column\ttype\tindexed\tindexBlockCapacity\tsymbolCached\tsymbolCapacity\tdesignated\tupsertKey\n" +
-                            "from\tINT\tfalse\t0\tfalse\t0\tfalse\tfalse\n",
-                    "table_columns('a')"
-            );
+            assertQuery("create table a (from int)")
+                    .fails(16, "table and column names that are SQL keywords have to be enclosed in double quotes, such as \"from\"");
+            execute("create table a (\"from\" int)");
+            assertQuery("table_columns('a')")
+                    .noLeakCheck()
+                    .noRandomAccess()
+                    .returns("""
+                            column\ttype\tindexed\tindexBlockCapacity\tsymbolCached\tsymbolCapacity\tsymbolTableSize\tdesignated\tupsertKey\tindexType\tindexInclude
+                            from\tINT\tfalse\t0\tfalse\t0\t0\tfalse\tfalse\t\t
+                            """);
         });
     }
 
     @Test
     public void testDropTable() throws Exception {
         assertMemoryLeak(() -> {
-            ddl("create table \"select\" (a int)");
-            assertException("drop table select", 11, "table and column names that are SQL keywords have to be enclosed in double quotes, such as \"select\"");
-            drop("drop table \"select\"");
+            execute("create table \"select\" (a int)");
+            assertQuery("drop table select")
+                    .fails(11, "table and column names that are SQL keywords have to be enclosed in double quotes, such as \"select\"");
+            execute("drop table \"select\"");
             Assert.assertEquals(TableUtils.TABLE_DOES_NOT_EXIST, engine.getTableStatus("select"));
         });
     }
@@ -98,185 +103,242 @@ public class KeywordAsTableNameTest extends AbstractCairoTest {
     @Test
     public void testInsert() throws Exception {
         assertMemoryLeak(() -> {
-            ddl("create table \"table\" (a int)");
-            assertException("insert into table values(10)", 12, "table and column names that are SQL keywords have to be enclosed in double quotes, such as \"table\"");
-            insert("insert into \"table\" values(10)");
-            assertSql(
-                    "a\n" +
-                            "10\n",
-                    "\"table\""
-            );
+            execute("create table \"table\" (a int)");
+            assertQuery("insert into table values(10)")
+                    .fails(12, "table and column names that are SQL keywords have to be enclosed in double quotes, such as \"table\"");
+            execute("insert into \"table\" values(10)");
+            assertQuery("\"table\"")
+                    .noLeakCheck()
+                    .expectSize()
+                    .returns("""
+                            a
+                            10
+                            """);
         });
     }
 
     @Test
     public void testInsertColumn() throws Exception {
         assertMemoryLeak(() -> {
-            ddl("create table \"from\" (\"from\" int)");
-            assertException("insert into \"from\" (from) values(50)", 20, "table and column names that are SQL keywords have to be enclosed in double quotes, such as \"from\"");
-            insert("insert into \"from\" (\"from\") values(50)");
-            assertSql(
-                    "from\n" +
-                            "50\n",
-                    "select * from \"from\""
-            );
+            execute("create table \"from\" (\"from\" int)");
+            assertQuery("insert into \"from\" (from) values(50)")
+                    .fails(20, "table and column names that are SQL keywords have to be enclosed in double quotes, such as \"from\"");
+            execute("insert into \"from\" (\"from\") values(50)");
+            assertQuery("select * from \"from\"")
+                    .noLeakCheck()
+                    .expectSize()
+                    .returns("""
+                            from
+                            50
+                            """);
 
-            assertSql(
-                    "from\n" +
-                            "50\n",
-                    "\"from\""
-            );
+            assertQuery("\"from\"")
+                    .noLeakCheck()
+                    .expectSize()
+                    .returns("""
+                            from
+                            50
+                            """);
             // alias cannot be unquoted keyword
-            assertException("select a from \"from\" select", 21, "table and column names that are SQL keywords have to be enclosed in double quotes, such as \"select\"");
+            assertQuery("select a from \"from\" select")
+                    .fails(21, "table and column names that are SQL keywords have to be enclosed in double quotes, such as \"select\"");
         });
     }
 
     @Test
     public void testRenameTable() throws Exception {
         assertMemoryLeak(() -> {
-            ddl("create table \"from\" (a int)");
-            assertException("rename table from to to", 13, "table and column names that are SQL keywords have to be enclosed in double quotes, such as \"from\"");
-            assertException("rename table \"from\" to to", 23, "table and column names that are SQL keywords have to be enclosed in double quotes, such as \"to\"");
-            ddl("rename table \"from\" to \"to\"");
-            assertSql(
-                    "id\ttable_name\tdesignatedTimestamp\tpartitionBy\tmaxUncommittedRows\to3MaxLag\twalEnabled\tdirectoryName\tdedup\n" +
-                            "1\tto\t\tNONE\t1000\t300000000\tfalse\tto~\tfalse\n", "tables()"
-            );
+            execute("create table \"from\" (a int)");
+            assertQuery("rename table from to to")
+                    .fails(13, "table and column names that are SQL keywords have to be enclosed in double quotes, such as \"from\"");
+            assertQuery("rename table \"from\" to to")
+                    .fails(23, "table and column names that are SQL keywords have to be enclosed in double quotes, such as \"to\"");
+            execute("rename table \"from\" to \"to\"");
+            assertQuery("select id, table_name, designatedTimestamp, partitionBy, maxUncommittedRows, o3MaxLag, walEnabled, directoryName, dedup, ttlValue, ttlUnit, matView from tables()")
+                    .noLeakCheck()
+                    .expectSize()
+                    .noRandomAccess()
+                    .returns("""
+                            id\ttable_name\tdesignatedTimestamp\tpartitionBy\tmaxUncommittedRows\to3MaxLag\twalEnabled\tdirectoryName\tdedup\tttlValue\tttlUnit\tmatView
+                            1\tto\t\tNONE\t1000\t300000000\tfalse\tto~\tfalse\t0\tHOUR\tfalse
+                            """);
         });
     }
 
     @Test
     public void testSelect() throws Exception {
         assertMemoryLeak(() -> {
-            ddl("create table \"from\" (a int)");
-            insert("insert into \"from\" values(50)");
-            assertException("select a from from", 14, "table and column names that are SQL keywords have to be enclosed in double quotes, such as \"from\"");
-            assertSql(
-                    "a\n" +
-                            "50\n",
-                    "select * from \"from\""
-            );
+            execute("create table \"from\" (a int)");
+            execute("insert into \"from\" values(50)");
+            assertQuery("select a from from")
+                    .fails(14, "table and column names that are SQL keywords have to be enclosed in double quotes, such as \"from\"");
+            assertQuery("select * from \"from\"")
+                    .noLeakCheck()
+                    .expectSize()
+                    .returns("""
+                            a
+                            50
+                            """);
 
-            assertSql(
-                    "a\n" +
-                            "50\n",
-                    "\"from\""
-            );
+            assertQuery("\"from\"")
+                    .noLeakCheck()
+                    .expectSize()
+                    .returns("""
+                            a
+                            50
+                            """);
             // alias cannot be unquoted keyword
-            assertException("select a from \"from\" select", 21, "table and column names that are SQL keywords have to be enclosed in double quotes, such as \"select\"");
+            assertQuery("select a from \"from\" select")
+                    .fails(21, "table and column names that are SQL keywords have to be enclosed in double quotes, such as \"select\"");
         });
     }
 
     @Test
     public void testSelectColumn() throws Exception {
         assertMemoryLeak(() -> {
-            ddl("create table \"from\" (\"from\" int)");
-            insert("insert into \"from\" values(50)");
-            assertException("select from from from", 7, "column expression expected");
-            assertSql(
-                    "from\n" +
-                            "50\n",
-                    "select * from \"from\""
-            );
+            execute("create table \"from\" (\"from\" int)");
+            execute("insert into \"from\" values(50)");
+            assertQuery("select from from from")
+                    .fails(7, "column expression expected");
+            assertQuery("select * from \"from\"")
+                    .noLeakCheck()
+                    .expectSize()
+                    .returns("""
+                            from
+                            50
+                            """);
 
             // alias cannot be unquoted keyword
-            assertException("select \"from\" select from \"from\"", 14, "table and column names that are SQL keywords have to be enclosed in double quotes, such as \"select\"");
+            assertQuery("select \"from\" select from \"from\"")
+                    .fails(14, "table and column names that are SQL keywords have to be enclosed in double quotes, such as \"select\"");
             // alias via "as" cannot be unquoted
-            assertException("select \"from\" as select from \"from\"", 17, "table and column names that are SQL keywords have to be enclosed in double quotes, such as \"select\"");
+            assertQuery("select \"from\" as select from \"from\"")
+                    .fails(17, "table and column names that are SQL keywords have to be enclosed in double quotes, such as \"select\"");
             // column name cannot be unquoted when referenced via .
-            assertException("select a.from from \"from\" a", 9, "table and column names that are SQL keywords have to be enclosed in double quotes, such as \"from\"");
+            assertQuery("select a.from from \"from\" a")
+                    .fails(9, "table and column names that are SQL keywords have to be enclosed in double quotes, such as \"from\"");
 
 
             // simple alias
-            assertSql(
-                    "select\n" +
-                            "50\n",
-                    "select \"from\" \"select\" from \"from\""
-            );
+            assertQuery("select \"from\" \"select\" from \"from\"")
+                    .noLeakCheck()
+                    .expectSize()
+                    .returns("""
+                            select
+                            50
+                            """);
 
             // alias via "as"
-            assertSql(
-                    "select\n" +
-                            "50\n",
-                    "select \"from\" as \"select\" from \"from\""
-            );
+            assertQuery("select \"from\" as \"select\" from \"from\"")
+                    .noLeakCheck()
+                    .expectSize()
+                    .returns("""
+                            select
+                            50
+                            """);
 
-            assertSql(
-                    "from\n" +
-                            "50\n",
-                    "select a.\"from\" from \"from\" a"
-            );
+            assertQuery("select a.\"from\" from \"from\" a")
+                    .noLeakCheck()
+                    .expectSize()
+                    .returns("""
+                            from
+                            50
+                            """);
         });
     }
 
     @Test
     public void testSelectOrderBy() throws Exception {
         assertMemoryLeak(() -> {
-            ddl("create table t (\"from\" int)");
-            insert("insert into t values(50)");
-            assertException("select * from t order by from", 25, "table and column names that are SQL keywords have to be enclosed in double quotes, such as \"from\"");
-            assertSql(
-                    "from\n" +
-                            "50\n",
-                    "select * from t order by \"from\""
-
-            );
+            execute("create table t (\"from\" int)");
+            execute("insert into t values(50)");
+            assertQuery("select * from t order by from")
+                    .fails(25, "table and column names that are SQL keywords have to be enclosed in double quotes, such as \"from\"");
+            assertQuery("select * from t order by \"from\"")
+                    .noLeakCheck()
+                    .expectSize()
+                    .returns("""
+                            from
+                            50
+                            """);
         });
     }
 
     @Test
     public void testSelectWithAlias() throws Exception {
         assertMemoryLeak(() -> {
-            ddl("create table \"from\" (\"from\" int)");
-            insert("insert into \"from\" values(50)");
-            assertException("with select as (select * from \"from\") select * from \"select\"", 5, "table and column names that are SQL keywords have to be enclosed in double quotes, such as \"select\"");
-            assertSql(
-                    "from\n" +
-                            "50\n",
-                    "with \"select\" as (select * from \"from\") select * from \"select\""
-
-            );
+            execute("create table \"from\" (\"from\" int)");
+            execute("insert into \"from\" values(50)");
+            assertQuery("with select as (select * from \"from\") select * from \"select\"")
+                    .fails(5, "table and column names that are SQL keywords have to be enclosed in double quotes, such as \"select\"");
+            assertQuery("with \"select\" as (select * from \"from\") select * from \"select\"")
+                    .noLeakCheck()
+                    .expectSize()
+                    .returns("""
+                            from
+                            50
+                            """);
         });
     }
 
     @Test
     public void testUpdate() throws Exception {
         assertMemoryLeak(() -> {
-            ddl("create table \"table\" (a int)");
-            insert("insert into \"table\" values(10)");
-            assertException("update table set a = 20", 7, "table and column names that are SQL keywords have to be enclosed in double quotes, such as \"table\"");
+            execute("create table \"table\" (a int)");
+            execute("insert into \"table\" values(10)");
+            assertQuery("update table set a = 20")
+                    .fails(7, "table and column names that are SQL keywords have to be enclosed in double quotes, such as \"table\"");
             // alias cannot be keyword either
-            assertException("update \"table\" table set a = 20", 15, "table and column names that are SQL keywords have to be enclosed in double quotes, such as \"table\"");
+            assertQuery("update \"table\" table set a = 20")
+                    .fails(15, "table and column names that are SQL keywords have to be enclosed in double quotes, such as \"table\"");
             update("update \"table\" set a = 20");
-            assertSql(
-                    "a\n" +
-                            "20\n",
-                    "\"table\""
-            );
+            assertQuery("\"table\"")
+                    .noLeakCheck()
+                    .expectSize()
+                    .returns("""
+                            a
+                            20
+                            """);
 
-            assertException("update \"table\" \"from set a = 30", 15, "unclosed quotation mark");
+            assertQuery("update \"table\" \"from set a = 30")
+                    .fails(15, "unclosed quotation mark");
 
-            assertSql(
-                    "a\n" +
-                            "20\n",
-                    "\"table\""
-            );
+            assertQuery("\"table\"")
+                    .noLeakCheck()
+                    .expectSize()
+                    .returns("""
+                            a
+                            20
+                            """);
 
             update("update \"table\" \"from\" set a = 30");
-            assertSql(
-                    "a\n" +
-                            "30\n",
-                    "\"table\""
-            );
+            assertQuery("\"table\"")
+                    .noLeakCheck()
+                    .expectSize()
+                    .returns("""
+                            a
+                            30
+                            """);
         });
     }
 
     @Test
     public void testVacuum() throws Exception {
         assertMemoryLeak(() -> {
-            ddl("create table \"from\" (a int)");
-            assertException("vacuum table from", 13, "table and column names that are SQL keywords have to be enclosed in double quotes, such as \"from\"");
-            ddl("vacuum table \"from\"");
+            execute("create table \"from\" (a int)");
+            assertQuery("vacuum table from")
+                    .fails(13, "table and column names that are SQL keywords have to be enclosed in double quotes, such as \"from\"");
+            execute("vacuum table \"from\"");
+        });
+    }
+
+    @Test
+    public void testVacuumTable() throws Exception {
+        assertMemoryLeak(() -> {
+            execute("create table \"table\" (a int)");
+            assertQuery("vacuum table table")
+                    .fails(13, "table and column names that are SQL keywords have to be enclosed in double quotes, such as \"table\"");
+            execute("vacuum table \"table\"");
         });
     }
 

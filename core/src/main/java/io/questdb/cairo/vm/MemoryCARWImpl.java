@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,12 +24,19 @@
 
 package io.questdb.cairo.vm;
 
+import io.questdb.cairo.CairoException;
 import io.questdb.cairo.vm.api.MemoryCARW;
 import io.questdb.griffin.engine.LimitOverflowException;
 import io.questdb.log.Log;
 import io.questdb.log.LogFactory;
-import io.questdb.std.*;
+import io.questdb.std.Long256Acceptor;
+import io.questdb.std.MemoryTracker;
+import io.questdb.std.Mutable;
+import io.questdb.std.Numbers;
+import io.questdb.std.Unsafe;
+import io.questdb.std.Vect;
 import org.jetbrains.annotations.NotNull;
+import org.jetbrains.annotations.Nullable;
 
 /**
  * A version of {@link MemoryPARWImpl} that uses a single contiguous memory region instead of pages.
@@ -41,15 +48,32 @@ public class MemoryCARWImpl extends AbstractMemoryCR implements MemoryCARW, Muta
     private static final Log LOG = LogFactory.getLog(MemoryCARWImpl.class);
     private final Long256Acceptor long256Acceptor = this::putLong256;
     private final int maxPages;
+    private final String maxPagesConfigKey;
     private final int memoryTag;
     private long appendAddress = 0;
+    // Per-query native memory tracker bound by the owning factory / function at
+    // cursor or init() time. Null when no per-query limit applies; all
+    // Unsafe.{malloc,realloc,free} calls degrade to the global-only overloads
+    // in that case. The class is lazy by design (the constructor does not
+    // allocate native memory), so a setter is enough (no openOnInit knob).
+    @Nullable
+    private MemoryTracker memoryTracker;
     private long sizeMsb;
 
     public MemoryCARWImpl(long pageSize, int maxPages, int memoryTag) {
-        super(false);
+        this(pageSize, maxPages, memoryTag, null);
+    }
+
+    public MemoryCARWImpl(long pageSize, int maxPages, int memoryTag, String maxPagesConfigKey) {
         this.memoryTag = memoryTag;
         this.maxPages = maxPages;
+        this.maxPagesConfigKey = maxPagesConfigKey;
         setPageSize(pageSize);
+    }
+
+    @Override
+    public long addressHi() {
+        return lim;
     }
 
     @Override
@@ -71,7 +95,7 @@ public class MemoryCARWImpl extends AbstractMemoryCR implements MemoryCARW, Muta
         super.clear();
         if (pageAddress != 0) {
             long baseLength = lim - pageAddress;
-            Unsafe.free(pageAddress, baseLength, memoryTag);
+            Unsafe.free(pageAddress, baseLength, memoryTag, memoryTracker);
             handleMemoryReleased();
             size = 0;
         }
@@ -83,6 +107,24 @@ public class MemoryCARWImpl extends AbstractMemoryCR implements MemoryCARW, Muta
         pageAddress = 0;
         lim = 0;
         appendAddress = 0;
+    }
+
+    /**
+     * Hands this buffer's outstanding tracker charge to the tracker's covered-bytes ledger and
+     * switches to global-only accounting. For a buffer whose native free is DEFERRED past the
+     * lifetime of its per-query tracker (e.g. a live-view tier slot a reader pins across a DROP or
+     * invalidate): {@link MemoryTracker#reconcileCovered()} removes the charge from the pooled
+     * tracker's {@code used} at its release, so it recycles clean, and the later global-only free
+     * debits no recycled tracker block. A no-op when no tracker is bound. After this call the buffer
+     * accounts globally only, so it must not be used to grow further under a per-query cap.
+     */
+    public void detachMemoryTracker() {
+        if (memoryTracker != null) {
+            if (pageAddress != 0) {
+                memoryTracker.addCoveredBytes(lim - pageAddress);
+            }
+            memoryTracker = null;
+        }
     }
 
     @Override
@@ -101,7 +143,7 @@ public class MemoryCARWImpl extends AbstractMemoryCR implements MemoryCARW, Muta
     }
 
     @Override
-    public int getFd() {
+    public long getFd() {
         return -1;
     }
 
@@ -117,13 +159,20 @@ public class MemoryCARWImpl extends AbstractMemoryCR implements MemoryCARW, Muta
      *
      * @param offset position from 0 in virtual memory.
      */
+    @Override
     public void jumpTo(long offset) {
         checkAndExtend(pageAddress + offset);
         appendAddress = pageAddress + offset;
     }
 
+    @Override
     public final void putLong256(@NotNull CharSequence hexString, int start, int end) {
         putLong256(hexString, start, end, long256Acceptor);
+    }
+
+    @Override
+    public void setMemoryTracker(@Nullable MemoryTracker tracker) {
+        this.memoryTracker = tracker;
     }
 
     /**
@@ -163,29 +212,60 @@ public class MemoryCARWImpl extends AbstractMemoryCR implements MemoryCARW, Muta
         extend0(address - pageAddress);
     }
 
-    private void extend0(long size) {
-        if (size == 0 && pageAddress == 0) {
+    private void extend0(final long requiredSize) {
+        if (requiredSize == 0 && pageAddress == 0) {
             return;
         }
 
-        long nPages = size > 0 ? ((size - 1) >>> sizeMsb) + 1 : 1;
-        size = nPages << sizeMsb;
         final long oldSize = size();
+        long newPageCount = getNewPageCount(requiredSize, oldSize);
+        long newSize = newPageCount << sizeMsb;
 
         // sometimes the resize request ends up being the same
         // as existing memory size
-        if (size == oldSize) {
+        if (newSize <= oldSize && requiredSize > 0) {
             return;
         }
 
-        if (nPages > maxPages) {
-            throw LimitOverflowException.instance().put("Maximum number of pages (").put(maxPages).put(") breached in VirtualMemory");
+        if (newPageCount > maxPages) {
+            LimitOverflowException ex = LimitOverflowException.instance();
+            ex.put("Maximum number of pages (").put(maxPages).put(") breached in VirtualMemory");
+            if (maxPagesConfigKey != null) {
+                ex.put(" (raise ").put(maxPagesConfigKey).put(')');
+            }
+            throw ex;
         }
-        final long newBaseAddress = reallocateMemory(pageAddress, size(), size);
+
+        long newBaseAddress;
+        try {
+            newBaseAddress = reallocateMemory(pageAddress, size(), newSize);
+        } catch (CairoException e) {
+            if (e.isOutOfMemory()) {
+                // allocate exact number of pages, without doubling
+                newPageCount = getNewPageCount(requiredSize, 0);
+                newSize = newPageCount << sizeMsb;
+                newBaseAddress = reallocateMemory(pageAddress, size(), newSize);
+            } else {
+                throw e;
+            }
+
+        }
         if (oldSize > 0) {
-            LOG.debug().$("extended [oldBase=").$(pageAddress).$(", newBase=").$(newBaseAddress).$(", oldSize=").$(oldSize).$(", newSize=").$(size).$(']').$();
+            LOG.debug().$("extended [oldBase=").$(pageAddress).$(", newBase=").$(newBaseAddress).$(", oldSize=").$(oldSize).$(", newSize=").$(newSize).$(']').$();
         }
-        handleMemoryReallocation(newBaseAddress, size);
+        handleMemoryReallocation(newBaseAddress, newSize);
+    }
+
+    private long getNewPageCount(long requiredSize, long oldSize) {
+        final long minPageCount = requiredSize > 0 ? ((requiredSize - 1) >>> sizeMsb) + 1 : 1;
+        final long oldPageCount = oldSize > 0 ? ((oldSize - 1) >>> sizeMsb) + 1 : 0;
+
+        // double the page count on each resize to avoid frequent resizes, unless this is
+        // a request to downsize the memory or aggressive resize will throw us over the limit
+        if (minPageCount > oldPageCount) {
+            return Math.max(Math.min(oldPageCount * 2, maxPages / 2), minPageCount);
+        }
+        return minPageCount;
     }
 
     protected final void handleMemoryReallocation(long newBaseAddress, long newSize) {
@@ -209,9 +289,13 @@ public class MemoryCARWImpl extends AbstractMemoryCR implements MemoryCARW, Muta
 
     protected long reallocateMemory(long currentBaseAddress, long currentSize, long newSize) {
         if (currentBaseAddress != 0) {
-            return Unsafe.realloc(currentBaseAddress, currentSize, newSize, memoryTag);
+            if (currentSize != newSize) {
+                return Unsafe.realloc(currentBaseAddress, currentSize, newSize, memoryTag, memoryTracker);
+            } else {
+                return currentBaseAddress;
+            }
         }
-        return Unsafe.malloc(newSize, memoryTag);
+        return Unsafe.malloc(newSize, memoryTag, memoryTracker);
     }
 
     protected final void setPageSize(long size) {

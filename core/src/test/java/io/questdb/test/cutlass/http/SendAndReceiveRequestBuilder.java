@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -28,7 +28,11 @@ import io.questdb.log.Log;
 import io.questdb.log.LogFactory;
 import io.questdb.network.NetworkFacade;
 import io.questdb.network.NetworkFacadeImpl;
-import io.questdb.std.*;
+import io.questdb.std.Files;
+import io.questdb.std.IntList;
+import io.questdb.std.MemoryTag;
+import io.questdb.std.Os;
+import io.questdb.std.Unsafe;
 import io.questdb.std.str.Utf8s;
 import io.questdb.test.tools.TestUtils;
 import org.junit.Assert;
@@ -36,24 +40,28 @@ import org.junit.Assert;
 import java.util.concurrent.BrokenBarrierException;
 
 public class SendAndReceiveRequestBuilder {
-    public final static String RequestHeaders = "Host: localhost:9000\r\n" +
-            "Connection: keep-alive\r\n" +
-            "Accept: */*\r\n" +
-            "X-Requested-With: XMLHttpRequest\r\n" +
-            "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/78.0.3904.87 Safari/537.36\r\n" +
-            "Sec-Fetch-Site: same-origin\r\n" +
-            "Sec-Fetch-Mode: cors\r\n" +
-            "Referer: http://localhost:9000/index.html\r\n" +
-            "Accept-Encoding: gzip, deflate, br\r\n" +
-            "Accept-Language: en-GB,en-US;q=0.9,en;q=0.8\r\n" +
-            "\r\n";
-    public final static String ResponseHeaders = "HTTP/1.1 200 OK\r\n" +
-            "Server: questDB/1.0\r\n" +
-            "Date: Thu, 1 Jan 1970 00:00:00 GMT\r\n" +
-            "Transfer-Encoding: chunked\r\n" +
-            "Content-Type: application/json; charset=utf-8\r\n" +
-            "Keep-Alive: timeout=5, max=10000\r\n" +
-            "\r\n";
+    public final static String RequestHeaders = """
+            Host: localhost:9000\r
+            Connection: keep-alive\r
+            Accept: */*\r
+            X-Requested-With: XMLHttpRequest\r
+            User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/78.0.3904.87 Safari/537.36\r
+            Sec-Fetch-Site: same-origin\r
+            Sec-Fetch-Mode: cors\r
+            Referer: http://localhost:9000/index.html\r
+            Accept-Encoding: gzip, deflate, br\r
+            Accept-Language: en-GB,en-US;q=0.9,en;q=0.8\r
+            \r
+            """;
+    public final static String ResponseHeaders = """
+            HTTP/1.1 200 OK\r
+            Server: questDB/1.0\r
+            Date: Thu, 1 Jan 1970 00:00:00 GMT\r
+            Transfer-Encoding: chunked\r
+            Content-Type: application/json; charset=utf-8\r
+            Keep-Alive: timeout=5, max=10000\r
+            \r
+            """;
 
     private static final Log LOG = LogFactory.getLog(SendAndReceiveRequestBuilder.class);
     private int clientLingerSeconds = -1;
@@ -69,8 +77,8 @@ public class SendAndReceiveRequestBuilder {
     private int requestCount = 1;
     private long statementTimeout = -1L;
 
-    public int connectAndSendRequest(String request) {
-        final int fd = nf.socketTcp(true);
+    public long connectAndSendRequest(String request) {
+        final long fd = nf.socketTcp(true);
         long sockAddrInfo = nf.getAddrInfo("127.0.0.1", port);
         try {
             TestUtils.assertConnectAddrInfo(fd, sockAddrInfo);
@@ -89,12 +97,12 @@ public class SendAndReceiveRequestBuilder {
         return fd;
     }
 
-    public int connectAndSendRequestWithHeaders(String request) {
+    public long connectAndSendRequestWithHeaders(String request) {
         return connectAndSendRequest(request + requestHeaders());
     }
 
     public void execute(String request, CharSequence expectedResponse) {
-        final int fd = nf.socketTcp(true);
+        final long fd = nf.socketTcp(true);
         try {
             long sockAddrInfo = nf.sockaddr("127.0.0.1", port);
             try {
@@ -116,7 +124,7 @@ public class SendAndReceiveRequestBuilder {
 
     public void executeExplicit(
             String request,
-            int fd,
+            long fd,
             CharSequence expectedResponse,
             final int len,
             long ptr,
@@ -153,10 +161,10 @@ public class SendAndReceiveRequestBuilder {
             int n = nf.recvRaw(fd, ptr + received, len - received);
             if (n > 0) {
                 for (int i = 0; i < n; i++) {
-                    receivedByteList.add(Unsafe.getUnsafe().getByte(ptr + received + i) & 0xff);
+                    receivedByteList.add(Unsafe.getByte(ptr + received + i) & 0xff);
                 }
                 received += n;
-                if (null != listener) {
+                if (listener != null) {
                     listener.onReceived(received);
                 }
             } else if (n < 0) {
@@ -215,7 +223,7 @@ public class SendAndReceiveRequestBuilder {
     }
 
     public void executeMany(RequestAction action) throws InterruptedException, BrokenBarrierException {
-        final int fd = nf.socketTcp(true);
+        final long fd = nf.socketTcp(true);
         try {
             long sockAddr = nf.sockaddr("127.0.0.1", port);
             Assert.assertTrue(fd > -1);
@@ -247,7 +255,7 @@ public class SendAndReceiveRequestBuilder {
         }
     }
 
-    public void executeUntilDisconnect(String request, int fd, final int len, long ptr, HttpClientStateListener listener) {
+    public void executeUntilDisconnect(String request, long fd, final int len, long ptr, HttpClientStateListener listener) {
         withExpectReceiveDisconnect(true);
         long timestamp = System.currentTimeMillis();
         int sent = 0;
@@ -270,10 +278,10 @@ public class SendAndReceiveRequestBuilder {
             int n = nf.recvRaw(fd, ptr + received, len - received);
             if (n > 0) {
                 for (int i = 0; i < n; i++) {
-                    receivedByteList.add(Unsafe.getUnsafe().getByte(ptr + received + i));
+                    receivedByteList.add(Unsafe.getByte(ptr + received + i));
                 }
                 received += n;
-                if (null != listener) {
+                if (listener != null) {
                     listener.onReceived(received);
                 }
             } else if (n < 0) {
@@ -382,7 +390,7 @@ public class SendAndReceiveRequestBuilder {
         return this;
     }
 
-    private void executeWithSocket(String request, CharSequence expectedResponse, int fd) {
+    private void executeWithSocket(String request, CharSequence expectedResponse, long fd) {
         final int len = Math.max(expectedResponse.length(), request.length()) * 2;
         long ptr = Unsafe.malloc(len, MemoryTag.NATIVE_DEFAULT);
         try {

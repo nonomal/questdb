@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -32,95 +32,95 @@ public class EqGeoHashStrFunctionFactoryTest extends AbstractCairoTest {
     @Test
     public void testEq1() throws Exception {
         assertMemoryLeak(() -> {
-            ddl("create table geohash as (" +
-                            "select " +
-                            "    cast('sp052w92p1' as GeOhAsH(50b)) geohash1, " +
-                            "    cast(null as GeOhAsH(50b)) geohash2 " +
-                            "from long_sequence(1)" +
-                            ")");
-            assertSql(
-                    "geohash1\tgeohash2\n" +
-                            "sp052w92p1\t\n", "geohash where 'sp052w92p1' = geohash1"
-            );
+            execute("create table geohash as (" +
+                    "select " +
+                    "    cast('sp052w92p1' as GeOhAsH(50b)) geohash1, " +
+                    "    cast(null as GeOhAsH(50b)) geohash2 " +
+                    "from long_sequence(1)" +
+                    ")");
+            assertQuery("geohash where 'sp052w92p1' = geohash1")
+                    .noLeakCheck()
+                    .returns("geohash1\tgeohash2\n" +
+                            "sp052w92p1\t\n");
         });
     }
 
     @Test
     public void testEq2() throws Exception {
         assertMemoryLeak(() -> {
-            ddl("create table geohash as (" +
-                            "select " +
-                            "    cast('sp052w92p1' as GeOhAsH(50b)) geohash1, " +
-                            "    cast(null as GeOhAsH(50b)) geohash2 " +
-                            "from long_sequence(1)" +
-                            ")");
-            assertSql(
-                    "geohash1\tgeohash2\n" +
-                            "sp052w92p1\t\n", "geohash where geohash1 = 'sp052w92p1'"
-            );
+            execute("create table geohash as (" +
+                    "select " +
+                    "    cast('sp052w92p1' as GeOhAsH(50b)) geohash1, " +
+                    "    cast(null as GeOhAsH(50b)) geohash2 " +
+                    "from long_sequence(1)" +
+                    ")");
+            assertQuery("geohash where geohash1 = 'sp052w92p1'")
+                    .noLeakCheck()
+                    .returns("geohash1\tgeohash2\n" +
+                            "sp052w92p1\t\n");
         });
     }
 
     @Test
     public void testEq3() throws Exception {
         assertMemoryLeak(() -> {
-            ddl("create table geohash as (" +
-                            "select " +
-                            "    cast('sp052w92p1' as GeOhAsH(50b)) geohash1, " +
-                            "    cast(null as GeOhAsH(50b)) geohash2 " +
-                            "from long_sequence(1)" +
-                            ")");
-            assertSql(
-                    "geohash1\tgeohash2\n" +
-                            "sp052w92p1\t\n", "geohash where geohash2 = null"
-            );
+            execute("create table geohash as (" +
+                    "select " +
+                    "    cast('sp052w92p1' as GeOhAsH(50b)) geohash1, " +
+                    "    cast(null as GeOhAsH(50b)) geohash2 " +
+                    "from long_sequence(1)" +
+                    ")");
+            assertQuery("geohash where geohash2 = null")
+                    .noLeakCheck()
+                    .returns("geohash1\tgeohash2\n" +
+                            "sp052w92p1\t\n");
         });
     }
 
     @Test
     public void testNoEq1() throws Exception {
         assertMemoryLeak(() -> {
-            ddl("create table geohash as (" +
-                            "select " +
-                            "    cast('sp052w92p1' as GeOhAsH(50b)) geohash1, " +
-                            "    cast(null as GeOhAsH(50b)) geohash2 " +
-                            "from long_sequence(1)" +
-                            ")");
-            assertSql(
-                    "geohash1\tgeohash2\n" +
-                            "sp052w92p1\t\n", "geohash where 'sp052w92p0' != geohash1"
-            );
+            execute("create table geohash as (" +
+                    "select " +
+                    "    cast('sp052w92p1' as GeOhAsH(50b)) geohash1, " +
+                    "    cast(null as GeOhAsH(50b)) geohash2 " +
+                    "from long_sequence(1)" +
+                    ")");
+            assertQuery("geohash where 'sp052w92p0' != geohash1")
+                    .noLeakCheck()
+                    .returns("geohash1\tgeohash2\n" +
+                            "sp052w92p1\t\n");
         });
     }
 
     @Test
     public void testNoEq2() throws Exception {
         assertMemoryLeak(() -> {
-            ddl("create table geohash as (" +
-                            "select " +
-                            "    cast('sp052w92p1' as GeOhAsH(50b)) geohash1, " +
-                            "    cast(null as GeOhAsH(50b)) geohash2 " +
-                            "from long_sequence(1)" +
-                            ")");
-            assertSql(
-                    "geohash1\tgeohash2\n" +
-                            "sp052w92p1\t\n", "geohash where geohash1 != 'sp052w92p0'"
-            );
+            execute("create table geohash as (" +
+                    "select " +
+                    "    cast('sp052w92p1' as GeOhAsH(50b)) geohash1, " +
+                    "    cast(null as GeOhAsH(50b)) geohash2 " +
+                    "from long_sequence(1)" +
+                    ")");
+            assertQuery("geohash where geohash1 != 'sp052w92p0'")
+                    .noLeakCheck()
+                    .returns("geohash1\tgeohash2\n" +
+                            "sp052w92p1\t\n");
         });
     }
 
     @Test
     public void testNoEq3() throws Exception {
         assertMemoryLeak(() -> {
-            ddl("create table geohash as (" +
-                            "select " +
-                            "    cast('sp052w92p1' as GeOhAsH(50b)) geohash1, " +
-                            "    cast(null as GeOhAsH(50b)) geohash2 " +
-                            "from long_sequence(1)" +
-                            ")");
-            assertSql(
-                    "geohash1\tgeohash2\n", "geohash where geohash2 != null"
-            );
+            execute("create table geohash as (" +
+                    "select " +
+                    "    cast('sp052w92p1' as GeOhAsH(50b)) geohash1, " +
+                    "    cast(null as GeOhAsH(50b)) geohash2 " +
+                    "from long_sequence(1)" +
+                    ")");
+            assertQuery("geohash where geohash2 != null")
+                    .noLeakCheck()
+                    .returns("geohash1\tgeohash2\n");
         });
     }
 }

@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -25,27 +25,40 @@
 package io.questdb.griffin;
 
 import io.questdb.MessageBus;
-import io.questdb.cairo.*;
+import io.questdb.cairo.CairoConfiguration;
+import io.questdb.cairo.CairoException;
+import io.questdb.cairo.ColumnTaskJob;
+import io.questdb.cairo.ColumnType;
+import io.questdb.cairo.ColumnTypeConverter;
+import io.questdb.cairo.ColumnVersionWriter;
+import io.questdb.cairo.PartitionBy;
+import io.questdb.cairo.SymbolMapReaderImpl;
+import io.questdb.cairo.TableUtils;
+import io.questdb.cairo.TableWriter;
+import io.questdb.cairo.TxReader;
+import io.questdb.cairo.sql.PartitionFormat;
 import io.questdb.cairo.sql.SymbolTable;
 import io.questdb.log.Log;
 import io.questdb.log.LogFactory;
 import io.questdb.log.LogRecord;
-import io.questdb.mp.*;
+import io.questdb.mp.RingQueue;
+import io.questdb.mp.SOUnboundedCountDownLatch;
+import io.questdb.mp.Sequence;
+import io.questdb.std.BoolList;
 import io.questdb.std.FilesFacade;
 import io.questdb.std.Misc;
-import io.questdb.std.Numbers;
 import io.questdb.std.Os;
-import io.questdb.std.datetime.microtime.MicrosecondClock;
+import io.questdb.std.datetime.Clock;
 import io.questdb.std.str.Path;
 import io.questdb.tasks.ColumnTask;
 import org.jetbrains.annotations.NotNull;
 
 import java.io.Closeable;
-import java.io.IOException;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static io.questdb.cairo.ColumnType.isVarSize;
-import static io.questdb.cairo.TableUtils.*;
+import static io.questdb.cairo.TableUtils.dFile;
+import static io.questdb.cairo.TableUtils.iFile;
 
 public class ConvertOperatorImpl implements Closeable {
     private static final Log LOG = LogFactory.getLog(ConvertOperatorImpl.class);
@@ -55,7 +68,8 @@ public class ConvertOperatorImpl implements Closeable {
     private final CairoConfiguration configuration;
     private final SOUnboundedCountDownLatch countDownLatch;
     private final FilesFacade ff;
-    private final long fileOpenOpts;
+    private final int fileOpenOpts;
+    private final BoolList invalidatedByPrepass = new BoolList();
     private final MessageBus messageBus;
     private final ColumnConversionOffsetSink noopConversionOffsetSink = new ColumnConversionOffsetSink() {
         @Override
@@ -70,14 +84,24 @@ public class ConvertOperatorImpl implements Closeable {
     private final PurgingOperator purgingOperator;
     private final int rootLen;
     private final TableWriter tableWriter;
-    private final MicrosecondClock timer;
+    private final Clock timer;
     private CharSequence columnName;
+    private long fixedFd;
     private int partitionUpdated;
     private SymbolMapReaderImpl symbolMapReader;
     private SymbolMapper symbolMapper;
     private final TableWriter.ColumnTaskHandler cthConvertPartitionHandler = this::cthConvertPartitionHandler;
+    private long varFd;
 
-    public ConvertOperatorImpl(CairoConfiguration configuration, TableWriter tableWriter, ColumnVersionWriter columnVersionWriter, Path path, int rootLen, PurgingOperator purgingOperator, MessageBus messageBus) {
+    public ConvertOperatorImpl(
+            CairoConfiguration configuration,
+            TableWriter tableWriter,
+            ColumnVersionWriter columnVersionWriter,
+            Path path,
+            int rootLen,
+            PurgingOperator purgingOperator,
+            MessageBus messageBus
+    ) {
         this.configuration = configuration;
         this.tableWriter = tableWriter;
         this.columnVersionWriter = columnVersionWriter;
@@ -93,29 +117,51 @@ public class ConvertOperatorImpl implements Closeable {
     }
 
     @Override
-    public void close() throws IOException {
+    public void close() {
     }
 
-    public void convertColumn(@NotNull CharSequence columnName, int existingColIndex, int existingType, int columnIndex, int newType) {
+    public void convertColumn(
+            @NotNull String columnName,
+            int existingColIndex,
+            int existingType,
+            byte existingIndexType,
+            int columnIndex,
+            int newType
+    ) {
         clear();
         partitionUpdated = 0;
-        convertColumn0(columnName, existingColIndex, existingType, columnIndex, newType);
+        convertColumn0(columnName, existingColIndex, existingType, existingIndexType, columnIndex, newType);
     }
 
     public void finishColumnConversion() {
-        if (partitionUpdated > -1 && asyncProcessingErrorCount.get() == 0) {
+        if (partitionUpdated > 0 && asyncProcessingErrorCount.get() == 0 && !tableWriter.isDistressed()) {
             partitionUpdated = 0;
-            purgingOperator.purge(path.trimTo(rootLen), tableWriter.getTableToken(), tableWriter.getPartitionBy(), tableWriter.checkScoreboardHasReadersBeforeLastCommittedTxn(), tableWriter.getMetadata(), tableWriter.getTruncateVersion(), tableWriter.getTxn());
+            purgingOperator.purge(
+                    path.trimTo(rootLen),
+                    tableWriter.getTableToken(),
+                    tableWriter.getMetadata().getTimestampType(),
+                    tableWriter.getPartitionBy(),
+                    tableWriter.checkScoreboardHasReadersBeforeLastCommittedTxn()
+                            || tableWriter.isCheckpointInProgress(),
+                    tableWriter.getTruncateVersion(),
+                    tableWriter.getTxn()
+            );
         }
         clear();
     }
 
     private void clear() {
+        invalidatedByPrepass.clear();
         purgingOperator.clear();
         Misc.free(symbolMapReader);
     }
 
-    private void closeFds(int srcFixFd, int srcVarFd, int dstFixFd, int dstVarFd) {
+    private void closeFds(long srcFixFd, long srcVarFd, long dstFixFd, long dstVarFd) {
+        LOG.debug().$("closing fds[srcFixFd=").$(srcFixFd)
+                .$(", srcVarFd=").$(srcVarFd)
+                .$(", dstFixFd=").$(dstFixFd)
+                .$(", dstVarFd=").$(dstVarFd)
+                .I$();
         ff.close(srcFixFd);
         ff.close(srcVarFd);
         ff.close(dstFixFd);
@@ -136,16 +182,24 @@ public class ConvertOperatorImpl implements Closeable {
 
         if (checkStatus && asyncProcessingErrorCount.get() > 0) {
             throw CairoException.critical(0)
-                    .put("column conversion failed, see logs for details [table=").put(tableWriter.getTableToken().getTableName())
+                    .put("column conversion failed, see logs for details [table=").put(tableWriter.getTableToken())
                     .put(", tableDir=").put(tableWriter.getTableToken().getDirName())
                     .put(", column=").put(columnName)
                     .put(']');
         }
     }
 
-    private void convertColumn0(@NotNull CharSequence columnName, int existingColIndex, int existingType, int columnIndex, int newType) {
+    private void convertColumn0(
+            @NotNull String columnName,
+            int existingColIndex,
+            int existingType,
+            byte existingIndexType,
+            int columnIndex,
+            int newType
+    ) {
         try {
             this.columnName = columnName;
+
             if (ColumnType.isSymbol(newType)) {
                 if (symbolMapper == null) {
                     symbolMapper = new SymbolMapper();
@@ -157,9 +211,9 @@ public class ConvertOperatorImpl implements Closeable {
                 if (symbolMapReader == null) {
                     symbolMapReader = new SymbolMapReaderImpl();
                 }
-                long existingColNameTxn = tableWriter.getDefaultColumnNameTxn(existingColIndex);
+                long existingSymbolTableNameTxn = columnVersionWriter.getSymbolTableNameTxn(existingColIndex);
                 int symbolCount = tableWriter.getSymbolMapWriter(existingColIndex).getSymbolCount();
-                symbolMapReader.of(configuration, path, columnName, existingColNameTxn, symbolCount);
+                symbolMapReader.of(configuration, path, columnName, existingSymbolTableNameTxn, symbolCount);
             }
 
             int queueCount = 0;
@@ -168,34 +222,136 @@ public class ConvertOperatorImpl implements Closeable {
             long start = timer.getTicks();
             long totalRows = 0;
 
+            // Pre-pass: convert parquet partitions to native when needed.
+            // Case 1: chained conversion (e.g. INT -> STRING -> DATE) where parquet stores an
+            //         older type - convert so the two-step path matches native behavior.
+            // Case 2: target type is Symbol - symbol maps cannot be built from parquet.
+            // Case 3: DOUBLE or FLOAT <-> DECIMAL - the Rust decoder has no arm for the pair.
+            //
+            // A dedup-key conversion that crosses the fixed vs var/symbol boundary is NOT a
+            // trigger. O3PartitionJob.mergeRowGroup materialises the parquet decode buffer into
+            // the target representation (its Phase 1a pass) before it builds the dedup-compare
+            // addresses, so the native comparer always sees correctly typed data even while the
+            // partition stays lazy parquet. Eagerly rewriting such partitions here would only
+            // force a full-partition rewrite at ALTER time; the first O3 merge re-encodes them
+            // with the new type anyway.
+            //
+            // Each per-partition convert is performed without committing; a single batched
+            // commit at the end of the loop publishes them atomically. If any partition
+            // throws midway, the loop exits without commit and the writer becomes distressed,
+            // so the in-memory updates are discarded and the on-disk state stays unchanged.
+            boolean hasPriorConversion = tableWriter.getMetadata()
+                    .getColumnMetadata(existingColIndex).getReplacingIndex() >= 0;
+            boolean isTargetSymbol = ColumnType.isSymbol(newType);
+            boolean isLazyDecodeSupported = isLazyDecodeSupported(existingType, newType);
+            boolean hasAnyPartitionConverted = false;
+            final int partitionCount = tableWriter.getPartitionCount();
+            invalidatedByPrepass.setAll(partitionCount, false);
+            for (int pi = 0; pi < partitionCount; pi++) {
+                if (tableWriter.getPartitionFormat(pi) != PartitionFormat.PARQUET) {
+                    continue;
+                }
+                if (!hasPriorConversion && !isTargetSymbol && isLazyDecodeSupported) {
+                    if (tableWriter.getTxWriter().isPartitionRemote(pi)) {
+                        tableWriter.markParquetPartitionRemoteStale(pi);
+                    }
+                    continue;
+                }
+                int parquetColType = tableWriter.getParquetColumnType(pi, existingColIndex);
+                if (!ColumnType.isUndefined(parquetColType)
+                        && (isTargetSymbol
+                        || !isLazyDecodeSupported
+                        || !isParquetStorageCompatible(parquetColType, existingType))) {
+                    long pts = tableWriter.getPartitionTimestamp(pi);
+                    LOG.info()
+                            .$("converting parquet partition to native before type change [partition=").$ts(pts)
+                            .$(", column=").$safe(columnName)
+                            .$(", targetType=").$(ColumnType.nameOf(newType))
+                            .I$();
+                    tableWriter.convertPartitionParquetToNative(pts, false);
+                    // The pre-pass above is a format-preserving conversion, so the conversion
+                    // primitive deliberately keeps REMOTE. This caller is not format-only,
+                    // though: ALTER will replace the column under a new writer index. Invalidate
+                    // the old object generation even when the column is full-top and the native
+                    // loop below therefore has zero physical rows to convert.
+                    tableWriter.markPartitionDataChanged(pi);
+                    invalidatedByPrepass.setQuick(pi, true);
+                    hasAnyPartitionConverted = true;
+                } else {
+                    if (tableWriter.getTxWriter().isPartitionRemote(pi)) {
+                        tableWriter.markParquetPartitionRemoteStale(pi);
+                    }
+                    long pts = tableWriter.getPartitionTimestamp(pi);
+                    LOG.debug()
+                            .$("skipping parquet partition conversion [partition=").$ts(pts)
+                            .$(", column=").$safe(columnName)
+                            .$(", parquetType=").$(ColumnType.nameOf(parquetColType)).$('(').$(parquetColType).$(')')
+                            .$(", existingType=").$(ColumnType.nameOf(existingType)).$('(').$(existingType).$(')')
+                            .$(", targetType=").$(ColumnType.nameOf(newType)).$('(').$(newType).$(')')
+                            .$(", reason=").$(ColumnType.isUndefined(parquetColType)
+                                    ? "column not stored in parquet, column top covers all rows"
+                                    : "parquet storage is compatible with existing type, lazy decode handles conversion")
+                            .I$();
+                }
+            }
+            if (hasAnyPartitionConverted) {
+                tableWriter.commitPendingParquetToNativeConversions();
+            }
+
             for (int partitionIndex = 0, n = tableWriter.getPartitionCount(); partitionIndex < n; partitionIndex++) {
                 if (asyncProcessingErrorCount.get() == 0) {
+                    if (tableWriter.getPartitionFormat(partitionIndex) == PartitionFormat.PARQUET) {
+                        // Parquet partitions are not converted here (the parquet decoder handles
+                        // on-the-fly type conversion via the replacingIndex chain). However, we
+                        // still propagate the column top from existingColIndex to columnIndex so
+                        // that if the parquet is later converted to native (e.g. by a chained
+                        // ALTER TYPE pre-pass), the native reader finds the data at the correct
+                        // row offsets.
+                        final long parquetPts = tableWriter.getPartitionTimestamp(partitionIndex);
+                        final long parquetColTop = columnVersionWriter.getColumnTop(parquetPts, existingColIndex);
+                        if (parquetColTop != tableWriter.getColumnTop(parquetPts, columnIndex, -1)) {
+                            long partTs = tableWriter.getPartitionBy() != PartitionBy.NONE
+                                    ? parquetPts
+                                    : TxReader.DEFAULT_PARTITION_TIMESTAMP;
+                            columnVersionWriter.upsertColumnTop(
+                                    partTs, columnIndex,
+                                    parquetColTop > -1 ? parquetColTop : tableWriter.getPartitionSize(partitionIndex)
+                            );
+                        }
+                        continue;
+                    }
                     try {
                         final long partitionTimestamp = tableWriter.getPartitionTimestamp(partitionIndex);
                         final long maxRow = tableWriter.getPartitionSize(partitionIndex);
 
                         final long columnTop = columnVersionWriter.getColumnTop(partitionTimestamp, existingColIndex);
-                        if (columnTop != -1) {
+                        if (columnTop > -1) {
                             long rowCount = maxRow - columnTop;
                             long partitionNameTxn = tableWriter.getPartitionNameTxn(partitionIndex);
 
                             if (rowCount > 0) {
                                 path.trimTo(rootLen);
-                                TableUtils.setPathForPartition(path, tableWriter.getPartitionBy(), partitionTimestamp, partitionNameTxn);
+                                TableUtils.setPathForNativePartition(
+                                        path,
+                                        tableWriter.getMetadata().getTimestampType(),
+                                        tableWriter.getPartitionBy(),
+                                        partitionTimestamp,
+                                        partitionNameTxn
+                                );
                                 int pathTrimToLen = path.size();
 
-                                int srcFixFd = -1, srcVarFd = -1, dstFixFd = -1, dstVarFd = -1;
+                                long srcFixFd = -1, srcVarFd = -1, dstFixFd = -1, dstVarFd = -1;
                                 try {
-                                    long srcFds = openColumnsRO(columnName, partitionTimestamp, existingColIndex, existingType, pathTrimToLen);
-                                    srcFixFd = Numbers.decodeLowInt(srcFds);
-                                    srcVarFd = Numbers.decodeHighInt(srcFds);
+                                    openColumnsRO(columnName, partitionTimestamp, existingColIndex, existingType, pathTrimToLen);
+                                    srcFixFd = this.fixedFd;
+                                    srcVarFd = this.varFd;
 
-                                    long dstFds = openColumnsRW(columnName, partitionTimestamp, columnIndex, newType, pathTrimToLen);
-                                    dstFixFd = Numbers.decodeLowInt(dstFds);
-                                    dstVarFd = Numbers.decodeHighInt(dstFds);
+                                    openColumnsRW(columnName, partitionTimestamp, columnIndex, newType, pathTrimToLen);
+                                    dstFixFd = this.fixedFd;
+                                    dstVarFd = this.varFd;
 
-                                    LOG.info().$("converting column [at=").$(path.trimTo(pathTrimToLen))
-                                            .$(", column=").utf8(columnName)
+                                    LOG.info().$("converting column [at=").$safe(path.trimTo(pathTrimToLen))
+                                            .$(", column=").$safe(columnName)
                                             .$(", from=").$(ColumnType.nameOf(existingType))
                                             .$(", to=").$(ColumnType.nameOf(newType))
                                             .$(", rowCount=").$(rowCount)
@@ -206,26 +362,41 @@ public class ConvertOperatorImpl implements Closeable {
                                     throw th;
                                 }
 
-                                if (dispatchConvertColumnPartitionTask(existingType, newType, srcFixFd, srcVarFd, dstFixFd, dstVarFd, rowCount, partitionTimestamp)) {
+                                if (dispatchConvertColumnPartitionTask(
+                                        existingType, newType, srcFixFd, srcVarFd, dstFixFd, dstVarFd, rowCount, partitionTimestamp)
+                                ) {
                                     queueCount++;
+                                }
+
+                                // The rewrite replaces the partition's bytes under a new column
+                                // index, so any remote copy is stale: stamp the ALTER's seqTxn and
+                                // clear REMOTE / staged parquet, exactly as the UPDATE path does
+                                // (UpdateOperatorImpl.markPartitionDataChanged).
+                                if (!invalidatedByPrepass.get(partitionIndex)) {
+                                    tableWriter.markPartitionDataChanged(partitionIndex);
                                 }
                             }
 
                             long existingColTxnVer = tableWriter.getColumnNameTxn(partitionTimestamp, existingColIndex);
-                            purgingOperator.add(existingColIndex, existingColTxnVer, partitionTimestamp, partitionNameTxn);
+                            purgingOperator.add(
+                                    existingColIndex,
+                                    columnName,
+                                    existingType,
+                                    existingIndexType,
+                                    existingColTxnVer,
+                                    partitionTimestamp,
+                                    partitionNameTxn);
                             partitionUpdated++;
                         }
                         if (columnTop != tableWriter.getColumnTop(partitionTimestamp, columnIndex, -1)) {
-                            long partTs = tableWriter.getPartitionBy() != PartitionBy.NONE ? partitionTimestamp : TxReader.DEFAULT_PARTITION_TIMESTAMP;
-                            if (columnTop != -1) {
-                                columnVersionWriter.upsertColumnTop(partTs, columnIndex, columnTop);
-                            } else {
-                                columnVersionWriter.removeColumnTop(partTs, columnIndex);
-                            }
+                            long partTs = tableWriter.getPartitionBy() != PartitionBy.NONE
+                                    ? partitionTimestamp
+                                    : TxReader.DEFAULT_PARTITION_TIMESTAMP;
+                            columnVersionWriter.upsertColumnTop(partTs, columnIndex, columnTop > -1 ? columnTop : maxRow);
                         }
                     } catch (Throwable th) {
-                        LOG.error().$("error converting column [at=").$(tableWriter.getTableToken().getDirNameUtf8())
-                                .$(", column=").utf8(columnName).$(", from=").$(ColumnType.nameOf(existingType))
+                        LOG.error().$("error converting column [at=").$(tableWriter.getTableToken())
+                                .$(", column=").$safe(columnName).$(", from=").$(ColumnType.nameOf(existingType))
                                 .$(", to=").$(ColumnType.nameOf(newType))
                                 .$(", error=").$(th).I$();
                         asyncProcessingErrorCount.incrementAndGet();
@@ -237,8 +408,8 @@ public class ConvertOperatorImpl implements Closeable {
             }
             consumeConversionTasks(messageBus.getColumnTaskQueue(), queueCount, true);
             long elapsed = timer.getTicks() - start;
-            LOG.info().$("completed column conversion [at=").$(tableWriter.getTableToken().getDirNameUtf8())
-                    .$(", column=").utf8(columnName).$(", from=").$(ColumnType.nameOf(existingType))
+            LOG.info().$("completed column conversion [at=").$(tableWriter.getTableToken())
+                    .$(", column=").$safe(columnName).$(", from=").$(ColumnType.nameOf(existingType))
                     .$(", to=").$(ColumnType.nameOf(newType))
                     .$(", partitions=").$(partitionUpdated)
                     .$(", rows=").$(totalRows)
@@ -248,42 +419,78 @@ public class ConvertOperatorImpl implements Closeable {
         }
     }
 
-    private void cthConvertPartitionHandler(int existingType, int newType, int srcFixFd, long srcVarFd, long dstFixFd, long dstVarFd, long partitionTimestamp, long rowCount) {
+    private void cthConvertPartitionHandler(
+            int existingType,
+            int newType,
+            long srcFixFd,
+            long srcVarFd,
+            long dstFixFd,
+            long dstVarFd,
+            long partitionTimestamp,
+            long rowCount
+    ) {
         try {
             if (asyncProcessingErrorCount.get() == 0) {
 
                 SymbolTable symbolTable = ColumnType.isSymbol(existingType) ? symbolMapReader.newSymbolTableView() : null;
-                boolean ok = ColumnTypeConverter.convertColumn(0, rowCount,
-                        existingType, srcFixFd, (int) srcVarFd, symbolTable,
-                        newType, (int) dstFixFd, (int) dstVarFd, symbolMapper,
-                        ff, appendPageSize, noopConversionOffsetSink);
+                boolean ok = ColumnTypeConverter.convertColumn(
+                        0,
+                        rowCount,
+                        existingType,
+                        srcFixFd,
+                        srcVarFd,
+                        symbolTable,
+                        newType,
+                        dstFixFd,
+                        dstVarFd,
+                        symbolMapper,
+                        ff,
+                        appendPageSize,
+                        noopConversionOffsetSink
+                );
 
                 if (!ok) {
-                    LOG.critical().$("failed to convert column, column is corrupt [at=").$(tableWriter.getTableToken().getDirNameUtf8())
-                            .$(", column=").utf8(columnName).$(", from=").$(ColumnType.nameOf(existingType))
-                            .$(", to=").$(ColumnType.nameOf(newType)).$(", srcFixFd=").$(srcFixFd)
-                            .$(", srcVarFd=").$(srcVarFd).$(", partition").$ts(partitionTimestamp)
+                    LOG.critical().$("failed to convert column, column is corrupt [at=")
+                            .$(tableWriter.getTableToken())
+                            .$(", column=").$safe(columnName)
+                            .$(", from=").$(ColumnType.nameOf(existingType))
+                            .$(", to=").$(ColumnType.nameOf(newType))
+                            .$(", srcFixFd=").$(srcFixFd)
+                            .$(", srcVarFd=").$(srcVarFd)
+                            .$(", partition ").$ts(ColumnType.getTimestampDriver(tableWriter.getTimestampType()), partitionTimestamp)
                             .I$();
                     asyncProcessingErrorCount.incrementAndGet();
                 }
             }
         } catch (Throwable th) {
             asyncProcessingErrorCount.incrementAndGet();
-            LogRecord log = LOG.critical().$("failed to convert column, column is corrupt [at=").$(tableWriter.getTableToken().getDirNameUtf8())
-                    .$(", column=").utf8(columnName).$(", from=").$(ColumnType.nameOf(existingType))
+            LogRecord log = LOG.critical().$("failed to convert column, column is corrupt [at=")
+                    .$(tableWriter.getTableToken())
+                    .$(", column=").$safe(columnName)
+                    .$(", from=").$(ColumnType.nameOf(existingType))
                     .$(", to=").$(ColumnType.nameOf(newType))
-                    .$(", srcFixFd=").$(srcFixFd).$(", srcVarFd=")
-                    .$(srcVarFd).$(", partition").$ts(partitionTimestamp);
+                    .$(", srcFixFd=").$(srcFixFd)
+                    .$(", srcVarFd=").$(srcVarFd)
+                    .$(", partition ").$ts(ColumnType.getTimestampDriver(tableWriter.getTimestampType()), partitionTimestamp);
             if (th instanceof CairoException) {
                 log.$(", errno=").$(((CairoException) th).getErrno());
             }
             log.$(", ex=").$(th).I$();
         } finally {
-            closeFds(srcFixFd, (int) srcVarFd, (int) dstFixFd, (int) dstVarFd);
+            closeFds(srcFixFd, srcVarFd, dstFixFd, dstVarFd);
         }
     }
 
-    private boolean dispatchConvertColumnPartitionTask(int existingType, int newType, int srcFixFd, int srcVarFd, int dstFixFd, int dstVarFd, long rowCount, long partitionTimestamp) {
+    private boolean dispatchConvertColumnPartitionTask(
+            int existingType,
+            int newType,
+            long srcFixFd,
+            long srcVarFd,
+            long dstFixFd,
+            long dstVarFd,
+            long rowCount,
+            long partitionTimestamp
+    ) {
         if (!ColumnType.isSymbol(newType)) {
             final Sequence pubSeq = this.messageBus.getColumnTaskPubSeq();
             final RingQueue<ColumnTask> queue = this.messageBus.getColumnTaskQueue();
@@ -292,7 +499,17 @@ public class ConvertOperatorImpl implements Closeable {
             if (cursor > -1) {
                 try {
                     final ColumnTask task = queue.get(cursor);
-                    task.of(countDownLatch, existingType, newType, srcFixFd, srcVarFd, dstFixFd, dstVarFd, partitionTimestamp, rowCount, cthConvertPartitionHandler);
+                    task.of(
+                            countDownLatch,
+                            existingType,
+                            newType,
+                            srcFixFd,
+                            srcVarFd,
+                            dstFixFd,
+                            dstVarFd,
+                            partitionTimestamp,
+                            rowCount,
+                            cthConvertPartitionHandler);
                     return true;
                 } finally {
                     pubSeq.done(cursor);
@@ -305,38 +522,71 @@ public class ConvertOperatorImpl implements Closeable {
         return false;
     }
 
-    private long openColumnsRO(CharSequence name, long partitionTimestamp, int columnIndex, int columnType, int pathTrimToLen) {
+    private void openColumnsRO(CharSequence name, long partitionTimestamp, int columnIndex, int columnType, int pathTrimToLen) {
         long columnNameTxn = tableWriter.getColumnNameTxn(partitionTimestamp, columnIndex);
         if (isVarSize(columnType)) {
-            int fixedFd = TableUtils.openRO(ff, iFile(path.trimTo(pathTrimToLen), name, columnNameTxn), LOG);
+            fixedFd = TableUtils.openRO(ff, iFile(path.trimTo(pathTrimToLen), name, columnNameTxn), LOG);
             try {
-                int varFd = TableUtils.openRO(ff, dFile(path.trimTo(pathTrimToLen), name, columnNameTxn), LOG);
-                return Numbers.encodeLowHighInts(fixedFd, varFd);
+                varFd = TableUtils.openRO(ff, dFile(path.trimTo(pathTrimToLen), name, columnNameTxn), LOG);
             } catch (Throwable e) {
                 ff.close(fixedFd);
                 throw e;
             }
         } else {
-            int fixedFd = TableUtils.openRO(ff, dFile(path.trimTo(pathTrimToLen), name, columnNameTxn), LOG);
-            return Numbers.encodeLowHighInts(fixedFd, -1);
+            fixedFd = TableUtils.openRO(ff, dFile(path.trimTo(pathTrimToLen), name, columnNameTxn), LOG);
+            varFd = -1;
         }
     }
 
-    private long openColumnsRW(CharSequence name, long partitionTimestamp, int columnIndex, int columnType, int pathTrimToLen) {
+    private void openColumnsRW(CharSequence name, long partitionTimestamp, int columnIndex, int columnType, int pathTrimToLen) {
         long columnNameTxn = tableWriter.getColumnNameTxn(partitionTimestamp, columnIndex);
         if (isVarSize(columnType)) {
-            int fixedFd = TableUtils.openRW(ff, iFile(path.trimTo(pathTrimToLen), name, columnNameTxn), LOG, fileOpenOpts);
+            fixedFd = TableUtils.openRW(ff, iFile(path.trimTo(pathTrimToLen), name, columnNameTxn), LOG, fileOpenOpts);
             try {
-                int varFd = TableUtils.openRW(ff, dFile(path.trimTo(pathTrimToLen), name, columnNameTxn), LOG, fileOpenOpts);
-                return Numbers.encodeLowHighInts(fixedFd, varFd);
+                varFd = TableUtils.openRW(ff, dFile(path.trimTo(pathTrimToLen), name, columnNameTxn), LOG, fileOpenOpts);
             } catch (Throwable e) {
                 ff.close(fixedFd);
                 throw e;
             }
         } else {
-            int fixedFd = TableUtils.openRW(ff, dFile(path.trimTo(pathTrimToLen), name, columnNameTxn), LOG, fileOpenOpts);
-            return Numbers.encodeLowHighInts(fixedFd, -1);
+            fixedFd = TableUtils.openRW(ff, dFile(path.trimTo(pathTrimToLen), name, columnNameTxn), LOG, fileOpenOpts);
+            varFd = -1;
         }
+    }
+
+    private static boolean isBinaryFloat(int columnType) {
+        return columnType == ColumnType.DOUBLE || columnType == ColumnType.FLOAT;
+    }
+
+    /**
+     * Returns false when the parquet decoder cannot produce {@code newType} from a partition
+     * holding {@code existingType}, so the partition has to become native before the conversion.
+     */
+    private static boolean isLazyDecodeSupported(int existingType, int newType) {
+        return !(isBinaryFloat(existingType) && ColumnType.isDecimal(newType))
+                && !(ColumnType.isDecimal(existingType) && isBinaryFloat(newType));
+    }
+
+    /**
+     * Returns true when a parquet partition that stores {@code parquetType} can be read
+     * lazily as {@code existingType} without diverging from the equivalent native conversion.
+     * <p>
+     * Lazy decode is safe when the two types are identical, or when they are stored
+     * identically in parquet AND the decoder transcodes losslessly (STRING and VARCHAR
+     * are both encoded as UTF-8 BYTE_ARRAY).
+     * <p>
+     * Tag-only equality is NOT enough: TIMESTAMP_MICRO and TIMESTAMP_NANO share a tag
+     * but require x/divide-by-1000 scaling, and the parquet decoder skips that scaling
+     * when the target is a non-time type (e.g. INT).
+     */
+    private static boolean isParquetStorageCompatible(int parquetType, int existingType) {
+        if (parquetType == existingType) {
+            return true;
+        }
+        // STRING (UTF-16) and VARCHAR (UTF-8) are both encoded as UTF-8 BYTE_ARRAY in parquet;
+        // the decoder transcodes between the two without any value loss.
+        return (parquetType == ColumnType.STRING && existingType == ColumnType.VARCHAR)
+                || (parquetType == ColumnType.VARCHAR && existingType == ColumnType.STRING);
     }
 
     private static class SymbolMapper implements SymbolMapWriterLite {

@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -33,13 +33,13 @@ import io.questdb.std.MemoryTag;
 import io.questdb.std.str.LPSZ;
 import io.questdb.std.str.Path;
 
-class MigrationContext {
+public class MigrationContext {
     private final CairoEngine engine;
     private final MemoryMARW rwMemory;
     private final long tempMemory;
     private final int tempMemoryLen;
     private final MemoryARW tempVirtualMem;
-    private int metadataFd;
+    private long metadataFd;
     private Path tablePath;
     private Path tablePath2;
 
@@ -72,12 +72,12 @@ class MigrationContext {
         return getConfiguration().getFilesFacade();
     }
 
-    public int getMetadataFd() {
+    public long getMetadataFd() {
         return metadataFd;
     }
 
     public int getNextTableId() {
-        return (int) engine.getTableIdGenerator().getNextId();
+        return engine.getNextTableId();
     }
 
     public MemoryMARW getRwMemory() {
@@ -111,7 +111,7 @@ class MigrationContext {
         return tempVirtualMem;
     }
 
-    public void of(Path path, Path pathCopy, int metadataFd) {
+    public void of(Path path, Path pathCopy, long metadataFd) {
         this.tablePath = path;
         this.tablePath2 = pathCopy;
         this.metadataFd = metadataFd;

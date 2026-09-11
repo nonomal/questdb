@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -32,10 +32,11 @@ public class DumpMemoryUsageTest extends AbstractCairoTest {
 
     @Test
     public void testSimple() throws Exception {
-        assertMemoryLeak(() -> assertSql(
-                "dump_memory_usage\n" +
-                        "true\n", "select dump_memory_usage"
-        ));
+        assertMemoryLeak(() -> assertQuery("select dump_memory_usage")
+                .noLeakCheck()
+                .expectSize()
+                .returns("dump_memory_usage\n" +
+                        "true\n"));
         // this sleep to allow async logger to print out the values,
         // although we don't assert them it is less awkward than calling
         // the dump and see no output in the logs

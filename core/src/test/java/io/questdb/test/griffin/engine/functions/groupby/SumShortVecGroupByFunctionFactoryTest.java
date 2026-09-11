@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -31,27 +31,25 @@ public class SumShortVecGroupByFunctionFactoryTest extends AbstractCairoTest {
 
     @Test
     public void testMixedWithCount() throws Exception {
-        assertQuery(
-                "sum\tcount\n" +
-                        "20384\t1001\n",
-                "select sum(f), count() from tab",
-                "create table tab as (select rnd_short(0, 42) f from long_sequence(1001))",
-                null,
-                false,
-                true
-        );
+        assertQuery("select sum(f), count() from tab")
+                .ddl("create table tab as (select rnd_short(0, 42) f from long_sequence(1001))")
+                .noRandomAccess()
+                .expectSize()
+                .returns("""
+                        sum\tcount
+                        20384\t1001
+                        """);
     }
 
     @Test
     public void testSimple() throws Exception {
-        assertQuery(
-                "sum\n" +
-                        "1073011\n",
-                "select sum(f) from tab",
-                "create table tab as (select rnd_short(0, 12323) f from long_sequence(181))",
-                null,
-                false,
-                true
-        );
+        assertQuery("select sum(f) from tab")
+                .ddl("create table tab as (select rnd_short(0, 12323) f from long_sequence(181))")
+                .noRandomAccess()
+                .expectSize()
+                .returns("""
+                        sum
+                        1073011
+                        """);
     }
 }

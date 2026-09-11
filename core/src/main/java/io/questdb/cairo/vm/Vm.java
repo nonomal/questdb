@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,22 +24,25 @@
 
 package io.questdb.cairo.vm;
 
-import io.questdb.cairo.vm.api.*;
+import io.questdb.cairo.CairoConfiguration;
+import io.questdb.cairo.vm.api.MemoryCARW;
+import io.questdb.cairo.vm.api.MemoryCMARW;
+import io.questdb.cairo.vm.api.MemoryCMOR;
+import io.questdb.cairo.vm.api.MemoryCMR;
+import io.questdb.cairo.vm.api.MemoryMAR;
+import io.questdb.cairo.vm.api.MemoryMARW;
 import io.questdb.log.Log;
 import io.questdb.std.Files;
 import io.questdb.std.FilesFacade;
 import io.questdb.std.str.LPSZ;
-import io.questdb.std.str.StableDirectString;
-import io.questdb.std.str.Utf8Sequence;
 
 public class Vm {
     // Set to true to enable the assertion of pointers and buffer sizes which are too expensive for production.
-    public static final boolean PARANOIA_MODE = false;
     public static final int STRING_LENGTH_BYTES = 4;
     public static final byte TRUNCATE_TO_PAGE = 0;
     public static final byte TRUNCATE_TO_POINTER = 1;
 
-    public static void bestEffortClose(FilesFacade ff, Log log, int fd, long size, byte truncateMode) {
+    public static void bestEffortClose(FilesFacade ff, Log log, long fd, long size, byte truncateMode) {
         try {
             if (size > -1L) {
                 bestEffortTruncate(ff, log, fd, size, truncateMode);
@@ -51,11 +54,11 @@ public class Vm {
         }
     }
 
-    public static void bestEffortClose(FilesFacade ff, Log log, int fd, long size) {
+    public static void bestEffortClose(FilesFacade ff, Log log, long fd, long size) {
         bestEffortClose(ff, log, fd, size, TRUNCATE_TO_PAGE);
     }
 
-    public static long bestEffortTruncate(FilesFacade ff, Log log, int fd, long size, byte truncateMode) {
+    public static long bestEffortTruncate(FilesFacade ff, Log log, long fd, long size, byte truncateMode) {
         long sz = (truncateMode == TRUNCATE_TO_PAGE) ? Files.ceilPageSize(size) : size;
         if (ff.truncate(Math.abs(fd), sz)) {
             log.debug()
@@ -68,24 +71,20 @@ public class Vm {
         return -1;
     }
 
-    public static long bestEffortTruncate(FilesFacade ff, Log log, int fd, long size) {
+    public static long bestEffortTruncate(FilesFacade ff, Log log, long fd, long size) {
         return bestEffortTruncate(ff, log, fd, size, TRUNCATE_TO_PAGE);
-    }
-
-    public static MemoryAR getARInstance(long pageSize, int maxPages, int memoryTag) {
-        return new MemoryCARWImpl(pageSize, maxPages, memoryTag);
-    }
-
-    public static MemoryARW getARWInstance(long pageSize, int maxPages, int memoryTag) {
-        return new MemoryCARWImpl(pageSize, maxPages, memoryTag);
     }
 
     public static MemoryCARW getCARWInstance(long pageSize, int maxPages, int memoryTag) {
         return new MemoryCARWImpl(pageSize, maxPages, memoryTag);
     }
 
-    public static MemoryCMARW getCMARWInstance(FilesFacade ff, LPSZ name, long pageSize, long size, int memoryTag, long opts) {
-        return new MemoryCMARWImpl(ff, name, pageSize, size, memoryTag, opts);
+    public static MemoryCARW getCARWInstance(long pageSize, int maxPages, int memoryTag, String maxPagesConfigKey) {
+        return new MemoryCARWImpl(pageSize, maxPages, memoryTag, maxPagesConfigKey);
+    }
+
+    public static MemoryCMARW getCMARWInstance(FilesFacade ff, LPSZ name, long extendSegmentSize, long size, int memoryTag, int opts) {
+        return new MemoryCMARWImpl(ff, name, extendSegmentSize, size, memoryTag, opts);
     }
 
     public static MemoryCMARW getCMARWInstance() {
@@ -96,50 +95,23 @@ public class Vm {
         return new MemoryCMRImpl();
     }
 
-    public static MemoryMA getMAInstance(int commitMode) {
-        return new MemoryPMARImpl(commitMode);
+    public static MemoryCMR getCMRInstance(boolean bypassFdCache) {
+        return new MemoryCMRImpl(bypassFdCache);
     }
 
-    public static MemoryMAR getMARInstance(int commitMode) {
-        return new MemoryPMARImpl(commitMode);
+    public static MemoryCMR getCMRInstance(FilesFacade ff, LPSZ name, long size, int memoryTag) {
+        return new MemoryCMRImpl(ff, name, size, memoryTag);
     }
 
-    public static MemoryMARW getMARWInstance() {
-        return new MemoryCMARWImpl();
+    public static MemoryCMOR getMemoryCMOR(boolean bypassFdCache) {
+        return new MemoryCMORImpl(bypassFdCache);
     }
 
-    public static MemoryMARW getMARWInstance(FilesFacade ff, LPSZ name, long extendSegmentSize, long size, int memoryTag, long opts) {
-        return new MemoryCMARWImpl(ff, name, extendSegmentSize, size, memoryTag, opts);
+    public static MemoryMAR getPMARInstance(CairoConfiguration configuration) {
+        return new MemoryPMARImpl(configuration);
     }
 
-    public static MemoryMR getMRInstance() {
-        return new MemoryCMRImpl();
-    }
-
-    public static MemoryMR getMRInstance(FilesFacade ff, LPSZ name, long size, int memoryTag) {
-        return new MemoryCMRImpl(ff, name, size, memoryTag, false);
-    }
-
-    /**
-     * note: set stable strings to true if the memory is used for query evaluation and strings are expected to be stable
-     * for the duration of the query.
-     *
-     * @see StableDirectString
-     * @see Utf8Sequence#isStable()
-     */
-    public static MemoryMR getMRInstance(FilesFacade ff, LPSZ name, long size, int memoryTag, boolean stableStrings) {
-        return new MemoryCMRImpl(ff, name, size, memoryTag, stableStrings);
-    }
-
-    public static MemoryCMOR getMemoryCMOR() {
-        return new MemoryCMORImpl();
-    }
-
-    public static MemoryCMARW getSmallCMARWInstance(FilesFacade ff, LPSZ name, int memoryTag, long opts) {
-        return new MemoryCMARWImpl(ff, name, ff.getPageSize(), -1, memoryTag, opts);
-    }
-
-    public static MemoryMA getSmallMAInstance(FilesFacade ff, LPSZ name, int memoryTag, long opts) {
+    public static MemoryCMARW getSmallCMARWInstance(FilesFacade ff, LPSZ name, int memoryTag, int opts) {
         return new MemoryCMARWImpl(ff, name, ff.getPageSize(), -1, memoryTag, opts);
     }
 
@@ -154,7 +126,7 @@ public class Vm {
         return STRING_LENGTH_BYTES + s.length() * 2;
     }
 
-    public static MemoryMARW getWholeMARWInstance(FilesFacade ff, LPSZ name, long extendSegmentSize, int memoryTag, long opts) {
-        return new MemoryCMARWImpl(ff, name, extendSegmentSize, -1, memoryTag, opts);
+    public static MemoryMARW getWholeMARWInstance(FilesFacade ff, LPSZ name, long extendSegmentSizePow2, int memoryTag, int opts) {
+        return new MemoryCMARWImpl(ff, name, extendSegmentSizePow2, -1, memoryTag, opts);
     }
 }

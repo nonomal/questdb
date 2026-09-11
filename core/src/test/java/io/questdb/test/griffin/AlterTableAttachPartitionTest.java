@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,27 +24,68 @@
 
 package io.questdb.test.griffin;
 
-import io.questdb.cairo.*;
-import io.questdb.cairo.sql.DataFrame;
+import io.questdb.PropertyKey;
+import io.questdb.cairo.AttachDetachStatus;
+import io.questdb.cairo.CairoConfiguration;
+import io.questdb.cairo.CairoException;
+import io.questdb.cairo.ColumnType;
+import io.questdb.cairo.FullFwdPartitionFrameCursor;
+import io.questdb.cairo.IndexType;
+import io.questdb.cairo.PartitionBy;
+import io.questdb.cairo.TableReader;
+import io.questdb.cairo.TableToken;
+import io.questdb.cairo.TableUtils;
+import io.questdb.cairo.TableWriter;
+import io.questdb.cairo.TimestampDriver;
+import io.questdb.cairo.sql.PartitionFrame;
 import io.questdb.griffin.SqlException;
-import io.questdb.griffin.model.IntervalUtils;
-import io.questdb.std.*;
-import io.questdb.std.datetime.microtime.TimestampFormatUtils;
+import io.questdb.std.Files;
+import io.questdb.std.FilesFacade;
+import io.questdb.std.FilesFacadeImpl;
+import io.questdb.std.MemoryTag;
+import io.questdb.std.NumericException;
+import io.questdb.std.Rnd;
+import io.questdb.std.Unsafe;
 import io.questdb.std.str.LPSZ;
 import io.questdb.std.str.Utf8s;
 import io.questdb.test.AbstractCairoTest;
+import io.questdb.test.TestTimestampType;
 import io.questdb.test.cairo.TableModel;
+import io.questdb.test.cairo.TestTableReaderRecordCursor;
 import io.questdb.test.std.TestFilesFacadeImpl;
 import io.questdb.test.tools.TestUtils;
 import org.junit.Assert;
 import org.junit.Test;
+import org.junit.runner.RunWith;
+import org.junit.runners.Parameterized;
 
+import java.util.Arrays;
+import java.util.Collection;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static io.questdb.cairo.AttachDetachStatus.ATTACH_ERR_RENAME;
 
-
+@RunWith(Parameterized.class)
 public class AlterTableAttachPartitionTest extends AbstractAlterTableAttachPartitionTest {
+    private final TestTimestampType timestampType;
+
+    public AlterTableAttachPartitionTest(TestTimestampType timestampType) {
+        this.timestampType = timestampType;
+    }
+
+    @Parameterized.Parameters(name = "{0}")
+    public static Collection<Object[]> testParams() {
+        return Arrays.asList(new Object[][]{
+                {TestTimestampType.MICRO}, {TestTimestampType.NANO}
+        });
+    }
+
+    @Override
+    public void setUp() {
+        Rnd rnd = TestUtils.generateRandom(LOG);
+        setProperty(PropertyKey.CAIRO_DEFAULT_SYMBOL_INDEX_TYPE, TestUtils.randomSymbolIndexTypeName(rnd));
+        super.setUp();
+    }
 
     @Test
     public void testAttach2Partitions() throws Exception {
@@ -53,14 +94,14 @@ public class AlterTableAttachPartitionTest extends AbstractAlterTableAttachParti
                     TableModel dst = new TableModel(configuration, "dst1", PartitionBy.DAY);
                     createPopulateTable(
                             1,
-                            src.timestamp("ts")
+                            src.timestamp("ts", timestampType.getTimestampType())
                                     .col("i", ColumnType.INT)
                                     .col("l", ColumnType.LONG),
                             10000,
                             "2020-01-01",
                             12);
 
-                    AbstractCairoTest.create(dst.timestamp("ts")
+                    AbstractCairoTest.create(dst.timestamp("ts", timestampType.getTimestampType())
                             .col("i", ColumnType.INT)
                             .col("l", ColumnType.LONG));
 
@@ -77,14 +118,14 @@ public class AlterTableAttachPartitionTest extends AbstractAlterTableAttachParti
 
                     createPopulateTable(
                             1,
-                            src.timestamp("ts")
+                            src.timestamp("ts", timestampType.getTimestampType())
                                     .col("i", ColumnType.INT)
                                     .col("l", ColumnType.LONG),
                             10000,
                             "2020-01-01",
                             12);
 
-                    AbstractCairoTest.create(dst.timestamp("ts")
+                    AbstractCairoTest.create(dst.timestamp("ts", timestampType.getTimestampType())
                             .col("i", ColumnType.INT)
                             .col("l", ColumnType.LONG));
 
@@ -102,14 +143,14 @@ public class AlterTableAttachPartitionTest extends AbstractAlterTableAttachParti
 
                     createPopulateTable(
                             1,
-                            src.timestamp("ts")
+                            src.timestamp("ts", timestampType.getTimestampType())
                                     .col("i", ColumnType.INT)
                                     .col("l", ColumnType.LONG),
                             10000,
                             "2020-01-01",
                             12);
 
-                    AbstractCairoTest.create(dst.timestamp("ts")
+                    AbstractCairoTest.create(dst.timestamp("ts", timestampType.getTimestampType())
                             .col("i", ColumnType.INT)
                             .col("l", ColumnType.LONG));
 
@@ -127,7 +168,7 @@ public class AlterTableAttachPartitionTest extends AbstractAlterTableAttachParti
 
                     createPopulateTable(
                             1,
-                            src.timestamp("ts")
+                            src.timestamp("ts", timestampType.getTimestampType())
                                     .col("i", ColumnType.INT)
                                     .col("l", ColumnType.LONG)
                                     .col("vch", ColumnType.VARCHAR),
@@ -135,7 +176,7 @@ public class AlterTableAttachPartitionTest extends AbstractAlterTableAttachParti
                             "2020-01-01",
                             11);
 
-                    AbstractCairoTest.create(dst.timestamp("ts")
+                    AbstractCairoTest.create(dst.timestamp("ts", timestampType.getTimestampType())
                             .col("i", ColumnType.INT)
                             .col("l", ColumnType.LONG));
 
@@ -149,13 +190,13 @@ public class AlterTableAttachPartitionTest extends AbstractAlterTableAttachParti
         assertMemoryLeak(() -> {
                     TableModel dst = new TableModel(configuration, "dst5", PartitionBy.MONTH);
 
-                    AbstractCairoTest.create(dst.timestamp("ts")
+                    AbstractCairoTest.create(dst.timestamp("ts", timestampType.getTimestampType())
                             .col("i", ColumnType.INT)
                             .col("l", ColumnType.LONG));
 
                     String alterCommand = "ALTER TABLE " + dst.getName() + " ATTACH PARTITION LIST '202A-01'";
                     try {
-                        ddl(alterCommand, sqlExecutionContext);
+                        execute(alterCommand, sqlExecutionContext);
                         Assert.fail();
                     } catch (SqlException e) {
                         Assert.assertEquals("[39] 'yyyy-MM' expected, found [ts=202A-01]", e.getMessage());
@@ -169,13 +210,13 @@ public class AlterTableAttachPartitionTest extends AbstractAlterTableAttachParti
         assertMemoryLeak(() -> {
                     TableModel dst = new TableModel(configuration, "dst6a", PartitionBy.YEAR);
 
-                    AbstractCairoTest.create(dst.timestamp("ts")
+                    AbstractCairoTest.create(dst.timestamp("ts", timestampType.getTimestampType())
                             .col("i", ColumnType.INT)
                             .col("l", ColumnType.LONG));
 
                     String alterCommand = "ALTER TABLE " + dst.getName() + " ATTACH PARTITION LIST 'nono'";
                     try {
-                        ddl(alterCommand, sqlExecutionContext);
+                        execute(alterCommand, sqlExecutionContext);
                         Assert.fail();
                     } catch (SqlException e) {
                         Assert.assertEquals("[40] 'yyyy' expected, found [ts=nono]", e.getMessage());
@@ -189,13 +230,13 @@ public class AlterTableAttachPartitionTest extends AbstractAlterTableAttachParti
         assertMemoryLeak(() -> {
                     TableModel dst = new TableModel(configuration, "dst6b", PartitionBy.YEAR);
 
-                    AbstractCairoTest.create(dst.timestamp("ts")
+                    AbstractCairoTest.create(dst.timestamp("ts", timestampType.getTimestampType())
                             .col("i", ColumnType.INT)
                             .col("l", ColumnType.LONG));
 
                     String alterCommand = "ALTER TABLE " + dst.getName() + " ATTACH PARTITION LIST '202'";
                     try {
-                        ddl(alterCommand, sqlExecutionContext);
+                        execute(alterCommand, sqlExecutionContext);
                         Assert.fail();
                     } catch (SqlException e) {
                         Assert.assertEquals("[40] 'yyyy' expected, found [ts=202]", e.getMessage());
@@ -209,13 +250,13 @@ public class AlterTableAttachPartitionTest extends AbstractAlterTableAttachParti
         assertMemoryLeak(() -> {
                     TableModel dst = new TableModel(configuration, "dst7a", PartitionBy.MONTH);
 
-                    AbstractCairoTest.create(dst.timestamp("ts")
+                    AbstractCairoTest.create(dst.timestamp("ts", timestampType.getTimestampType())
                             .col("i", ColumnType.INT)
                             .col("l", ColumnType.LONG));
 
                     String alterCommand = "ALTER TABLE " + dst.getName() + " ATTACH PARTITION LIST '2020-no'";
                     try {
-                        ddl(alterCommand, sqlExecutionContext);
+                        execute(alterCommand, sqlExecutionContext);
                         Assert.fail();
                     } catch (SqlException e) {
                         Assert.assertEquals("[40] 'yyyy-MM' expected, found [ts=2020-no]", e.getMessage());
@@ -229,13 +270,13 @@ public class AlterTableAttachPartitionTest extends AbstractAlterTableAttachParti
         assertMemoryLeak(() -> {
                     TableModel dst = new TableModel(configuration, "dst7b", PartitionBy.MONTH);
 
-                    AbstractCairoTest.create(dst.timestamp("ts")
+                    AbstractCairoTest.create(dst.timestamp("ts", timestampType.getTimestampType())
                             .col("i", ColumnType.INT)
                             .col("l", ColumnType.LONG));
 
                     String alterCommand = "ALTER TABLE " + dst.getName() + " ATTACH PARTITION LIST '2020'";
                     try {
-                        ddl(alterCommand, sqlExecutionContext);
+                        execute(alterCommand, sqlExecutionContext);
                         Assert.fail();
                     } catch (SqlException e) {
                         Assert.assertEquals("[40] 'yyyy-MM' expected, found [ts=2020]", e.getMessage());
@@ -249,13 +290,13 @@ public class AlterTableAttachPartitionTest extends AbstractAlterTableAttachParti
         assertMemoryLeak(() -> {
                     TableModel dst = new TableModel(configuration, "dst8", PartitionBy.MONTH);
 
-                    AbstractCairoTest.create(dst.timestamp("ts")
+                    AbstractCairoTest.create(dst.timestamp("ts", timestampType.getTimestampType())
                             .col("i", ColumnType.INT)
                             .col("l", ColumnType.LONG));
 
                     String alterCommand = "ALTER TABLE " + dst.getName() + " ATTACH PARTITION LIST '2020-01'.'2020-02'";
                     try {
-                        ddl(alterCommand, sqlExecutionContext);
+                        execute(alterCommand, sqlExecutionContext);
                         Assert.fail();
                     } catch (SqlException e) {
                         Assert.assertEquals("[48] ',' expected", e.getMessage());
@@ -268,14 +309,14 @@ public class AlterTableAttachPartitionTest extends AbstractAlterTableAttachParti
     public void testAttachMissingPartition() throws Exception {
         assertMemoryLeak(() -> {
                     TableModel dst = new TableModel(configuration, "dst9", PartitionBy.DAY);
-                    AbstractCairoTest.create(dst.timestamp("ts")
+                    AbstractCairoTest.create(dst.timestamp("ts", timestampType.getTimestampType())
                             .col("i", ColumnType.INT)
                             .col("l", ColumnType.LONG)
                             .col("vch", ColumnType.VARCHAR));
 
                     String alterCommand = "ALTER TABLE " + dst.getName() + " ATTACH PARTITION LIST '2020-01-01'";
                     try {
-                        ddl(alterCommand, sqlExecutionContext);
+                        execute(alterCommand, sqlExecutionContext);
                         Assert.fail();
                     } catch (CairoException e) {
                         TestUtils.assertContains(e.getFlyweightMessage(), "could not attach partition");
@@ -289,7 +330,7 @@ public class AlterTableAttachPartitionTest extends AbstractAlterTableAttachParti
         // todo: what's the different between this and testAttachMissingPartition() ?
         assertMemoryLeak(() -> {
                     TableModel dst = new TableModel(configuration, "dst10", PartitionBy.DAY);
-                    AbstractCairoTest.create(dst.timestamp("ts")
+                    AbstractCairoTest.create(dst.timestamp("ts", timestampType.getTimestampType())
                             .col("i", ColumnType.INT)
                             .col("l", ColumnType.LONG)
                             .col("vch", ColumnType.VARCHAR));
@@ -297,13 +338,89 @@ public class AlterTableAttachPartitionTest extends AbstractAlterTableAttachParti
                     String alterCommand = "ALTER TABLE " + dst.getName() + " ATTACH PARTITION LIST '2020-01-01'";
 
                     try {
-                        ddl(alterCommand, sqlExecutionContext);
+                        execute(alterCommand, sqlExecutionContext);
                         Assert.fail();
                     } catch (CairoException e) {
                         TestUtils.assertContains(e.getFlyweightMessage(), "could not attach partition");
                     }
                 }
         );
+    }
+
+    @Test
+    public void testAttachParquetPartitionDerivesMetadataTokenFromDataFile() throws Exception {
+        assertMemoryLeak(() -> {
+            TableModel src = new TableModel(configuration, "srcParquetAttach", PartitionBy.DAY);
+            TableModel dst = new TableModel(configuration, "dstParquetAttach", PartitionBy.DAY);
+
+            TableToken srcTableToken = createPopulateTable(
+                    1,
+                    src.timestamp("ts", timestampType.getTimestampType())
+                            .col("i", ColumnType.INT)
+                            .col("l", ColumnType.LONG),
+                    10,
+                    "2020-01-01",
+                    1);
+            execute("INSERT INTO " + src.getName() + " VALUES ('2020-01-02T00:00:00.000Z', 11, 11)", sqlExecutionContext);
+            execute("ALTER TABLE " + src.getName() + " CONVERT PARTITION TO PARQUET LIST '2020-01-01'", sqlExecutionContext);
+
+            AbstractCairoTest.create(dst.timestamp("ts", timestampType.getTimestampType())
+                    .col("i", ColumnType.INT)
+                    .col("l", ColumnType.LONG));
+            TableToken dstTableToken = engine.verifyTableName(dst.getName());
+            copyPartitionToAttachable(srcTableToken, getPartitionDirName(src.getName(), "2020-01-01"), dstTableToken.getDirName(), "2020-01-01");
+
+            engine.clear();
+            try (TableWriter writer = getWriter(dst.getName())) {
+                Assert.assertEquals(AttachDetachStatus.OK, writer.attachPartition(timestampType.getDriver().parseFloorLiteral("2020-01-01T00:00:00.000Z"), 10));
+                writer.commit();
+            }
+
+            assertQuery("SELECT count() FROM " + dst.getName())
+                    .noRandomAccess()
+                    .expectSize()
+                    .returns("""
+                            count
+                            10
+                            """);
+        });
+    }
+
+    @Test
+    public void testAttachParquetPartitionFailsWhenMetadataDataFileIsMissing() throws Exception {
+        assertMemoryLeak(() -> {
+            TableModel src = new TableModel(configuration, "srcParquetMissingData", PartitionBy.DAY);
+            TableModel dst = new TableModel(configuration, "dstParquetMissingData", PartitionBy.DAY);
+
+            TableToken srcTableToken = createPopulateTable(
+                    1,
+                    src.timestamp("ts", timestampType.getTimestampType())
+                            .col("i", ColumnType.INT)
+                            .col("l", ColumnType.LONG),
+                    10,
+                    "2020-01-01",
+                    1);
+            execute("INSERT INTO " + src.getName() + " VALUES ('2020-01-02T00:00:00.000Z', 11, 11)", sqlExecutionContext);
+            execute("ALTER TABLE " + src.getName() + " CONVERT PARTITION TO PARQUET LIST '2020-01-01'", sqlExecutionContext);
+
+            AbstractCairoTest.create(dst.timestamp("ts", timestampType.getTimestampType())
+                    .col("i", ColumnType.INT)
+                    .col("l", ColumnType.LONG));
+            TableToken dstTableToken = engine.verifyTableName(dst.getName());
+            copyPartitionToAttachable(srcTableToken, getPartitionDirName(src.getName(), "2020-01-01"), dstTableToken.getDirName(), "2020-01-01");
+
+            path.of(configuration.getDbRoot()).concat(dstTableToken).concat("2020-01-01" + configuration.getAttachPartitionSuffix()).concat(TableUtils.PARQUET_PARTITION_NAME).$();
+            Assert.assertTrue(Files.remove(path.$()));
+
+            try {
+                engine.clear();
+                execute("ALTER TABLE " + dst.getName() + " ATTACH PARTITION LIST '2020-01-01'", sqlExecutionContext);
+                Assert.fail();
+            } catch (CairoException e) {
+                TestUtils.assertContains(e.getFlyweightMessage(), "could not attach partition");
+                TestUtils.assertContains(e.getFlyweightMessage(), "detachStatus=ATTACH_ERR_MISSING_PARQUET_DATA");
+            }
+        });
     }
 
     @Test
@@ -317,7 +434,7 @@ public class AlterTableAttachPartitionTest extends AbstractAlterTableAttachParti
                             src.col("l", ColumnType.LONG)
                                     .col("i", ColumnType.INT)
                                     .col("vch", ColumnType.VARCHAR)
-                                    .timestamp("ts"),
+                                    .timestamp("ts", timestampType.getTimestampType()),
                             10000,
                             "2020-01-01",
                             1);
@@ -325,12 +442,12 @@ public class AlterTableAttachPartitionTest extends AbstractAlterTableAttachParti
                     AbstractCairoTest.create(
                             dst.col("i", ColumnType.INT)
                                     .col("l", ColumnType.LONG)
-                                    .timestamp("ts"));
+                                    .timestamp("ts", timestampType.getTimestampType()));
 
                     copyPartitionToAttachable(srcTableToken, "2020-01-01", dst.getName(), "COCONUTS");
 
                     try {
-                        ddl("ALTER TABLE " + dst.getName() + " ATTACH PARTITION LIST '2020-01-02'", sqlExecutionContext);
+                        execute("ALTER TABLE " + dst.getName() + " ATTACH PARTITION LIST '2020-01-02'", sqlExecutionContext);
                         Assert.fail();
                     } catch (CairoException e) {
                         TestUtils.assertContains(e.getFlyweightMessage(), "could not attach partition");
@@ -344,14 +461,14 @@ public class AlterTableAttachPartitionTest extends AbstractAlterTableAttachParti
         assertMemoryLeak(() -> {
             AddColumn src = s -> s.col("l", ColumnType.LONG)
                     .col("i", ColumnType.INT)
-                    .timestamp("ts")
+                    .timestamp("ts", timestampType.getTimestampType())
                     .col("str", ColumnType.STRING);
 
             assertSchemaMismatch(
                     "src26",
                     src,
                     "dst26",
-                    dst -> {
+                    _ -> {
                     },
                     s -> writeToStrIndexFile(s, "2022-08-01", "str.i", 0L, 16L),
                     "Variable size column has invalid data address value"
@@ -364,14 +481,14 @@ public class AlterTableAttachPartitionTest extends AbstractAlterTableAttachParti
         assertMemoryLeak(() -> {
             AddColumn src = s -> s.col("i", ColumnType.INT)
                     .col("l", ColumnType.LONG)
-                    .timestamp("ts")
+                    .timestamp("ts", timestampType.getTimestampType())
                     .col("str", ColumnType.STRING);
 
             assertSchemaMismatch(
                     "src27",
                     src,
                     "dst27",
-                    dst -> {
+                    _ -> {
                     },
                     s -> writeToStrIndexFile(s, "2022-08-01", "str.i", Long.MAX_VALUE, 256L),
                     "dataAddress=" + Long.MAX_VALUE
@@ -381,7 +498,7 @@ public class AlterTableAttachPartitionTest extends AbstractAlterTableAttachParti
                     "src28",
                     src,
                     "dst28",
-                    dst -> {
+                    _ -> {
                     },
                     s -> writeToStrIndexFile(s, "2022-08-01", "str.i", -1L, 256L),
                     "dataAddress=" + -1L
@@ -394,20 +511,20 @@ public class AlterTableAttachPartitionTest extends AbstractAlterTableAttachParti
         assertMemoryLeak(() -> {
             AddColumn src = s -> s.col("i", ColumnType.INT)
                     .col("l", ColumnType.LONG)
-                    .timestamp("ts")
+                    .timestamp("ts", timestampType.getTimestampType())
                     .col("sh", ColumnType.STRING);
 
             assertSchemaMismatch(
                     "src30",
                     src,
                     "dst30",
-                    dst -> {
+                    _ -> {
                     },
                     s -> {
                         engine.clear();
                         TableToken tableToken = engine.verifyTableName(s.getName());
-                        path.of(configuration.getRoot()).concat(tableToken).concat("2022-08-01").concat("sh.i").$();
-                        int fd = TestFilesFacadeImpl.INSTANCE.openRW(path.$(), CairoConfiguration.O_NONE);
+                        path.of(configuration.getDbRoot()).concat(tableToken).concat("2022-08-01").concat("sh.i").$();
+                        long fd = TestFilesFacadeImpl.INSTANCE.openRW(path.$(), CairoConfiguration.O_NONE);
                         Files.truncate(fd, Files.length(fd) / 4);
                         TestFilesFacadeImpl.INSTANCE.close(fd);
                     },
@@ -422,7 +539,7 @@ public class AlterTableAttachPartitionTest extends AbstractAlterTableAttachParti
                     TableModel src = new TableModel(configuration, "src31", PartitionBy.DAY);
                     createPopulateTable(
                             1,
-                            src.timestamp("ts")
+                            src.timestamp("ts", timestampType.getTimestampType())
                                     .col("l", ColumnType.LONG)
                                     .col("sym", ColumnType.SYMBOL)
                                     .col("i", ColumnType.INT),
@@ -435,7 +552,7 @@ public class AlterTableAttachPartitionTest extends AbstractAlterTableAttachParti
                     TableModel dst = new TableModel(configuration, "dst31", PartitionBy.DAY);
                     createPopulateTable(
                             1,
-                            dst.timestamp("ts")
+                            dst.timestamp("ts", timestampType.getTimestampType())
                                     .col("l", ColumnType.LONG)
                                     .col("sym", ColumnType.SYMBOL)
                                     .col("i", ColumnType.INT),
@@ -459,21 +576,21 @@ public class AlterTableAttachPartitionTest extends AbstractAlterTableAttachParti
 
             AddColumn src = s -> s.col("i", ColumnType.INT)
                     .col("l", ColumnType.LONG)
-                    .timestamp("ts")
+                    .timestamp("ts", timestampType.getTimestampType())
                     .col("sh", ColumnType.SYMBOL);
 
             assertSchemaMismatch(
                     "src32",
                     src,
                     "dst32",
-                    dst -> {
+                    _ -> {
                     },
                     s -> {
                         // .v file
                         engine.clear();
                         TableToken tableToken = engine.verifyTableName(s.getName());
-                        path.of(configuration.getRoot()).concat(tableToken).concat("2022-08-01").concat("sh.v").$();
-                        int fd = TestFilesFacadeImpl.INSTANCE.openRW(path.$(), CairoConfiguration.O_NONE);
+                        path.of(configuration.getDbRoot()).concat(tableToken).concat("2022-08-01").concat("sh.v").$();
+                        long fd = TestFilesFacadeImpl.INSTANCE.openRW(path.$(), CairoConfiguration.O_NONE);
                         Files.truncate(fd, Files.length(fd) / 2);
                         TestFilesFacadeImpl.INSTANCE.close(fd);
                     },
@@ -490,7 +607,7 @@ public class AlterTableAttachPartitionTest extends AbstractAlterTableAttachParti
 
                     createPopulateTable(
                             1,
-                            src.timestamp("ts")
+                            src.timestamp("ts", timestampType.getTimestampType())
                                     .col("i", ColumnType.INT)
                                     .col("l", ColumnType.LONG),
                             10000,
@@ -506,7 +623,7 @@ public class AlterTableAttachPartitionTest extends AbstractAlterTableAttachParti
                         Assert.fail();
                     } catch (CairoException e) {
                         TestUtils.assertContains(e.getFlyweightMessage(),
-                                "could not open read-only"
+                                "could not open, file does not exist"
                         );
                         TestUtils.assertContains(e.getFlyweightMessage(),
                                 "ts1.d"
@@ -545,12 +662,12 @@ public class AlterTableAttachPartitionTest extends AbstractAlterTableAttachParti
     public void testAttachPartitionsDeletedColumnFromSrc() throws Exception {
         assertMemoryLeak(() -> {
 
-                    TableModel src = new TableModel(configuration, testName.getMethodName() + "_src", PartitionBy.DAY);
-                    TableModel dst = new TableModel(configuration, testName.getMethodName() + "_dst", PartitionBy.DAY);
+                    TableModel src = new TableModel(configuration, "testAttachPartitionsDeletedColumnFromSrc" + "_src", PartitionBy.DAY);
+                    TableModel dst = new TableModel(configuration, "testAttachPartitionsDeletedColumnFromSrc" + "_dst", PartitionBy.DAY);
 
                     TableToken srcTableToken = createPopulateTable(
                             1,
-                            src.timestamp("ts")
+                            src.timestamp("ts", timestampType.getTimestampType())
                                     .col("i", ColumnType.INT)
                                     .col("l", ColumnType.LONG)
                                     .col("s", ColumnType.SYMBOL).indexed(true, 128)
@@ -566,7 +683,7 @@ public class AlterTableAttachPartitionTest extends AbstractAlterTableAttachParti
                         writer.removeColumn("i");
                     }
 
-                    TableToken dstTableToken = AbstractCairoTest.create(dst.timestamp("ts")
+                    TableToken dstTableToken = AbstractCairoTest.create(dst.timestamp("ts", timestampType.getTimestampType())
                             .col("i", ColumnType.INT)
                             .col("l", ColumnType.LONG)
                             .col("s", ColumnType.SYMBOL).indexed(true, 128)
@@ -575,18 +692,17 @@ public class AlterTableAttachPartitionTest extends AbstractAlterTableAttachParti
                     );
 
                     copyPartitionToAttachable(srcTableToken, "2022-08-02", dstTableToken.getDirName(), "2022-08-02");
-                    ddl("ALTER TABLE " + dst.getName() + " ATTACH PARTITION LIST '2022-08-02'", sqlExecutionContext);
+                    execute("ALTER TABLE " + dst.getName() + " ATTACH PARTITION LIST '2022-08-02'", sqlExecutionContext);
 
                     engine.clear();
-                    assertQuery(
-                            "ts\ti\tl\ts\tstr\tvch\n" +
-                                    "2022-08-02T11:59:59.625000Z\tnull\t3\t\t\t\uF2C1ӍKB\n" +
-                                    "2022-08-02T23:59:59.500000Z\tnull\t4\t\t\tK䰭\n",
-                            dst.getName(),
-                            "ts",
-                            true,
-                            true
-                    );
+                    assertQuery(dst.getName())
+                            .timestamp("ts")
+                            .expectSize()
+                            .returns(replaceTimestampSuffix(replaceTimestampSuffix("""
+                                    ts\ti\tl\ts\tstr\tvch
+                                    2022-08-02T11:59:59.625000Z\tnull\t3\t\t\t\uF2C1ӍKB
+                                    2022-08-02T23:59:59.500000Z\tnull\t4\t\t\tK䰭
+                                    """), timestampType.getTypeName()));
                 }
         );
     }
@@ -600,7 +716,7 @@ public class AlterTableAttachPartitionTest extends AbstractAlterTableAttachParti
                     int partitionRowCount = 11;
                     TableToken srcTableToken = createPopulateTable(
                             1,
-                            src.timestamp("ts")
+                            src.timestamp("ts", timestampType.getTimestampType())
                                     .col("i", ColumnType.INT)
                                     .col("l", ColumnType.LONG)
                                     .col("s", ColumnType.SYMBOL).indexed(true, 128)
@@ -609,40 +725,51 @@ public class AlterTableAttachPartitionTest extends AbstractAlterTableAttachParti
                             "2022-08-01",
                             4);
 
-                    TableToken dstTableToken = AbstractCairoTest.create(dst.timestamp("ts")
+                    TableToken dstTableToken = AbstractCairoTest.create(dst.timestamp("ts", timestampType.getTimestampType())
                             .col("i", ColumnType.INT)
                             .col("l", ColumnType.LONG));
 
                     copyPartitionToAttachable(srcTableToken, "2022-08-01", dstTableToken.getDirName(), "2022-08-01");
 
-                    long timestamp = TimestampFormatUtils.parseTimestamp("2022-08-01T00:00:00.000z");
+                    TimestampDriver driver = timestampType.getDriver();
+                    long timestamp = driver.parseFloorLiteral("2022-08-01T00:00:00.000Z");
                     long txn;
                     try (TableWriter writer = getWriter(dst.getName())) {
                         txn = writer.getTxn();
                         writer.attachPartition(timestamp);
                     }
-                    path.of(configuration.getRoot()).concat(dstTableToken);
-                    TableUtils.setPathForPartition(path, PartitionBy.DAY, IntervalUtils.parseFloorPartialTimestamp("2022-08-01"), txn);
+                    path.of(configuration.getDbRoot()).concat(dstTableToken);
+                    TableUtils.setPathForNativePartition(path, driver.getTimestampType(), PartitionBy.DAY, driver.parseFloorLiteral("2022-08-01"), txn);
                     int pathLen = path.size();
 
                     // Extra columns not deleted
                     Assert.assertTrue(Files.exists(path.concat("s.d").$()));
-                    Assert.assertTrue(Files.exists(path.trimTo(pathLen).concat("s.k").$()));
-                    Assert.assertTrue(Files.exists(path.trimTo(pathLen).concat("s.v").$()));
+                    if (configuration.getDefaultSymbolIndexType() == IndexType.BITMAP) {
+                        Assert.assertTrue(Files.exists(path.trimTo(pathLen).concat("s.k").$()));
+                        Assert.assertTrue(Files.exists(path.trimTo(pathLen).concat("s.v").$()));
+                    } else {
+                        Assert.assertTrue(Files.exists(path.trimTo(pathLen).concat("s.pk").$()));
+                        Assert.assertTrue(Files.exists(path.trimTo(pathLen).concat("s.pv.0").$()));
+                    }
                     Assert.assertTrue(Files.exists(path.trimTo(pathLen).concat("l.d").$()));
                     Assert.assertTrue(Files.exists(path.trimTo(pathLen).concat("vch.d").$()));
                     Assert.assertTrue(Files.exists(path.trimTo(pathLen).concat("vch.i").$()));
 
                     engine.clear();
-                    assertQuery(
-                            "ts\ti\tl\n" +
-                                    "2022-08-01T08:43:38.090909Z\t1\t1\n" +
-                                    "2022-08-01T17:27:16.181818Z\t2\t2\n",
-                            dst.getName(),
-                            "ts",
-                            true,
-                            true
-                    );
+                    assertQuery(dst.getName())
+                            .timestamp("ts")
+                            .expectSize()
+                            .returns(ColumnType.isTimestampMicro(timestampType.getTimestampType()) ?
+                                    """
+                                            ts\ti\tl
+                                            2022-08-01T08:43:38.090909Z\t1\t1
+                                            2022-08-01T17:27:16.181818Z\t2\t2
+                                            """ :
+                                    """
+                                            ts\ti\tl
+                                            2022-08-01T08:43:38.090909090Z\t1\t1
+                                            2022-08-01T17:27:16.181818180Z\t2\t2
+                                            """);
                 }
         );
     }
@@ -655,14 +782,14 @@ public class AlterTableAttachPartitionTest extends AbstractAlterTableAttachParti
 
                     createPopulateTable(
                             1,
-                            src.timestamp("ts")
+                            src.timestamp("ts", timestampType.getTimestampType())
                                     .col("i", ColumnType.INT)
                                     .col("l", ColumnType.LONG),
                             10000,
                             "2022-08-01",
                             10);
 
-                    AbstractCairoTest.create(dst.timestamp("ts")
+                    AbstractCairoTest.create(dst.timestamp("ts", timestampType.getTimestampType())
                             .col("i", ColumnType.INT)
                             .col("l", ColumnType.LONG));
 
@@ -685,24 +812,25 @@ public class AlterTableAttachPartitionTest extends AbstractAlterTableAttachParti
                     int partitionRowCount = 111;
                     TableToken srcTableToken = createPopulateTable(
                             1,
-                            src.timestamp("ts")
+                            src.timestamp("ts", timestampType.getTimestampType())
                                     .col("i", ColumnType.INT)
                                     .col("l", ColumnType.LONG),
                             partitionRowCount,
                             "2022-08-01",
                             1);
 
-                    TableToken dstTableToken = AbstractCairoTest.create(dst.timestamp("ts")
+                    TableToken dstTableToken = AbstractCairoTest.create(dst.timestamp("ts", timestampType.getTimestampType())
                             .col("i", ColumnType.INT)
                             .col("l", ColumnType.LONG));
 
                     copyPartitionToAttachable(srcTableToken, "2022-08-01", dstTableToken.getDirName(), "2022-08-01");
 
+                    TimestampDriver driver = timestampType.getDriver();
                     // Add 1 row without commit
-                    long timestamp = TimestampFormatUtils.parseTimestamp("2022-08-01T00:00:00.000z");
+                    long timestamp = driver.parseFloorLiteral("2022-08-01T00:00:00.000Z");
                     try (TableWriter writer = getWriter(dst.getName())) {
-                        long insertTs = TimestampFormatUtils.parseTimestamp("2022-08-01T23:59:59.999z");
-                        TableWriter.Row row = writer.newRow(insertTs + 1000L);
+                        long insertTs = driver.parseFloorLiteral("2022-08-01T23:59:59.999Z");
+                        TableWriter.Row row = writer.newRow(insertTs + driver.fromMicros(1000L));
                         row.putLong(0, 1L);
                         row.putInt(1, 1);
                         row.append();
@@ -726,13 +854,13 @@ public class AlterTableAttachPartitionTest extends AbstractAlterTableAttachParti
                     TableModel dst = new TableModel(configuration, "dst3a", PartitionBy.DAY);
                     createPopulateTable(
                             1,
-                            src.timestamp("ts")
+                            src.timestamp("ts", timestampType.getTimestampType())
                                     .col("i", ColumnType.INT)
                                     .col("l", ColumnType.LONG),
                             10000,
                             "2020-01-01",
                             12);
-                    AbstractCairoTest.create(dst.timestamp("ts")
+                    AbstractCairoTest.create(dst.timestamp("ts", timestampType.getTimestampType())
                             .col("i", ColumnType.INT)
                             .col("l", ColumnType.LONG));
                     attachFromSrcIntoDst(src, dst, "2020-01-09.10", "2020-01-10T19", "2020-01-01T20:22:24.262829Z");
@@ -748,7 +876,7 @@ public class AlterTableAttachPartitionTest extends AbstractAlterTableAttachParti
 
                     createPopulateTable(
                             1,
-                            src.timestamp("ts")
+                            src.timestamp("ts", timestampType.getTimestampType())
                                     .col("i", ColumnType.INT)
                                     .col("l", ColumnType.LONG)
                                     .col("s", ColumnType.SYMBOL).indexed(false, 4096),
@@ -757,11 +885,15 @@ public class AlterTableAttachPartitionTest extends AbstractAlterTableAttachParti
                             10);
 
                     // Make sure nulls are included in the partition to be attached
-                    assertSql("count\n302\n", "select count() from " + src.getName() + " where ts in '2022-08-09' and s = null");
+                    assertQuery("select count() from " + src.getName() + " where ts in '2022-08-09' and s = null")
+                            .noLeakCheck()
+                            .expectSize()
+                            .noRandomAccess()
+                            .returns("count\n302\n");
 
                     createPopulateTable(
                             1,
-                            dst.timestamp("ts")
+                            dst.timestamp("ts", timestampType.getTimestampType())
                                     .col("i", ColumnType.INT)
                                     .col("l", ColumnType.LONG)
                                     .col("s", ColumnType.SYMBOL).indexed(false, 4096),
@@ -769,7 +901,7 @@ public class AlterTableAttachPartitionTest extends AbstractAlterTableAttachParti
                             "2022-08-01",
                             10);
 
-                    compile("alter table " + dst.getName() + " drop partition list '2022-08-09'");
+                    execute("alter table " + dst.getName() + " drop partition list '2022-08-09'");
 
                     attachFromSrcIntoDst(src, dst, "2022-08-09");
                 }
@@ -784,7 +916,7 @@ public class AlterTableAttachPartitionTest extends AbstractAlterTableAttachParti
 
                     createPopulateTable(
                             1,
-                            src.timestamp("ts")
+                            src.timestamp("ts", timestampType.getTimestampType())
                                     .col("i", ColumnType.INT)
                                     .col("s2", ColumnType.SYMBOL)
                                     .col("l", ColumnType.LONG),
@@ -792,7 +924,7 @@ public class AlterTableAttachPartitionTest extends AbstractAlterTableAttachParti
                             "2022-08-01",
                             3);
 
-                    AbstractCairoTest.create(dst.timestamp("ts")
+                    AbstractCairoTest.create(dst.timestamp("ts", timestampType.getTimestampType())
                             .col("i", ColumnType.INT)
                             .col("s", ColumnType.SYMBOL)
                             .col("l", ColumnType.LONG));
@@ -801,7 +933,11 @@ public class AlterTableAttachPartitionTest extends AbstractAlterTableAttachParti
 
                     // s2 column files from the attached partitions should be ignored
                     // and coltops for s column should be created instead.
-                    assertSql("count\n0\n", "select count() from " + dst.getName() + " where s is not null");
+                    assertQuery("select count() from " + dst.getName() + " where s is not null")
+                            .noLeakCheck()
+                            .expectSize()
+                            .noRandomAccess()
+                            .returns("count\n0\n");
                 }
         );
     }
@@ -817,25 +953,29 @@ public class AlterTableAttachPartitionTest extends AbstractAlterTableAttachParti
                             src.col("l", ColumnType.LONG)
                                     .col("i", ColumnType.INT)
                                     .col("s", ColumnType.SYMBOL)
-                                    .timestamp("ts"),
+                                    .timestamp("ts", timestampType.getTimestampType()),
                             10000,
                             "2022-08-01",
                             10);
 
                     // Make sure nulls are included in the partition to be attached
-                    assertSql("count\n302\n", "select count() from " + src.getName() + " where ts in '2022-08-09' and s = null");
+                    assertQuery("select count() from " + src.getName() + " where ts in '2022-08-09' and s = null")
+                            .noLeakCheck()
+                            .expectSize()
+                            .noRandomAccess()
+                            .returns("count\n302\n");
 
                     createPopulateTable(
                             1,
                             dst.col("l", ColumnType.LONG)
                                     .col("i", ColumnType.INT)
                                     .col("s", ColumnType.SYMBOL)
-                                    .timestamp("ts"),
+                                    .timestamp("ts", timestampType.getTimestampType()),
                             10000,
                             "2022-08-01",
                             10);
 
-                    compile("alter table " + dst.getName() + " drop partition list '2022-08-09'");
+                    execute("alter table " + dst.getName() + " drop partition list '2022-08-09'");
 
                     attachFromSrcIntoDst(src, dst, "2022-08-09");
                 }
@@ -852,7 +992,7 @@ public class AlterTableAttachPartitionTest extends AbstractAlterTableAttachParti
                             src.col("l", ColumnType.LONG)
                                     .col("i", ColumnType.INT)
                                     .col("s", ColumnType.SYMBOL)
-                                    .timestamp("ts"),
+                                    .timestamp("ts", timestampType.getTimestampType()),
                             10000,
                             "2022-08-01",
                             10);
@@ -862,19 +1002,19 @@ public class AlterTableAttachPartitionTest extends AbstractAlterTableAttachParti
                             dst.col("l", ColumnType.LONG)
                                     .col("i", ColumnType.INT)
                                     .col("s", ColumnType.SYMBOL).indexed(true, 4096)
-                                    .timestamp("ts"),
+                                    .timestamp("ts", timestampType.getTimestampType()),
                             10000,
                             "2022-08-01",
                             10);
 
-                    compile("alter table " + dst.getName() + " drop partition list '2022-08-09'");
+                    execute("alter table " + dst.getName() + " drop partition list '2022-08-09'");
 
                     try {
                         attachFromSrcIntoDst(src, dst, "2022-08-09");
                         Assert.fail();
                     } catch (CairoException e) {
                         TestUtils.assertContains(e.getFlyweightMessage(),
-                                "Symbol index value file does not exist"
+                                "Index key file does not exist"
                         );
                     }
                 }
@@ -892,7 +1032,7 @@ public class AlterTableAttachPartitionTest extends AbstractAlterTableAttachParti
                             src.col("l", ColumnType.LONG)
                                     .col("i", ColumnType.INT)
                                     .col("s", ColumnType.SYMBOL).indexed(true, 4096)
-                                    .timestamp("ts"),
+                                    .timestamp("ts", timestampType.getTimestampType()),
                             10000,
                             "2022-08-01",
                             10);
@@ -902,23 +1042,24 @@ public class AlterTableAttachPartitionTest extends AbstractAlterTableAttachParti
                             dst.col("l", ColumnType.LONG)
                                     .col("i", ColumnType.INT)
                                     .col("s", ColumnType.SYMBOL).indexed(true, 4096)
-                                    .timestamp("ts"),
+                                    .timestamp("ts", timestampType.getTimestampType()),
                             10000,
                             "2022-08-01",
                             10);
 
-                    compile("alter table " + dst.getName() + " drop partition list '2022-08-09'");
+                    execute("alter table " + dst.getName() + " drop partition list '2022-08-09'");
 
-                    // remove .k
+                    // remove the index key file
                     engine.clear();
                     TableToken tableToken = engine.verifyTableName(src.getName());
-                    path.of(configuration.getRoot()).concat(tableToken).concat("2022-08-09").concat("s.k").$();
-            Assert.assertTrue(Files.remove(path.$()));
+                    String keyFile = configuration.getDefaultSymbolIndexType() == IndexType.BITMAP ? "s.k" : "s.pk";
+                    path.of(configuration.getDbRoot()).concat(tableToken).concat("2022-08-09").concat(keyFile).$();
+                    Assert.assertTrue(TestUtils.remove(path.$()));
                     try {
                         attachFromSrcIntoDst(src, dst, "2022-08-09");
                         Assert.fail();
                     } catch (CairoException e) {
-                        TestUtils.assertContains(e.getFlyweightMessage(), "Symbol index key file does not exist");
+                        TestUtils.assertContains(e.getFlyweightMessage(), "Index key file does not exist");
                     }
                 }
         );
@@ -932,14 +1073,14 @@ public class AlterTableAttachPartitionTest extends AbstractAlterTableAttachParti
 
                     createPopulateTable(
                             1,
-                            src.timestamp("ts")
+                            src.timestamp("ts", timestampType.getTimestampType())
                                     .col("i", ColumnType.INT)
                                     .col("l", ColumnType.LONG),
                             10000,
                             "2022-08-01",
                             10);
 
-                    AbstractCairoTest.create(dst.timestamp("ts")
+                    AbstractCairoTest.create(dst.timestamp("ts", timestampType.getTimestampType())
                             .col("i", ColumnType.INT)
                             .col("l", ColumnType.LONG));
 
@@ -948,7 +1089,7 @@ public class AlterTableAttachPartitionTest extends AbstractAlterTableAttachParti
                     String alterCommand = "ALTER TABLE " + dst.getName() + " ATTACH PARTITION LIST '2022-08-09'";
 
                     try {
-                        ddl(alterCommand, sqlExecutionContext);
+                        execute(alterCommand, sqlExecutionContext);
                         Assert.fail();
                     } catch (CairoException e) {
                         TestUtils.assertContains(e.getFlyweightMessage(), "could not attach partition");
@@ -963,7 +1104,7 @@ public class AlterTableAttachPartitionTest extends AbstractAlterTableAttachParti
         FilesFacadeImpl ff = new TestFilesFacadeImpl() {
 
             @Override
-            public long mmap(int fd, long len, long offset, int flags, int memoryTag) {
+            public long mmap(long fd, long len, long offset, int flags, int memoryTag) {
                 if (this.fd != fd) {
                     return super.mmap(fd, len, offset, flags, memoryTag);
                 }
@@ -972,8 +1113,8 @@ public class AlterTableAttachPartitionTest extends AbstractAlterTableAttachParti
             }
 
             @Override
-            public int openRO(LPSZ name) {
-                int fd = super.openRO(name);
+            public long openRO(LPSZ name) {
+                long fd = super.openRO(name);
                 if (Utf8s.endsWithAscii(name, "ts.d") && counter.decrementAndGet() == 0) {
                     this.fd = fd;
                 }
@@ -989,7 +1130,7 @@ public class AlterTableAttachPartitionTest extends AbstractAlterTableAttachParti
         AtomicInteger counter = new AtomicInteger(1);
         FilesFacadeImpl ff = new TestFilesFacadeImpl() {
             @Override
-            public int openRO(LPSZ name) {
+            public long openRO(LPSZ name) {
                 if (Utf8s.endsWithAscii(name, "ts.d") && counter.decrementAndGet() == 0) {
                     return -1;
                 }
@@ -997,7 +1138,7 @@ public class AlterTableAttachPartitionTest extends AbstractAlterTableAttachParti
             }
         };
 
-        testSqlFailedOnFsOperation(ff, "srcTs", "dstTs", false, "could not open read-only");
+        testSqlFailedOnFsOperation(ff, "srcTs", "dstTs", false, "could not open, file does not exist");
     }
 
     @Test
@@ -1005,7 +1146,7 @@ public class AlterTableAttachPartitionTest extends AbstractAlterTableAttachParti
         AtomicInteger counter = new AtomicInteger(1);
         FilesFacadeImpl ff = new TestFilesFacadeImpl() {
             @Override
-            public int openRO(LPSZ name) {
+            public long openRO(LPSZ name) {
                 if (Utf8s.endsWithAscii(name, "ts.d") && counter.decrementAndGet() == 0) {
                     return -1;
                 }
@@ -1013,7 +1154,7 @@ public class AlterTableAttachPartitionTest extends AbstractAlterTableAttachParti
             }
         };
 
-        testSqlFailedOnFsOperation(ff, "srcTs2", "dstTs2", false, "could not open read-only", "ts.d");
+        testSqlFailedOnFsOperation(ff, "srcTs2", "dstTs2", false, "could not open, file does not exist", "ts.d");
     }
 
     @Test
@@ -1037,15 +1178,15 @@ public class AlterTableAttachPartitionTest extends AbstractAlterTableAttachParti
         AtomicInteger counter = new AtomicInteger(1);
         FilesFacadeImpl ff = new TestFilesFacadeImpl() {
             @Override
-            public int openRW(LPSZ name, long opts) {
-                if (Utf8s.containsAscii(name, "dst" + testName.getMethodName()) && Utf8s.containsAscii(name, "2020-01-01") && counter.decrementAndGet() == 0) {
+            public long openRW(LPSZ name, int opts) {
+                if (Utf8s.containsAscii(name, "dst" + "testCannotSwitchPartition") && Utf8s.containsAscii(name, "2020-01-01") && counter.decrementAndGet() == 0) {
                     return -1;
                 }
                 return super.openRW(name, opts);
             }
         };
 
-        testSqlFailedOnFsOperation(ff, "src" + testName.getMethodName(), "dst" + testName.getMethodName(), true, " is distressed");
+        testSqlFailedOnFsOperation(ff, "src" + "testCannotSwitchPartition", "dst" + "testCannotSwitchPartition", true, " is distressed");
     }
 
     @Test
@@ -1069,7 +1210,7 @@ public class AlterTableAttachPartitionTest extends AbstractAlterTableAttachParti
                             .col("i", ColumnType.INT)
                             .col("str", ColumnType.STRING)
                             .col("vch", ColumnType.VARCHAR)
-                            .timestamp("ts"),
+                            .timestamp("ts", timestampType.getTimestampType()),
                     partitionRowCount,
                     "2020-01-09",
                     2
@@ -1084,20 +1225,24 @@ public class AlterTableAttachPartitionTest extends AbstractAlterTableAttachParti
                             .col("i", ColumnType.INT)
                             .col("str", ColumnType.STRING)
                             .col("vch", ColumnType.VARCHAR)
-                            .timestamp("ts"),
+                            .timestamp("ts", timestampType.getTimestampType()),
                     partitionRowCount - 3,
                     "2020-01-09",
                     2
             );
 
-            try (TableReader dstReader = newOffPoolReader(configuration, dst.getTableName())) {
+            try (
+                    TableReader dstReader = newOffPoolReader(configuration, dst.getTableName());
+                    TestTableReaderRecordCursor dstCursor = new TestTableReaderRecordCursor().of(dstReader)
+            ) {
                 dstReader.openPartition(0);
                 dstReader.openPartition(1);
                 dstReader.goPassive();
 
+                TimestampDriver driver = timestampType.getDriver();
                 try (TableWriter writer = getWriter(dst.getTableName())) {
                     // remove 2020-01-09 partition from dst table
-                    long timestamp = TimestampFormatUtils.parseTimestamp("2020-01-09T00:00:00.000z");
+                    long timestamp = driver.parseFloorLiteral("2020-01-09T00:00:00.000Z");
                     writer.removePartition(timestamp);
                     // at this point dst table has only 1 partition: 2020-01-10  and it has 1 row
 
@@ -1108,16 +1253,23 @@ public class AlterTableAttachPartitionTest extends AbstractAlterTableAttachParti
 
                 // Go active
                 Assert.assertTrue(dstReader.reload());
-                try (TableReader srcReader = getReader(src.getTableName())) {
+                try (
+                        TableReader srcReader = getReader(src.getTableName());
+                        TestTableReaderRecordCursor srcCursor = new TestTableReaderRecordCursor().of(srcReader)
+                ) {
                     String tableHeader = "l\ti\tstr\tvch\tts\n";
                     // check the original src table is not affected
-                    String srcPartition2020_01_09 = "1\t1\t1\t&\uDA1F\uDE98|\uD924\uDE04\t2020-01-09T09:35:59.800000Z\n" +
-                            "2\t2\t2\t\t2020-01-09T19:11:59.600000Z\n";
-                    String srcPartition2020_01_10 = "3\t3\t3\těȞ鼷G\uD991\uDE7E\t2020-01-10T04:47:59.400000Z\n" +
-                            "4\t4\t4\t\t2020-01-10T14:23:59.200000Z\n" +
-                            "5\t5\t5\t͛Ԉ龘и\uDA89\uDFA4~\t2020-01-10T23:59:59.000000Z\n";
+                    String srcPartition2020_01_09 = """
+                            1\t1\t1\t&\uDA1F\uDE98|\uD924\uDE04\t2020-01-09T09:35:59.800000Z
+                            2\t2\t2\t\t2020-01-09T19:11:59.600000Z
+                            """;
+                    String srcPartition2020_01_10 = """
+                            3\t3\t3\těȞ鼷G\uD991\uDE7E\t2020-01-10T04:47:59.400000Z
+                            4\t4\t4\t\t2020-01-10T14:23:59.200000Z
+                            5\t5\t5\t͛Ԉ龘и\uDA89\uDFA4~\t2020-01-10T23:59:59.000000Z
+                            """;
                     String expected = tableHeader + srcPartition2020_01_09 + srcPartition2020_01_10;
-                    assertCursor(expected, srcReader.getCursor(), srcReader.getMetadata(), true);
+                    assertCursor(replaceTimestampSuffix(expected), srcCursor, srcReader.getMetadata(), true);
 
                     // now check the dst table
                     // the first 2 rows must be the same as the src table - because we attached the 2020-01-09 partition from src table
@@ -1125,8 +1277,8 @@ public class AlterTableAttachPartitionTest extends AbstractAlterTableAttachParti
                     String dstPartition2020_01_10 = "2\t2\t2\tqK䰭\u008B}ѱʜ\uDB8D\uDE4Eᯤ\\篸\t2020-01-10T23:59:59.000000Z\n";
                     expected = tableHeader + srcPartition2020_01_09 + dstPartition2020_01_10;
                     assertCursor(
-                            expected,
-                            dstReader.getCursor(),
+                            replaceTimestampSuffix(expected),
+                            dstCursor,
                             dstReader.getMetadata(),
                             true
                     );
@@ -1144,7 +1296,7 @@ public class AlterTableAttachPartitionTest extends AbstractAlterTableAttachParti
                     TableModel dst = new TableModel(configuration, "dstCM" + idx, PartitionBy.DAY);
                     src.col("l", ColumnType.LONG)
                             .col("i", ColumnType.INT)
-                            .timestamp("ts");
+                            .timestamp("ts", timestampType.getTimestampType());
                     tm.add(src);
 
                     createPopulateTable(
@@ -1155,7 +1307,7 @@ public class AlterTableAttachPartitionTest extends AbstractAlterTableAttachParti
 
                     dst.col("l", ColumnType.LONG)
                             .col("i", ColumnType.INT)
-                            .timestamp("ts");
+                            .timestamp("ts", timestampType.getTimestampType());
                     tm.add(dst);
 
                     AbstractCairoTest.create(dst);
@@ -1231,31 +1383,23 @@ public class AlterTableAttachPartitionTest extends AbstractAlterTableAttachParti
         engine.clear();
 
         TableToken tableToken = engine.verifyTableName(src.getName());
-        path.of(configuration.getRoot()).concat(tableToken);
+        path.of(configuration.getDbRoot()).concat(tableToken);
         int pathLen = path.size();
 
         TableToken tableToken0 = engine.verifyTableName(dst.getName());
-        other.of(configuration.getRoot()).concat(tableToken0);
+        other.of(configuration.getDbRoot()).concat(tableToken0);
         int otherLen = other.size();
 
         int hi = -1;
-        switch (dst.getPartitionBy()) {
-            case PartitionBy.DAY:
-                hi = 10; // yyyy-MM-dd;
-                break;
-            case PartitionBy.WEEK:
-                hi = 8; // YYYY-Www
-                break;
-            case PartitionBy.MONTH:
-                hi = 7; // yyyy-MM
-                break;
-            case PartitionBy.YEAR:
-                hi = 4; // yyyy
-                break;
-            case PartitionBy.HOUR:
-                hi = 13; // yyyy-MM-ddTHH
-                break;
-        }
+        // yyyy-MM-ddTHH
+        hi = switch (dst.getPartitionBy()) {
+            case PartitionBy.DAY -> 10; // yyyy-MM-dd;
+            case PartitionBy.WEEK -> 8; // YYYY-Www
+            case PartitionBy.MONTH -> 7; // yyyy-MM
+            case PartitionBy.YEAR -> 4; // yyyy
+            case PartitionBy.HOUR -> 13;
+            default -> hi;
+        };
         for (int i = 0; i < partitionList.length; i++) {
             String partition = partitionList[i];
             int limit;
@@ -1272,17 +1416,18 @@ public class AlterTableAttachPartitionTest extends AbstractAlterTableAttachParti
 
         int rowCount = readAllRows(dst.getName());
         engine.clear();
-        ddl("ALTER TABLE " + dst.getName() + " ATTACH PARTITION LIST " + partitions + ";", sqlExecutionContext);
+        execute("ALTER TABLE " + dst.getName() + " ATTACH PARTITION LIST " + partitions + ";", sqlExecutionContext);
         int newRowCount = readAllRows(dst.getName());
         Assert.assertTrue(newRowCount > rowCount);
 
+        TimestampDriver driver = timestampType.getDriver();
         long timestamp = 0;
         for (String partition : partitionList) {
             int limit = hi == -1 ? partition.length() : hi;
-            long ts = TimestampFormatUtils.parseTimestamp(partition.substring(0, limit)
+            long ts = driver.parseFloorLiteral(partition.substring(0, limit)
                     + (src.getPartitionBy() == PartitionBy.YEAR ? "-01-01" : "")
                     + (src.getPartitionBy() == PartitionBy.MONTH ? "-01" : "")
-                    + "T23:59:59.999z");
+                    + "T23:59:59.999Z");
             if (ts > timestamp) {
                 timestamp = ts;
             }
@@ -1305,20 +1450,28 @@ public class AlterTableAttachPartitionTest extends AbstractAlterTableAttachParti
             String dstPartitionName
     ) {
         copyPartitionAndMetadata(
-                configuration.getRoot(),
+                configuration.getDbRoot(),
                 srcTableToken,
                 srcPartitionName,
-                configuration.getRoot(),
+                configuration.getDbRoot(),
                 dstTableName,
                 dstPartitionName,
                 configuration.getAttachPartitionSuffix()
         );
     }
 
+    private String getPartitionDirName(String tableName, String partitionName) throws NumericException {
+        long partitionTimestamp = timestampType.getDriver().parseFloorLiteral(partitionName + "T00:00:00.000Z");
+        try (TableReader reader = getReader(tableName)) {
+            long partitionNameTxn = reader.getTxFile().getPartitionNameTxnByPartitionTimestamp(partitionTimestamp);
+            return partitionNameTxn > -1 ? partitionName + "." + partitionNameTxn : partitionName;
+        }
+    }
+
     private int readAllRows(String tableName) {
-        try (FullFwdDataFrameCursor cursor = new FullFwdDataFrameCursor()) {
+        try (FullFwdPartitionFrameCursor cursor = new FullFwdPartitionFrameCursor()) {
             cursor.of(getReader(tableName));
-            DataFrame frame;
+            PartitionFrame frame;
             int count = 0;
             while ((frame = cursor.next()) != null) {
                 for (long index = frame.getRowHi() - 1, lo = frame.getRowLo() - 1; index > lo; index--) {
@@ -1331,24 +1484,28 @@ public class AlterTableAttachPartitionTest extends AbstractAlterTableAttachParti
         }
     }
 
+    private String replaceTimestampSuffix(String expected) {
+        return ColumnType.isTimestampNano(timestampType.getTimestampType()) ? expected.replace("Z\t", "000Z\t").replace("Z\n", "000Z\n") : expected;
+    }
+
     private void testAttachPartitionWrongFixedColumn(int columnType) throws Exception {
         assertMemoryLeak(() -> {
             AddColumn src = s -> s.col("l", ColumnType.LONG)
                     .col("i", ColumnType.INT)
-                    .timestamp("ts")
+                    .timestamp("ts", timestampType.getTimestampType())
                     .col("t", columnType);
 
             assertSchemaMismatch(
                     "src34" + ColumnType.nameOf(columnType),
                     src,
                     "dst34" + ColumnType.nameOf(columnType),
-                    dst -> {
+                    _ -> {
                     },
                     s -> {
                         engine.clear();
                         TableToken tableToken = engine.verifyTableName(s.getName());
-                        path.of(configuration.getRoot()).concat(tableToken).concat("2022-08-01").concat("t.d").$();
-                        int fd = TestFilesFacadeImpl.INSTANCE.openRW(path.$(), CairoConfiguration.O_NONE);
+                        path.of(configuration.getDbRoot()).concat(tableToken).concat("2022-08-01").concat("t.d").$();
+                        long fd = TestFilesFacadeImpl.INSTANCE.openRW(path.$(), CairoConfiguration.O_NONE);
                         Files.truncate(fd, Files.length(fd) / 10);
                         TestFilesFacadeImpl.INSTANCE.close(fd);
                     },
@@ -1370,14 +1527,14 @@ public class AlterTableAttachPartitionTest extends AbstractAlterTableAttachParti
 
                     createPopulateTable(
                             1,
-                            src.timestamp("ts")
+                            src.timestamp("ts", timestampType.getTimestampType())
                                     .col("i", ColumnType.INT)
                                     .col("l", ColumnType.LONG),
                             100,
                             "2020-01-01",
                             3);
 
-                    AbstractCairoTest.create(dst.timestamp("ts")
+                    AbstractCairoTest.create(dst.timestamp("ts", timestampType.getTimestampType())
                             .col("i", ColumnType.INT)
                             .col("l", ColumnType.LONG));
 
@@ -1406,15 +1563,15 @@ public class AlterTableAttachPartitionTest extends AbstractAlterTableAttachParti
 
     private void writeToStrIndexFile(TableModel src, String partition, String columnFileName, long value, long offset) {
         FilesFacade ff = TestFilesFacadeImpl.INSTANCE;
-        int fd = -1;
+        long fd = -1;
         long writeBuff = Unsafe.malloc(Long.BYTES, MemoryTag.NATIVE_DEFAULT);
         try {
             // .i file
             engine.clear();
             TableToken tableToken = engine.verifyTableName(src.getName());
-            path.of(configuration.getRoot()).concat(tableToken).concat(partition).concat(columnFileName).$();
+            path.of(configuration.getDbRoot()).concat(tableToken).concat(partition).concat(columnFileName).$();
             fd = ff.openRW(path.$(), CairoConfiguration.O_NONE);
-            Unsafe.getUnsafe().putLong(writeBuff, value);
+            Unsafe.putLong(writeBuff, value);
             ff.write(fd, writeBuff, Long.BYTES, offset);
         } finally {
             ff.close(fd);

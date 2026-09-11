@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,21 +24,37 @@
 
 package io.questdb.cairo;
 
+import io.questdb.cairo.security.AllowAllSecurityContext;
+import io.questdb.cairo.view.ViewDefinition;
 import io.questdb.std.Mutable;
-import io.questdb.std.ObjHashSet;
 import io.questdb.std.ObjList;
 import org.jetbrains.annotations.NotNull;
 
+@SuppressWarnings("unused")
 public interface SecurityContext extends Mutable {
     // Implementations are free to define unique authentication types.
     // The user authenticated with credentials.
     byte AUTH_TYPE_CREDENTIALS = 1;
     // The user authenticated with a JWK token.
     byte AUTH_TYPE_JWK_TOKEN = 2;
-    // The context is not aware of authentication types.
+    // The user is not authenticated.
+    // Either tried to authenticate and failed, or did not try to authenticate at all.
     byte AUTH_TYPE_NONE = 0;
 
-    void authorizeAdminAction();
+    /**
+     * Returns the security context to use during SQL validation, i.e. syntax-only
+     * compilation that must not enforce authorization. The default returns an
+     * allow-all context, which is sufficient for open-source builds; implementations
+     * that enforce permissions return a view that skips authorization while
+     * preserving identity information.
+     */
+    default SecurityContext asValidationContext() {
+        return AllowAllSecurityContext.INSTANCE;
+    }
+
+    void authorizeAlterMatViewSetRefreshLimit(TableToken tableToken);
+
+    void authorizeAlterMatViewSetRefreshType(TableToken tableToken);
 
     void authorizeAlterTableAddColumn(TableToken tableToken);
 
@@ -48,7 +64,13 @@ public interface SecurityContext extends Mutable {
 
     void authorizeAlterTableAlterColumnType(TableToken tableToken, @NotNull ObjList<CharSequence> columnNames);
 
+    void authorizeAlterTableAlterSymbolCapacity(TableToken tableToken, @NotNull ObjList<CharSequence> columnNames);
+
     void authorizeAlterTableAttachPartition(TableToken tableToken);
+
+    void authorizeAlterTableConvertPartitionToNative(TableToken tableToken);
+
+    void authorizeAlterTableConvertPartitionToParquet(TableToken tableToken);
 
     void authorizeAlterTableDedupDisable(TableToken tableToken);
 
@@ -65,12 +87,19 @@ public interface SecurityContext extends Mutable {
     // the names are pairs from-to
     void authorizeAlterTableRenameColumn(TableToken tableToken, @NotNull ObjList<CharSequence> columnNames);
 
+    void authorizeAlterTableSetFormat(TableToken tableToken);
+
+    void authorizeAlterTableSetParam(TableToken tableToken);
+
+    void authorizeAlterTableSetParquetSettings(TableToken tableToken);
+
     void authorizeAlterTableSetType(TableToken tableToken);
 
-    default void authorizeCancelQuery() {
-    }
+    void authorizeAlterView(TableToken tableToken);
 
     void authorizeCopyCancel(SecurityContext cancellingSecurityContext);
+
+    void authorizeDatabaseBackup();
 
     void authorizeDatabaseSnapshot();
 
@@ -80,17 +109,61 @@ public interface SecurityContext extends Mutable {
 
     void authorizeLineTcp();
 
+    void authorizeLiveViewCreate();
+
+    void authorizeLiveViewDrop(TableToken tableToken);
+
+    void authorizeMatViewCreate();
+
+    void authorizeMatViewDrop(TableToken tableToken);
+
+    void authorizeMatViewRefresh(TableToken tableToken);
+
     void authorizePGWire();
 
+    /**
+     * Authorizes {@code ALTER TABLE ... REBASE WAL}. REBASE WAL is destructive: it discards pending WAL
+     * (including queued structural changes), mints a fresh tableId and drops the old directory. It is
+     * therefore gated behind system-admin privilege rather than the table-level RESUME WAL grant, so by
+     * default it delegates to {@link #authorizeSystemAdmin()}.
+     */
+    default void authorizeRebaseWal(TableToken tableToken) {
+        authorizeSystemAdmin();
+    }
+
     void authorizeResumeWal(TableToken tableToken);
+
+    void authorizeSelect(ViewDefinition viewDefinition);
 
     void authorizeSelect(TableToken tableToken, @NotNull ObjList<CharSequence> columnNames);
 
     void authorizeSelectOnAnyColumn(TableToken tableToken);
 
-    void authorizeTableBackup(ObjHashSet<TableToken> tableTokens);
+    void authorizeSettings();
+
+    void authorizeSqlEngineAdmin();
+
+    default void authorizeSuspendWal(TableToken tableToken) {
+        authorizeResumeWal(tableToken);
+    }
+
+    void authorizeSystemAdmin();
 
     void authorizeTableCreate();
+
+    default void authorizeTableCreate(int tableKind) {
+        switch (tableKind) {
+            case TableUtils.TABLE_KIND_REGULAR_TABLE:
+                authorizeTableCreate();
+                break;
+            case TableUtils.TABLE_KIND_TEMP_PARQUET_EXPORT:
+                // Allowed even in read-only mode
+                return;
+            default:
+                throw new UnsupportedOperationException("Unsupported table kind: " + tableKind);
+        }
+    }
+
 
     void authorizeTableDrop(TableToken tableToken);
 
@@ -104,6 +177,12 @@ public interface SecurityContext extends Mutable {
     void authorizeTableUpdate(TableToken tableToken, @NotNull ObjList<CharSequence> columnNames);
 
     void authorizeTableVacuum(TableToken tableToken);
+
+    void authorizeViewCompile(TableToken tableToken);
+
+    void authorizeViewCreate();
+
+    void authorizeViewDrop(TableToken tableToken);
 
     /**
      * Should throw an exception if:
@@ -130,6 +209,23 @@ public interface SecurityContext extends Mutable {
     }
 
     /**
+     * The principal to record as owner when this context auto-creates a database object during
+     * ingestion (e.g. ILP auto-creates a table or column), or {@code null} when this context carries no
+     * ACL identity that should receive an owner grant. Defaults to {@link #getPrincipal()}.
+     * <p>
+     * The identity-less allow-all / read-only contexts the ILP line-ACL bypass hands out still report a
+     * default principal from {@link #getPrincipal()} (so {@code current_user()} stays coherent), but they
+     * are not an ACL identity. Returning {@code null} here keeps anonymous ingestion from granting object
+     * ownership to a real ACL user who merely shares that default name (e.g. after the built-in admin is
+     * renamed). The full ACL contexts keep the default, so an authenticated ingesting user still owns what
+     * it auto-creates. It exists as a separate accessor because it is carried across the ILP I/O-to-writer
+     * thread hand-off, where only a serialized string survives and the originating context is gone.
+     */
+    default CharSequence getAutoCreateOwner() {
+        return getPrincipal();
+    }
+
+    /**
      * User account used for permission checks, i.e. the session user account
      * or the service account defined by an executed ASSUME statement.
      */
@@ -148,4 +244,10 @@ public interface SecurityContext extends Mutable {
     default boolean isExternal() {
         return false;
     }
+
+    default boolean isQueryCancellationAllowed() {
+        return true;
+    }
+
+    boolean isSystemAdmin();
 }

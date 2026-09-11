@@ -1,46 +1,75 @@
 jobs:
-  - job: linux_arm64
+  - job: linux_arm64_jdk25
+    workspace:
+      clean: all
     displayName: "on linux-arm64"
     pool:
-      name: "arm64"
-      vmImage:
-      demands:
-        - Agent.Name -equals arm64-$(System.StageName)$(Build.BuildId)
-    dependsOn:
-      - StartArmAgent
+      name: "hetzner-incus-arm"
     timeoutInMinutes: 60
-    condition: eq(variables['System.PullRequest.IsFork'], 'false')
+    condition: ne(variables['System.PullRequest.IsFork'], 'true')
     variables:
-      SOURCE_CODE_CHANGED: $[stageDependencies.CheckChanges.CheckChanges.outputs['check_changes.SOURCE_CODE_CHANGED']]
+      SOURCE_CODE_CHANGED: $[stageDependencies.CheckChanges.CheckChanges.outputs['check_coverage.SOURCE_CODE_CHANGED']]
+      RUST_SOURCE_CODE_CHANGED: $[stageDependencies.CheckChanges.CheckChanges.outputs['check_coverage.RUST_SOURCE_CODE_CHANGED']]
       CODE_COVERAGE_TOOL_OPTION: $[stageDependencies.CheckChanges.CheckChanges.outputs['check_coverage.CODE_COVERAGE_TOOL_OPTION']]
+      DIFF_COVER_THRESHOLD_PCT: 50
       ARCHIVED_CRASH_LOG: "$(Build.ArtifactStagingDirectory)/questdb-crash-$(Build.SourceBranchName)-$(Build.SourceVersion)-$(System.StageAttempt)-$(Agent.OS)-$(jdk).log"
       testset: "all"
       javadoc_step: ""
       javadoc_profile: ""
-      jdk: "1.11"
+      jdk: "1.25"
+      JAVA_HOME_25_X64: "/usr/lib/jvm/java-25-openjdk-arm64"
+      JAVA_HOME: "/usr/lib/jvm/java-25-openjdk-arm64"
       os: Linux
+      poolName: "hetzner-incus-arm"
     steps:
       - template: steps.yml
 
-  - job: linux_x64_zfs
+  - job: linux_x64_zfs_jdk25
+    workspace:
+      clean: all
     displayName: "on linux-x64-zfs"
     pool:
-      name: "amd64-zfs"
-      vmImage:
-      demands:
-        - Agent.Name -equals amd64-zfs-$(System.StageName)$(Build.BuildId)
-    dependsOn:
-      - StartX64ZfsAgent
+      name: "hetzner-incus-zfs"
     timeoutInMinutes: 60
-    condition: eq(variables['System.PullRequest.IsFork'], 'false')
+    condition: ne(variables['System.PullRequest.IsFork'], 'true')
     variables:
-      SOURCE_CODE_CHANGED: $[stageDependencies.CheckChanges.CheckChanges.outputs['check_changes.SOURCE_CODE_CHANGED']]
+      SOURCE_CODE_CHANGED: $[stageDependencies.CheckChanges.CheckChanges.outputs['check_coverage.SOURCE_CODE_CHANGED']]
+      RUST_SOURCE_CODE_CHANGED: $[stageDependencies.CheckChanges.CheckChanges.outputs['check_coverage.RUST_SOURCE_CODE_CHANGED']]
       CODE_COVERAGE_TOOL_OPTION: $[stageDependencies.CheckChanges.CheckChanges.outputs['check_coverage.CODE_COVERAGE_TOOL_OPTION']]
+      DIFF_COVER_THRESHOLD_PCT: 50
       ARCHIVED_CRASH_LOG: "$(Build.ArtifactStagingDirectory)/questdb-crash-$(Build.SourceBranchName)-$(Build.SourceVersion)-$(System.StageAttempt)-$(Agent.OS)-$(jdk).log"
       testset: "all"
       javadoc_step: ""
       javadoc_profile: ""
-      jdk: "1.11"
+      jdk: "1.25"
       os: Linux
+      JAVA_HOME_25_X64: "/usr/lib/jvm/java-25-openjdk-amd64"
+      JAVA_HOME: "/usr/lib/jvm/java-25-openjdk-amd64"
+      poolName: "hetzner-incus-zfs"
+    steps:
+      - template: steps.yml
+
+  - job: linux_x64_graal
+    workspace:
+      clean: all
+    displayName: "on linux-x86-graal"
+    pool:
+      name: "hetzner-incus"
+    timeoutInMinutes: 60
+    condition: ne(variables['System.PullRequest.IsFork'], 'true')
+    variables:
+      SOURCE_CODE_CHANGED: $[stageDependencies.CheckChanges.CheckChanges.outputs['check_coverage.SOURCE_CODE_CHANGED']]
+      RUST_SOURCE_CODE_CHANGED: $[stageDependencies.CheckChanges.CheckChanges.outputs['check_coverage.RUST_SOURCE_CODE_CHANGED']]
+      CODE_COVERAGE_TOOL_OPTION: $[stageDependencies.CheckChanges.CheckChanges.outputs['check_coverage.CODE_COVERAGE_TOOL_OPTION']]
+      DIFF_COVER_THRESHOLD_PCT: 50
+      ARCHIVED_CRASH_LOG: "$(Build.ArtifactStagingDirectory)/questdb-crash-$(Build.SourceBranchName)-$(Build.SourceVersion)-$(System.StageAttempt)-$(Agent.OS)-$(jdk).log"
+      testset: "all"
+      javadoc_step: ""
+      javadoc_profile: ""
+      jdk: "1.25"
+      os: Linux
+      JAVA_HOME_25_X64: "/opt/graalvm-25"
+      JAVA_HOME: "/opt/graalvm-25"
+      poolName: "hetzner-incus"
     steps:
       - template: steps.yml

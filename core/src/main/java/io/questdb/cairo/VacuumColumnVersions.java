@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -26,11 +26,22 @@ package io.questdb.cairo;
 
 import io.questdb.MessageBus;
 import io.questdb.PropertyKey;
+import io.questdb.griffin.PurgingOperator;
 import io.questdb.log.Log;
 import io.questdb.log.LogFactory;
 import io.questdb.mp.Sequence;
-import io.questdb.std.*;
-import io.questdb.std.datetime.millitime.DateFormatUtils;
+import io.questdb.std.CharSequenceIntHashMap;
+import io.questdb.std.DirectLongList;
+import io.questdb.std.Files;
+import io.questdb.std.FilesFacade;
+import io.questdb.std.FindVisitor;
+import io.questdb.std.LongList;
+import io.questdb.std.MemoryTag;
+import io.questdb.std.Misc;
+import io.questdb.std.Numbers;
+import io.questdb.std.NumericException;
+import io.questdb.std.Os;
+import io.questdb.std.Vect;
 import io.questdb.std.str.Path;
 import io.questdb.std.str.StringSink;
 import io.questdb.std.str.Utf8StringSink;
@@ -41,6 +52,7 @@ import java.io.Closeable;
 
 import static io.questdb.cairo.PartitionBy.getPartitionDirFormatMethod;
 import static io.questdb.std.Files.DT_DIR;
+import static io.questdb.std.datetime.DateLocaleFactory.EN_LOCALE;
 
 public class VacuumColumnVersions implements Closeable {
     private static final int COLUMN_VERSION_LIST_CAPACITY = 8;
@@ -48,6 +60,7 @@ public class VacuumColumnVersions implements Closeable {
     private final CairoEngine engine;
     private final FilesFacade ff;
     private final ColumnPurgeTask purgeTask = new ColumnPurgeTask();
+    private final CharSequenceIntHashMap rogueColumns = new CharSequenceIntHashMap();
     private StringSink columnNameSink;
     private Utf8StringSink fileNameSink;
     private int partitionBy;
@@ -58,12 +71,13 @@ public class VacuumColumnVersions implements Closeable {
     private int tablePathLen;
     private TableReader tableReader;
     private final FindVisitor visitTableFiles = this::visitTableFiles;
+    private int timestampType;
     private final FindVisitor visitTablePartition = this::visitTablePartition;
 
     public VacuumColumnVersions(CairoEngine engine) {
         try {
             this.engine = engine;
-            this.purgeExecution = new ColumnPurgeOperator(engine.getConfiguration());
+            this.purgeExecution = new ColumnPurgeOperator(engine);
             this.tableFiles = new DirectLongList(COLUMN_VERSION_LIST_CAPACITY, MemoryTag.NATIVE_SQL_COMPILER);
             this.ff = engine.getConfiguration().getFilesFacade();
         } catch (Throwable th) {
@@ -79,22 +93,29 @@ public class VacuumColumnVersions implements Closeable {
     }
 
     public void run(TableReader reader) {
-        LOG.info().$("processing [dirName=").utf8(reader.getTableToken().getDirName()).I$();
+        if (engine.getCheckpointStatus().isInProgress()) {
+            throw CairoException.nonCritical().put("cannot vacuum while checkpoint is in progress");
+        }
+
+        LOG.info().$("processing [table=").$(reader.getTableToken()).I$();
         fileNameSink = new Utf8StringSink();
         columnNameSink = new StringSink();
 
         CairoConfiguration configuration = engine.getConfiguration();
 
         TableToken tableToken = reader.getTableToken();
-        Path path = Path.getThreadLocal(configuration.getRoot());
+        Path path = Path.getThreadLocal(configuration.getDbRoot());
         path.concat(tableToken);
         tablePathLen = path.size();
-        path2 = Path.getThreadLocal2(configuration.getRoot()).concat(tableToken);
+        path2 = Path.getThreadLocal2(configuration.getDbRoot()).concat(tableToken);
 
         this.tableReader = reader;
+        timestampType = reader.getMetadata().getTimestampType();
         partitionBy = reader.getPartitionedBy();
 
         tableFiles.clear();
+        rogueColumns.clear();
+
         try {
             ff.iterateDir(path.$(), visitTablePartition);
             Vect.sort3LongAscInPlace(tableFiles.getAddress(), tableFiles.size() / 3);
@@ -129,17 +150,31 @@ public class VacuumColumnVersions implements Closeable {
                         purgeTask.clear();
                     }
 
-                    writerIndex = metadata.getWriterIndex(newReaderIndex);
-                    CharSequence columnName = metadata.getColumnName(newReaderIndex);
-                    int columnType = metadata.getColumnType(newReaderIndex);
-                    purgeTask.of(reader.getTableToken(), columnName, tableId, truncateVersion, columnType, partitionBy, updateTxn);
+                    writerIndex = newReaderIndex > -1 ? metadata.getWriterIndex(newReaderIndex) : newReaderIndex;
+                    String columnName = newReaderIndex > -1 ?
+                            metadata.getColumnName(newReaderIndex) :
+                            rogueColumns.keys().get(-newReaderIndex - 1).toString();
+
+                    int columnType = newReaderIndex > -1 ? metadata.getColumnType(newReaderIndex) : ColumnType.UNDEFINED;
+                    byte indexType = newReaderIndex > -1 ? metadata.getColumnIndexType(newReaderIndex) : IndexType.NONE;
+                    purgeTask.of(
+                            reader.getTableToken(),
+                            columnName,
+                            tableId,
+                            truncateVersion,
+                            columnType,
+                            indexType,
+                            timestampType,
+                            partitionBy,
+                            updateTxn
+                    );
                 }
             }
 
             columnIndex = (int) tableFiles.get(i);
             long partitionTs = tableFiles.get(i + 1);
             long columnVersion = tableFiles.get(i + 2);
-            long latestColumnNameTxn = columnVersionReader.getColumnNameTxn(partitionTs, writerIndex);
+            long latestColumnNameTxn = columnIndex > -1 ? columnVersionReader.getColumnNameTxn(partitionTs, writerIndex) : reader.getTxn();
             // Do not delete if columnVersion >= reader.getTxn(), this may be the transaction not committed yet
             if (columnVersion != latestColumnNameTxn && columnVersion < reader.getTxn()) {
                 // Has to be deleted. Columns can have multiple files e.g. .i, .d, .k, .v
@@ -160,7 +195,7 @@ public class VacuumColumnVersions implements Closeable {
 
     private void queueColumnVersionPurge(ColumnPurgeTask purgeTask, CairoEngine engine) {
         MessageBus messageBus = engine.getMessageBus();
-        LOG.info().$("scheduling column version purge [table=").$(purgeTask.getTableName())
+        LOG.info().$("scheduling column version purge [table=").$(purgeTask.getTableToken())
                 .$(", column=").$(purgeTask.getColumnName())
                 .I$();
 
@@ -209,9 +244,40 @@ public class VacuumColumnVersions implements Closeable {
                     Utf8s.utf8ToUtf16(fileNameSink, 0, dotIndex, columnNameSink);
                     int name2Index = resolveName2Index(columnNameSink, tableReader);
                     if (name2Index < 0) {
-                        // Unknown file. Log the problem
-                        LOG.error().$("file does not belong to the table [name=").$(fileNameSink).$(", path=").$(path2).I$();
-                        return;
+                        // Unknown file. Can be a column file that was deleted but not purged.
+                        if (!Utf8s.containsAscii(fileNameSink, ".d.")
+                                && !Utf8s.containsAscii(fileNameSink, ".i.")
+                                && !Utf8s.containsAscii(fileNameSink, ".k.")
+                                && !Utf8s.containsAscii(fileNameSink, ".v.")
+                                && !Utf8s.containsAscii(fileNameSink, ".c.")
+                                && !Utf8s.containsAscii(fileNameSink, ".o.")
+                                && !Utf8s.containsAscii(fileNameSink, ".pk.")
+                                && !Utf8s.containsAscii(fileNameSink, ".pv.")
+                                && !Utf8s.containsAscii(fileNameSink, ".pci.")
+                                && !Utf8s.containsAscii(fileNameSink, ".pc") // covers .pc0, .pc1, ..., .pci
+                                && !Utf8s.containsAscii(fileNameSink, ".pd")
+                                && !Utf8s.endsWithAscii(fileNameSink, ".d")
+                                && !Utf8s.endsWithAscii(fileNameSink, ".i")
+                                && !Utf8s.endsWithAscii(fileNameSink, ".k")
+                                && !Utf8s.endsWithAscii(fileNameSink, ".v")
+                                && !Utf8s.endsWithAscii(fileNameSink, ".c")
+                                && !Utf8s.endsWithAscii(fileNameSink, ".pk")
+                                && !Utf8s.endsWithAscii(fileNameSink, ".pv")
+                                && !Utf8s.endsWithAscii(fileNameSink, ".pci")
+                                && !Utf8s.endsWithAscii(fileNameSink, ".pd")
+                                && !Utf8s.endsWithAscii(fileNameSink, ".lock")
+                                && !Utf8s.endsWithAscii(fileNameSink, ".o")) {
+                            LOG.critical().$("file does not belong to the table, will be left on disk [name=").$(fileNameSink).$(", path=").$(path2).I$();
+                            return;
+                        }
+                        // This looks like a file of a dropped column.
+                        int keyIndex = rogueColumns.keyIndex(columnNameSink);
+                        if (keyIndex > -1) {
+                            name2Index = -rogueColumns.keys().size() - 1;
+                            rogueColumns.putAt(keyIndex, columnNameSink, name2Index);
+                        } else {
+                            name2Index = rogueColumns.valueAt(keyIndex);
+                        }
                     }
 
                     int secondDot = Utf8s.indexOfAscii(fileNameSink, dotIndex + 1, '.');
@@ -242,9 +308,9 @@ public class VacuumColumnVersions implements Closeable {
             }
 
             try {
-                partitionTimestamp = getPartitionDirFormatMethod(partitionBy).parse(fileNameSink.asAsciiCharSequence(), 0, dotIndex, DateFormatUtils.EN_LOCALE);
+                partitionTimestamp = getPartitionDirFormatMethod(timestampType, partitionBy).parse(fileNameSink.asAsciiCharSequence(), 0, dotIndex, EN_LOCALE);
             } catch (NumericException ex) {
-                // Directory is invalid partition name, continue
+                // Directory is an invalid partition name, continue
                 LOG.error().$("skipping column version purge VACUUM, invalid partition directory name [name=").$(fileNameSink)
                         .$(", path=").$(path2).I$();
                 return;
@@ -270,6 +336,10 @@ public class VacuumColumnVersions implements Closeable {
             path2.concat(pUtf8NameZ);
             LOG.info().$("enumerating files at ").$(path2).$();
             ff.iterateDir(path2.$(), visitTableFiles);
+        } else {
+            // Table root
+            partitionTimestamp = PurgingOperator.TABLE_ROOT_PARTITION;
+            visitTableFiles(pUtf8NameZ, type);
         }
     }
 }

@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -25,7 +25,6 @@
 package io.questdb.std.str;
 
 import io.questdb.std.MemoryTag;
-import io.questdb.std.Unsafe;
 import io.questdb.std.bytes.DirectByteSink;
 import io.questdb.std.bytes.NativeByteSink;
 import org.jetbrains.annotations.NotNull;
@@ -40,16 +39,18 @@ import java.io.Closeable;
 public class DirectUtf8Sink implements MutableUtf8Sink, BorrowableUtf8Sink, DirectUtf8Sequence, Closeable {
     private final AsciiCharSequence asciiCharSequence = new AsciiCharSequence();
     private final DirectByteSink sink;
-    private boolean ascii;
+    private int[] ryuE10;
 
     public DirectUtf8Sink(long initialCapacity) {
-        sink = new DirectByteSink(initialCapacity) {
-            @Override
-            protected int memoryTag() {
-                return MemoryTag.NATIVE_DIRECT_UTF8_SINK;
-            }
-        };
-        ascii = true;
+        this(initialCapacity, true);
+    }
+
+    public DirectUtf8Sink(long initialCapacity, boolean alloc) {
+        sink = new DirectByteSink(initialCapacity, MemoryTag.NATIVE_DIRECT_UTF8_SINK, !alloc);
+    }
+
+    public DirectUtf8Sink(long initialCapacity, boolean alloc, int memoryTag) {
+        sink = new DirectByteSink(initialCapacity, memoryTag, !alloc);
     }
 
     @Override
@@ -67,15 +68,13 @@ public class DirectUtf8Sink implements MutableUtf8Sink, BorrowableUtf8Sink, Dire
         return sink.byteAt(index);
     }
 
-    @TestOnly
     public long capacity() {
-        return sink.capacity();
+        return sink.allocatedCapacity();
     }
 
     @Override
     public void clear() {
         sink.clear();
-        ascii = true;
     }
 
     @Override
@@ -85,7 +84,7 @@ public class DirectUtf8Sink implements MutableUtf8Sink, BorrowableUtf8Sink, Dire
 
     @Override
     public boolean isAscii() {
-        return ascii;
+        return sink.isAscii();
     }
 
     @Override
@@ -98,12 +97,10 @@ public class DirectUtf8Sink implements MutableUtf8Sink, BorrowableUtf8Sink, Dire
         if (us == null) {
             return this;
         }
-        ascii &= us.isAscii();
+        setAscii(isAscii() & us.isAscii());
         final int size = us.size();
-        final long dest = sink.checkCapacity(size);
-        for (int i = 0; i < size; i++) {
-            Unsafe.getUnsafe().putByte(dest + i, us.byteAt(i));
-        }
+        final long dest = sink.ensureCapacity(size);
+        us.writeTo(dest, 0, size);
         sink.advance(size);
         return this;
     }
@@ -111,16 +108,24 @@ public class DirectUtf8Sink implements MutableUtf8Sink, BorrowableUtf8Sink, Dire
     @Override
     public DirectUtf8Sink put(byte b) {
         assert b < 0 : "b is ascii";
-        ascii = false;
+        setAscii(false);
         sink.put(b);
         return this;
     }
 
     @Override
     public DirectUtf8Sink putAny(byte b) {
-        ascii &= b >= 0;
+        setAscii(isAscii() & b >= 0);
         sink.put(b);
         return this;
+    }
+
+    /**
+     * Same as {@link #putAny(byte)}, but writes 8 consequent bytes (a long).
+     */
+    public void putAny8(long w) {
+        setAscii(isAscii() & Utf8s.isAscii(w));
+        sink.putLong(w);
     }
 
     @Override
@@ -135,11 +140,38 @@ public class DirectUtf8Sink implements MutableUtf8Sink, BorrowableUtf8Sink, Dire
         return this;
     }
 
+    @TestOnly
+    public DirectUtf8Sink putDouble(double value) {
+        setAscii(false);
+        sink.putDouble(value);
+        return this;
+    }
+
     @Override
     public DirectUtf8Sink putNonAscii(long lo, long hi) {
-        ascii = false;
+        setAscii(false);
         sink.put(lo, hi);
         return this;
+    }
+
+    public void reopen() {
+        sink.reopen();
+    }
+
+    public void reserve(long minCapacity) {
+        sink.reserve(minCapacity);
+    }
+
+    public void resetCapacity() {
+        sink.resetCapacity();
+    }
+
+    @Override
+    public int[] ryuScratch() {
+        if (ryuE10 == null) {
+            ryuE10 = new int[1];
+        }
+        return ryuE10;
     }
 
     @Override
@@ -148,7 +180,16 @@ public class DirectUtf8Sink implements MutableUtf8Sink, BorrowableUtf8Sink, Dire
     }
 
     @Override
+    public long tailPadding() {
+        return sink.tailPadding();
+    }
+
+    @Override
     public @NotNull String toString() {
         return Utf8s.stringFromUtf8Bytes(sink.lo(), sink.hi());
+    }
+
+    private void setAscii(boolean ascii) {
+        sink.setAscii(ascii);
     }
 }

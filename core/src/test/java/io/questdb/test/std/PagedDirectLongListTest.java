@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -44,7 +44,7 @@ public class PagedDirectLongListTest extends AbstractTest {
                 for (int i = 0; i < count; i++) {
                     long addr = pagedList.allocateBlock();
                     for (int j = 0; j < blockSize / 8; j += 8) {
-                        Unsafe.getUnsafe().putLong(addr + (long) j * Long.BYTES, i + j);
+                        Unsafe.putLong(addr + (long) j * Long.BYTES, i + j);
                     }
                 }
 
@@ -58,7 +58,7 @@ public class PagedDirectLongListTest extends AbstractTest {
                 for (int i = 0; i < count; i++) {
                     long addr = pagedList.allocateBlock();
                     for (int j = 0; j < blockSize / 8; j += 8) {
-                        Unsafe.getUnsafe().putLong(addr + (long) j * Long.BYTES, i + j);
+                        Unsafe.putLong(addr + (long) j * Long.BYTES, i + j);
                     }
                 }
 
@@ -80,7 +80,7 @@ public class PagedDirectLongListTest extends AbstractTest {
         while ((blockIndex = pagedList.nextBlockIndex(blockIndex)) > -1L) {
             long memAddr = pagedList.getBlockAddress(blockIndex);
             for (int j = 0; j < blockSize / 8; j += 8) {
-                Assert.assertEquals(c + j, Unsafe.getUnsafe().getLong(memAddr + (long) j * Long.BYTES));
+                Assert.assertEquals(c + j, Unsafe.getLong(memAddr + (long) j * Long.BYTES));
             }
             c++;
         }

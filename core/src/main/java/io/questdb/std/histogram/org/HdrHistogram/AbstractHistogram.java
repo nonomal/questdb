@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -22,19 +22,21 @@
  *
  ******************************************************************************/
 
-/*
- * Written by Gil Tene of Azul Systems, and released to the public domain,
- * as explained at http://creativecommons.org/publicdomain/zero/1.0/
- *
- * @author Gil Tene
- */
+// Written by Gil Tene of Azul Systems, and released to the public domain,
+// as explained at http://creativecommons.org/publicdomain/zero/1.0/
+//
+// @author Gil Tene
 
 package io.questdb.std.histogram.org.HdrHistogram;
 
 import io.questdb.cairo.CairoException;
 import org.jetbrains.annotations.NotNull;
 
-import java.io.*;
+import java.io.IOException;
+import java.io.ObjectInputStream;
+import java.io.ObjectOutputStream;
+import java.io.PrintStream;
+import java.io.Serializable;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.InvocationTargetException;
 import java.nio.ByteBuffer;
@@ -526,6 +528,7 @@ public abstract class AbstractHistogram extends AbstractHistogramBase implements
     //
 
     /**
+     * @param value the value for which to determine the bucket index
      * @return the lowest (and therefore highest precision) bucket index that can represent the value
      */
     public int getBucketIndex(final long value) {
@@ -662,7 +665,7 @@ public abstract class AbstractHistogram extends AbstractHistogramBase implements
             totalValue += medianEquivalentValue(iterationValue.getValueIteratedTo())
                     * (double) iterationValue.getCountAtValueIteratedTo();
         }
-        return (totalValue * 1.0) / getTotalCount();
+        return (totalValue) / getTotalCount();
     }
 
     /**
@@ -993,7 +996,6 @@ public abstract class AbstractHistogram extends AbstractHistogramBase implements
      * five (5) percentile reporting tick points.
      *
      * @param printStream                 Stream into which the distribution will be output
-     *                                    <p>
      * @param outputValueUnitScalingRatio The scaling factor by which to divide histogram recorded values units in
      *                                    output
      */
@@ -1027,9 +1029,7 @@ public abstract class AbstractHistogram extends AbstractHistogramBase implements
      * <i>dumpTicksPerHalf</i> percentile reporting tick points.
      *
      * @param printStream                    Stream into which the distribution will be output
-     *                                       <p>
      * @param percentileTicksPerHalfDistance The number of reporting points per exponentially decreasing half-distance
-     *                                       <p>
      * @param outputValueUnitScalingRatio    The scaling factor by which to divide histogram recorded values units in
      *                                       output
      */
@@ -1045,9 +1045,7 @@ public abstract class AbstractHistogram extends AbstractHistogramBase implements
      * <i>dumpTicksPerHalf</i> percentile reporting tick points.
      *
      * @param printStream                    Stream into which the distribution will be output
-     *                                       <p>
      * @param percentileTicksPerHalfDistance The number of reporting points per exponentially decreasing half-distance
-     *                                       <p>
      * @param outputValueUnitScalingRatio    The scaling factor by which to divide histogram recorded values units in
      *                                       output
      * @param useCsvFormat                   Output in CSV format if true. Otherwise use plain text form.
@@ -1124,7 +1122,6 @@ public abstract class AbstractHistogram extends AbstractHistogramBase implements
      * performed in steps that start at 0% and reduce their distance to 100% according to the
      * <i>percentileTicksPerHalfDistance</i> parameter, ultimately reaching 100% when all recorded histogram
      * values are exhausted.
-     * <p>
      *
      * @param percentileTicksPerHalfDistance The number of iteration steps per half-distance to 100%.
      * @return An {@link java.lang.Iterable}{@literal <}{@link HistogramIterationValue}{@literal >}
@@ -2437,7 +2434,7 @@ public abstract class AbstractHistogram extends AbstractHistogramBase implements
  */
 
 abstract class AbstractHistogramBase extends EncodableHistogram {
-    static AtomicLong constructionIdentityCount = new AtomicLong(0);
+    static final AtomicLong constructionIdentityCount = new AtomicLong(0);
     volatile boolean autoResize = false;
     int bucketCount;
     int countsArrayLength;

@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -25,9 +25,26 @@
 package io.questdb.griffin.engine.groupby.vect;
 
 import io.questdb.MessageBus;
-import io.questdb.cairo.*;
+import io.questdb.cairo.AbstractRecordCursorFactory;
+import io.questdb.cairo.CairoConfiguration;
+import io.questdb.cairo.CairoEngine;
+import io.questdb.cairo.CairoException;
+import io.questdb.cairo.ColumnType;
+import io.questdb.cairo.ColumnTypes;
+import io.questdb.cairo.sql.AtomicBooleanCircuitBreaker;
+import io.questdb.cairo.sql.PageFrame;
+import io.questdb.cairo.sql.PageFrameAddressCache;
+import io.questdb.cairo.sql.PageFrameCursor;
+import io.questdb.cairo.sql.PageFrameMemoryPool;
 import io.questdb.cairo.sql.Record;
-import io.questdb.cairo.sql.*;
+import io.questdb.cairo.sql.RecordCursor;
+import io.questdb.cairo.sql.RecordCursorFactory;
+import io.questdb.cairo.sql.RecordMetadata;
+import io.questdb.cairo.sql.SqlExecutionCircuitBreaker;
+import io.questdb.cairo.sql.SymbolTable;
+import io.questdb.cairo.sql.async.AsyncQueryErrorState;
+import io.questdb.cairo.sql.async.AsyncQueryProgressState;
+import io.questdb.cairo.sql.async.QueryParallelFiberDispatcher;
 import io.questdb.cairo.sql.async.WorkStealingStrategy;
 import io.questdb.cairo.sql.async.WorkStealingStrategyFactory;
 import io.questdb.griffin.PlanSink;
@@ -36,41 +53,59 @@ import io.questdb.griffin.SqlExecutionContext;
 import io.questdb.griffin.engine.PerWorkerLocks;
 import io.questdb.log.Log;
 import io.questdb.log.LogFactory;
+import io.questdb.mp.MCSequence;
 import io.questdb.mp.MPSequence;
 import io.questdb.mp.RingQueue;
 import io.questdb.mp.SOUnboundedCountDownLatch;
 import io.questdb.mp.Worker;
-import io.questdb.std.*;
+import io.questdb.std.DirectLongLongSortedList;
+import io.questdb.std.IntList;
+import io.questdb.std.Long256;
+import io.questdb.std.Long256Impl;
+import io.questdb.std.MemoryTracker;
+import io.questdb.std.Misc;
+import io.questdb.std.Numbers;
+import io.questdb.std.ObjList;
+import io.questdb.std.ObjectPool;
+import io.questdb.std.Os;
+import io.questdb.std.Rosti;
+import io.questdb.std.RostiAllocFacade;
+import io.questdb.std.Transient;
+import io.questdb.std.Unsafe;
 import io.questdb.std.str.CharSink;
-import io.questdb.std.str.Utf16Sink;
 import io.questdb.tasks.VectorAggregateTask;
 import org.jetbrains.annotations.Nullable;
 
 import java.util.concurrent.atomic.AtomicInteger;
 
-import static io.questdb.cairo.sql.DataFrameCursorFactory.ORDER_ASC;
+import static io.questdb.cairo.sql.PartitionFrameCursorFactory.ORDER_ASC;
 
 public class GroupByRecordCursorFactory extends AbstractRecordCursorFactory {
-
     private final static Log LOG = LogFactory.getLog(GroupByRecordCursorFactory.class);
-
     private final static int ROSTI_MINIMIZED_SIZE = 16; // 16 is the minimum size usable on arm
-    private final RecordCursorFactory base;
+
+    private final AsyncQueryErrorState aggregateError = new AsyncQueryErrorState();
     private final RostiRecordCursor cursor;
     private final SOUnboundedCountDownLatch doneLatch = new SOUnboundedCountDownLatch();
     private final ObjectPool<VectorAggregateEntry> entryPool;
+    private final PageFrameAddressCache frameAddressCache;
     private final int keyColumnIndex;
     private final AtomicInteger oomCounter = new AtomicInteger();
-    private final long[] pRosti;
     private final PerWorkerLocks perWorkerLocks; // used to protect pRosti and VAF's internal slots
+    private final AsyncQueryProgressState progressState = new AsyncQueryProgressState();
     private final RostiAllocFacade raf;
     private final AtomicBooleanCircuitBreaker sharedCircuitBreaker; // used to signal cancellation to workers
     private final AtomicInteger startedCounter = new AtomicInteger();
-    private final ObjList<VectorAggregateFunction> vafList;
     private final WorkStealingStrategy workStealingStrategy;
     private final int workerCount;
+    private RecordCursorFactory base;
+    private ObjList<PageFrameMemoryPool> frameMemoryPools; // per worker pools
+    private long[] pRosti;
+    private ObjList<RostiSharedCursor> sharedCursors;
+    private ObjList<VectorAggregateFunction> vafList;
 
     public GroupByRecordCursorFactory(
+            CairoEngine engine,
             CairoConfiguration configuration,
             RecordCursorFactory base,
             RecordMetadata metadata,
@@ -93,8 +128,9 @@ public class GroupByRecordCursorFactory extends AbstractRecordCursorFactory {
             // functions[n].type == columnTypes[n+1]
 
             this.base = base;
+            this.frameAddressCache = new PageFrameAddressCache();
             perWorkerLocks = new PerWorkerLocks(configuration, workerCount);
-            sharedCircuitBreaker = new AtomicBooleanCircuitBreaker();
+            sharedCircuitBreaker = new AtomicBooleanCircuitBreaker(engine);
             workStealingStrategy = WorkStealingStrategyFactory.getInstance(configuration, workerCount);
             workStealingStrategy.of(startedCounter);
             // first column is INT or SYMBOL
@@ -110,17 +146,19 @@ public class GroupByRecordCursorFactory extends AbstractRecordCursorFactory {
                         raf.free(pRosti[k]);
                         pRosti[k] = 0;
                     }
-                    throw new OutOfMemoryError();
+                    throw CairoException.nonCritical()
+                            .put("could not allocate rosti hash table")
+                            .setOutOfMemory(true);
                 }
                 pRosti[i] = ptr;
 
                 // remember, single key for now
                 switch (ColumnType.tagOf(columnTypes.getColumnType(0))) {
                     case ColumnType.INT:
-                        Unsafe.getUnsafe().putInt(Rosti.getInitialValueSlot(pRosti[i], 0), Numbers.INT_NULL);
+                        Unsafe.putInt(Rosti.getInitialValueSlot(pRosti[i], 0), Numbers.INT_NULL);
                         break;
                     case ColumnType.SYMBOL:
-                        Unsafe.getUnsafe().putInt(Rosti.getInitialValueSlot(pRosti[i], 0), SymbolTable.VALUE_IS_NULL);
+                        Unsafe.putInt(Rosti.getInitialValueSlot(pRosti[i], 0), SymbolTable.VALUE_IS_NULL);
                         break;
                     default:
                 }
@@ -156,9 +194,15 @@ public class GroupByRecordCursorFactory extends AbstractRecordCursorFactory {
             if (symbolTableSkewIndex != null && symbolTableSkewIndex.size() > 0) {
                 final IntList symbolSkew = new IntList(symbolTableSkewIndex.size());
                 symbolSkew.addAll(symbolTableSkewIndex);
-                cursor = new RostiRecordCursor(pRosti, columnSkewIndex, symbolSkew);
+                cursor = new RostiRecordCursor(pRosti, columnTypes.getColumnCount(), columnSkewIndex, symbolSkew);
             } else {
-                cursor = new RostiRecordCursor(pRosti, columnSkewIndex, null);
+                cursor = new RostiRecordCursor(pRosti, columnTypes.getColumnCount(), columnSkewIndex, null);
+            }
+
+            this.frameMemoryPools = new ObjList<>(workerCount);
+            for (int i = 0; i < workerCount; i++) {
+                // Single sequential scan; no LRU caching needed across frames.
+                frameMemoryPools.add(new PageFrameMemoryPool(configuration, 0L));
             }
         } catch (Throwable th) {
             close();
@@ -171,8 +215,21 @@ public class GroupByRecordCursorFactory extends AbstractRecordCursorFactory {
         return base;
     }
 
+    // Vector aggregates are column-bound builtins (sum/min/max/avg/count/...) with no argument
+    // expressions, hence deterministic by construction; stability is the base's.
+    @Override
+    public boolean isNonDeterministic() {
+        return base.isNonDeterministic();
+    }
+
+    @Override
+    public boolean isStableWithinExecution() {
+        return base.isStableWithinExecution();
+    }
+
     @Override
     public RecordCursor getCursor(SqlExecutionContext executionContext) throws SqlException {
+        aggregateError.clear();
         oomCounter.set(0);
         // clear maps
         for (int i = 0, n = pRosti.length; i < n; i++) {
@@ -183,7 +240,34 @@ public class GroupByRecordCursorFactory extends AbstractRecordCursorFactory {
             vafList.getQuick(i).clear();
         }
         final PageFrameCursor pageFrameCursor = base.getPageFrameCursor(executionContext, ORDER_ASC);
-        return cursor.of(pageFrameCursor, executionContext.getMessageBus(), executionContext.getCircuitBreaker());
+        return cursor.of(
+                base.getMetadata(),
+                pageFrameCursor,
+                executionContext.getMessageBus(),
+                executionContext.getCircuitBreaker(),
+                executionContext.getMemoryTracker()
+        );
+    }
+
+    @Override
+    public RecordCursor getSharedCursor(SqlExecutionContext executionContext, int sharedId) {
+        if (sharedCursors == null) {
+            sharedCursors = new ObjList<>();
+        }
+        int idx = sharedId - 1;
+        RostiSharedCursor shared = sharedCursors.getQuiet(idx);
+        if (shared == null) {
+            shared = new RostiSharedCursor();
+            sharedCursors.extendAndSet(idx, shared);
+        }
+        shared.of();
+        return shared;
+    }
+
+    @Override
+    public boolean recordCursorSupportsLongTopK(int columnIndex) {
+        final int columnType = getMetadata().getColumnType(columnIndex);
+        return columnType == ColumnType.LONG || ColumnType.isTimestamp(columnType);
     }
 
     @Override
@@ -192,11 +276,16 @@ public class GroupByRecordCursorFactory extends AbstractRecordCursorFactory {
     }
 
     @Override
+    public boolean supportsSharedCursors() {
+        return true;
+    }
+
+    @Override
     public void toPlan(PlanSink sink) {
         sink.type("GroupBy");
         sink.meta("vectorized").val(true);
         sink.meta("workers").val(workerCount);
-        sink.attr("keys").val("[").putBaseColumnNameNoRemap(keyColumnIndex).val("]");
+        sink.attr("keys").val("[").putBaseColumnName(keyColumnIndex).val("]");
         sink.optAttr("values", vafList, true);
         sink.child(base);
     }
@@ -219,31 +308,132 @@ public class GroupByRecordCursorFactory extends AbstractRecordCursorFactory {
             long columnOffsets
     ) {
         for (int i = start; i < end; i++) {
-            columnSkewIndex.add(Unsafe.getUnsafe().getInt(columnOffsets + vafList.getQuick(i).getValueOffset() * 4L));
+            columnSkewIndex.add(Unsafe.getInt(columnOffsets + vafList.getQuick(i).getValueOffset() * 4L));
         }
+    }
+
+    private static int runWhatsLeft(
+            MCSequence subSeq,
+            RingQueue<VectorAggregateTask> queue,
+            @Nullable QueryParallelFiberDispatcher dispatcher,
+            AsyncQueryProgressState progressState,
+            AsyncQueryErrorState aggregateError,
+            int queuedCount,
+            int reclaimed,
+            int mergedCount,
+            int workerId,
+            SOUnboundedCountDownLatch doneLatch,
+            SqlExecutionCircuitBreaker circuitBreaker,
+            AtomicBooleanCircuitBreaker sharedCB,
+            WorkStealingStrategy workStealingStrategy
+    ) {
+        while (true) {
+            final long observedProgress = progressState.getVersion();
+            final long observedGlobalProgress = dispatcher != null ? dispatcher.getProgressVersion() : 0;
+            final boolean isOwnerParkable = dispatcher != null && dispatcher.isOwnerParkable();
+            if (doneLatch.done(queuedCount)) {
+                break;
+            }
+            final boolean isOwnerTripped = circuitBreaker.checkIfTripped();
+            if (isOwnerTripped) {
+                sharedCB.cancel();
+            }
+
+            if (!isOwnerParkable && workStealingStrategy.shouldSteal(mergedCount)) {
+                long cursor = subSeq.next();
+                if (cursor > -1) {
+                    VectorAggregateTask task = queue.get(cursor);
+                    // run() releases the slot
+                    // Keep draining even if an entry throws (e.g. OOM in a parquet decode): a
+                    // survivor left in the shared queue references frame memory pools buildRosti
+                    // frees on exit, so a later query would steal it and hit the freed pool.
+                    // Surface the first error only once the queue is fully drained.
+                    try {
+                        if (dispatcher != null) {
+                            task.entry.run(workerId, subSeq, cursor, dispatcher);
+                        } else {
+                            task.entry.run(workerId, subSeq, cursor);
+                        }
+                    } catch (Throwable th) {
+                        aggregateError.setError(th);
+                        sharedCB.cancel();
+                    }
+                    reclaimed++;
+                } else {
+                    Os.pause();
+                }
+            } else if (isOwnerParkable) {
+                final boolean isProgressObserved = isOwnerTripped
+                        ? dispatcher.awaitProgressWhileDraining(
+                        progressState,
+                        observedProgress,
+                        observedGlobalProgress
+                )
+                        : dispatcher.awaitProgressWhileDraining(
+                        progressState,
+                        observedProgress,
+                        observedGlobalProgress,
+                        circuitBreaker
+                );
+                if (!isProgressObserved) {
+                    Os.pause();
+                }
+            } else {
+                Os.pause();
+            }
+            mergedCount = doneLatch.getCount();
+        }
+        return reclaimed;
     }
 
     private void resetRostiMemorySize() {
         for (int i = 0, n = pRosti.length; i < n; i++) {
             if (!raf.reset(pRosti[i], ROSTI_MINIMIZED_SIZE)) {
-                LOG.debug().$("Couldn't minimize rosti memory [i=").$(i).$(",current_size=").$(Rosti.getSize(pRosti[i])).I$();
+                LOG.debug().$("could not minimize rosti memory [i=").$(i).$(", currentSize=").$(Rosti.getSize(pRosti[i])).I$();
             }
         }
     }
 
     @Override
     protected void _close() {
-        Misc.free(base);
-        Misc.freeObjList(vafList);
-        for (int i = 0, n = pRosti.length; i < n; i++) {
-            if (pRosti[i] != 0) {
-                raf.free(pRosti[i]);
+        final RecordCursorFactory base = this.base;
+        this.base = null;
+        final ObjList<PageFrameMemoryPool> frameMemoryPools = this.frameMemoryPools;
+        this.frameMemoryPools = null;
+        final long[] pRosti = this.pRosti;
+        this.pRosti = null;
+        final ObjList<RostiSharedCursor> sharedCursors = this.sharedCursors;
+        this.sharedCursors = null;
+        final ObjList<VectorAggregateFunction> vafList = this.vafList;
+        this.vafList = null;
+
+        Throwable failure = Misc.freeObjListAndKeepObjectsBestEffort(null, frameMemoryPools);
+        failure = Misc.freeObjListBestEffort(failure, vafList);
+        if (pRosti != null) {
+            for (int i = 0, n = pRosti.length; i < n; i++) {
+                final long pointer = pRosti[i];
                 pRosti[i] = 0;
+                if (pointer != 0) {
+                    try {
+                        raf.free(pointer);
+                    } catch (Throwable th) {
+                        if (failure == null) {
+                            failure = th;
+                        } else if (failure != th) {
+                            failure.addSuppressed(th);
+                        }
+                    }
+                }
             }
         }
+        failure = Misc.freeBestEffort(failure, base);
+        // Shared cursors hold no native memory; primary state freed above covers it.
+        Misc.clear(sharedCursors);
+        CairoException.rethrowCleanupFailure(failure);
     }
 
     private class RostiRecordCursor implements RecordCursor {
+        private final int columnCount;
         private final IntList columnSkewIndex;
         private final RostiRecord record;
         private final IntList symbolTableSkewIndex;
@@ -252,27 +442,26 @@ public class GroupByRecordCursorFactory extends AbstractRecordCursorFactory {
         private long count;
         private long ctrl;
         private long ctrlStart;
+        private int frameCount;
+        private PageFrameCursor frameCursor;
         private boolean isRostiBuilt;
         private long pRostiBig;
-        private PageFrameCursor pageFrameCursor;
         private RostiRecord recordB;
         private long shift;
         private long size;
         private long slots;
 
-        public RostiRecordCursor(long pRosti, IntList columnSkewIndex, IntList symbolTableSkewIndex) {
-            pRostiBig = pRosti;
-            record = new RostiRecord();
+        public RostiRecordCursor(long pRosti, int columnCount, IntList columnSkewIndex, IntList symbolTableSkewIndex) {
+            this.pRostiBig = pRosti;
+            this.columnCount = columnCount;
+            this.record = new RostiRecord(columnCount);
             this.symbolTableSkewIndex = symbolTableSkewIndex;
             this.columnSkewIndex = columnSkewIndex;
         }
 
         @Override
         public void calculateSize(SqlExecutionCircuitBreaker circuitBreaker, Counter counter) {
-            if (!isRostiBuilt) {
-                buildRosti();
-                isRostiBuilt = true;
-            }
+            buildRostiConditionally();
 
             if (count < size) {
                 counter.add(size - count);
@@ -282,7 +471,8 @@ public class GroupByRecordCursorFactory extends AbstractRecordCursorFactory {
 
         @Override
         public void close() {
-            pageFrameCursor = Misc.free(pageFrameCursor);
+            Misc.free(frameAddressCache);
+            frameCursor = Misc.free(frameCursor);
             raf.reset(pRostiBig, ROSTI_MINIMIZED_SIZE);
         }
 
@@ -296,22 +486,19 @@ public class GroupByRecordCursorFactory extends AbstractRecordCursorFactory {
             if (recordB != null) {
                 return recordB;
             }
-            return (recordB = new RostiRecord());
+            return (recordB = new RostiRecord(columnCount));
         }
 
         @Override
         public SymbolTable getSymbolTable(int columnIndex) {
-            return pageFrameCursor.getSymbolTable(symbolTableSkewIndex.getQuick(columnIndex));
+            return frameCursor.getSymbolTable(symbolTableSkewIndex.getQuick(columnIndex));
         }
 
         @Override
         public boolean hasNext() {
-            if (!isRostiBuilt) {
-                buildRosti();
-                isRostiBuilt = true;
-            }
+            buildRostiConditionally();
             while (count < size) {
-                byte b = Unsafe.getUnsafe().getByte(ctrl);
+                byte b = Unsafe.getByte(ctrl);
                 if ((b & 0x80) != 0) {
                     ctrl++;
                     continue;
@@ -325,16 +512,59 @@ public class GroupByRecordCursorFactory extends AbstractRecordCursorFactory {
         }
 
         @Override
-        public SymbolTable newSymbolTable(int columnIndex) {
-            return pageFrameCursor.newSymbolTable(symbolTableSkewIndex.getQuick(columnIndex));
+        public void longTopK(DirectLongLongSortedList list, int columnIndex) {
+            buildRostiConditionally();
+            final long offset = columnSkewIndex.getQuick(columnIndex);
+            while (count < size) {
+                byte b = Unsafe.getByte(ctrl);
+                if ((b & 0x80) != 0) {
+                    ctrl++;
+                    continue;
+                }
+                count++;
+                final long pRow = slots + ((ctrl - ctrlStart) << shift);
+                final long v = Unsafe.getLong(pRow + offset);
+                list.add(pRow, v);
+                ctrl++;
+            }
         }
 
-        public RostiRecordCursor of(PageFrameCursor pageFrameCursor, MessageBus bus, SqlExecutionCircuitBreaker circuitBreaker) {
-            this.pageFrameCursor = pageFrameCursor;
+        @Override
+        public SymbolTable newSymbolTable(int columnIndex) {
+            return frameCursor.newSymbolTable(symbolTableSkewIndex.getQuick(columnIndex));
+        }
+
+        public RostiRecordCursor of(
+                RecordMetadata metadata,
+                PageFrameCursor frameCursor,
+                MessageBus bus,
+                SqlExecutionCircuitBreaker circuitBreaker,
+                MemoryTracker memoryTracker
+        ) {
+            this.frameCursor = frameCursor;
             this.bus = bus;
             this.circuitBreaker = circuitBreaker;
+            frameAddressCache.of(metadata, frameCursor.getColumnMapping(), frameCursor.isExternal());
+            for (int i = 0; i < workerCount; i++) {
+                final PageFrameMemoryPool pool = frameMemoryPools.getQuick(i);
+                pool.setMemoryTracker(memoryTracker);
+                pool.of(frameAddressCache);
+            }
+            // Note: only the per-worker page-frame pools are bound to the per-query tracker. The
+            // Rosti hash tables (pRosti), which hold this operator's dominant, cardinality-scaled
+            // allocation, are deliberately left on the global RSS counter: Rosti grows inside
+            // native C with its own OOM path, so it cannot throw at the offending allocation site
+            // the way the wired allocators do. A runaway keyed vectorized GROUP BY is therefore
+            // backstopped by the global RSS limit, not the per-query limit. Wiring Rosti is a
+            // follow-up (see the PR tradeoffs), consistent with how COPY TO is deferred.
+            frameCount = 0;
             isRostiBuilt = false;
             return this;
+        }
+
+        @Override
+        public long preComputedStateSize() {
+            return isRostiBuilt ? 1 : 0;
         }
 
         @Override
@@ -357,9 +587,15 @@ public class GroupByRecordCursorFactory extends AbstractRecordCursorFactory {
         }
 
         private void buildRosti() {
+            // Consult the breaker before dispatching frames, so an empty base scan still observes cancellation.
+            // Time-throttled so it checks cancellation/timeout unconditionally while bounding the
+            // connection probe to once per window.
+            circuitBreaker.statefulThrowExceptionIfTrippedTimeThrottled();
             final int vafCount = vafList.size();
             final RingQueue<VectorAggregateTask> queue = bus.getVectorAggregateQueue();
             final MPSequence pubSeq = bus.getVectorAggregatePubSeq();
+            final QueryParallelFiberDispatcher dispatcher = bus.getQueryParallelFiberDispatcher();
+            final boolean publicationPermit = dispatcher != null && dispatcher.tryAcquirePublication();
 
             sharedCircuitBreaker.reset();
             startedCounter.set(0);
@@ -372,99 +608,122 @@ public class GroupByRecordCursorFactory extends AbstractRecordCursorFactory {
             int total = 0;
             int mergedCount = 0; // used for work stealing decisions
 
-            final Thread thread = Thread.currentThread();
-            final int workerId;
-            if (thread instanceof Worker) {
-                // it's a worker thread, potentially from the shared pool
-                workerId = ((Worker) thread).getWorkerId() % workerCount;
-            } else {
-                // it's an embedder's thread, so use a random slot
-                workerId = -1;
-            }
+            final Worker worker = Worker.current();
+            final int workerId = worker != null ? worker.getWorkerId() % workerCount : -1;
+            final boolean isFiberOwner = dispatcher != null
+                    && !publicationPermit
+                    && QueryParallelFiberDispatcher.isFiberOwner();
+            long lastOwnerYieldNanos = QueryParallelFiberDispatcher.OWNER_YIELD_UNSET;
 
             try {
                 PageFrame frame;
-                while ((frame = pageFrameCursor.next()) != null) {
-                    final long keyAddress = frame.getPageAddress(keyColumnIndex);
-                    for (int i = 0; i < vafCount; i++) {
-                        final VectorAggregateFunction vaf = vafList.getQuick(i);
+                while ((frame = frameCursor.next()) != null) {
+                    frameAddressCache.add(frameCount++, frame);
+                }
+
+                // Covered frames decode their columns on the vector-aggregate
+                // workers (PageFrameMemoryPool.navigateTo) over the shared
+                // per-partition posting readers; freeze each reader so its mmaps
+                // stay stable for the concurrent detached cursors. The add() loop
+                // above already positioned + warmed them via the eager production
+                // decode. unfreezeCoveredReaders() runs in the finally below, after
+                // runWhatsLeft has drained the done-latch (so no worker is reading).
+                frameAddressCache.freezeCoveredReaders();
+
+                dispatch:
+                for (int frameIndex = 0; frameIndex < frameCount; frameIndex++) {
+                    final long frameRowCount = frameAddressCache.getFrameSize(frameIndex);
+                    for (int vafIndex = 0; vafIndex < vafCount; vafIndex++) {
+                        final VectorAggregateFunction vaf = vafList.getQuick(vafIndex);
                         // when column index = -1 we assume that vector function does not have value
                         // argument, and it can only derive count via memory size
-                        final int columnIndex = vaf.getColumnIndex();
-                        // for functions like `count()`, that do not have arguments we are required to provide
-                        // count of rows in table in a form of "pageSize >> shr". Since `vaf` doesn't provide column
-                        // this code used column 0. Assumption here that column 0 is fixed size.
-                        // This assumption only holds because our aggressive algorithm for "top down columns", e.g.
-                        // the algorithm that forces page frame to provide only columns required by the select. At the time
-                        // of writing this code there is no way to return variable length column out of non-keyed aggregation
-                        // query. This might change if we introduce something like `first(string)`. When this happens we will
-                        // need to rethink our way of computing size for the count. This would be either type checking column
-                        // 0 and working out size differently or finding any fixed-size column and using that.
-                        final long valueAddress = columnIndex > -1 ? frame.getPageAddress(columnIndex) : 0;
-                        final int pageColIndex = columnIndex > -1 ? columnIndex : 0;
-                        final int columnSizeShr = frame.getColumnShiftBits(pageColIndex);
-                        final long valueAddressSize = frame.getPageSize(pageColIndex);
+                        final int valueColumnIndex = vaf.getColumnIndex();
+
+                        if (dispatcher != null && !publicationPermit) {
+                            circuitBreaker.statefulThrowExceptionIfTrippedTimeThrottled();
+                            if (isFiberOwner) {
+                                lastOwnerYieldNanos = dispatcher.cooperateFiberOwner(lastOwnerYieldNanos);
+                            }
+                            VectorAggregateEntry.aggregateUnsafe(
+                                    workerId,
+                                    oomCounter,
+                                    frameIndex,
+                                    frameRowCount,
+                                    keyColumnIndex,
+                                    valueColumnIndex,
+                                    pRosti,
+                                    frameMemoryPools,
+                                    raf,
+                                    vaf,
+                                    perWorkerLocks,
+                                    circuitBreaker
+                            );
+                            ownCount++;
+                            total++;
+                            continue;
+                        }
 
                         while (true) {
+                            if (aggregateError.hasError()) {
+                                break dispatch;
+                            }
+                            final long observedProgress = progressState.getVersion();
+                            final long observedGlobalProgress = dispatcher != null ? dispatcher.getProgressVersion() : 0;
+                            final boolean isOwnerParkable = dispatcher != null && dispatcher.isOwnerParkable();
                             long cursor = pubSeq.next();
                             if (cursor < 0) {
-                                circuitBreaker.statefulThrowExceptionIfTrippedNoThrottle();
+                                circuitBreaker.statefulThrowExceptionIfTrippedTimeThrottled();
 
                                 if (workStealingStrategy.shouldSteal(mergedCount)) {
-                                    // acquire the slot and DIY the func
-                                    final int slot = perWorkerLocks.acquireSlot(workerId, circuitBreaker);
-                                    try {
-                                        if (keyAddress == 0) {
-                                            vaf.aggregate(valueAddress, valueAddressSize, columnSizeShr, slot);
-                                        } else {
-                                            long oldSize = Rosti.getAllocMemory(pRosti[slot]);
-                                            if (!vaf.aggregate(pRosti[slot], keyAddress, valueAddress, valueAddressSize, columnSizeShr, slot)) {
-                                                oomCounter.incrementAndGet();
-                                            }
-                                            raf.updateMemoryUsage(pRosti[slot], oldSize);
-                                        }
-                                    } finally {
-                                        perWorkerLocks.releaseSlot(slot);
+                                    if (isOwnerParkable) {
+                                        lastOwnerYieldNanos = dispatcher.cooperateFiberOwner(lastOwnerYieldNanos);
                                     }
+                                    VectorAggregateEntry.aggregateUnsafe(
+                                            workerId,
+                                            oomCounter,
+                                            frameIndex,
+                                            frameRowCount,
+                                            keyColumnIndex,
+                                            valueColumnIndex,
+                                            pRosti,
+                                            frameMemoryPools,
+                                            raf,
+                                            vaf,
+                                            perWorkerLocks,
+                                            circuitBreaker
+                                    );
                                     ownCount++;
                                     total++;
                                     mergedCount = doneLatch.getCount();
                                     break;
                                 }
+                                if (isOwnerParkable) {
+                                    if (!dispatcher.awaitProgress(progressState, observedProgress, observedGlobalProgress, circuitBreaker)) {
+                                        Os.pause();
+                                    }
+                                } else {
+                                    Os.pause();
+                                }
                                 mergedCount = doneLatch.getCount();
                             } else {
                                 final VectorAggregateEntry entry = entryPool.next();
-                                if (keyAddress == 0) {
-                                    entry.of(
-                                            vaf,
-                                            null,
-                                            0,
-                                            valueAddress,
-                                            valueAddressSize,
-                                            columnSizeShr,
-                                            startedCounter,
-                                            doneLatch,
-                                            oomCounter,
-                                            null,
-                                            perWorkerLocks,
-                                            sharedCircuitBreaker
-                                    );
-                                } else {
-                                    entry.of(
-                                            vaf,
-                                            pRosti,
-                                            keyAddress,
-                                            valueAddress,
-                                            valueAddressSize,
-                                            columnSizeShr,
-                                            startedCounter,
-                                            doneLatch,
-                                            oomCounter,
-                                            raf,
-                                            perWorkerLocks,
-                                            sharedCircuitBreaker
-                                    );
-                                }
+                                entry.of(
+                                        frameIndex,
+                                        frameRowCount,
+                                        keyColumnIndex,
+                                        valueColumnIndex,
+                                        vaf,
+                                        pRosti,
+                                        frameMemoryPools,
+                                        startedCounter,
+                                        doneLatch,
+                                        oomCounter,
+                                        aggregateError,
+                                        raf,
+                                        perWorkerLocks,
+                                        sharedCircuitBreaker,
+                                        progressState
+                                );
                                 queue.get(cursor).entry = entry;
                                 pubSeq.done(cursor);
                                 queuedCount++;
@@ -474,42 +733,55 @@ public class GroupByRecordCursorFactory extends AbstractRecordCursorFactory {
                         }
                     }
                 }
-            } catch (DataUnavailableException e) {
-                // We're not yet done, so no need to cancel the circuit breaker. 
-                throw e;
-            } catch (Throwable e) {
+            } catch (Throwable th) {
                 sharedCircuitBreaker.cancel();
-                throw e;
+                throw th;
             } finally {
-                // all done? great start consuming the queue we just published
-                // how do we get to the end? If we consume our own queue there is chance we will be consuming
-                // aggregation tasks not related to this execution (we work in concurrent environment)
-                // To deal with that we need to have our own checklist.
-
-                // Make sure we're consuming jobs even when we failed. We cannot close "rosti" when there are
-                // tasks in flight.
-
-                reclaimed = GroupByNotKeyedVectorRecordCursorFactory.runWhatsLeft(
-                        bus.getVectorAggregateSubSeq(),
-                        queue,
-                        queuedCount,
-                        reclaimed,
-                        mergedCount,
-                        workerId,
-                        doneLatch,
-                        circuitBreaker,
-                        sharedCircuitBreaker,
-                        workStealingStrategy
-                );
-                // we can't reallocate rosti until tasks are complete because some other thread could be using it
-                if (sharedCircuitBreaker.checkIfTripped()) {
-                    resetRostiMemorySize();
+                try {
+                    if (dispatcher != null && publicationPermit) {
+                        dispatcher.releasePublication();
+                    }
+                } finally {
+                    reclaimed = runWhatsLeft(
+                            bus.getVectorAggregateSubSeq(),
+                            queue,
+                            dispatcher,
+                            progressState,
+                            aggregateError,
+                            queuedCount,
+                            reclaimed,
+                            mergedCount,
+                            workerId,
+                            doneLatch,
+                            circuitBreaker,
+                            sharedCircuitBreaker,
+                            workStealingStrategy
+                    );
+                    if (sharedCircuitBreaker.checkIfTripped()) {
+                        resetRostiMemorySize();
+                    }
+                    frameAddressCache.unfreezeCoveredReaders();
+                    Misc.freeObjListAndKeepObjects(frameMemoryPools);
                 }
             }
 
             if (oomCounter.get() > 0) {
                 resetRostiMemorySize();
-                throw new OutOfMemoryError();
+                throw CairoException.nonCritical()
+                        .put("could not resize rosti hash table")
+                        .setOutOfMemory(true);
+            }
+
+            if (aggregateError.hasError()) {
+                aggregateError.throwError();
+            }
+
+            if (sharedCircuitBreaker.checkIfTripped()) {
+                // A tripped shared breaker with no recorded error means the dispatcher aborted
+                // queued entries (quiesce); the rostis were reset above, so the query must fail
+                // rather than return a partial aggregate.
+                circuitBreaker.statefulThrowExceptionIfTrippedNoThrottle();
+                throw CairoException.queryCancelled();
             }
 
             // merge maps only when cursor was fetched successfully
@@ -539,7 +811,9 @@ public class GroupByRecordCursorFactory extends AbstractRecordCursorFactory {
                             long oldSize = Rosti.getAllocMemory(pRostiBig);
                             if (!vaf.merge(pRostiBig, pRosti[i])) {
                                 resetRostiMemorySize();
-                                throw new OutOfMemoryError();
+                                throw CairoException.nonCritical()
+                                        .put("could not merge rosti hash table")
+                                        .setOutOfMemory(true);
                             }
                             raf.updateMemoryUsage(pRostiBig, oldSize);
                         }
@@ -550,7 +824,9 @@ public class GroupByRecordCursorFactory extends AbstractRecordCursorFactory {
                         long oldSize = Rosti.getAllocMemory(pRostiBig);
                         if (!vaf.wrapUp(pRostiBig)) {
                             resetRostiMemorySize();
-                            throw new OutOfMemoryError();
+                            throw CairoException.nonCritical()
+                                    .put("could not wrap up rosti hash table")
+                                    .setOutOfMemory(true);
                         }
                         raf.updateMemoryUsage(pRostiBig, oldSize);
                     }
@@ -567,10 +843,15 @@ public class GroupByRecordCursorFactory extends AbstractRecordCursorFactory {
                 } else {
                     circuitBreaker.statefulThrowExceptionIfTrippedNoThrottle();
                     for (int j = 0; j < vafCount; j++) {
+                        // some wrapUp() methods can increase rosti size (e.g. inserting the null key)
+                        long oldSize = Rosti.getAllocMemory(pRostiBig);
                         if (!vafList.getQuick(j).wrapUp(pRostiBig)) {
                             resetRostiMemorySize();
-                            throw new OutOfMemoryError();
+                            throw CairoException.nonCritical()
+                                    .put("could not wrap up rosti hash table")
+                                    .setOutOfMemory(true);
                         }
+                        raf.updateMemoryUsage(pRostiBig, oldSize);
                     }
                 }
             } catch (Throwable t) {
@@ -586,10 +867,22 @@ public class GroupByRecordCursorFactory extends AbstractRecordCursorFactory {
                     .$(", queuedCount=").$(queuedCount).I$();
         }
 
+        private void buildRostiConditionally() {
+            if (!isRostiBuilt) {
+                buildRosti();
+                isRostiBuilt = true;
+            }
+        }
+
         private class RostiRecord implements Record {
-            private final Long256Impl long256A = new Long256Impl();
-            private final Long256Impl long256B = new Long256Impl();
+            private final ObjList<Long256Impl> longs256A;
+            private final ObjList<Long256Impl> longs256B;
             private long pRow;
+
+            public RostiRecord(int columnCount) {
+                this.longs256A = new ObjList<>(columnCount);
+                this.longs256B = new ObjList<>(columnCount);
+            }
 
             @Override
             public long getDate(int col) {
@@ -598,7 +891,7 @@ public class GroupByRecordCursorFactory extends AbstractRecordCursorFactory {
 
             @Override
             public double getDouble(int col) {
-                return Unsafe.getUnsafe().getDouble(getValueAddress(col));
+                return Unsafe.getDouble(getValueAddress(col));
             }
 
             @Override
@@ -628,17 +921,17 @@ public class GroupByRecordCursorFactory extends AbstractRecordCursorFactory {
 
             @Override
             public int getIPv4(int col) {
-                return Unsafe.getUnsafe().getInt(getValueAddress(col));
+                return Unsafe.getInt(getValueAddress(col));
             }
 
             @Override
             public int getInt(int col) {
-                return Unsafe.getUnsafe().getInt(getValueAddress(col));
+                return Unsafe.getInt(getValueAddress(col));
             }
 
             @Override
             public long getLong(int col) {
-                return Unsafe.getUnsafe().getLong(getValueAddress(col));
+                return Unsafe.getLong(getValueAddress(col));
             }
 
             @Override
@@ -649,12 +942,12 @@ public class GroupByRecordCursorFactory extends AbstractRecordCursorFactory {
 
             @Override
             public Long256 getLong256A(int col) {
-                return getLong256Value(long256A, col);
+                return getLong256Value(long256A(col), col);
             }
 
             @Override
             public Long256 getLong256B(int col) {
-                return getLong256Value(long256B, col);
+                return getLong256Value(long256B(col), col);
             }
 
             public Long256 getLong256Value(Long256 dst, int col) {
@@ -670,10 +963,6 @@ public class GroupByRecordCursorFactory extends AbstractRecordCursorFactory {
             @Override
             public short getShort(int col) {
                 return 0;
-            }
-
-            @Override
-            public void getStr(int col, Utf16Sink utf16Sink) {
             }
 
             @Override
@@ -693,12 +982,12 @@ public class GroupByRecordCursorFactory extends AbstractRecordCursorFactory {
 
             @Override
             public CharSequence getSymA(int col) {
-                return pageFrameCursor.getSymbolTable(symbolTableSkewIndex.getQuick(col)).valueOf(getInt(col));
+                return frameCursor.getSymbolTable(symbolTableSkewIndex.getQuick(col)).valueOf(getInt(col));
             }
 
             @Override
             public CharSequence getSymB(int col) {
-                return pageFrameCursor.getSymbolTable(symbolTableSkewIndex.getQuick(col)).valueBOf(getInt(col));
+                return frameCursor.getSymbolTable(symbolTableSkewIndex.getQuick(col)).valueBOf(getInt(col));
             }
 
             @Override
@@ -713,6 +1002,147 @@ public class GroupByRecordCursorFactory extends AbstractRecordCursorFactory {
             private long getValueAddress(int column) {
                 return pRow + columnSkewIndex.getQuick(column);
             }
+
+            private Long256Impl long256A(int columnIndex) {
+                if (longs256A.getQuiet(columnIndex) == null) {
+                    longs256A.extendAndSet(columnIndex, new Long256Impl());
+                }
+                return longs256A.getQuick(columnIndex);
+            }
+
+            private Long256Impl long256B(int columnIndex) {
+                if (longs256B.getQuiet(columnIndex) == null) {
+                    longs256B.extendAndSet(columnIndex, new Long256Impl());
+                }
+                return longs256B.getQuick(columnIndex);
+            }
+        }
+    }
+
+    private class RostiSharedCursor implements RecordCursor {
+        private final RostiRecordCursor.RostiRecord record;
+        private long count;
+        private long ctrl;
+        private long ctrlStart;
+        private boolean isBuilt;
+        private RostiRecordCursor.RostiRecord recordB;
+        private long shift;
+        private long size;
+        private long slots;
+
+        RostiSharedCursor() {
+            this.record = cursor.new RostiRecord(cursor.columnCount);
+        }
+
+        @Override
+        public void calculateSize(SqlExecutionCircuitBreaker circuitBreaker, Counter counter) {
+            buildRostiConditionally();
+            if (count < size) {
+                counter.add(size - count);
+                count = size;
+            }
+        }
+
+        @Override
+        public void close() {
+        }
+
+        @Override
+        public Record getRecord() {
+            return record;
+        }
+
+        @Override
+        public Record getRecordB() {
+            if (recordB == null) {
+                recordB = cursor.new RostiRecord(cursor.columnCount);
+            }
+            return recordB;
+        }
+
+        @Override
+        public SymbolTable getSymbolTable(int columnIndex) {
+            return cursor.getSymbolTable(columnIndex);
+        }
+
+        @Override
+        public boolean hasNext() {
+            buildRostiConditionally();
+            while (count < size) {
+                byte b = Unsafe.getByte(ctrl);
+                if ((b & 0x80) != 0) {
+                    ctrl++;
+                    continue;
+                }
+                count++;
+                record.of(slots + ((ctrl - ctrlStart) << shift));
+                ctrl++;
+                return true;
+            }
+            return false;
+        }
+
+        @Override
+        public void longTopK(DirectLongLongSortedList list, int columnIndex) {
+            buildRostiConditionally();
+            final long offset = cursor.columnSkewIndex.getQuick(columnIndex);
+            while (count < size) {
+                byte b = Unsafe.getByte(ctrl);
+                if ((b & 0x80) != 0) {
+                    ctrl++;
+                    continue;
+                }
+                count++;
+                final long pRow = slots + ((ctrl - ctrlStart) << shift);
+                final long v = Unsafe.getLong(pRow + offset);
+                list.add(pRow, v);
+                ctrl++;
+            }
+        }
+
+        @Override
+        public SymbolTable newSymbolTable(int columnIndex) {
+            return cursor.newSymbolTable(columnIndex);
+        }
+
+        @Override
+        public long preComputedStateSize() {
+            return 0;
+        }
+
+        @Override
+        public void recordAt(Record record, long atRowId) {
+            ((RostiRecordCursor.RostiRecord) record).of(atRowId);
+        }
+
+        @Override
+        public long size() {
+            return isBuilt ? size : -1;
+        }
+
+        @Override
+        public void toTop() {
+            ctrlStart = Rosti.getCtrl(cursor.pRostiBig);
+            ctrl = ctrlStart;
+            slots = Rosti.getSlots(cursor.pRostiBig);
+            shift = Rosti.getSlotShift(cursor.pRostiBig);
+            size = raf.getSize(cursor.pRostiBig);
+            count = 0;
+        }
+
+        private void buildRostiConditionally() {
+            if (!isBuilt) {
+                // isRostiBuilt and pRostiBig do not need to be volatile: both the primary cursor
+                // and all shared cursors are driven by the same SQL execution thread currently, so there
+                // is no cross-thread visibility concern.
+                cursor.buildRostiConditionally();
+                toTop();
+                isBuilt = true;
+            }
+        }
+
+        void of() {
+            isBuilt = false;
         }
     }
 }

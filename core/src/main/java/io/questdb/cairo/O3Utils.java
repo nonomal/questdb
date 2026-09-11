@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -40,14 +40,26 @@ public class O3Utils {
             long srcLo,
             long dstAddr,
             long dstFixFileOffset,
-            int dstFd,
+            long dstFd,
             boolean mixedIOFlag,
             long len,
             int shl
     ) {
         final long fromAddress = srcAddr + (srcLo << shl);
+        o3Copy(ff, dstAddr, dstFixFileOffset, dstFd, fromAddress, len, mixedIOFlag);
+    }
+
+    public static void o3Copy(
+            FilesFacade ff,
+            long dstAddr,
+            long dstFileOffset,
+            long dstFd,
+            long fromAddress,
+            long len,
+            boolean mixedIOFlag
+    ) {
         if (mixedIOFlag) {
-            if (ff.write(Math.abs(dstFd), fromAddress, len, dstFixFileOffset) != len) {
+            if (ff.write(Math.abs(dstFd), fromAddress, len, dstFileOffset) != len) {
                 throw CairoException.critical(ff.errno()).put("cannot copy fixed column prefix [fd=")
                         .put(dstFd).put(", len=").put(len).put(", offset=").put(fromAddress).put(']');
             }
@@ -56,7 +68,7 @@ public class O3Utils {
         }
     }
 
-    static void close(FilesFacade ff, int fd) {
+    static void close(FilesFacade ff, long fd) {
         if (fd > 0) {
             LOG.debug().$("closed [fd=").$(fd).$(']').$();
             ff.close(fd);
@@ -72,23 +84,13 @@ public class O3Utils {
         Vect.copyFromTimestampIndex(src, srcLo, srcHi, dstAddr);
     }
 
-    static void shiftCopyVarcharColumnAux(
-            long shift,
-            long srcAddr,
-            long srcLo,
-            long srcHi,
-            long dstAddr
-    ) {
-        Vect.shiftCopyVarcharColumnAux(shift, srcAddr, srcLo, srcHi, dstAddr);
-    }
-
     static void unmap(FilesFacade ff, long addr, long size) {
         if (addr != 0 && size > 0) {
             ff.munmap(addr, size, MemoryTag.MMAP_O3);
         }
     }
 
-    static void unmapAndClose(FilesFacade ff, int dstFixFd, long dstFixAddr, long dstFixSize) {
+    static void unmapAndClose(FilesFacade ff, long dstFixFd, long dstFixAddr, long dstFixSize) {
         unmap(ff, dstFixAddr, dstFixSize);
         close(ff, dstFixFd);
     }

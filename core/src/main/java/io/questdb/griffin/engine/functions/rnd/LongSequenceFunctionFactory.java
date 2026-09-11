@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,11 +24,16 @@
 
 package io.questdb.griffin.engine.functions.rnd;
 
-import io.questdb.cairo.*;
+import io.questdb.cairo.AbstractRecordCursorFactory;
+import io.questdb.cairo.CairoConfiguration;
+import io.questdb.cairo.ColumnType;
+import io.questdb.cairo.GenericRecordMetadata;
+import io.questdb.cairo.TableColumnMetadata;
 import io.questdb.cairo.sql.Function;
 import io.questdb.cairo.sql.Record;
 import io.questdb.cairo.sql.RecordCursor;
 import io.questdb.cairo.sql.RecordMetadata;
+import io.questdb.cairo.sql.SqlExecutionCircuitBreaker;
 import io.questdb.griffin.FunctionFactory;
 import io.questdb.griffin.PlanSink;
 import io.questdb.griffin.SqlException;
@@ -37,6 +42,7 @@ import io.questdb.griffin.engine.functions.CursorFunction;
 import io.questdb.std.IntList;
 import io.questdb.std.ObjList;
 import io.questdb.std.Rnd;
+import io.questdb.std.Transient;
 
 public class LongSequenceFunctionFactory implements FunctionFactory {
     private static final RecordMetadata METADATA;
@@ -47,23 +53,36 @@ public class LongSequenceFunctionFactory implements FunctionFactory {
     }
 
     @Override
-    public Function newInstance(int position, ObjList<Function> args, IntList argPositions, CairoConfiguration configuration, SqlExecutionContext sqlExecutionContext) throws SqlException {
+    public Function newInstance(
+            int position,
+            @Transient ObjList<Function> args,
+            @Transient IntList argPositions,
+            CairoConfiguration configuration,
+            SqlExecutionContext sqlExecutionContext
+    ) throws SqlException {
         Function countFunc;
         final Function seedLoFunc;
         final Function seedHiFunc;
         if (args != null) {
             final int argCount = args.size();
-            if (argCount == 1 && ColumnType.isAssignableFrom((countFunc = args.getQuick(0)).getType(), ColumnType.LONG)) {
-                return new CursorFunction(
-                        new LongSequenceCursorFactory(METADATA, countFunc.getLong(null))
-                );
+            countFunc = args.getQuick(0);
+
+            if (argCount == 1 && ColumnType.isConvertibleFrom(countFunc.getType(), ColumnType.LONG)) {
+                try {
+                    return new CursorFunction(
+                            new LongSequenceCursorFactory(METADATA, countFunc.getLong(null))
+                    );
+                } catch (UnsupportedOperationException ex) {
+                    throw SqlException.position(position).put("argument type ")
+                            .put(ColumnType.nameOf(countFunc.getType())).put(" is not supported");
+                }
             }
 
             if (
                     argCount > 2
-                            && ColumnType.isAssignableFrom((countFunc = args.getQuick(0)).getType(), ColumnType.LONG)
-                            && ColumnType.isAssignableFrom((seedLoFunc = args.getQuick(1)).getType(), ColumnType.LONG)
-                            && ColumnType.isAssignableFrom((seedHiFunc = args.getQuick(2)).getType(), ColumnType.LONG)
+                            && ColumnType.isSameOrBuiltInWideningCast((countFunc = args.getQuick(0)).getType(), ColumnType.LONG)
+                            && ColumnType.isSameOrBuiltInWideningCast((seedLoFunc = args.getQuick(1)).getType(), ColumnType.LONG)
+                            && ColumnType.isSameOrBuiltInWideningCast((seedHiFunc = args.getQuick(2)).getType(), ColumnType.LONG)
             ) {
                 return new CursorFunction(
                         new SeedingLongSequenceCursorFactory(
@@ -86,8 +105,15 @@ public class LongSequenceFunctionFactory implements FunctionFactory {
             this.cursor = new LongSequenceRecordCursor(Math.max(0L, recordCount));
         }
 
+        // The produced relation is always 1..N; deterministic by construction.
+        @Override
+        public boolean isNonDeterministic() {
+            return false;
+        }
+
         @Override
         public RecordCursor getCursor(SqlExecutionContext executionContext) {
+            cursor.circuitBreaker = executionContext.getCircuitBreaker();
             cursor.toTop();
             return cursor;
         }
@@ -135,6 +161,7 @@ public class LongSequenceFunctionFactory implements FunctionFactory {
         private final LongSequenceRecord recordA = new LongSequenceRecord();
         private final LongSequenceRecord recordB = new LongSequenceRecord();
         private final long recordCount;
+        private SqlExecutionCircuitBreaker circuitBreaker = SqlExecutionCircuitBreaker.NOOP_CIRCUIT_BREAKER;
 
         public LongSequenceRecordCursor(long recordCount) {
             this.recordCount = recordCount;
@@ -157,11 +184,17 @@ public class LongSequenceFunctionFactory implements FunctionFactory {
 
         @Override
         public boolean hasNext() {
+            circuitBreaker.statefulThrowExceptionIfTripped();
             if (recordA.getValue() < recordCount) {
                 recordA.next();
                 return true;
             }
             return false;
+        }
+
+        @Override
+        public long preComputedStateSize() {
+            return 0;
         }
 
         @Override
@@ -192,10 +225,18 @@ public class LongSequenceFunctionFactory implements FunctionFactory {
             this.rnd = new Rnd(this.seedLo = seedLo, this.seedHi = seedHi);
         }
 
+        // The produced relation is always 1..N and the rnd seeds are fixed constructor arguments
+        // reset on every open, so even downstream seeded rnd_* draws are reproducible.
+        @Override
+        public boolean isNonDeterministic() {
+            return false;
+        }
+
         @Override
         public RecordCursor getCursor(SqlExecutionContext executionContext) {
             rnd.reset(this.seedLo, this.seedHi);
             executionContext.setRandom(rnd);
+            cursor.circuitBreaker = executionContext.getCircuitBreaker();
             cursor.toTop();
             return cursor;
         }

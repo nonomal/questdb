@@ -1,0 +1,360 @@
+/*+*****************************************************************************
+ *     ___                  _   ____  ____
+ *    / _ \ _   _  ___  ___| |_|  _ \| __ )
+ *   | | | | | | |/ _ \/ __| __| | | |  _ \
+ *   | |_| | |_| |  __/\__ \ |_| |_| | |_) |
+ *    \__\_\\__,_|\___||___/\__|____/|____/
+ *
+ *  Copyright (c) 2014-2019 Appsicle
+ *  Copyright (c) 2019-2026 QuestDB
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *
+ *  http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ *
+ ******************************************************************************/
+
+package io.questdb.std;
+
+import io.questdb.cairo.CairoException;
+import io.questdb.cairo.Reopenable;
+import org.jetbrains.annotations.Nullable;
+
+/**
+ * Specialized off-heap hash table that stores int keys and multiple long values.
+ * Designed for storing GroupByLongList pointers in window join operations.
+ * <p>
+ * Memory layout per entry:
+ * <pre>
+ * | key (4 bytes) | value1 (8 bytes) | value2 (8 bytes) | ... | valueN (8 bytes) |
+ * +---------------+------------------+------------------+-----+------------------+
+ * |     int       |       long       |       long       | ... |       long       |
+ * +---------------+------------------+------------------+-----+------------------+
+ * </pre>
+ * <p>
+ * This allows storing multiple related long values (e.g., rowIds pointer, timestamps pointer,
+ * rowLos value) for each int key, optimized for GROUP BY operations with GroupByAllocator.
+ */
+public class DirectIntMultiLongHashMap implements Mutable, QuietCloseable, Reopenable {
+    private static final int MIN_INITIAL_CAPACITY = 4;
+    private final long entrySize; // 4 bytes (key) + valueCount * 8 bytes (values)
+    private final int initialCapacity;
+    private final double loadFactor;
+    private final int memoryTag;
+    private final int noEntryKey;
+    private final long noEntryValue;
+    private final int valueCount;
+    private int capacity;
+    private int free;
+    private long mask;
+    // Per-workload native memory tracker bound by the owning cursor at workload start.
+    // Null when no per-query limit applies; all Unsafe.{malloc,realloc,free} calls
+    // degrade to the global-only overloads in that case.
+    private @Nullable MemoryTracker memoryTracker;
+    private long ptr;
+    private int size;
+
+    /**
+     * Creates a new DirectIntMultiLongHashMap.
+     *
+     * @param initialCapacity initial capacity of the hash table
+     * @param loadFactor      load factor for the hash table (should be between 0 and 1)
+     * @param noEntryKey      value representing an empty key
+     * @param noEntryValue    value representing an empty value
+     * @param valueCount      number of long values to store per key
+     * @param memoryTag       memory tag for tracking allocations
+     */
+    public DirectIntMultiLongHashMap(int initialCapacity, double loadFactor, int noEntryKey, long noEntryValue, int valueCount, int memoryTag) {
+        if (loadFactor <= 0d || loadFactor >= 1d) {
+            throw new IllegalArgumentException("0 < loadFactor < 1");
+        }
+        if (valueCount <= 0) {
+            throw new IllegalArgumentException("valueCount must be positive");
+        }
+        this.noEntryKey = noEntryKey;
+        this.noEntryValue = noEntryValue;
+        this.valueCount = valueCount;
+        this.entrySize = 4 + 8L * valueCount;
+        this.loadFactor = loadFactor;
+        this.memoryTag = memoryTag;
+        this.initialCapacity = this.capacity = Numbers.ceilPow2((int) (Math.max(initialCapacity, MIN_INITIAL_CAPACITY) / loadFactor));
+        this.size = 0;
+        this.free = (int) (capacity * loadFactor);
+        this.mask = capacity - 1;
+        this.ptr = Unsafe.malloc(entrySize * capacity, memoryTag);
+        zero();
+    }
+
+    public int capacity() {
+        return capacity;
+    }
+
+    @Override
+    public void clear() {
+        free = (int) (capacity * loadFactor);
+        size = 0;
+        zero();
+    }
+
+    @Override
+    public void close() {
+        if (ptr != 0) {
+            ptr = Unsafe.free(ptr, entrySize * capacity, memoryTag, memoryTracker);
+            capacity = 0;
+            free = 0;
+            size = 0;
+        }
+        // The block is gone, so the tracker that charged it carries no debt for this map any more.
+        // Dropping the reference keeps a later free - one that runs after the pooled tracker was
+        // recycled by another workload - on the global counter, where it cannot corrupt someone
+        // else's total.
+        memoryTracker = null;
+    }
+
+    public boolean excludes(int key) {
+        return keyIndex(key) > -1;
+    }
+
+    /**
+     * Gets a specific long value for the given key.
+     *
+     * @param key        the key to look up
+     * @param valueIndex index of the value (0 to valueCount-1)
+     * @return the long value at the specified index, or 0 if key not found
+     */
+    public long get(int key, int valueIndex) {
+        if (valueIndex < 0 || valueIndex >= valueCount) {
+            throw new IllegalArgumentException("valueIndex out of bounds: " + valueIndex);
+        }
+        return valueAt(keyIndex(key), valueIndex);
+    }
+
+    public int getValueCount() {
+        return valueCount;
+    }
+
+    public int keyAt(long index) {
+        return Unsafe.getInt(ptr + index * entrySize);
+    }
+
+    public long keyIndex(int key) {
+        long hashCode = Hash.hashInt64(key);
+        long index = hashCode & mask;
+        int k = keyAt(index);
+        if (k == noEntryKey) {
+            return index;
+        }
+        if (key == k) {
+            return -index - 1;
+        }
+        return probe(key, index);
+    }
+
+    public long ptr() {
+        return ptr;
+    }
+
+    /**
+     * Puts a single value at the specified index for the given key.
+     *
+     * @param key        the key
+     * @param valueIndex index of the value to set (0 to valueCount-1)
+     * @param value      the value to set
+     */
+    public void put(int key, int valueIndex, long value) {
+        if (valueIndex < 0 || valueIndex >= valueCount) {
+            throw new IllegalArgumentException("valueIndex out of bounds: " + valueIndex);
+        }
+        putAt(keyIndex(key), key, valueIndex, value);
+    }
+
+    /**
+     * Puts all values for the given key.
+     *
+     * @param key    the key
+     * @param values array of values to set (must have length >= valueCount)
+     */
+    public void putAll(int key, long[] values) {
+        if (values.length < valueCount) {
+            throw new IllegalArgumentException("values array too small");
+        }
+        putAllAt(keyIndex(key), key, values);
+    }
+
+    public void putAllAt(long index, int key, long[] values) {
+        if (index < 0) {
+            long entryPtr = ptr + (-index - 1) * entrySize;
+            for (int i = 0; i < valueCount; i++) {
+                Unsafe.putLong(entryPtr + 4 + 8L * i, values[i]);
+            }
+        } else {
+            putAllAt0(index, key, values);
+            size++;
+            if (--free == 0) {
+                try {
+                    rehash(capacity() << 1);
+                } catch (CairoException e) {
+                    free = 1;
+                    throw e;
+                }
+            }
+        }
+    }
+
+    public void putAt(long index, int key, int valueIndex, long value) {
+        if (valueIndex < 0 || valueIndex >= valueCount) {
+            throw new IllegalArgumentException("valueIndex out of bounds: " + valueIndex);
+        }
+        if (index < 0) {
+            Unsafe.putLong(ptr + (-index - 1) * entrySize + 4 + 8L * valueIndex, value);
+        } else {
+            long entryPtr = ptr + index * entrySize;
+            Unsafe.putInt(entryPtr, key);
+            for (int i = 0; i < valueCount; i++) {
+                Unsafe.putLong(entryPtr + 4 + 8L * i, 0L);
+            }
+            Unsafe.putLong(entryPtr + 4 + 8L * valueIndex, value);
+            size++;
+            if (--free == 0) {
+                try {
+                    rehash(capacity() << 1);
+                } catch (CairoException e) {
+                    free = 1;
+                    throw e;
+                }
+            }
+        }
+    }
+
+    @Override
+    public void reopen() {
+        if (ptr == 0) {
+            restoreInitialCapacity();
+        }
+    }
+
+    public void restoreInitialCapacity() {
+        if (ptr == 0 || capacity != initialCapacity) {
+            final long oldCapacity = capacity;
+            long newPtr;
+            if (ptr == 0) {
+                newPtr = Unsafe.malloc(entrySize * initialCapacity, memoryTag, memoryTracker);
+            } else {
+                newPtr = Unsafe.realloc(ptr, entrySize * oldCapacity, entrySize * initialCapacity, memoryTag, memoryTracker);
+            }
+            ptr = newPtr;
+            capacity = initialCapacity;
+            mask = capacity - 1;
+        }
+
+        clear();
+    }
+
+    /**
+     * Binds the per-workload {@link MemoryTracker} that every subsequent allocation charges. A
+     * {@code null} tracker degrades the map to global-only accounting.
+     * <p>
+     * Rebinding releases the live block first: a block has to be freed under the tracker that
+     * charged it, or the two counters drift apart and the per-query limit stops holding. Callers
+     * therefore bind at workload start, immediately before {@link #reopen()}, when the map is empty.
+     */
+    public void setMemoryTracker(@Nullable MemoryTracker tracker) {
+        if (tracker != memoryTracker) {
+            close();
+            memoryTracker = tracker;
+        }
+    }
+
+    public int size() {
+        return size;
+    }
+
+    public long valueAt(long index, int valueIndex) {
+        if (valueIndex < 0 || valueIndex >= valueCount) {
+            throw new IllegalArgumentException("valueIndex out of bounds: " + valueIndex);
+        }
+        return index < 0 ? Unsafe.getLong(ptr + (-index - 1) * entrySize + 4 + 8L * valueIndex) : noEntryValue;
+    }
+
+    private long probe(int key, long index) {
+        final long index0 = index;
+        do {
+            index = (index + 1) & mask;
+            int k = keyAt(index);
+            if (k == noEntryKey) {
+                return index;
+            }
+            if (key == k) {
+                return -index - 1;
+            }
+        } while (index != index0);
+
+        throw CairoException.critical(0).put("corrupt int multi-long hash map");
+    }
+
+    private void putAllAt0(long index, int key, long[] values) {
+        final long entryPtr = ptr + index * entrySize;
+        Unsafe.putInt(entryPtr, key);
+        for (int i = 0; i < valueCount; i++) {
+            Unsafe.putLong(entryPtr + 4 + 8L * i, values[i]);
+        }
+    }
+
+    private void rehash(int newCapacity) {
+        if (newCapacity < 0) {
+            throw CairoException.nonCritical().put("int multi-long hash map capacity overflow");
+        }
+
+        final int oldCapacity = capacity;
+        long newPtr = Unsafe.malloc(entrySize * newCapacity, memoryTag, memoryTracker);
+
+        long oldPtr = ptr;
+        ptr = newPtr;
+        capacity = newCapacity;
+        mask = newCapacity - 1;
+        free += (int) ((newCapacity - oldCapacity) * loadFactor);
+        zero();
+
+        for (long p = oldPtr, lim = oldPtr + entrySize * oldCapacity; p < lim; p += entrySize) {
+            int key = Unsafe.getInt(p);
+            if (key != noEntryKey) {
+                long hashCode = Hash.hashInt64(key);
+                long index = hashCode & mask;
+                while (keyAt(index) != noEntryKey) {
+                    index = (index + 1) & mask;
+                }
+
+                long entryPtr = ptr + index * entrySize;
+                Unsafe.putInt(entryPtr, key);
+                // Copy all values
+                for (long o = 4, oLim = 4 + 8L * valueCount; o < oLim; o += 8) {
+                    Unsafe.putLong(entryPtr + o, Unsafe.getLong(p + o));
+                }
+            }
+        }
+
+        Unsafe.free(oldPtr, entrySize * oldCapacity, memoryTag, memoryTracker);
+    }
+
+    private void zero() {
+        if (ptr == 0) {
+            // Closed: clear() still runs its bookkeeping, but there is no block to wipe.
+            return;
+        }
+        if (noEntryKey == 0) {
+            Vect.memset(ptr, entrySize * capacity, 0);
+        } else {
+            for (long p = ptr, lim = ptr + entrySize * capacity; p < lim; p += entrySize) {
+                Unsafe.putInt(p, noEntryKey);
+            }
+        }
+    }
+}

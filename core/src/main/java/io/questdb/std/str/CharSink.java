@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,9 +24,10 @@
 
 package io.questdb.std.str;
 
+import io.questdb.cairo.MicrosTimestampDriver;
+import io.questdb.cairo.TimestampDriver;
 import io.questdb.std.Misc;
 import io.questdb.std.Numbers;
-import io.questdb.std.datetime.microtime.TimestampFormatUtils;
 import io.questdb.std.datetime.millitime.DateFormatUtils;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
@@ -37,6 +38,31 @@ import org.jetbrains.annotations.Nullable;
  */
 @SuppressWarnings("unchecked")
 public interface CharSink<T extends CharSink<?>> {
+
+    default void escapeJsonStrChar(char c) {
+        switch (c) {
+            case '\b':
+                putAscii("\\b");
+                break;
+            case '\f':
+                putAscii("\\f");
+                break;
+            case '\n':
+                putAscii("\\n");
+                break;
+            case '\r':
+                putAscii("\\r");
+                break;
+            case '\t':
+                putAscii("\\t");
+                break;
+            default:
+                putAscii("\\u00");
+                put(c >> 4);
+                putAscii(Numbers.hexDigits[c & 15]);
+                break;
+        }
+    }
 
     /**
      * Assumes the char is ASCII and appends it to the sink n times.
@@ -104,8 +130,8 @@ public interface CharSink<T extends CharSink<?>> {
     /**
      * Appends a string representation of the supplied number to this sink.
      */
-    default T put(float value, int scale) {
-        Numbers.append(this, value, scale);
+    default T put(float value) {
+        Numbers.append(this, value);
         return (T) this;
     }
 
@@ -114,14 +140,6 @@ public interface CharSink<T extends CharSink<?>> {
      */
     default T put(double value) {
         Numbers.append(this, value);
-        return (T) this;
-    }
-
-    /**
-     * Appends a string representation of the supplied number to this sink.
-     */
-    default T put(double value, int scale) {
-        Numbers.append(this, value, scale);
         return (T) this;
     }
 
@@ -177,7 +195,11 @@ public interface CharSink<T extends CharSink<?>> {
     }
 
     default T putISODate(long value) {
-        TimestampFormatUtils.appendDateTimeUSec(this, value);
+        return putISODate(MicrosTimestampDriver.INSTANCE, value);
+    }
+
+    default T putISODate(TimestampDriver driver, long value) {
+        driver.append(this, value);
         return (T) this;
     }
 
@@ -200,14 +222,30 @@ public interface CharSink<T extends CharSink<?>> {
         return (T) this;
     }
 
-    default CharSink putSize(long bytes) {
-        long b = bytes == Long.MIN_VALUE ? Long.MAX_VALUE : Math.abs(bytes);
-        return b < 1024L ? put(bytes).put(' ').put('B')
-                : b <= 0xfffccccccccccccL >> 40 ? put(Math.round(bytes / 0x1p10 * 1000.0) / 1000.0).put(" KiB")
-                : b <= 0xfffccccccccccccL >> 30 ? put(Math.round(bytes / 0x1p20 * 1000.0) / 1000.0).put(" MiB")
-                : b <= 0xfffccccccccccccL >> 20 ? put(Math.round(bytes / 0x1p30 * 1000.0) / 1000.0).put(" GiB")
-                : b <= 0xfffccccccccccccL >> 10 ? put(Math.round(bytes / 0x1p40 * 1000.0) / 1000.0).put(" TiB")
-                : b <= 0xfffccccccccccccL ? put(Math.round((bytes >> 10) / 0x1p40 * 1000.0) / 1000.0).put(" PiB")
-                : put(Math.round((bytes >> 20) / 0x1p40 * 1000.0) / 1000.0).put(" EiB");
+    default T putQuoted(@NotNull Utf8Sequence cs) {
+        putAscii('\"').put(cs).putAscii('\"');
+        return (T) this;
     }
+
+    default T putSize(long bytes) {
+        long b = bytes == Long.MIN_VALUE ? Long.MAX_VALUE : Math.abs(bytes);
+        return (T) (b < 1024L ? put(bytes).put(' ').put('B')
+                : b <= 0xfffccccccccccccL >> 40 ? put(Math.round(bytes / 0x1p10 * 1000.0) / 1000.0).put(" KiB")
+                  : b <= 0xfffccccccccccccL >> 30 ? put(Math.round(bytes / 0x1p20 * 1000.0) / 1000.0).put(" MiB")
+                    : b <= 0xfffccccccccccccL >> 20 ? put(Math.round(bytes / 0x1p30 * 1000.0) / 1000.0).put(" GiB")
+                      : b <= 0xfffccccccccccccL >> 10 ? put(Math.round(bytes / 0x1p40 * 1000.0) / 1000.0).put(" TiB")
+                        : b <= 0xfffccccccccccccL ? put(Math.round((bytes >> 10) / 0x1p40 * 1000.0) / 1000.0).put(" PiB")
+                          : put(Math.round((bytes >> 20) / 0x1p40 * 1000.0) / 1000.0).put(" EiB"));
+    }
+
+    /**
+     * Returns a reusable {@code int[1]} scratch slot for the Ryu double/float decomposition
+     * performed by {@link Numbers#append(CharSink, double, int)}. Each sink owns one cached array
+     * so the formatter never does a thread-local/carrier-local lookup per value.
+     * <p>
+     * The array is consumed entirely within a single {@code append} call, before any sink write,
+     * so one slot per sink is safe for the single-threaded use a sink instance sees, and it
+     * travels with the sink across a continuation migration (no carrier identity involved).
+     */
+    int[] ryuScratch();
 }

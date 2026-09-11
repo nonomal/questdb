@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -37,6 +37,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
@@ -103,7 +104,7 @@ public class PathTest {
 
     @Test
     public void testConcatTableToken() {
-        path.concat(new TableToken("root", "root", 0, false, false, false)).$();
+        path.concat(new TableToken("root", "root", null, 0, false, false, false)).$();
         Assert.assertEquals("root", path.toString());
     }
 
@@ -282,9 +283,7 @@ public class PathTest {
     @Test
     public void testOverflow() {
         StringBuilder b = new StringBuilder();
-        for (int i = 0; i < 256; i++) {
-            b.append('9');
-        }
+        b.repeat("9", 256);
 
         try (Path p = new Path()) {
             TestUtils.assertEquals(
@@ -383,7 +382,7 @@ public class PathTest {
             sink.put(payload1);
             p0.put(sink);
             Assert.assertFalse(p0.isAscii());
-            Assert.assertEquals(p0.capacity(), 16);
+            Assert.assertEquals(16, p0.capacity());
             Assert.assertEquals(payload1, p0.toString());
             final String payload2 = ", mooooooooooooooooooooo: 🐮!";
             sink.clear();
@@ -476,7 +475,7 @@ public class PathTest {
     }
 
     @Test
-    public void testThreadLocalMultiThreaded() {
+    public void testThreadLocalMultiThreaded() throws InterruptedException {
         int numThreads = 9;
         SOCountDownLatch started = new SOCountDownLatch(numThreads);
         SOCountDownLatch completed = new SOCountDownLatch(numThreads);
@@ -490,42 +489,42 @@ public class PathTest {
             thread.setDaemon(true);
             return thread;
         });
-        for (int i = 0; i < numThreads; i++) {
-            int threadId = i;
-            executor.submit(() -> {
-                String threadName = "thread" + threadId;
-                Thread.currentThread().setName(threadName);
-                String root = Files.SEPARATOR + threadName + Files.SEPARATOR + "dbRoot"; // 15
-                String expected1 = root + Files.SEPARATOR + "table" + Files.SEPARATOR; // 22
-                String expected2 = expected1 + "partition" + Files.SEPARATOR; // 32
-                started.countDown();
-                try {
-                    while (keepRunning.get()) {
-                        Path path = Path.getThreadLocal(root);
-                        path.concat("table").slash$();
-                        Assert.assertEquals(expected1, path.toString());
-                        Assert.assertEquals(22, path.size());
-                        Assert.assertFalse(Files.exists(path.$()));
-                        path.concat("partition").slash$();
-                        Assert.assertEquals(expected2, path.toString());
-                        Assert.assertEquals(32, path.size());
-                        AtomicLong count = stats.computeIfAbsent(threadId, k -> new AtomicLong());
-                        count.incrementAndGet();
-                        Os.pause();
-                    }
-                } catch (Throwable err) {
-                    failCount.incrementAndGet();
-                    err.printStackTrace();
-                    Assert.fail(err.getMessage());
-                } finally {
-                    completed.countDown();
-                    Path.clearThreadLocals();
-                }
-            });
-        }
-        started.await();
 
         try {
+            for (int i = 0; i < numThreads; i++) {
+                int threadId = i;
+                executor.submit(() -> {
+                    String threadName = "thread" + threadId;
+                    Thread.currentThread().setName(threadName);
+                    String root = Files.SEPARATOR + threadName + Files.SEPARATOR + "dbRoot"; // 15
+                    String expected1 = root + Files.SEPARATOR + "table" + Files.SEPARATOR; // 22
+                    String expected2 = expected1 + "partition" + Files.SEPARATOR; // 32
+                    started.countDown();
+                    try {
+                        while (keepRunning.get()) {
+                            Path path = Path.getThreadLocal(root);
+                            path.concat("table").slash$();
+                            Assert.assertEquals(expected1, path.toString());
+                            Assert.assertEquals(22, path.size());
+                            Assert.assertFalse(Files.exists(path.$()));
+                            path.concat("partition").slash$();
+                            Assert.assertEquals(expected2, path.toString());
+                            Assert.assertEquals(32, path.size());
+                            AtomicLong count = stats.computeIfAbsent(threadId, _ -> new AtomicLong());
+                            count.incrementAndGet();
+                            Os.pause();
+                        }
+                    } catch (Throwable err) {
+                        failCount.incrementAndGet();
+                        err.printStackTrace();
+                        Assert.fail(err.getMessage());
+                    } finally {
+                        completed.countDown();
+                        Path.clearThreadLocals();
+                    }
+                });
+            }
+            started.await();
             String root = "" + Files.SEPARATOR;
             String expected1 = root + "banana" + Files.SEPARATOR;
             String expected2 = expected1 + "party" + Files.SEPARATOR;
@@ -550,6 +549,7 @@ public class PathTest {
                 Assert.assertNotNull(count);
                 Assert.assertTrue(count.get() > 0);
             }
+            Assert.assertTrue(executor.awaitTermination(5, TimeUnit.MINUTES));
         }
     }
 
@@ -589,7 +589,7 @@ public class PathTest {
             p0.zeroPad(len);
             Assert.assertEquals(17, p0.capacity());
             for (int i = 0; i < len; i++) {
-                Assert.assertEquals(0, Unsafe.getUnsafe().getByte(p0.hi() + i));
+                Assert.assertEquals(0, Unsafe.getByte(p0.hi() + i));
             }
         }
     }

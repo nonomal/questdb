@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -111,8 +111,11 @@ class LineTcpNetworkIOJob implements NetworkIOJob {
     }
 
     @Override
-    public boolean run(int workerId, @NotNull RunStatus runStatus) {
-        assert this.workerId == workerId;
+    public boolean run(@NotNull WorkerContext workerContext) {
+        // This job ignores workerContext.carrierId(): legacy ILP scratch
+        // (TableUpdateDetails.localDetailsArray) is keyed by the pool-local writer
+        // slot baked into this.workerId at construction time, so all routing and
+        // array-indexing below uses this.workerId.
         boolean busy = false;
         if (busyContext != null) {
             if (handleIO(busyContext, dispatcher)) {

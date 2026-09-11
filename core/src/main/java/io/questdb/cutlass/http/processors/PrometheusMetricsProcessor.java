@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,8 +24,14 @@
 
 package io.questdb.cutlass.http.processors;
 
-import io.questdb.cutlass.http.*;
-import io.questdb.metrics.Scrapable;
+import io.questdb.cutlass.http.HttpChunkedResponse;
+import io.questdb.cutlass.http.HttpConnectionContext;
+import io.questdb.cutlass.http.HttpRequestHandler;
+import io.questdb.cutlass.http.HttpRequestHeader;
+import io.questdb.cutlass.http.HttpRequestProcessor;
+import io.questdb.cutlass.http.HttpServerConfiguration;
+import io.questdb.cutlass.http.LocalValue;
+import io.questdb.metrics.Target;
 import io.questdb.network.PeerDisconnectedException;
 import io.questdb.network.PeerIsSlowToReadException;
 import io.questdb.std.Files;
@@ -36,17 +42,22 @@ import io.questdb.std.str.DirectUtf8Sink;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.TestOnly;
 
-public class PrometheusMetricsProcessor implements HttpRequestProcessor {
+public class PrometheusMetricsProcessor implements HttpRequestProcessor, HttpRequestHandler {
     private static final CharSequence CONTENT_TYPE_TEXT = "text/plain; version=0.0.4; charset=utf-8";
     private static final LocalValue<RequestState> LV = new LocalValue<>();
-    private final Scrapable metrics;
+    private final Target metrics;
     private final RequestStatePool pool;
     private final byte requiredAuthType;
 
-    public PrometheusMetricsProcessor(Scrapable metrics, HttpMinServerConfiguration configuration, RequestStatePool pool) {
+    public PrometheusMetricsProcessor(Target metrics, HttpServerConfiguration configuration, RequestStatePool pool) {
         this.metrics = metrics;
         this.requiredAuthType = configuration.getRequiredAuthType();
         this.pool = pool;
+    }
+
+    @Override
+    public HttpRequestProcessor getProcessor(HttpRequestHeader requestHeader) {
+        return this;
     }
 
     @Override
@@ -161,6 +172,7 @@ public class PrometheusMetricsProcessor implements HttpRequestProcessor {
     public static class RequestStatePool implements QuietCloseable {
         private final int maxPoolSize;
         private final ObjList<RequestState> objects = new ObjList<>();
+        private volatile boolean closed = false;
 
         public RequestStatePool(int maxPoolSize) {
             assert maxPoolSize > 0;
@@ -168,7 +180,8 @@ public class PrometheusMetricsProcessor implements HttpRequestProcessor {
         }
 
         @Override
-        public void close() {
+        public synchronized void close() {
+            closed = true;
             for (int i = 0, n = objects.size(); i < n; i++) {
                 objects.getQuick(i).free();
             }
@@ -188,6 +201,13 @@ public class PrometheusMetricsProcessor implements HttpRequestProcessor {
         }
 
         public synchronized void push(RequestState requestState) {
+            // If the pool has been closed (e.g. during HttpServer.close(), when idle
+            // connections still in the factory pool return their state), free the
+            // buffer directly rather than adding to the cleared list.
+            if (closed) {
+                requestState.free();
+                return;
+            }
             if (objects.size() < maxPoolSize) {
                 objects.add(requestState);
             } else {

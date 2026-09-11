@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -25,17 +25,26 @@
 package io.questdb.cutlass.http.processors;
 
 import io.questdb.cutlass.http.HttpConnectionContext;
-import io.questdb.cutlass.http.HttpMultipartContentListener;
+import io.questdb.cutlass.http.HttpMultipartContentProcessor;
 import io.questdb.cutlass.http.HttpRequestHeader;
-import io.questdb.cutlass.http.HttpRequestProcessor;
 import io.questdb.network.PeerDisconnectedException;
 import io.questdb.network.PeerIsSlowToReadException;
-import io.questdb.network.QueryPausedException;
 import io.questdb.network.ServerDisconnectException;
+import io.questdb.std.str.CharSink;
 
-public interface RejectProcessor extends HttpRequestProcessor, HttpMultipartContentListener {
+import static io.questdb.cutlass.http.HttpRequestValidator.ALL;
+import static io.questdb.cutlass.http.HttpRequestValidator.INVALID;
+
+public interface RejectProcessor extends HttpMultipartContentProcessor {
 
     void clear();
+
+    CharSink<?> getMessageSink();
+
+    @Override
+    default short getSupportedRequestTypes() {
+        return ALL | INVALID;
+    }
 
     boolean isRequestBeingRejected();
 
@@ -48,11 +57,18 @@ public interface RejectProcessor extends HttpRequestProcessor, HttpMultipartCont
     default void onPartEnd() {
     }
 
-    HttpRequestProcessor rejectRequest(int code, CharSequence userMessage, CharSequence cookieName, CharSequence cookieValue, byte authenticationType);
+    RejectProcessor reject(int rejectCode);
 
-    default void resumeSend(
-            HttpConnectionContext context
-    ) throws PeerDisconnectedException, PeerIsSlowToReadException, ServerDisconnectException, QueryPausedException {
+    RejectProcessor reject(int rejectCode, CharSequence rejectMessage);
+
+    default void resumeSend(HttpConnectionContext context)
+            throws PeerDisconnectedException, PeerIsSlowToReadException, ServerDisconnectException {
         onRequestComplete(context);
     }
+
+    RejectProcessor withAuthenticationType(byte authenticationType);
+
+    RejectProcessor withCookie(CharSequence cookieName, CharSequence cookieValue);
+
+    RejectProcessor withShutdownWrite();
 }

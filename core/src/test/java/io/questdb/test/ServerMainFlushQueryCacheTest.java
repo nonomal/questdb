@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -75,14 +75,14 @@ public class ServerMainFlushQueryCacheTest extends AbstractBootstrapTest {
                 }
 
                 final Metrics metrics = serverMain.getEngine().getMetrics();
-                TestUtils.assertEventually(() -> Assert.assertEquals(nQueries, metrics.pgWire().cachedSelectsGauge().getValue()));
+                TestUtils.assertEventually(() -> Assert.assertEquals(nQueries, metrics.pgWireMetrics().cachedSelectsGauge().getValue()));
 
                 try (Statement statement = conn.createStatement()) {
                     statement.execute("select flush_query_cache();");
                 }
 
                 // Only the select flush_query_cache(); query may remain in the cache.
-                TestUtils.assertEventually(() -> Assert.assertTrue(metrics.pgWire().cachedSelectsGauge().getValue() <= 1));
+                TestUtils.assertEventually(() -> Assert.assertTrue(metrics.pgWireMetrics().cachedSelectsGauge().getValue() <= 1));
             }
         }
     }

@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,12 +24,20 @@
 
 package io.questdb.griffin.engine.join;
 
-import io.questdb.cairo.*;
+import io.questdb.cairo.AbstractRecordMetadata;
+import io.questdb.cairo.ArrayColumnTypes;
+import io.questdb.cairo.CairoConfiguration;
+import io.questdb.cairo.CairoException;
+import io.questdb.cairo.ColumnType;
+import io.questdb.cairo.ColumnTypes;
+import io.questdb.cairo.SingleColumnType;
+import io.questdb.cairo.TableColumnMetadata;
 import io.questdb.cairo.map.Map;
 import io.questdb.cairo.map.MapKey;
 import io.questdb.cairo.map.MapValue;
 import io.questdb.cairo.map.OrderedMap;
 import io.questdb.cairo.sql.RecordMetadata;
+import io.questdb.griffin.SqlUtil;
 import io.questdb.std.Chars;
 import io.questdb.std.MemoryTag;
 import io.questdb.std.Misc;
@@ -38,7 +46,6 @@ import io.questdb.std.str.Utf16Sink;
 import java.io.Closeable;
 
 public class JoinRecordMetadata extends AbstractRecordMetadata implements Closeable {
-
     private static final ColumnTypes keyTypes;
     private static final ColumnTypes valueTypes;
     private final Map map;
@@ -59,23 +66,32 @@ public class JoinRecordMetadata extends AbstractRecordMetadata implements Closea
         this.refCount = 1;
     }
 
+    // This overload does not propagate parquetEncodingConfig because it is only
+    // used for synthetic horizon join pseudo-columns that never carry encoding overrides.
     public void add(
             CharSequence tableAlias,
             CharSequence columnName,
             int columnType,
-            boolean indexFlag,
+            byte indexType,
             int indexValueBlockCapacity,
             boolean symbolTableStatic,
             RecordMetadata metadata
     ) {
-        int dot = addAlias(tableAlias, columnName);
+        int dot = Chars.indexOfLastUnquoted(columnName, '.');
+        columnName = protectDottedColumnName(tableAlias, columnName, dot);
+        if (tableAlias != null) {
+            // aliased side: the name is either re-quoted (its dot is now content) or was never
+            // dotted, so it carries no table.column separator
+            dot = -1;
+        }
+        addAlias(tableAlias, columnName, dot);
         final Utf16Sink b = Misc.getThreadLocalSink();
         TableColumnMetadata cm;
         if (dot == -1) {
             cm = new TableColumnMetadata(
                     b.put(tableAlias).put('.').put(columnName).toString(),
                     columnType,
-                    indexFlag,
+                    indexType,
                     indexValueBlockCapacity,
                     symbolTableStatic,
                     metadata
@@ -84,7 +100,7 @@ public class JoinRecordMetadata extends AbstractRecordMetadata implements Closea
             cm = new TableColumnMetadata(
                     Chars.toString(columnName),
                     columnType,
-                    indexFlag,
+                    indexType,
                     indexValueBlockCapacity,
                     symbolTableStatic,
                     metadata
@@ -94,19 +110,26 @@ public class JoinRecordMetadata extends AbstractRecordMetadata implements Closea
     }
 
     public void add(CharSequence tableAlias, TableColumnMetadata m) {
-        final CharSequence columnName = m.getName();
-        final int dot = addAlias(tableAlias, columnName);
-        final Utf16Sink b = Misc.getThreadLocalSink();
+        CharSequence columnName = m.getColumnName();
+        int dot = Chars.indexOfLastUnquoted(columnName, '.');
+        columnName = protectDottedColumnName(tableAlias, columnName, dot);
+        if (tableAlias != null) {
+            dot = -1;
+        }
+        addAlias(tableAlias, columnName, dot);
         TableColumnMetadata cm;
-        if (dot == -1) {
+        if (dot == -1 && tableAlias != null) {
+            // qualify the column with its side's alias; a re-quoted dotted name lands here too
+            // (dot == -1 after quoting), producing alias."a.b"
             cm = new TableColumnMetadata(
-                    b.put(tableAlias).put('.').put(columnName).toString(),
-                    m.getType(),
-                    m.isIndexed(),
+                    Misc.getThreadLocalSink().put(tableAlias).put('.').put(columnName).toString(),
+                    m.getColumnType(),
+                    m.getIndexType(),
                     m.getIndexValueBlockCapacity(),
                     m.isSymbolTableStatic(),
                     m.getMetadata()
             );
+            cm.setParquetEncodingConfig(m.getParquetEncodingConfig());
         } else {
             cm = m;
         }
@@ -128,18 +151,32 @@ public class JoinRecordMetadata extends AbstractRecordMetadata implements Closea
 
     @Override
     public int getColumnIndexQuiet(CharSequence columnName, int lo, int hi) {
-        final MapKey key = map.withKey();
-        final int dot = Chars.indexOf(columnName, lo, '.');
+        final int dot = Chars.indexOfLastUnquoted(columnName, '.', lo, hi);
+        MapKey key = map.withKey();
         if (dot == -1) {
             key.putStr(null);
             key.putStrLowerCase(columnName, lo, hi);
         } else {
-            key.putStrLowerCase(columnName, 0, dot);
-            key.putStrLowerCase(columnName, dot + 1, columnName.length());
+            key.putStrLowerCase(columnName, lo, dot);
+            key.putStrLowerCase(columnName, dot + 1, hi);
         }
         MapValue value = key.findValue();
         if (value != null) {
             return value.getInt(0);
+        }
+        // A composed "alias.column" reference whose column part carries the compiler's protective
+        // quotes (e.g. a join wildcard reference m."in") resolves against the unquoted stored name.
+        // Only an OPERATOR-TOKEN column part (quoteProtectedInteriorDot == -1) is stored bare and
+        // worth the strip-retry; a dotted column part is stored re-quoted and already matched
+        // verbatim above, so stripping it would only re-probe the map for a name that cannot be there.
+        if (dot > -1 && SqlUtil.quoteProtectedInteriorDot(columnName, dot + 1, hi) == -1) {
+            key = map.withKey();
+            key.putStrLowerCase(columnName, lo, dot);
+            key.putStrLowerCase(columnName, dot + 2, hi - 1);
+            value = key.findValue();
+            if (value != null) {
+                return value.getInt(0);
+            }
         }
         return -1;
     }
@@ -152,15 +189,20 @@ public class JoinRecordMetadata extends AbstractRecordMetadata implements Closea
         this.timestampIndex = index;
     }
 
-    private int addAlias(CharSequence tableAlias, CharSequence columnName) {
-        int dot = Chars.indexOf(columnName, '.');
-        assert dot != -1 || tableAlias != null;
+    @Override
+    public boolean splitsOnDot() {
+        // getColumnIndexQuiet splits a composed reference on the unquoted dot (table.column).
+        return true;
+    }
 
-        // add column with its own alias
+    private void addAlias(CharSequence tableAlias, CharSequence columnName, int dot) {
+        // add column with its own alias; the caller precomputes dot (the table.column split)
         MapKey key = map.withKey();
 
         if (dot == -1) {
-            key.putStrLowerCase(tableAlias);
+            if (tableAlias != null) {
+                key.putStrLowerCase(tableAlias);
+            }
         } else {
             assert tableAlias == null;
             key.putStrLowerCase(columnName, 0, dot);
@@ -173,7 +215,6 @@ public class JoinRecordMetadata extends AbstractRecordMetadata implements Closea
         }
 
         value.putInt(0, columnCount++);
-        return dot;
     }
 
     private void addToMap(CharSequence columnName, int dot, TableColumnMetadata cm) {
@@ -191,6 +232,18 @@ public class JoinRecordMetadata extends AbstractRecordMetadata implements Closea
             // we would treat this lookup as if column hadn't been found.
             value.putInt(0, -1);
         }
+    }
+
+    // Restores the protective quotes around a plain column of an aliased side, whose dots are
+    // content rather than a "table.column" separator. Base factory metadata stores such names
+    // unquoted (SqlUtil.toColumnName), but this map's dot-splitting convention keys on the
+    // quotes; with a null alias the name is an already-composed prefixed form and must keep
+    // splitting at the dot, so it is left untouched. dot is the caller's single dot scan.
+    private CharSequence protectDottedColumnName(CharSequence tableAlias, CharSequence columnName, int dot) {
+        if (tableAlias != null && dot > -1) {
+            return Misc.getThreadLocalSink().put('"').put(columnName).put('"').toString();
+        }
+        return columnName;
     }
 
     static {

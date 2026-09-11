@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2023 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -35,20 +35,18 @@ public class NotMatchVarcharFunctionFactoryTest extends AbstractCairoTest {
     @Test
     public void testNullRegex() throws Exception {
         assertMemoryLeak(() -> {
-            ddl("create table x as (select rnd_varchar() name from long_sequence(2000))");
-            try {
-                assertExceptionNoLeakCheck("select * from x where name !~ null");
-            } catch (SqlException e) {
-                Assert.assertEquals(30, e.getPosition());
-                TestUtils.assertContains(e.getFlyweightMessage(), "NULL regex");
-            }
+            execute("create table x as (select rnd_varchar() name from long_sequence(2000))");
+            assertQuery("select * from x where name !~ null")
+                    .noLeakCheck()
+                    .expectSize()
+                    .returns("name\n");
         });
     }
 
     @Test
     public void testRegexSyntaxError() throws Exception {
         assertMemoryLeak(() -> {
-            ddl("create table x as (select rnd_varchar() name from long_sequence(2000))");
+            execute("create table x as (select rnd_varchar() name from long_sequence(2000))");
             try {
                 assertExceptionNoLeakCheck("select * from x where name !~ 'XJ**'");
             } catch (SqlException e) {
@@ -61,23 +59,24 @@ public class NotMatchVarcharFunctionFactoryTest extends AbstractCairoTest {
     @Test
     public void testSimple() throws Exception {
         assertMemoryLeak(() -> {
-            final String expected = "name\n" +
-                    "8#3TsZ\n" +
-                    "zV衞͛Ԉ龘и\uDA89\uDFA4~\n" +
-                    "\uDBAE\uDD12ɜ|\n" +
-                    "\uDB59\uDF3B룒jᷚ\n" +
-                    "p-鳓w\n" +
-                    "h\uDAF5\uDE17qRӽ-\n" +
-                    "Ǆ Ԡ阷l싒8쮠\n" +
-                    "kɷ씌䒙\uD8F2\uDE8E>\uDAE6\uDEE3\n" +
-                    "\uD908\uDECBŗ\uDB47\uDD9C\uDA96\uDF8F㔸\n" +
-                    "91g>\n" +
-                    "h볱9\n";
-            ddl("create table x as (select rnd_varchar() name from long_sequence(20))");
-            assertSql(
-                    expected,
-                    "select * from x where name !~ '[ABCDEFGHIJKLMN]'"
-            );
+            final String expected = """
+                    name
+                    8#3TsZ
+                    zV衞͛Ԉ龘и\uDA89\uDFA4~
+                    \uDBAE\uDD12ɜ|
+                    \uDB59\uDF3B룒jᷚ
+                    p-鳓w
+                    h\uDAF5\uDE17qRӽ-
+                    Ǆ Ԡ阷l싒8쮠
+                    kɷ씌䒙\uD8F2\uDE8E>\uDAE6\uDEE3
+                    \uD908\uDECBŗ\uDB47\uDD9C\uDA96\uDF8F㔸
+                    91g>
+                    h볱9
+                    """;
+            execute("create table x as (select rnd_varchar() name from long_sequence(20))");
+            assertQuery("select * from x where name !~ '[ABCDEFGHIJKLMN]'")
+                    .noLeakCheck()
+                    .returns(expected);
         });
     }
 }

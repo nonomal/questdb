@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -30,13 +30,10 @@ import io.questdb.cairo.map.MapValue;
 import io.questdb.cairo.map.OrderedMap;
 import io.questdb.cairo.map.UnorderedVarcharMap;
 import io.questdb.cairo.vm.Vm;
+import io.questdb.cairo.vm.api.MemoryCMR;
 import io.questdb.cairo.vm.api.MemoryMA;
-import io.questdb.cairo.vm.api.MemoryMR;
 import io.questdb.std.*;
-import io.questdb.std.str.LPSZ;
-import io.questdb.std.str.Path;
-import io.questdb.std.str.Utf8Sequence;
-import io.questdb.std.str.Utf8StringSink;
+import io.questdb.std.str.*;
 import org.openjdk.jmh.annotations.*;
 import org.openjdk.jmh.runner.Runner;
 import org.openjdk.jmh.runner.RunnerException;
@@ -56,11 +53,11 @@ public class UnorderedVarcharMapBenchmark {
     private static final int MIN_SIZE = 5;
     private static final int ROW_COUNT = 1_000_000;
     private static final int WORD_COUNT = 1_000;
-    private MemoryMR auxReadMemStable;
-    private MemoryMR auxReadMemUnstable;
-    private MemoryMR dataReadMemStable;
-    private MemoryMR dataReadMemUnstable;
+    private MemoryCMR auxReadMem;
+    private MemoryCMR dataReadMem;
     private OrderedMap orderedMap;
+    private final Utf8SplitString stableUtf8String = new Utf8SplitString(() -> true);
+    private final Utf8SplitString unstableUtf8String = new Utf8SplitString(() -> false);
     private UnorderedVarcharMap varcharMap;
 
     public static void main(String[] args) throws RunnerException {
@@ -71,7 +68,7 @@ public class UnorderedVarcharMapBenchmark {
                 .warmupIterations(1)
                 .measurementIterations(2)
                 .forks(1)
-                //            .addProfiler(AsyncProfiler.class, "output=flamegraph")
+                // .addProfiler(AsyncProfiler.class, "output=flamegraph")
                 .build();
 
         new Runner(opt).run();
@@ -81,7 +78,7 @@ public class UnorderedVarcharMapBenchmark {
     public void benchOrderedMap() {
         orderedMap.clear();
         for (int i = 0; i < ROW_COUNT; i++) {
-            Utf8Sequence value = VarcharTypeDriver.getSplitValue(auxReadMemUnstable, dataReadMemUnstable, i, 0);
+            Utf8Sequence value = VarcharTypeDriver.getSplitValue(auxReadMem, dataReadMem, i, 0);
 
             MapKey mapKey = orderedMap.withKey();
             mapKey.putVarchar(value);
@@ -98,7 +95,14 @@ public class UnorderedVarcharMapBenchmark {
     public void benchVarcharMapStable() {
         varcharMap.clear();
         for (int i = 0; i < ROW_COUNT; i++) {
-            Utf8Sequence value = VarcharTypeDriver.getSplitValue(auxReadMemStable, dataReadMemStable, i, 0);
+            Utf8Sequence value = VarcharTypeDriver.getSplitValue(
+                    auxReadMem.addressOf(0),
+                    auxReadMem.addressHi(),
+                    dataReadMem.addressOf(0),
+                    dataReadMem.addressHi(),
+                    i,
+                    stableUtf8String
+            );
 
             MapKey mapKey = varcharMap.withKey();
             mapKey.putVarchar(value);
@@ -115,7 +119,14 @@ public class UnorderedVarcharMapBenchmark {
     public void benchVarcharMapUnstable() {
         varcharMap.clear();
         for (int i = 0; i < ROW_COUNT; i++) {
-            Utf8Sequence value = VarcharTypeDriver.getSplitValue(auxReadMemUnstable, dataReadMemUnstable, i, 0);
+            Utf8Sequence value = VarcharTypeDriver.getSplitValue(
+                    auxReadMem.addressOf(0),
+                    auxReadMem.addressHi(),
+                    dataReadMem.addressOf(0),
+                    dataReadMem.addressHi(),
+                    i,
+                    unstableUtf8String
+            );
 
             MapKey mapKey = varcharMap.withKey();
             mapKey.putVarchar(value);
@@ -140,8 +151,10 @@ public class UnorderedVarcharMapBenchmark {
     @Setup(Level.Trial)
     public void createMem() {
         FilesFacade ff = FilesFacadeImpl.INSTANCE;
-        try (MemoryMA auxAppendMem = Vm.getMAInstance(CommitMode.NOSYNC);
-             MemoryMA dataAppendMem = Vm.getMAInstance(CommitMode.NOSYNC)) {
+        try (
+                MemoryMA auxAppendMem = Vm.getPMARInstance(null);
+                MemoryMA dataAppendMem = Vm.getPMARInstance(null)
+        ) {
             try (Path path = new Path()) {
                 path.of(AUX_MEM_FILENAME);
                 auxAppendMem.of(ff, path.$(), ff.getMapPageSize(), MemoryTag.NATIVE_DEFAULT, CairoConfiguration.O_NONE);
@@ -175,11 +188,9 @@ public class UnorderedVarcharMapBenchmark {
 
         try (Path path = new Path()) {
             LPSZ lpsz = path.of(AUX_MEM_FILENAME).$();
-            auxReadMemUnstable = Vm.getMRInstance(ff, lpsz, -1, MemoryTag.NATIVE_DEFAULT, false);
-            auxReadMemStable = Vm.getMRInstance(ff, lpsz, -1, MemoryTag.NATIVE_DEFAULT, true);
+            auxReadMem = Vm.getCMRInstance(ff, lpsz, -1, MemoryTag.NATIVE_DEFAULT);
             path.of(DATA_MEM_FILENAME).$();
-            dataReadMemUnstable = Vm.getMRInstance(ff, lpsz, -1, MemoryTag.NATIVE_DEFAULT, false);
-            dataReadMemStable = Vm.getMRInstance(ff, lpsz, -1, MemoryTag.NATIVE_DEFAULT, true);
+            dataReadMem = Vm.getCMRInstance(ff, lpsz, -1, MemoryTag.NATIVE_DEFAULT);
         }
     }
 

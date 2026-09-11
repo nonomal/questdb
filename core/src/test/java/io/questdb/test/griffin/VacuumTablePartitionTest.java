@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -36,11 +36,11 @@ public class VacuumTablePartitionTest extends AbstractCairoTest {
     @Test
     public void testVacuumExceedsQueueSize() throws Exception {
         assertMemoryLeak(() -> {
-            ddl("create table \"таблица\"  (x long, ts timestamp) timestamp(ts) partition by month");
+            execute("create table \"таблица\"  (x long, ts timestamp) timestamp(ts) partition by month");
             try {
                 int n = engine.getConfiguration().getO3PurgeDiscoveryQueueCapacity() * 2;
                 for (int i = 0; i < n; i++) {
-                    ddl("VACUUM partitions \"таблица\";");
+                    execute("VACUUM partitions \"таблица\";");
                 }
                 Assert.fail();
             } catch (SqlException ex) {
@@ -50,7 +50,7 @@ public class VacuumTablePartitionTest extends AbstractCairoTest {
             }
 
             // cleanup
-            try (O3PartitionPurgeJob purgeDiscoveryJob = new O3PartitionPurgeJob(engine, engine.getSnapshotAgent(), 1)) {
+            try (O3PartitionPurgeJob purgeDiscoveryJob = new O3PartitionPurgeJob(engine, 1)) {
                 purgeDiscoveryJob.drain(0);
             }
         });
@@ -95,7 +95,7 @@ public class VacuumTablePartitionTest extends AbstractCairoTest {
     @Test
     public void testVacuumSyntaxErrorNoEOL() throws Exception {
         assertMemoryLeak(() -> {
-            ddl("create table tbl (x long, ts timestamp) timestamp(ts)");
+            execute("create table tbl (x long, ts timestamp) timestamp(ts)");
             try {
                 assertExceptionNoLeakCheck("vacuum partitions tbl asdf");
             } catch (SqlException ex) {
@@ -108,7 +108,7 @@ public class VacuumTablePartitionTest extends AbstractCairoTest {
     @Test
     public void testVacuumSyntaxErrorNonPartitioned() throws Exception {
         assertMemoryLeak(() -> {
-            ddl("create table tbl (x long, ts timestamp) timestamp(ts)");
+            execute("create table tbl (x long, ts timestamp) timestamp(ts)");
             try {
                 assertExceptionNoLeakCheck("vacuum partitions tbl");
             } catch (SqlException ex) {
@@ -133,12 +133,12 @@ public class VacuumTablePartitionTest extends AbstractCairoTest {
     @Test
     public void testVacuumSyntaxQuotedTableOk() throws Exception {
         assertMemoryLeak(() -> {
-            ddl("create table tbl (x long, ts timestamp) timestamp(ts) partition by month");
-            ddl("VACUUM partitions 'tbl'");
-            ddl("VACUUM PARTITIONS tbl;");
+            execute("create table tbl (x long, ts timestamp) timestamp(ts) partition by month");
+            execute("VACUUM partitions 'tbl'");
+            execute("VACUUM PARTITIONS tbl;");
 
-            ddl("create table \"tbl with space\" (x long, ts timestamp) timestamp(ts) partition by month");
-            ddl("VACUUM PARTITIONS \"tbl with space\";");
+            execute("create table \"tbl with space\" (x long, ts timestamp) timestamp(ts) partition by month");
+            execute("VACUUM PARTITIONS \"tbl with space\";");
         });
     }
 }

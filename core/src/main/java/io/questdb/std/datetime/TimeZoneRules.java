@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -25,17 +25,37 @@
 package io.questdb.std.datetime;
 
 public interface TimeZoneRules {
-    long getNextDST(long utcEpoch, int year, boolean leap);
 
     /**
-     * Computes UTC time for the next Daylight Saving Transition
+     * If the local epoch is a Daylight Saving Transition gap in forward time shift,
+     * this method returns the offset of the timestamp to the beginning of the gap.
+     */
+    long getDstGapOffset(long localEpoch);
+
+    long getLocalOffset(long localEpoch);
+
+    long getLocalOffset(long localEpoch, int year);
+
+    /**
+     * Computes UTC epoch time for the next Daylight Saving Transition.
      *
      * @param utcEpoch arbitrary point in time, UTC epoch time
      * @return UTC epoch
      */
     long getNextDST(long utcEpoch);
 
-    long getOffset(long utcEpoch, int year, boolean leap);
+    long getNextDST(long utcEpoch, int year);
 
     long getOffset(long utcEpoch);
+
+    long getOffset(long utcEpoch, int year);
+
+    /**
+     * Returns the standard (non-DST) UTC offset for this timezone. This is
+     * the base offset without any daylight saving adjustment, i.e. the
+     * "winter time" offset for most timezones.
+     */
+    long getStandardOffset();
+
+    boolean hasFixedOffset();
 }

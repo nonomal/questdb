@@ -1,0 +1,1057 @@
+/*+*****************************************************************************
+ *     ___                  _   ____  ____
+ *    / _ \ _   _  ___  ___| |_|  _ \| __ )
+ *   | | | | | | |/ _ \/ __| __| | | |  _ \
+ *   | |_| | |_| |  __/\__ \ |_| |_| | |_) |
+ *    \__\_\\__,_|\___||___/\__|____/|____/
+ *
+ *  Copyright (c) 2014-2019 Appsicle
+ *  Copyright (c) 2019-2026 QuestDB
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
+ *
+ *  http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
+ *
+ ******************************************************************************/
+
+package io.questdb.test.griffin;
+
+import io.questdb.std.Rnd;
+import io.questdb.test.AbstractCairoTest;
+import org.junit.Before;
+import org.junit.Test;
+
+public class ProjectionReferenceTest extends AbstractCairoTest {
+
+    private Rnd rnd;
+
+    @Before
+    @Override
+    public void setUp() {
+        super.setUp();
+        // A projection suite compiles what production compiles: memoization is on by default in a
+        // server and off by default in the corpus, and a memoizer changes the plan shape a
+        // projection reference resolves against, not just its speed.
+        allowFunctionMemoization();
+        rnd = new Rnd();
+    }
+
+    @Test
+    public void testAsofJoinSimple() throws Exception {
+        execute("create table events (symbol string, value int, ts timestamp) timestamp(ts)");
+        execute("create table quotes (symbol string, quote int, ts timestamp) timestamp(ts)");
+
+        execute("insert into events values ('A', 100, '2025-01-01T10:00:00.000Z'), ('A', 200, '2025-01-01T10:05:00.000Z')");
+        execute("insert into quotes values ('A', 10, '2025-01-01T09:59:00.000Z'), ('A', 20, '2025-01-01T10:03:00.000Z')");
+
+        // Simple ASOF JOIN without projection references
+        assertQuery("select e.symbol, e.value, q.quote, e.value + q.quote as sum " +
+                "from events e asof join quotes q on e.symbol = q.symbol")
+                .noLeakCheck()
+                .noRandomAccess()
+                .expectSize()
+                .returns("""
+                        symbol\tvalue\tquote\tsum
+                        A\t100\t10\t110
+                        A\t200\t20\t220
+                        """);
+    }
+
+    @Test
+    public void testBindingVars() throws Exception {
+        assertMemoryLeak(() -> {
+            bindVariableService.setLong(0, 1);
+
+            assertQuery("select $1 as b, b + 1 as inc from long_sequence(3)")
+                    .expectSize()
+                    .returns("""
+                            b\tinc
+                            1\t2
+                            1\t2
+                            1\t2
+                            """);
+
+            // we can use a projected column inside an expression
+            assertQuery("select $1 + x as b, b + 1 as inc from long_sequence(3)")
+                    .expectSize()
+                    .returns("""
+                            b\tinc
+                            2\t3
+                            3\t4
+                            4\t5
+                            """);
+
+            // we prioritise base column over projection
+            assertQuery("select $1 as x, x as x_orig from long_sequence(3)")
+                    .expectSize()
+                    .returns("""
+                            x\tx_orig
+                            1\t1
+                            1\t2
+                            1\t3
+                            """);
+
+            assertQuery("select $1 + x as x, x as x_orig from long_sequence(3)")
+                    .expectSize()
+                    .returns("""
+                            x\tx_orig
+                            2\t1
+                            3\t2
+                            4\t3
+                            """);
+
+            assertQuery("select x as i, $1 + i c from long_sequence(3)")
+                    .expectSize()
+                    .returns("""
+                            i\tc
+                            1\t2
+                            2\t3
+                            3\t4
+                            """);
+        });
+    }
+
+    @Test
+    public void testColumnAsColumnReference() throws Exception {
+        assertQuery("select x k, k from long_sequence(10)")
+                .noLeakCheck()
+                .expectSize()
+                .returns("""
+                        k\tk1
+                        1\t1
+                        2\t2
+                        3\t3
+                        4\t4
+                        5\t5
+                        6\t6
+                        7\t7
+                        8\t8
+                        9\t9
+                        10\t10
+                        """);
+    }
+
+    @Test
+    public void testColumnAsColumnReferencePreferBaseTable() throws Exception {
+        assertQuery("select a x, x from (select x a, x b, x from long_sequence(10))")
+                .noLeakCheck()
+                .expectSize()
+                .returns("""
+                        x\tx1
+                        1\t1
+                        2\t2
+                        3\t3
+                        4\t4
+                        5\t5
+                        6\t6
+                        7\t7
+                        8\t8
+                        9\t9
+                        10\t10
+                        """);
+    }
+
+    @Test
+    public void testInnerJoinSimple() throws Exception {
+        execute("create table t1 (id int, val int)");
+        execute("create table t2 (id int, val int)");
+        execute("insert into t1 values (1, 10), (2, 20)");
+        execute("insert into t2 values (1, 100), (2, 200)");
+
+        // Simple join without projection references to ensure JOIN works
+        assertQuery("select t1.id, t1.val as val1, t2.val as val2, t1.val + t2.val as sum " +
+                "from t1 inner join t2 on t1.id = t2.id")
+                .noLeakCheck()
+                .noRandomAccess()
+                .returns("""
+                        id\tval1\tval2\tsum
+                        1\t10\t100\t110
+                        2\t20\t200\t220
+                        """);
+    }
+
+    @Test
+    public void testJoinWithProjectionReference() throws Exception {
+        execute("create table orders (id int, amount int)");
+        execute("create table customers (id int, name string)");
+        execute("insert into orders values (1, 100), (2, 200)");
+        execute("insert into customers values (1, 'Alice'), (2, 'Bob')");
+
+        assertQuery("select" +
+                " o.id as order_id," +
+                " c.name as customer_name," +
+                " o.amount," +
+                " o.amount * 0.1 as tax," +
+                " o.amount + tax as total" +
+                " from orders o join customers c on o.id = c.id")
+                .noLeakCheck()
+                .noRandomAccess()
+                .returns("""
+                        order_id\tcustomer_name\tamount\ttax\ttotal
+                        1\tAlice\t100\t10.0\t110.0
+                        2\tBob\t200\t20.0\t220.0
+                        """);
+    }
+
+    @Test
+    public void testJsonProjectionInOrderByWithByte() throws Exception {
+        testJsonProjectionInOrderByWith0("""
+                        name\tval\tdoubled
+                        C\t1\t2
+                        C\t6\t12
+                        C\t18\t36
+                        C\t20\t40
+                        C\t33\t66
+                        C\t39\t78
+                        C\t42\t84
+                        C\t48\t96
+                        C\t71\t142
+                        C\t71\t142
+                        """,
+                """
+                        QUERY PLAN
+                        Encode sort light
+                          keys: [doubled]
+                            VirtualRecord
+                              functions: [name,memoize(json_extract()::byte),memoize(val*2)]
+                                PageFrame
+                                    Row forward scan
+                                    Frame forward scan on: items
+                        """,
+                "byte");
+    }
+
+    @Test
+    public void testJsonProjectionInOrderByWithDouble() throws Exception {
+        testJsonProjectionInOrderByWithF("double");
+    }
+
+    @Test
+    public void testJsonProjectionInOrderByWithFloat() throws Exception {
+        testJsonProjectionInOrderByWithF("float");
+    }
+
+    @Test
+    public void testJsonProjectionInOrderByWithInt() throws Exception {
+        testJsonProjectionInOrderByWithI("int");
+    }
+
+    @Test
+    public void testJsonProjectionInOrderByWithLong() throws Exception {
+        testJsonProjectionInOrderByWithI("long");
+    }
+
+    @Test
+    public void testJsonProjectionInOrderByWithShort() throws Exception {
+        testJsonProjectionInOrderByWithI("short");
+    }
+
+    @Test
+    public void testMultipleLevelProjections() throws Exception {
+        execute("create table data (x int)");
+        execute("insert into data values (1), (2), (3)");
+
+        assertQuery("select x, x + 1 as a, a + 2 as b, b + 4 as c, c + 8 as d from data")
+                .expectSize()
+                .returns("""
+                        x\ta\tb\tc\td
+                        1\t2\t4\t8\t16
+                        2\t3\t5\t9\t17
+                        3\t4\t6\t10\t18
+                        """);
+    }
+
+    @Test
+    public void testNestedSubquerySimple() throws Exception {
+        execute("create table base (id int, value int)");
+        execute("insert into base values (1, 10), (2, 20), (3, 30)");
+
+        // Test projection references across subquery boundaries
+        assertQuery("select id, doubled from (select id, value * 2 as doubled from base)")
+                .expectSize()
+                .returns("""
+                        id\tdoubled
+                        1\t20
+                        2\t40
+                        3\t60
+                        """);
+    }
+
+    @Test
+    public void testOrderBy() throws Exception {
+        // note: ordering prioritises projected columns over base columns, this is intentional and is consistent with DuckDB
+        execute("create table trades (symbol string, price double, ts timestamp) timestamp(ts)");
+        execute("insert into trades values ('A', 1, '2025-01-01T10:00:00.000Z'), ('B', 2, '2025-01-01T10:05:00.000Z')");
+        assertQuery("select symbol, price as orig_price, -price as price from trades order by price limit 10")
+                .expectSize()
+                .returns("""
+                        symbol\torig_price\tprice
+                        B\t2.0\t-2.0
+                        A\t1.0\t-1.0
+                        """);
+    }
+
+    @Test
+    public void testPreferBaseColumnOverProjectionVanilla() throws Exception {
+        execute("create table temp (x int)");
+        execute("insert into temp values (1), (2), (3)");
+        assertQuery("select x + 10 x, x - 5 from temp")
+                .expectSize()
+                .returns("""
+                        x\tcolumn
+                        11\t-4
+                        12\t-3
+                        13\t-2
+                        """);
+    }
+
+    @Test
+    public void testProjectionAliasPreference() throws Exception {
+        execute("create table test (a int, b int)");
+        execute("insert into test values (5, 10), (15, 20)");
+
+        // Verify that when we create an alias with the same name as a column,
+        // references still use the original column (not the alias)
+        assertQuery("select a + b as a, b, a as original_a from test")
+                .expectSize()
+                .returns("""
+                        a\tb\toriginal_a
+                        15\t10\t5
+                        35\t20\t15
+                        """);
+    }
+
+    @Test
+    public void testProjectionInOrderByWithBoolean() throws Exception {
+        execute("create table items (name string, value boolean)");
+        execute("insert into items values ('C', true), ('A', false), ('B', false)");
+
+        allowFunctionMemoization();
+
+        assertQuery("select name, value v, true value, (rnd_boolean() or value) vv from items order by 4")
+                .noLeakCheck()
+                .returnsOnce("""
+                        name\tv\tvalue\tvv
+                        A\tfalse\ttrue\tfalse
+                        B\tfalse\ttrue\tfalse
+                        C\ttrue\ttrue\ttrue
+                        """);
+    }
+
+    @Test
+    public void testProjectionInOrderByWithByte() throws Exception {
+        testProjectionInOrderByWithInt("byte");
+    }
+
+    @Test
+    public void testProjectionInOrderByWithDate() throws Exception {
+        testProjectionInOrderByWith0(
+                """
+                        name\tvalue\tdoubled
+                        B\t1970-01-01T00:00:00.020Z\t1.6973928465121335
+                        A\t1970-01-01T00:00:00.010Z\t2.246301342497259
+                        C\t1970-01-01T00:00:00.030Z\t19.823333682561998
+                        """,
+                "date"
+        );
+    }
+
+    @Test
+    public void testProjectionInOrderByWithDouble() throws Exception {
+        testProjectionInOrderByWithF("double");
+    }
+
+    @Test
+    public void testProjectionInOrderByWithFloat() throws Exception {
+        testProjectionInOrderByWithF("float");
+    }
+
+    @Test
+    public void testProjectionInOrderByWithInt() throws Exception {
+        testProjectionInOrderByWithInt("int");
+    }
+
+    @Test
+    public void testProjectionInOrderByWithLong() throws Exception {
+        testProjectionInOrderByWithInt("long");
+    }
+
+    @Test
+    public void testProjectionInOrderByWithShort() throws Exception {
+        testProjectionInOrderByWithInt("short");
+    }
+
+    @Test
+    public void testProjectionInOrderByWithString() throws Exception {
+        execute("create table items (name string, value string)");
+        execute("insert into items values ('C', 'zebra'), ('A', 'apple'), ('B', 'banana')");
+
+        allowFunctionMemoization();
+
+        assertQuery("select name, value, upper(value) as upper, upper || '_UPPER' as concat from items order by upper")
+                .expectSize()
+                .returns("""
+                        name\tvalue\tupper\tconcat
+                        A\tapple\tAPPLE\tAPPLE_UPPER
+                        B\tbanana\tBANANA\tBANANA_UPPER
+                        C\tzebra\tZEBRA\tZEBRA_UPPER
+                        """);
+    }
+
+    @Test
+    public void testProjectionInOrderByWithSymbol() throws Exception {
+        execute("create table items (name string, value symbol)");
+        execute("insert into items values ('C', 'zebra'), ('A', 'apple'), ('B', 'banana')");
+
+        allowFunctionMemoization();
+
+        assertQuery("select name, value, upper(value)::symbol as upper, upper || '_UPPER' as concat from items order by upper")
+                .expectSize()
+                .returns("""
+                        name\tvalue\tupper\tconcat
+                        A\tapple\tAPPLE\tAPPLE_UPPER
+                        B\tbanana\tBANANA\tBANANA_UPPER
+                        C\tzebra\tZEBRA\tZEBRA_UPPER
+                        """);
+    }
+
+    @Test
+    public void testProjectionInOrderByWithTimestamp() throws Exception {
+        testProjectionInOrderByWith0(
+                """
+                        name\tvalue\tdoubled
+                        B\t1970-01-01T00:00:00.000020Z\t1.6973928465121335
+                        A\t1970-01-01T00:00:00.000010Z\t2.246301342497259
+                        C\t1970-01-01T00:00:00.000030Z\t19.823333682561998
+                        """,
+                "timestamp"
+        );
+    }
+
+    @Test
+    public void testProjectionInOrderByWithVarchar() throws Exception {
+        execute("create table items (name string, value varchar)");
+        execute("insert into items values ('C', 'zebra'), ('A', 'apple'), ('B', 'banana')");
+
+        allowFunctionMemoization();
+
+        assertQuery("select name, value, upper(value) as upper, upper || '_UPPER' as concat from items order by upper")
+                .expectSize()
+                .returns("""
+                        name\tvalue\tupper\tconcat
+                        A\tapple\tAPPLE\tAPPLE_UPPER
+                        B\tbanana\tBANANA\tBANANA_UPPER
+                        C\tzebra\tZEBRA\tZEBRA_UPPER
+                        """);
+    }
+
+    @Test
+    public void testProjectionInWhereClause() throws Exception {
+        execute("create table data (x int, y int)");
+        execute("insert into data values (1, 10), (2, 20), (3, 30), (4, 40)");
+
+        // Test that WHERE clause uses base columns, not projections
+        assertQuery("select x + y as x from data where x > 1")
+                .returns("""
+                        x
+                        22
+                        33
+                        44
+                        """);
+    }
+
+    @Test
+    public void testProjectionSymbolAccess() throws Exception {
+        // `a` is referenced twice, so the production plan wraps it in a memoizer and the
+        // concatenation reads the value the row already produced. That is what makes the two
+        // columns agree per row: without memoization - the corpus default this suite overrides
+        // in setUp() - rnd_symbol() is called a second time and the two disagree on most rows.
+        assertQuery("select rnd_symbol('abc', 'fgk') a, a || '--', x p, p + 2.0 b from long_sequence(10);")
+                .noLeakCheck()
+                .returnsOnce("""
+                        a\tconcat\tp\tb
+                        abc\tabc--\t1\t3.0
+                        abc\tabc--\t2\t4.0
+                        fgk\tfgk--\t3\t5.0
+                        fgk\tfgk--\t4\t6.0
+                        fgk\tfgk--\t5\t7.0
+                        fgk\tfgk--\t6\t8.0
+                        abc\tabc--\t7\t9.0
+                        fgk\tfgk--\t8\t10.0
+                        abc\tabc--\t9\t11.0
+                        abc\tabc--\t10\t12.0
+                        """);
+    }
+
+    @Test
+    public void testProjectionWithArithmetic() throws Exception {
+        execute("create table numbers (n int)");
+        execute("insert into numbers values (10), (20), (30)");
+
+        // Test that projection references work with various arithmetic operations
+        assertQuery("select n, n * 2 as double_n, double_n + n as triple_n, double_n / 2 as half_of_double from numbers")
+                .ddl(null)
+                .expectSize()
+                .returns("""
+                        n\tdouble_n\ttriple_n\thalf_of_double
+                        10\t20\t30\t10
+                        20\t40\t60\t20
+                        30\t60\t90\t30
+                        """);
+    }
+
+    @Test
+    public void testProjectionWithArray() throws Exception {
+        execute("create table items (name string, value double[][])");
+        execute("insert into items values ('C', ARRAY[[3.0, 6], [9.0, 12]]), ('A', ARRAY[[1.0, 2], [3.0, 4]]), ('B', ARRAY[[2.0, 4], [6.0, 8]])");
+
+        allowFunctionMemoization();
+
+        assertQuery("select name, value, value[1] as first_row, value[2, 1] as second_row_first_elem, first_row[1] as first_elem, first_elem * 2 as doubled from items order by second_row_first_elem")
+                .expectSize()
+                .returns("""
+                        name	value	first_row	second_row_first_elem	first_elem	doubled
+                        A	[[1.0,2.0],[3.0,4.0]]	[1.0,2.0]	3.0	1.0	2.0
+                        B	[[2.0,4.0],[6.0,8.0]]	[2.0,4.0]	6.0	2.0	4.0
+                        C	[[3.0,6.0],[9.0,12.0]]	[3.0,6.0]	9.0	3.0	6.0
+                        """);
+    }
+
+    @Test
+    public void testProjectionWithCase() throws Exception {
+        execute("create table grades (score int)");
+        execute("insert into grades values (95), (85), (75), (65)");
+
+        assertQuery("select score, " +
+                "case when score >= 90 then 'A' " +
+                "     when score >= 80 then 'B' " +
+                "     when score >= 70 then 'C' " +
+                "     else 'D' end as grade, " +
+                "case when grade in ('A', 'B', 'C') then 'PASS' else 'FAIL' end as pass_status " +
+                "from grades")
+                .ddl(null)
+                .expectSize()
+                .returns("""
+                        score\tgrade\tpass_status
+                        95\tA\tPASS
+                        85\tB\tPASS
+                        75\tC\tPASS
+                        65\tD\tFAIL
+                        """);
+    }
+
+    @Test
+    public void testProjectionWithDecimalColumns() throws Exception {
+        execute("""
+                CREATE TABLE items (
+                    d8 DECIMAL(2, 1),
+                    d16 DECIMAL(4, 2),
+                    d32 DECIMAL(9, 4),
+                    d64 DECIMAL(18, 4),
+                    d128 DECIMAL(38, 18),
+                    d256 DECIMAL(76, 38)
+                )""");
+        execute("""
+                INSERT INTO items VALUES
+                    ('1.5'::DECIMAL(2, 1), '1.5'::DECIMAL(4, 2), '1.5'::DECIMAL(9, 4),
+                     '1.5'::DECIMAL(18, 4), '1.5'::DECIMAL(38, 18), '1.5'::DECIMAL(76, 38)),
+                    ('-9.9'::DECIMAL(2, 1), '-99.99'::DECIMAL(4, 2), '-99999.9999'::DECIMAL(9, 4),
+                     '-99999999999999.9999'::DECIMAL(18, 4), '-9.5'::DECIMAL(38, 18), '-9.5'::DECIMAL(76, 38)),
+                    ('0'::DECIMAL(2, 1), '0'::DECIMAL(4, 2), '0'::DECIMAL(9, 4),
+                     '0'::DECIMAL(18, 4), '0'::DECIMAL(38, 18), '0'::DECIMAL(76, 38)),
+                    (NULL, NULL, NULL, NULL, NULL, NULL)""");
+
+        allowFunctionMemoization();
+
+        // each alias is read twice, so the projection wraps every width in a DecimalFunctionMemoizer;
+        // a memoizer that never invalidates would repeat row 1 on every row
+        assertQuery("""
+                SELECT d8 a, a IS NULL a_null, a a2,
+                       d16 b, b IS NULL b_null, b b2,
+                       d32 c, c IS NULL c_null, c c2,
+                       d64 e, e IS NULL e_null, e e2,
+                       d128 f, f IS NULL f_null, f f2,
+                       d256 g, g IS NULL g_null, g g2
+                FROM items""")
+                .expectSize()
+                .returns("""
+                        a\ta_null\ta2\tb\tb_null\tb2\tc\tc_null\tc2\te\te_null\te2\tf\tf_null\tf2\tg\tg_null\tg2
+                        1.5\tfalse\t1.5\t1.50\tfalse\t1.50\t1.5000\tfalse\t1.5000\t1.5000\tfalse\t1.5000\t1.500000000000000000\tfalse\t1.500000000000000000\t1.50000000000000000000000000000000000000\tfalse\t1.50000000000000000000000000000000000000
+                        -9.9\tfalse\t-9.9\t-99.99\tfalse\t-99.99\t-99999.9999\tfalse\t-99999.9999\t-99999999999999.9999\tfalse\t-99999999999999.9999\t-9.500000000000000000\tfalse\t-9.500000000000000000\t-9.50000000000000000000000000000000000000\tfalse\t-9.50000000000000000000000000000000000000
+                        0.0\tfalse\t0.0\t0.00\tfalse\t0.00\t0.0000\tfalse\t0.0000\t0.0000\tfalse\t0.0000\t0.000000000000000000\tfalse\t0.000000000000000000\t0.00000000000000000000000000000000000000\tfalse\t0.00000000000000000000000000000000000000
+                        \ttrue\t\t\ttrue\t\t\ttrue\t\t\ttrue\t\t\ttrue\t\t\ttrue\t
+                        """);
+    }
+
+    @Test
+    public void testProjectionWithRandomDecimals() throws Exception {
+        allowFunctionMemoization();
+
+        // rnd_decimal is non-deterministic, so without memoization the second read of each alias
+        // draws a different value. The count is stable across cursor passes, the draws are not.
+        assertQuery("""
+                SELECT count() FROM (
+                    SELECT rnd_decimal(2, 1, 2) a, a a2,
+                           rnd_decimal(4, 2, 2) b, b b2,
+                           rnd_decimal(9, 4, 2) c, c c2,
+                           rnd_decimal(18, 4, 2) e, e e2,
+                           rnd_decimal(38, 18, 2) f, f f2,
+                           rnd_decimal(76, 38, 2) g, g g2
+                    FROM long_sequence(1_000)
+                )
+                WHERE a <> a2 OR b <> b2 OR c <> c2 OR e <> e2 OR f <> f2 OR g <> g2
+                   OR (a IS NULL) <> (a2 IS NULL) OR (b IS NULL) <> (b2 IS NULL)
+                   OR (c IS NULL) <> (c2 IS NULL) OR (e IS NULL) <> (e2 IS NULL)
+                   OR (f IS NULL) <> (f2 IS NULL) OR (g IS NULL) <> (g2 IS NULL)""")
+                .noRandomAccess()
+                .expectSize()
+                .returns("""
+                        count
+                        0
+                        """);
+    }
+
+    @Test
+    public void testSimpleProjectionChain() throws Exception {
+        execute("create table data (x int)");
+        execute("insert into data values (1), (2), (3)");
+
+        // Test simple chaining: x -> a -> b
+        assertQuery("select x, x + 1 as a, a + 2 as b from data")
+                .ddl(null)
+                .expectSize()
+                .returns("""
+                        x\ta\tb
+                        1\t2\t4
+                        2\t3\t5
+                        3\t4\t6
+                        """);
+    }
+
+    @Test
+    public void testTopDownDiamondProjectionReferences() throws Exception {
+        execute("CREATE TABLE data (x INT)");
+        execute("INSERT INTO data VALUES (10), (20), (30)");
+
+        assertQuery("select sum(c) from (" +
+                "select x, x + 1 as a, x + 2 as b, a + b as c from data" +
+                ")")
+                .noLeakCheck()
+                .noRandomAccess()
+                .expectSize()
+                .returns("""
+                        sum
+                        129
+                        """);
+    }
+
+    @Test
+    public void testTopDownMultipleColumnsReferenceSameColumn() throws Exception {
+        execute("CREATE TABLE data (x INT, y INT)");
+        execute("INSERT INTO data VALUES (10, 2), (20, 4), (30, 6)");
+        assertQuery("select sum(b), sum(c), sum(d) from (" +
+                "select x, x + y as a, a * 2 as b, a * 3 as c, a * 4 as d from data" +
+                ")")
+                .noLeakCheck()
+                .noRandomAccess()
+                .expectSize()
+                .returns("""
+                        sum	sum1	sum2
+                        144	216	288
+                        """);
+    }
+
+    @Test
+    public void testTopDownNestedSubqueries() throws Exception {
+        execute("CREATE TABLE data (x INT)");
+        execute("INSERT INTO data VALUES (1), (2), (3)");
+
+        assertQuery("select sum(c) from (" +
+                "select b, b + 1 as c from (" +
+                "select x, x + 1 as a, a + 2 as b from data" +
+                ")" +
+                ")")
+                .noLeakCheck()
+                .noRandomAccess()
+                .expectSize()
+                .returns("""
+                        sum
+                        18
+                        """);
+    }
+
+    @Test
+    public void testTopDownProjectionReferenceInSubquery() throws Exception {
+        execute("CREATE TABLE core_price (" +
+                "    timestamp TIMESTAMP," +
+                "    symbol SYMBOL," +
+                "    bid_price DOUBLE," +
+                "    bid_volume LONG," +
+                "    ask_price DOUBLE," +
+                "    ask_volume LONG" +
+                ") timestamp(timestamp)");
+        execute("INSERT INTO core_price VALUES " +
+                "('2025-01-01T00:00:00.000000Z', 'A', 100.0, 10, 101.0, 20)," +
+                "('2025-01-01T00:00:01.000000Z', 'B', 200.0, 30, 201.0, 40)");
+
+        assertQuery("select avg(schmalolzers) from (" +
+                "select timestamp, bid_volume * 1.0 / ask_volume as lolzings, lolzings * bid_price as schmalolzers from core_price" +
+                ")")
+                .noLeakCheck()
+                .noRandomAccess()
+                .expectSize()
+                .returns("""
+                        avg
+                        100.0
+                        """);
+    }
+
+    @Test
+    public void testTopDownProjectionWithFunction() throws Exception {
+        execute("CREATE TABLE data (x INT)");
+        execute("INSERT INTO data VALUES (4), (9), (16)");
+
+        assertQuery("select sum(b) from (" +
+                "select x, sqrt(x) as a, a * 2 as b from data" +
+                ")")
+                .noLeakCheck()
+                .noRandomAccess()
+                .expectSize()
+                .returns("""
+                        sum
+                        18.0
+                        """);
+    }
+
+    @Test
+    public void testTopDownSelectSpecificColumnsFromProjectionChain() throws Exception {
+        execute("CREATE TABLE data (x INT)");
+        execute("INSERT INTO data VALUES (1), (2), (3)");
+
+        assertQuery("select x, b, d from (" +
+                "select x, x + 1 as a, a + 2 as b, b + 1 as c, c + 5 as d from data" +
+                ")")
+                .noLeakCheck()
+                .expectSize()
+                .returns("""
+                        x	b	d
+                        1	4	10
+                        2	5	11
+                        3	6	12
+                        """);
+    }
+
+    @Test
+    public void testUnionAll() throws Exception {
+        // note: different types in union all -> it also exercises type coercion
+        execute("create table temp (x int)");
+        execute("create table temp2 (x long)");
+        execute("insert into temp values (1), (2), (3)");
+        execute("insert into temp2 values (4), (5), (6)");
+
+        assertQuery("select x + 1 as x, x - 1 as dec from temp union all select x + 1 as x, x - 1 from temp2")
+                .ddl(null)
+                .noRandomAccess()
+                .expectSize()
+                .returns("""
+                        x\tdec
+                        2\t0
+                        3\t1
+                        4\t2
+                        5\t3
+                        6\t4
+                        7\t5
+                        """);
+    }
+
+    @Test
+    public void testUnion_overlappingOnAllColumns() throws Exception {
+        execute("create table temp (x int)");
+        execute("create table temp2 (x long)");
+        execute("insert into temp values (1), (2), (3)");
+        execute("insert into temp2 values (2), (3), (4)");
+
+        assertQuery("select x + 1 as x, x - 1 as dec from temp union select x + 1 as x, x - 1 from temp2")
+                .ddl(null)
+                .noRandomAccess()
+                .returns("""
+                        x\tdec
+                        2\t0
+                        3\t1
+                        4\t2
+                        5\t3
+                        """);
+    }
+
+    @Test
+    public void testUnion_overlappingOnProjectedColumnOnly() throws Exception {
+        execute("create table temp (x int)");
+        execute("create table temp2 (x long)");
+        execute("insert into temp values (1), (2), (3)");
+        execute("insert into temp2 values (4), (5), (6)");
+
+        // overlapping rows with different types
+        assertQuery("select -x as x, x > 0 as b from temp union select -x as x, x > 0 from temp2")
+                .ddl(null)
+                .noRandomAccess()
+                .returns("""
+                        x\tb
+                        -1\ttrue
+                        -2\ttrue
+                        -3\ttrue
+                        -4\ttrue
+                        -5\ttrue
+                        -6\ttrue
+                        """);
+    }
+
+    @Test
+    public void testVanilla() throws Exception {
+        execute("create table tmp as" +
+                " (select" +
+                " rnd_double() a," +
+                " timestamp_sequence('2025-06-22'::timestamp, 150099) ts" +
+                " from long_sequence(10)" +
+                ") timestamp(ts) partition by hour");
+        assertQuery("select a * 2 i, i + 1 from tmp;")
+                .expectSize()
+                .returns("""
+                        i\tcolumn
+                        1.3215555788374664\t2.3215555788374664
+                        0.4492602684994518\t1.4492602684994518
+                        0.16973928465121335\t1.1697392846512134
+                        0.59839809192369\t1.59839809192369
+                        0.4089488367575551\t1.4089488367575551
+                        1.3017188051710602\t2.30171880517106
+                        1.684682184176669\t2.684682184176669
+                        1.9712581691748525\t2.9712581691748525
+                        0.44904681712176453\t1.4490468171217645
+                        1.0187654003234814\t2.018765400323481
+                        """);
+    }
+
+    @Test
+    public void testVirtualFunctionAsColumnReference() throws Exception {
+        // The reference resolves to the projected column rather than to a second evaluation:
+        // `k` is referenced twice, so the production plan memoizes it and both columns carry the
+        // one value the row produced. Without memoization rnd_int() runs twice per row and the
+        // two columns disagree, which is the shape this test recorded before the suite compiled
+        // what a server compiles.
+        assertQuery("select rnd_int() + 1 k, k from long_sequence(10)")
+                .noLeakCheck()
+                .returnsOnce("""
+                        k\tk1
+                        -1148479919\t-1148479919
+                        315515119\t315515119
+                        1548800834\t1548800834
+                        -727724770\t-727724770
+                        73575702\t73575702
+                        -948263338\t-948263338
+                        1326447243\t1326447243
+                        592859672\t592859672
+                        1868723707\t1868723707
+                        -847531047\t-847531047
+                        """);
+    }
+
+    @Test
+    public void testVirtualFunctionAsColumnReferencePreferBaseTable() throws Exception {
+        assertQuery("select rnd_int() + 1 x, x from long_sequence(10)")
+                .noLeakCheck()
+                .returnsOnce("""
+                        x\tx1
+                        -1148479919\t1
+                        315515119\t2
+                        1548800834\t3
+                        -727724770\t4
+                        73575702\t5
+                        -948263338\t6
+                        1326447243\t7
+                        592859672\t8
+                        1868723707\t9
+                        -847531047\t10
+                        """);
+    }
+
+    @Test
+    public void testWindowFunction() throws Exception {
+        execute("create table tmp as (select rnd_symbol('abc', 'cde') sym, rnd_double() price from long_sequence(20))");
+        assertQuery("select sym, -price i, lag(i) over (partition by sym) prev from tmp")
+                .noLeakCheck()
+                .noRandomAccess()
+                .expectSize()
+                .returns("""
+                        sym\ti\tprev
+                        abc\t-0.8043224099968393\tnull
+                        cde\t-0.08486964232560668\tnull
+                        abc\t-0.0843832076262595\t-0.8043224099968393
+                        abc\t-0.6508594025855301\t-0.0843832076262595
+                        abc\t-0.7905675319675964\t-0.6508594025855301
+                        abc\t-0.22452340856088226\t-0.7905675319675964
+                        cde\t-0.3491070363730514\t-0.08486964232560668
+                        cde\t-0.7611029514995744\t-0.3491070363730514
+                        cde\t-0.4217768841969397\t-0.7611029514995744
+                        abc\t-0.0367581207471136\t-0.22452340856088226
+                        cde\t-0.6276954028373309\t-0.4217768841969397
+                        cde\t-0.6778564558839208\t-0.6276954028373309
+                        cde\t-0.8756771741121929\t-0.6778564558839208
+                        abc\t-0.8799634725391621\t-0.0367581207471136
+                        cde\t-0.5249321062686694\t-0.8756771741121929
+                        abc\t-0.7675673070796104\t-0.8799634725391621
+                        cde\t-0.21583224269349388\t-0.5249321062686694
+                        cde\t-0.15786635599554755\t-0.21583224269349388
+                        abc\t-0.1911234617573182\t-0.7675673070796104
+                        cde\t-0.5793466326862211\t-0.15786635599554755
+                        """);
+    }
+
+    @Test
+    public void testWindowFunctionPreferBaseTable() throws Exception {
+        execute("create table tmp as (select rnd_symbol('abc', 'cde') sym, rnd_double() price from long_sequence(20))");
+        assertQuery("select sym, -price price, lag(price) over (partition by sym) prev from tmp")
+                .noLeakCheck()
+                .noRandomAccess()
+                .expectSize()
+                .returns("""
+                        sym\tprice\tprev
+                        abc\t-0.8043224099968393\tnull
+                        cde\t-0.08486964232560668\tnull
+                        abc\t-0.0843832076262595\t0.8043224099968393
+                        abc\t-0.6508594025855301\t0.0843832076262595
+                        abc\t-0.7905675319675964\t0.6508594025855301
+                        abc\t-0.22452340856088226\t0.7905675319675964
+                        cde\t-0.3491070363730514\t0.08486964232560668
+                        cde\t-0.7611029514995744\t0.3491070363730514
+                        cde\t-0.4217768841969397\t0.7611029514995744
+                        abc\t-0.0367581207471136\t0.22452340856088226
+                        cde\t-0.6276954028373309\t0.4217768841969397
+                        cde\t-0.6778564558839208\t0.6276954028373309
+                        cde\t-0.8756771741121929\t0.6778564558839208
+                        abc\t-0.8799634725391621\t0.0367581207471136
+                        cde\t-0.5249321062686694\t0.8756771741121929
+                        abc\t-0.7675673070796104\t0.8799634725391621
+                        cde\t-0.21583224269349388\t0.5249321062686694
+                        cde\t-0.15786635599554755\t0.21583224269349388
+                        abc\t-0.1911234617573182\t0.7675673070796104
+                        cde\t-0.5793466326862211\t0.15786635599554755
+                        """);
+    }
+
+    private void testJsonProjectionInOrderByWith0(String expectedResult, String expectedPlan, String typeToExtract) throws Exception {
+        execute("create table items (name string, value varchar)");
+        for (int i = 0; i < 10; i++) {
+            int id = rnd.nextInt(100);
+            String json = "{ \"name\": \"B\", \"value\": " + id + " }";
+            execute("insert into items values ('C', '" + json + "')");
+        }
+
+        allowFunctionMemoization();
+        String query = "select name, json_extract(value, '.value')::" + typeToExtract + " as val, val * 2 as doubled from items order by doubled";
+        assertQuery(query)
+                .noLeakCheck()
+                .expectSize()
+                .returns(expectedResult);
+
+        assertQuery("EXPLAIN " + query)
+                .noLeakCheck()
+                .noRandomAccess()
+                .expectSize()
+                .returns(expectedPlan);
+    }
+
+    private void testJsonProjectionInOrderByWithF(String type) throws Exception {
+        testJsonProjectionInOrderByWith0("""
+                        name\tval\tdoubled
+                        C\t1.0\t2.0
+                        C\t6.0\t12.0
+                        C\t18.0\t36.0
+                        C\t20.0\t40.0
+                        C\t33.0\t66.0
+                        C\t39.0\t78.0
+                        C\t42.0\t84.0
+                        C\t48.0\t96.0
+                        C\t71.0\t142.0
+                        C\t71.0\t142.0
+                        """,
+                """
+                        QUERY PLAN
+                        Encode sort light
+                          keys: [doubled]
+                            VirtualRecord
+                              functions: [name,memoize(json_extract()),memoize(val*2)]
+                                PageFrame
+                                    Row forward scan
+                                    Frame forward scan on: items
+                        """,
+                type);
+    }
+
+    private void testJsonProjectionInOrderByWithI(String type) throws Exception {
+        testJsonProjectionInOrderByWith0("""
+                        name\tval\tdoubled
+                        C\t1\t2
+                        C\t6\t12
+                        C\t18\t36
+                        C\t20\t40
+                        C\t33\t66
+                        C\t39\t78
+                        C\t42\t84
+                        C\t48\t96
+                        C\t71\t142
+                        C\t71\t142
+                        """,
+                """
+                        QUERY PLAN
+                        Encode sort light
+                          keys: [doubled]
+                            VirtualRecord
+                              functions: [name,memoize(json_extract()),memoize(val*2)]
+                                PageFrame
+                                    Row forward scan
+                                    Frame forward scan on: items
+                        """,
+                type);
+    }
+
+    private void testProjectionInOrderByWith0(String expected, String type) throws Exception {
+        execute("create table items (name string, value " + type + ")");
+        execute("insert into items values ('C', 30), ('A', 10), ('B', 20)");
+
+        allowFunctionMemoization();
+        assertQuery("select name, value, value * rnd_double() as doubled from items order by doubled")
+                .noLeakCheck()
+                .returnsOnce(expected);
+    }
+
+    private void testProjectionInOrderByWithF(String type) throws Exception {
+        testProjectionInOrderByWith0(
+                """
+                        name\tvalue\tdoubled
+                        B\t20.0\t1.6973928465121335
+                        A\t10.0\t2.246301342497259
+                        C\t30.0\t19.823333682561998
+                        """,
+                type
+        );
+    }
+
+    private void testProjectionInOrderByWithInt(String type) throws Exception {
+        testProjectionInOrderByWith0(
+                """
+                        name\tvalue\tdoubled
+                        B\t20\t1.6973928465121335
+                        A\t10\t2.246301342497259
+                        C\t30\t19.823333682561998
+                        """,
+                type
+        );
+    }
+}

@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -36,7 +36,6 @@ import io.questdb.griffin.engine.groupby.GroupByAllocator;
 import io.questdb.griffin.engine.groupby.StableAwareUtf8StringHolder;
 import io.questdb.std.Numbers;
 import io.questdb.std.str.Utf8Sequence;
-import io.questdb.std.str.Utf8Sink;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 
@@ -63,14 +62,26 @@ public class FirstVarcharGroupByFunction extends VarcharFunction implements Grou
             mapValue.putBool(valueIndex + 2, true);
         } else {
             sink.of(0).clearAndSet(val);
-            mapValue.putLong(valueIndex + 1, sink.ptr());
+            mapValue.putLong(valueIndex + 1, sink.colouredPtr());
             mapValue.putBool(valueIndex + 2, false);
         }
     }
 
     @Override
     public void computeNext(MapValue mapValue, Record record, long rowId) {
-        // empty
+        if (rowId < mapValue.getLong(valueIndex)) {
+            mapValue.putLong(valueIndex, rowId);
+            final Utf8Sequence val = arg.getVarcharA(record);
+            if (val == null) {
+                mapValue.putLong(valueIndex + 1, 0);
+                mapValue.putBool(valueIndex + 2, true);
+            } else {
+                long ptr = mapValue.getLong(valueIndex + 1);
+                sink.of(ptr).clearAndSet(val);
+                mapValue.putLong(valueIndex + 1, sink.colouredPtr());
+                mapValue.putBool(valueIndex + 2, false);
+            }
+        }
     }
 
     @Override
@@ -86,11 +97,6 @@ public class FirstVarcharGroupByFunction extends VarcharFunction implements Grou
     @Override
     public int getValueIndex() {
         return valueIndex;
-    }
-
-    @Override
-    public void getVarchar(Record rec, Utf8Sink utf8Sink) {
-        utf8Sink.put(getVarcharA(rec));
     }
 
     @Override
@@ -127,12 +133,12 @@ public class FirstVarcharGroupByFunction extends VarcharFunction implements Grou
     }
 
     @Override
-    public boolean isReadThreadSafe() {
+    public boolean isScalar() {
         return false;
     }
 
     @Override
-    public boolean isScalar() {
+    public boolean isThreadSafe() {
         return false;
     }
 

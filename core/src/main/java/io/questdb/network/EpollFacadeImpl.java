@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -26,6 +26,8 @@ package io.questdb.network;
 
 import io.questdb.std.Os;
 
+import static io.questdb.std.Files.toOsFd;
+
 public class EpollFacadeImpl implements EpollFacade {
     public static final EpollFacadeImpl INSTANCE = new EpollFacadeImpl();
 
@@ -35,12 +37,12 @@ public class EpollFacadeImpl implements EpollFacade {
     }
 
     @Override
-    public int epollCtl(int epFd, int op, int fd, long eventPtr) {
-        return EpollAccessor.epollCtl(epFd, op, fd, eventPtr);
+    public int epollCtl(long epFd, int op, long fd, long eventPtr) {
+        return EpollAccessor.epollCtl(toOsFd(epFd), op, toOsFd(fd), eventPtr);
     }
 
     @Override
-    public int epollWait(int epfd, long eventPtr, int eventCount, int timeout) {
+    public int epollWait(long epfd, long eventPtr, int eventCount, int timeout) {
         return EpollAccessor.epollWait(epfd, eventPtr, eventCount, timeout);
     }
 
@@ -50,22 +52,7 @@ public class EpollFacadeImpl implements EpollFacade {
     }
 
     @Override
-    public int eventFd() {
-        return EpollAccessor.eventFd();
-    }
-
-    @Override
     public NetworkFacade getNetworkFacade() {
         return NetworkFacadeImpl.INSTANCE;
-    }
-
-    @Override
-    public long readEventFd(int fd) {
-        return EpollAccessor.readEventFd(fd);
-    }
-
-    @Override
-    public int writeEventFd(int fd) {
-        return EpollAccessor.writeEventFd(fd);
     }
 }

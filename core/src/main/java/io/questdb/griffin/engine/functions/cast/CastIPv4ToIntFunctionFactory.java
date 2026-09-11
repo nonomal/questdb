@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -53,10 +53,11 @@ public class CastIPv4ToIntFunctionFactory implements FunctionFactory {
 
         @Override
         public int getInt(Record rec) {
-            if (arg.getIPv4(rec) == Numbers.IPv4_NULL) {
-                return Numbers.INT_NULL;
-            }
-            return arg.getIPv4(rec);
+            // Read once: the mirror of the int -> IPv4 direction. A non-deterministic argument
+            // returns a different value on every call, so testing one draw and returning another
+            // turned a NULL into the address 0 and an address into NULL.
+            final int value = arg.getIPv4(rec);
+            return value == Numbers.IPv4_NULL ? Numbers.INT_NULL : value;
         }
     }
 }

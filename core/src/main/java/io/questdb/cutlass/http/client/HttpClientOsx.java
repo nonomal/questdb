@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -35,16 +35,28 @@ public class HttpClientOsx extends HttpClient {
 
     public HttpClientOsx(HttpClientConfiguration configuration, SocketFactory socketFactory) {
         super(configuration, socketFactory);
-        this.kqueue = new Kqueue(
-                configuration.getKQueueFacade(),
-                configuration.getWaitQueueCapacity()
-        );
+        try {
+            this.kqueue = new Kqueue(
+                    configuration.getKQueueFacade(),
+                    configuration.getWaitQueueCapacity()
+            );
+        } catch (Throwable th) {
+            // super() has already taken the socket, both buffers and the response parser. A throw
+            // here leaves a half-built client the caller never receives, so nothing would close it.
+            closeBaseQuietly(th);
+            throw th;
+        }
     }
 
     @Override
     public void close() {
-        super.close();
-        this.kqueue = Misc.free(kqueue);
+        // Free kqueue in a finally: super.close() disconnects first, and an extension socket that
+        // throws there used to leak the poller for good, since close() is the only thing that frees it.
+        try {
+            super.close();
+        } finally {
+            this.kqueue = Misc.free(kqueue);
+        }
     }
 
     @Override

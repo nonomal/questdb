@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -48,21 +48,18 @@ public class CopyNoMangleTest extends AbstractCairoTest {
         String inputWorkRootTmp = inputWorkRoot;
         inputWorkRoot = temp.getRoot().getAbsolutePath();
 
-        CopyTest.CopyRunnable stmt = () -> CopyTest.runAndFetchCopyID(
+        CopyImportTest.CopyRunnable stmt = () -> CopyImportTest.runAndFetchCopyID(
                 "copy dbRoot from 'test-quotes-big.csv' with header true timestamp 'ts' delimiter ',' " +
                         "format 'yyyy-MM-ddTHH:mm:ss.SSSUUUZ' on error ABORT partition by day; ",
                 sqlExecutionContext
         );
 
-        CopyTest.CopyRunnable test = () -> assertQueryNoLeakCheck(
-                "message\ncould not remove import work directory because it points to one of main directories\n",
-                "select left(message, 83) message from " + configuration.getSystemTableNamePrefix() + "text_import_log limit -1",
-                null,
-                true,
-                false
-        );
+        CopyImportTest.CopyRunnable test = () -> assertQuery("select left(message, 83) message from " + configuration.getSystemTableNamePrefix() + "text_import_log limit -1")
+                .noLeakCheck()
+                .expectSize()
+                .returns("message\ncould not remove import work directory because it points to one of main directories\n");
 
-        CopyTest.testCopy(stmt, test);
+        CopyImportTest.testCopy(stmt, test);
 
         inputWorkRoot = inputWorkRootTmp;
     }

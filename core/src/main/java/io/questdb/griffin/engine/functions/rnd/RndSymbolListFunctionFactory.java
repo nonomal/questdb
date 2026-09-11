@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -27,6 +27,7 @@ package io.questdb.griffin.engine.functions.rnd;
 import io.questdb.cairo.CairoConfiguration;
 import io.questdb.cairo.sql.Function;
 import io.questdb.cairo.sql.Record;
+import io.questdb.cairo.sql.SymbolTable;
 import io.questdb.cairo.sql.SymbolTableSource;
 import io.questdb.griffin.FunctionFactory;
 import io.questdb.griffin.PlanSink;
@@ -36,6 +37,7 @@ import io.questdb.griffin.engine.functions.SymbolFunction;
 import io.questdb.std.IntList;
 import io.questdb.std.ObjList;
 import io.questdb.std.Rnd;
+import io.questdb.std.Transient;
 import io.questdb.std.str.Sinkable;
 
 public class RndSymbolListFunctionFactory implements FunctionFactory {
@@ -47,17 +49,16 @@ public class RndSymbolListFunctionFactory implements FunctionFactory {
     @Override
     public Function newInstance(
             int position,
-            ObjList<Function> args,
-            IntList argPositions,
+            @Transient ObjList<Function> args,
+            @Transient IntList argPositions,
             CairoConfiguration configuration,
             SqlExecutionContext sqlExecutionContext
     ) throws SqlException {
         if (args == null || args.size() == 0) {
-            throw SqlException.$(position, "function rnd_symbol expects arguments but has none");
+            throw SqlException.$(position, "no arguments provided");
         }
         final ObjList<String> symbols = new ObjList<>(args.size());
         RndStringListFunctionFactory.copyConstants(args, argPositions, symbols);
-
         return new Func(symbols);
     }
 
@@ -73,7 +74,8 @@ public class RndSymbolListFunctionFactory implements FunctionFactory {
 
         @Override
         public int getInt(Record rec) {
-            return next();
+            final int key = next();
+            return symbols.getQuick(key) == null ? SymbolTable.VALUE_IS_NULL : key;
         }
 
         @Override
@@ -92,8 +94,42 @@ public class RndSymbolListFunctionFactory implements FunctionFactory {
         }
 
         @Override
+        public boolean isNonDeterministic() {
+            return true;
+        }
+
+        @Override
+        public boolean isRandom() {
+            return true;
+        }
+
+        @Override
         public boolean isSymbolTableStatic() {
             return false;
+        }
+
+        @Override
+        public SymbolTable newSymbolTable() {
+            Func func = new Func(symbols);
+            func.rnd = new Rnd(this.rnd.getSeed0(), this.rnd.getSeed1());
+            return func;
+        }
+
+        @Override
+        public boolean shouldMemoize() {
+            // Every accessor draws a fresh value, so getInt() and getSymbol() on one row disagree.
+            // A consumer that reads both - an all-symbol UNION resolves the re-symbolised key
+            // against the row's own text - would otherwise see two different values for one row.
+            return true;
+        }
+
+        @Override
+        public boolean supportsKeyValueAccess() {
+            // The dictionary is a fixed list built once per cursor, so getInt() returns an index
+            // for a value, or VALUE_IS_NULL for a null slot, and valueOf() resolves it without
+            // touching text. A key consumer (QWP egress) should therefore take the key path and
+            // encode each distinct value once, not once per row.
+            return true;
         }
 
         @Override
@@ -108,7 +144,7 @@ public class RndSymbolListFunctionFactory implements FunctionFactory {
 
         @Override
         public CharSequence valueOf(int symbolKey) {
-            return symbols.getQuick(symbolKey);
+            return symbolKey > -1 ? symbols.getQuick(symbolKey) : null;
         }
 
         private int next() {

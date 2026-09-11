@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -41,12 +41,16 @@ public final class MemoryTag {
     public static final int MMAP_TX_LOG = MMAP_TABLE_WRITER + 1;
     public static final int MMAP_TX_LOG_CURSOR = MMAP_TX_LOG + 1;
     public static final int MMAP_UPDATE = MMAP_TX_LOG_CURSOR + 1;
+    public static final int MMAP_PARQUET_PARTITION_CONVERTER = MMAP_UPDATE + 1;
+    public static final int MMAP_PARQUET_PARTITION_DECODER = MMAP_PARQUET_PARTITION_CONVERTER + 1;
+    public static final int MMAP_PARQUET_METADATA_READER = MMAP_PARQUET_PARTITION_DECODER + 1;
 
     // All malloc calls should use NATIVE_* tags
-    public static final int NATIVE_PATH = MMAP_UPDATE + 1;
+    public static final int NATIVE_PATH = MMAP_PARQUET_METADATA_READER + 1;
     public static final int NATIVE_DEFAULT = NATIVE_PATH + 1;
-    public static final int NATIVE_CB1 = NATIVE_DEFAULT + 1;
-    public static final int NATIVE_CB2 = NATIVE_CB1 + 1;
+    // Keep the former circuit-breaker tags reserved so removing them does not renumber every later tag.
+    // Memory metrics and allocation error diagnostics expose these tag identities.
+    public static final int NATIVE_CB2 = NATIVE_DEFAULT + 1;
     public static final int NATIVE_CB3 = NATIVE_CB2 + 1;
     public static final int NATIVE_CB4 = NATIVE_CB3 + 1;
     public static final int NATIVE_CB5 = NATIVE_CB4 + 1;
@@ -75,7 +79,8 @@ public final class MemoryTag {
     public static final int NATIVE_OFFLOAD = NATIVE_O3 + 1;
     public static final int NATIVE_PARALLEL_IMPORT = NATIVE_OFFLOAD + 1;
     public static final int NATIVE_PGW_CONN = NATIVE_PARALLEL_IMPORT + 1;
-    public static final int NATIVE_RECORD_CHAIN = NATIVE_PGW_CONN + 1;
+    public static final int NATIVE_PGW_PIPELINE = NATIVE_PGW_CONN + 1;
+    public static final int NATIVE_RECORD_CHAIN = NATIVE_PGW_PIPELINE + 1;
     public static final int NATIVE_REPL = NATIVE_RECORD_CHAIN + 1;
     public static final int NATIVE_ROSTI = NATIVE_REPL + 1;
     public static final int NATIVE_SAMPLE_BY_LONG_LIST = NATIVE_ROSTI + 1;
@@ -88,7 +93,19 @@ public final class MemoryTag {
     public static final int NATIVE_UNORDERED_MAP = NATIVE_TREE_CHAIN + 1;
     public static final int NATIVE_INDEX_READER = NATIVE_UNORDERED_MAP + 1;
     public static final int NATIVE_TABLE_WAL_WRITER = NATIVE_INDEX_READER + 1;
-    public static final int SIZE = NATIVE_TABLE_WAL_WRITER + 1;
+    public static final int NATIVE_METADATA_READER = NATIVE_TABLE_WAL_WRITER + 1;
+    public static final int NATIVE_BIT_SET = NATIVE_METADATA_READER + 1;
+    public static final int NATIVE_PARQUET_PARTITION_DECODER = NATIVE_BIT_SET + 1;
+    public static final int NATIVE_PARQUET_PARTITION_UPDATER = NATIVE_PARQUET_PARTITION_DECODER + 1;
+    public static final int NATIVE_ND_ARRAY = NATIVE_PARQUET_PARTITION_UPDATER + 1;
+    public static final int NATIVE_ND_ARRAY_DBG1 = NATIVE_ND_ARRAY + 1;
+    public static final int NATIVE_ND_ARRAY_DBG2 = NATIVE_ND_ARRAY_DBG1 + 1;
+    public static final int NATIVE_PATH_THREAD_LOCAL = NATIVE_ND_ARRAY_DBG2 + 1;
+    public static final int NATIVE_PARQUET_EXPORTER = NATIVE_PATH_THREAD_LOCAL + 1;
+    public static final int NATIVE_LIVE_VIEW_IN_MEM = NATIVE_PARQUET_EXPORTER + 1;
+    public static final int NATIVE_MEMORY_TRACKER = NATIVE_LIVE_VIEW_IN_MEM + 1;
+    public static final int SIZE = NATIVE_MEMORY_TRACKER + 1;
+
     private static final ObjList<String> tagNameMap = new ObjList<>(SIZE);
 
     public static String nameOf(int tag) {
@@ -110,6 +127,7 @@ public final class MemoryTag {
         tagNameMap.extendAndSet(NATIVE_UNORDERED_MAP, "NATIVE_UNORDERED_MAP");
         tagNameMap.extendAndSet(NATIVE_HTTP_CONN, "NATIVE_HTTP_CONN");
         tagNameMap.extendAndSet(NATIVE_PGW_CONN, "NATIVE_PGW_CONN");
+        tagNameMap.extendAndSet(NATIVE_PGW_PIPELINE, "NATIVE_PGW_PIPELINE");
         tagNameMap.extendAndSet(MMAP_INDEX_READER, "MMAP_INDEX_READER");
         tagNameMap.extendAndSet(MMAP_INDEX_WRITER, "MMAP_INDEX_WRITER");
         tagNameMap.extendAndSet(MMAP_INDEX_SLIDER, "MMAP_INDEX_SLIDER");
@@ -122,10 +140,11 @@ public final class MemoryTag {
         tagNameMap.extendAndSet(NATIVE_JIT, "NATIVE_JIT");
         tagNameMap.extendAndSet(NATIVE_OFFLOAD, "NATIVE_OFFLOAD");
         tagNameMap.extendAndSet(MMAP_UPDATE, "MMAP_UPDATE");
+        tagNameMap.extendAndSet(MMAP_PARQUET_PARTITION_CONVERTER, "MMAP_PARQUET_PARTITION_CONVERTER");
+        tagNameMap.extendAndSet(MMAP_PARQUET_PARTITION_DECODER, "MMAP_PARQUET_PARTITION_DECODER");
         tagNameMap.extendAndSet(NATIVE_PATH, "NATIVE_PATH");
         tagNameMap.extendAndSet(NATIVE_TABLE_READER, "NATIVE_TABLE_READER");
         tagNameMap.extendAndSet(NATIVE_TABLE_WRITER, "NATIVE_TABLE_WRITER");
-        tagNameMap.extendAndSet(NATIVE_CB1, "NATIVE_CB1");
         tagNameMap.extendAndSet(NATIVE_CB2, "NATIVE_CB2");
         tagNameMap.extendAndSet(NATIVE_CB3, "NATIVE_CB3");
         tagNameMap.extendAndSet(NATIVE_CB4, "NATIVE_CB4");
@@ -157,5 +176,17 @@ public final class MemoryTag {
         tagNameMap.extendAndSet(NATIVE_GROUP_BY_FUNCTION, "NATIVE_GROUP_BY_FUNCTION");
         tagNameMap.extendAndSet(NATIVE_INDEX_READER, "NATIVE_INDEX_READER");
         tagNameMap.extendAndSet(NATIVE_TABLE_WAL_WRITER, "NATIVE_TABLE_WAL_WRITER");
+        tagNameMap.extendAndSet(NATIVE_METADATA_READER, "NATIVE_METADATA_READER");
+        tagNameMap.extendAndSet(NATIVE_BIT_SET, "NATIVE_BIT_SET");
+        tagNameMap.extendAndSet(NATIVE_PARQUET_PARTITION_DECODER, "NATIVE_PARQUET_PARTITION_DECODER");
+        tagNameMap.extendAndSet(NATIVE_PARQUET_PARTITION_UPDATER, "NATIVE_PARQUET_PARTITION_UPDATER");
+        tagNameMap.extendAndSet(NATIVE_ND_ARRAY, "NATIVE_ND_ARRAY");
+        tagNameMap.extendAndSet(NATIVE_ND_ARRAY_DBG1, "NATIVE_ND_ARRAY_DBG1");
+        tagNameMap.extendAndSet(NATIVE_ND_ARRAY_DBG2, "NATIVE_ND_ARRAY_DBG2");
+        tagNameMap.extendAndSet(NATIVE_PATH_THREAD_LOCAL, "NATIVE_PATH_THREAD_LOCAL");
+        tagNameMap.extendAndSet(NATIVE_PARQUET_EXPORTER, "NATIVE_PARQUET_EXPORTER");
+        tagNameMap.extendAndSet(NATIVE_LIVE_VIEW_IN_MEM, "NATIVE_LIVE_VIEW_IN_MEM");
+        tagNameMap.extendAndSet(NATIVE_MEMORY_TRACKER, "NATIVE_MEMORY_TRACKER");
+        tagNameMap.extendAndSet(MMAP_PARQUET_METADATA_READER, "MMAP_PARQUET_METADATA_READER");
     }
 }

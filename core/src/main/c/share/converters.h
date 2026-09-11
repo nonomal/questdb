@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -29,44 +29,12 @@
 #include <cmath>
 #include <cstdint>
 #include "jni.h"
+#include "column_type.h"
 
 /**
  * ColumnType enum, matching the Java definitions.
  */
-enum class ColumnType : int {
-    UNDEFINED = 0,
-    BOOLEAN = 1,
-    BYTE = 2,
-    SHORT = 3,
-    CHAR = 4,
-    INT = 5,
-    LONG = 6,
-    DATE = 7,
-    TIMESTAMP = 8,
-    FLOAT = 9,
-    DOUBLE = 10,
-    STRING = 11,
-    SYMBOL = 12,
-    LONG256 = 13,
-    GEOBYTE = 14,
-    GEOSHORT = 15,
-    GEOINT = 16,
-    GEOLONG = 17,
-    BINARY = 18,
-    UUID = 19,
-    CURSOR = 20,
-    VAR_ARG = 21,
-    RECORD = 22,
-    GEOHASH = 23,
-    LONG128 = 24,
-    IPV4 = 25,
-    VARCHAR = 26,
-    REGCLASS = 27,
-    REGPROCEDURE = 28,
-    ARRAY_STRING = 29,
-    PARAMETER = 30,
-    NULL_ = 31
-};
+
 
 /**
  * Packs the column types into an int64_t, so we can use a single switch over both enum values.
@@ -139,11 +107,18 @@ struct EnumTypeMap<ColumnType::DOUBLE> {
     static constexpr bool has_null = true;
 };
 
-template<>
-struct EnumTypeMap<ColumnType::TIMESTAMP> {
-    using type = int64_t;
-    static constexpr type null_value =  static_cast<int64_t>(0x8000000000000000LL);
-    static constexpr bool has_null = true;
+template <>
+struct EnumTypeMap<ColumnType::TIMESTAMP_MICRO> {
+  using type = int64_t;
+  static constexpr type null_value = static_cast<int64_t>(0x8000000000000000LL);
+  static constexpr bool has_null = true;
+};
+
+template <>
+struct EnumTypeMap<ColumnType::TIMESTAMP_NANO> {
+  using type = int64_t;
+  static constexpr type null_value = static_cast<int64_t>(0x8000000000000000LL);
+  static constexpr bool has_null = true;
 };
 
 template<>

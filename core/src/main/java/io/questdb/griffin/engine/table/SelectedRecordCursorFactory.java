@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -25,32 +25,70 @@
 package io.questdb.griffin.engine.table;
 
 import io.questdb.cairo.AbstractRecordCursorFactory;
-import io.questdb.cairo.BitmapIndexReader;
+import io.questdb.cairo.ReaderScanProfile;
+import io.questdb.cairo.TableReader;
 import io.questdb.cairo.TableToken;
-import io.questdb.cairo.sql.*;
+import io.questdb.cairo.idx.IndexReader;
+import io.questdb.cairo.sql.ColumnMapping;
+import io.questdb.cairo.sql.Function;
+import io.questdb.cairo.sql.PageFrame;
+import io.questdb.cairo.sql.PageFrameCursor;
+import io.questdb.cairo.sql.ParquetDecodeHint;
+import io.questdb.cairo.sql.PartitionFrameCursor;
+import io.questdb.cairo.sql.Record;
+import io.questdb.cairo.sql.RecordCursor;
+import io.questdb.cairo.sql.RecordCursorFactory;
+import io.questdb.cairo.sql.RecordMetadata;
+import io.questdb.cairo.sql.StaticSymbolTable;
+import io.questdb.cairo.sql.SymbolTable;
+import io.questdb.cairo.sql.TimeFrame;
+import io.questdb.cairo.sql.TimeFrameCursor;
+import io.questdb.cairo.vm.api.MemoryCARW;
 import io.questdb.griffin.PlanSink;
 import io.questdb.griffin.SqlException;
 import io.questdb.griffin.SqlExecutionContext;
+import io.questdb.griffin.engine.table.parquet.ParquetDecoder;
+import io.questdb.jit.CompiledFilter;
 import io.questdb.std.IntList;
+import io.questdb.std.Misc;
+import io.questdb.std.ObjList;
 import org.jetbrains.annotations.Nullable;
 
-public class SelectedRecordCursorFactory extends AbstractRecordCursorFactory {
-
+public final class SelectedRecordCursorFactory extends AbstractRecordCursorFactory {
     private final RecordCursorFactory base;
     private final IntList columnCrossIndex;
     private final SelectedRecordCursor cursor;
+    private final boolean needsProjection;
     private SelectedPageFrameCursor pageFrameCursor;
+    private ObjList<SelectedRecordCursor> sharedCursors;
+    private SelectedTablePageFrameCursor tablePageFrameCursor;
+    private SelectedTimeFrameCursor timeFrameCursor;
 
     public SelectedRecordCursorFactory(RecordMetadata metadata, IntList columnCrossIndex, RecordCursorFactory base) {
         super(metadata);
         this.base = base;
         this.columnCrossIndex = columnCrossIndex;
         this.cursor = new SelectedRecordCursor(columnCrossIndex, base.recordCursorSupportsRandomAccess());
+        // True when the cursor must wrap its base to expose only the projected columns.
+        // isCrossedIndex covers reorder; the size check covers drop-only-with-identity-mapping
+        // (kept columns are at base[0..size-1]). Without the size check, page frame consumers
+        // that iterate by base columnMapping size would walk past the projected metadata.
+        this.needsProjection = isCrossedIndex(columnCrossIndex)
+                || columnCrossIndex.size() != base.getMetadata().getColumnCount();
+    }
+
+    public static boolean isCrossedIndex(IntList columnCrossIndex) {
+        for (int i = 0, n = columnCrossIndex.size(); i < n; i++) {
+            if (columnCrossIndex.get(i) != i) {
+                return true;
+            }
+        }
+        return false;
     }
 
     @Override
-    public boolean followedLimitAdvice() {
-        return base.followedLimitAdvice();
+    public boolean canPeelForTopK() {
+        return true;
     }
 
     @Override
@@ -63,28 +101,85 @@ public class SelectedRecordCursorFactory extends AbstractRecordCursorFactory {
         return base;
     }
 
+    // Pure column re-mapping: stability is exactly the base's.
+    @Override
+    public boolean isNonDeterministic() {
+        return base.isNonDeterministic();
+    }
+
+    @Override
+    public boolean isStableWithinExecution() {
+        return base.isStableWithinExecution();
+    }
+
+    // to be used in combination with compiled filter
+    @Nullable
+    public ObjList<Function> getBindVarFunctions() {
+        return base.getBindVarFunctions();
+    }
+
+    // to be used in combination with compiled filter
+    @Nullable
+    public MemoryCARW getBindVarMemory() {
+        return base.getBindVarMemory();
+    }
+
+    @Override
+    public IntList getColumnCrossIndex() {
+        return columnCrossIndex;
+    }
+
+    @Override
+    public CompiledFilter getCompiledFilter() {
+        return base.getCompiledFilter();
+    }
+
     @Override
     public RecordCursor getCursor(SqlExecutionContext executionContext) throws SqlException {
         final RecordCursor baseCursor = base.getCursor(executionContext);
+        if (!needsProjection) {
+            return baseCursor;
+        }
         try {
             cursor.of(baseCursor);
             return cursor;
         } catch (Throwable th) {
-            baseCursor.close();
+            cursor.close();
             throw th;
         }
     }
 
     @Override
+    public Function getFilter() {
+        return base.getFilter();
+    }
+
+    @Override
     public PageFrameCursor getPageFrameCursor(SqlExecutionContext executionContext, int order) throws SqlException {
-        PageFrameCursor baseCursor = base.getPageFrameCursor(executionContext, order);
-        if (baseCursor == null) {
-            return null;
+        final PageFrameCursor baseCursor = base.getPageFrameCursor(executionContext, order);
+        if (baseCursor == null || !needsProjection) {
+            return baseCursor;
         }
-        if (pageFrameCursor == null) {
-            pageFrameCursor = new SelectedPageFrameCursor(columnCrossIndex);
+        try {
+            // Claim only what the base provides: a table base keeps the TablePageFrameCursor
+            // surface (parents such as the horizon joins downcast to it), while a non-table
+            // base such as read_parquet() - whose page-frame cursor is a plain PageFrameCursor -
+            // gets a plain projection wrapper instead of a getTableReader()/hasIntervalFilter()/
+            // toPartition() contract it cannot honor.
+            if (baseCursor instanceof TablePageFrameCursor tableBaseCursor) {
+                if (tablePageFrameCursor == null) {
+                    tablePageFrameCursor = new SelectedTablePageFrameCursor(columnCrossIndex);
+                }
+                return tablePageFrameCursor.wrap(tableBaseCursor);
+            }
+            if (pageFrameCursor == null) {
+                pageFrameCursor = new SelectedPageFrameCursor(columnCrossIndex);
+            }
+            return pageFrameCursor.wrap(baseCursor);
+        } catch (Throwable th) {
+            Misc.free(baseCursor);
+            throw th;
         }
-        return pageFrameCursor.of(baseCursor);
     }
 
     @Override
@@ -93,8 +188,65 @@ public class SelectedRecordCursorFactory extends AbstractRecordCursorFactory {
     }
 
     @Override
+    public RecordCursor getSharedCursor(SqlExecutionContext executionContext, int sharedId) throws SqlException {
+        if (!needsProjection) {
+            return base.getSharedCursor(executionContext, sharedId);
+        }
+        if (sharedCursors == null) {
+            sharedCursors = new ObjList<>();
+        }
+        int idx = sharedId - 1;
+        SelectedRecordCursor shared = sharedCursors.getQuiet(idx);
+        if (shared == null) {
+            shared = new SelectedRecordCursor(columnCrossIndex, base.recordCursorSupportsRandomAccess());
+            sharedCursors.extendAndSet(idx, shared);
+        }
+        shared.of(base.getSharedCursor(executionContext, sharedId));
+        return shared;
+    }
+
+    @Override
+    public TimeFrameCursor getTimeFrameCursor(SqlExecutionContext executionContext) throws SqlException {
+        TimeFrameCursor baseCursor = base.getTimeFrameCursor(executionContext);
+        if (baseCursor == null || !needsProjection) {
+            return baseCursor;
+        }
+        if (timeFrameCursor == null) {
+            timeFrameCursor = new SelectedTimeFrameCursor(columnCrossIndex, base.recordCursorSupportsRandomAccess(), getMetadata().getTimestampIndex());
+        }
+        return timeFrameCursor.of(baseCursor);
+    }
+
+    @Override
+    public void halfClose() {
+        base.halfClose();
+    }
+
+    @Override
     public boolean implementsLimit() {
         return base.implementsLimit();
+    }
+
+    @Override
+    public boolean isProjection() {
+        return true;
+    }
+
+    @Override
+    public ConcurrentTimeFrameCursor newTimeFrameCursor() {
+        ConcurrentTimeFrameCursor baseCursor = base.newTimeFrameCursor();
+        if (baseCursor == null || !needsProjection) {
+            return baseCursor;
+        }
+        return new SelectedConcurrentTimeFrameCursor(baseCursor, getMetadata().getTimestampIndex());
+    }
+
+    @Override
+    public boolean recordCursorSupportsLongTopK(int columnIndex) {
+        if (columnIndex < 0 || columnIndex >= columnCrossIndex.size()) {
+            return false;
+        }
+        return base.recordCursorSupportsLongTopK(columnCrossIndex.getQuick(columnIndex));
     }
 
     @Override
@@ -103,8 +255,27 @@ public class SelectedRecordCursorFactory extends AbstractRecordCursorFactory {
     }
 
     @Override
+    public RecordCursorFactory rewrapOverTopK(RecordCursorFactory topK, RecordMetadata orderedMetadata) {
+        RecordCursorFactory rewrappedBase = base.rewrapOverTopK(topK, base.getMetadata());
+        // Shares columnCrossIndex with the orphaned wrapper. Per the
+        // RecordCursorFactory.rewrapOverTopK contract, the caller must not close the orphan;
+        // its state has transferred here. Same precedent as the AsOf and LatestBy peels.
+        return new SelectedRecordCursorFactory(orderedMetadata, columnCrossIndex, rewrappedBase);
+    }
+
+    @Override
     public boolean supportsPageFrameCursor() {
         return base.supportsPageFrameCursor();
+    }
+
+    @Override
+    public boolean supportsSharedCursors() {
+        return base.supportsSharedCursors();
+    }
+
+    @Override
+    public boolean supportsTimeFrameCursor() {
+        return base.supportsTimeFrameCursor();
     }
 
     @Override
@@ -116,6 +287,14 @@ public class SelectedRecordCursorFactory extends AbstractRecordCursorFactory {
     public void toPlan(PlanSink sink) {
         sink.type("SelectedRecord");
         sink.child(base);
+    }
+
+    @Override
+    public int translateOrderByColumnToBase(int projectedIndex) {
+        if (projectedIndex < 0 || projectedIndex >= columnCrossIndex.size()) {
+            return -1;
+        }
+        return base.translateOrderByColumnToBase(columnCrossIndex.getQuick(projectedIndex));
     }
 
     @Override
@@ -131,6 +310,121 @@ public class SelectedRecordCursorFactory extends AbstractRecordCursorFactory {
     @Override
     protected void _close() {
         base.close();
+        Misc.clear(sharedCursors);
+    }
+
+    // This wrapper handles column remapping for ConcurrentTimeFrameCursor when a
+    // SelectedRecordCursorFactory wraps another factory. Column remapping for symbol
+    // tables and page frame data is handled by SelectedPageFrameCursor (which wraps
+    // the delegate's frameCursor). This wrapper only needs to:
+    // 1. Override getTimestampIndex() to return the selected timestamp index.
+    // 2. Pass the selected timestamp index to the delegate via of() so that
+    //    ConcurrentTimeFrameCursorImpl.open() reads timestamps from the correct
+    //    position in the logically-remapped address cache.
+    // Record data access works correctly without wrapping because the address cache
+    // is populated with SelectedPageFrame data (logically-indexed), and the join code
+    // accesses it using logical column indices from the selected metadata.
+    static final class SelectedConcurrentTimeFrameCursor implements ConcurrentTimeFrameCursor {
+        private final ConcurrentTimeFrameCursor delegate;
+        private final int selectedTimestampIndex;
+
+        SelectedConcurrentTimeFrameCursor(
+                ConcurrentTimeFrameCursor delegate,
+                int selectedTimestampIndex
+        ) {
+            this.delegate = delegate;
+            this.selectedTimestampIndex = selectedTimestampIndex;
+        }
+
+        @Override
+        public void close() {
+            delegate.close();
+        }
+
+        @Override
+        public Record getRecord() {
+            return delegate.getRecord();
+        }
+
+        @Override
+        public StaticSymbolTable getSymbolTable(int columnIndex) {
+            return delegate.getSymbolTable(columnIndex);
+        }
+
+        @Override
+        public TimeFrame getTimeFrame() {
+            return delegate.getTimeFrame();
+        }
+
+        @Override
+        public int getTimestampIndex() {
+            return selectedTimestampIndex;
+        }
+
+        @Override
+        public void jumpTo(int frameIndex) {
+            delegate.jumpTo(frameIndex);
+        }
+
+        @Override
+        public SymbolTable newSymbolTable(int columnIndex) {
+            return delegate.newSymbolTable(columnIndex);
+        }
+
+        @Override
+        public boolean next() {
+            return delegate.next();
+        }
+
+        @Override
+        public ConcurrentTimeFrameCursor of(
+                ConcurrentTimeFrameState sharedState,
+                TablePageFrameCursor frameCursor,
+                int timestampIndex
+        ) {
+            delegate.of(sharedState, frameCursor, selectedTimestampIndex);
+            return this;
+        }
+
+        @Override
+        public long open() {
+            return delegate.open();
+        }
+
+        @Override
+        public boolean prev() {
+            return delegate.prev();
+        }
+
+        @Override
+        public void recordAt(Record record, long rowId) {
+            delegate.recordAt(record, rowId);
+        }
+
+        @Override
+        public void recordAt(Record record, int frameIndex, long rowIndex) {
+            delegate.recordAt(record, frameIndex, rowIndex);
+        }
+
+        @Override
+        public void recordAtRowIndex(Record record, long rowIndex) {
+            delegate.recordAtRowIndex(record, rowIndex);
+        }
+
+        @Override
+        public void seekEstimate(long timestamp) {
+            delegate.seekEstimate(timestamp);
+        }
+
+        @Override
+        public void setParquetDecodeHint(ParquetDecodeHint hint) {
+            delegate.setParquetDecodeHint(hint);
+        }
+
+        @Override
+        public void toTop() {
+            delegate.toTop();
+        }
     }
 
     private static class SelectedPageFrame implements PageFrame {
@@ -142,18 +436,71 @@ public class SelectedRecordCursorFactory extends AbstractRecordCursorFactory {
         }
 
         @Override
-        public BitmapIndexReader getBitmapIndexReader(int columnIndex, int dirForward) {
-            return baseFrame.getBitmapIndexReader(columnCrossIndex.getQuick(columnIndex), dirForward);
+        public long getAuxPageAddress(int columnIndex) {
+            return baseFrame.getAuxPageAddress(columnCrossIndex.getQuick(columnIndex));
         }
 
         @Override
-        public int getColumnShiftBits(int columnIndex) {
-            return baseFrame.getColumnShiftBits(columnCrossIndex.getQuick(columnIndex));
+        public long getAuxPageSize(int columnIndex) {
+            return baseFrame.getAuxPageSize(columnCrossIndex.getQuick(columnIndex));
         }
 
         @Override
-        public long getIndexPageAddress(int columnIndex) {
-            return baseFrame.getIndexPageAddress(columnCrossIndex.getQuick(columnIndex));
+        public int getColumnCount() {
+            return columnCrossIndex.size();
+        }
+
+        @Override
+        public byte getColumnSource(int columnIndex) {
+            // Per-column source must be remapped through the projection so that a
+            // projected covered column still reports COVERED (and a non-covered
+            // base column reports DIRECT). Without this the projection wrapper
+            // would report the PageFrame default (DIRECT) for every column and
+            // PageFrameAddressCache.add would record the frame as non-covered,
+            // no-op'ing the worker covered-decode arm.
+            return baseFrame.getColumnSource(columnCrossIndex.getQuick(columnIndex));
+        }
+
+        @Override
+        public int getCoveredIncludeIndex(int columnIndex) {
+            // PER-COLUMN remap: the include (sidecar) index a covered column
+            // decodes from must follow the projected column space so the
+            // worker-decoded covered buffers line up with the projected columns.
+            return baseFrame.getCoveredIncludeIndex(columnCrossIndex.getQuick(columnIndex));
+        }
+
+        @Override
+        public int[] getCoveredIncludeIndices() {
+            // Per-frame set of sidecar columns to decode -- pass through.
+            return baseFrame.getCoveredIncludeIndices();
+        }
+
+        @Override
+        public int getCoveredKey() {
+            // Per-frame resolved WHERE symbol key -- pass through.
+            return baseFrame.getCoveredKey();
+        }
+
+        @Override
+        public long getCoveredRowHi() {
+            // Per-frame base row range -- pass through.
+            return baseFrame.getCoveredRowHi();
+        }
+
+        @Override
+        public long getCoveredRowLo() {
+            // Per-frame base row range -- pass through.
+            return baseFrame.getCoveredRowLo();
+        }
+
+        @Override
+        public byte getFormat() {
+            return baseFrame.getFormat();
+        }
+
+        @Override
+        public IndexReader getIndexReader(int columnIndex, int direction) {
+            return baseFrame.getIndexReader(columnCrossIndex.getQuick(columnIndex), direction);
         }
 
         @Override
@@ -164,6 +511,26 @@ public class SelectedRecordCursorFactory extends AbstractRecordCursorFactory {
         @Override
         public long getPageSize(int columnIndex) {
             return baseFrame.getPageSize(columnCrossIndex.getQuick(columnIndex));
+        }
+
+        @Override
+        public ParquetDecoder getParquetDecoder() {
+            return baseFrame.getParquetDecoder();
+        }
+
+        @Override
+        public int getParquetRowGroup() {
+            return baseFrame.getParquetRowGroup();
+        }
+
+        @Override
+        public int getParquetRowGroupHi() {
+            return baseFrame.getParquetRowGroupHi();
+        }
+
+        @Override
+        public int getParquetRowGroupLo() {
+            return baseFrame.getParquetRowGroupLo();
         }
 
         @Override
@@ -187,8 +554,16 @@ public class SelectedRecordCursorFactory extends AbstractRecordCursorFactory {
         }
     }
 
+    /**
+     * Projects the base page-frame cursor through the crossed column index. Claims only the
+     * plain {@link PageFrameCursor} surface, so it can sit over any base (e.g. read_parquet()).
+     * When the base cursor is a {@link TablePageFrameCursor}, the factory hands out
+     * {@link SelectedTablePageFrameCursor} instead so parents that downcast to the table
+     * surface keep working.
+     */
     private static class SelectedPageFrameCursor implements PageFrameCursor {
         private final IntList columnCrossIndex;
+        private final ColumnMapping columnMapping = new ColumnMapping();
         private final SelectedPageFrame pageFrame;
         private PageFrameCursor baseCursor;
 
@@ -198,18 +573,38 @@ public class SelectedRecordCursorFactory extends AbstractRecordCursorFactory {
         }
 
         @Override
-        public void close() {
-            baseCursor.close();
+        public void calculateSize(RecordCursor.Counter counter) {
+            baseCursor.calculateSize(counter);
         }
 
         @Override
-        public SymbolTable getSymbolTable(int columnIndex) {
+        public void close() {
+            baseCursor = Misc.free(baseCursor);
+        }
+
+        @Override
+        public ColumnMapping getColumnMapping() {
+            return columnMapping;
+        }
+
+        @Override
+        public long getRemainingRowsInInterval() {
+            return baseCursor.getRemainingRowsInInterval();
+        }
+
+        @Override
+        public StaticSymbolTable getSymbolTable(int columnIndex) {
             return baseCursor.getSymbolTable(columnCrossIndex.getQuick(columnIndex));
         }
 
         @Override
-        public long getUpdateRowId(long rowIndex) {
-            return baseCursor.getUpdateRowId(rowIndex);
+        public boolean hasActivePushdownFilter() {
+            return baseCursor.hasActivePushdownFilter();
+        }
+
+        @Override
+        public boolean isExternal() {
+            return baseCursor.isExternal();
         }
 
         @Override
@@ -218,19 +613,220 @@ public class SelectedRecordCursorFactory extends AbstractRecordCursorFactory {
         }
 
         @Override
-        public @Nullable PageFrame next() {
-            PageFrame baseFrame = baseCursor.next();
+        public @Nullable PageFrame next(long skipTarget) {
+            PageFrame baseFrame = baseCursor.next(skipTarget);
             return baseFrame != null ? pageFrame.of(baseFrame) : null;
         }
 
-        public SelectedPageFrameCursor of(PageFrameCursor baseCursor) {
-            this.baseCursor = baseCursor;
-            return this;
+        @Override
+        public void releaseOpenPartitions() {
+            baseCursor.releaseOpenPartitions();
+        }
+
+        @Override
+        public void setScanProfile(ReaderScanProfile profile) {
+            baseCursor.setScanProfile(profile);
         }
 
         @Override
         public long size() {
             return baseCursor.size();
+        }
+
+        @Override
+        public boolean supportsSizeCalculation() {
+            return baseCursor.supportsSizeCalculation();
+        }
+
+        @Override
+        public void toTop() {
+            baseCursor.toTop();
+        }
+
+        private SelectedPageFrameCursor wrap(PageFrameCursor baseCursor) {
+            this.baseCursor = baseCursor;
+            // Project the base column mapping through columnCrossIndex so that this cursor's
+            // mapping stays parallel with the projected metadata. Page frame consumers like
+            // PageFrameAddressCache assume mapping[i] corresponds to metadata column i.
+            final ColumnMapping baseMapping = baseCursor.getColumnMapping();
+            columnMapping.clear();
+            for (int i = 0, n = columnCrossIndex.size(); i < n; i++) {
+                final int basePos = columnCrossIndex.getQuick(i);
+                columnMapping.addColumn(
+                        baseMapping.getColumnIndex(basePos),
+                        baseMapping.getWriterIndex(basePos),
+                        baseMapping.getOriginalWriterIndex(basePos)
+                );
+            }
+            return this;
+        }
+    }
+
+    /**
+     * The projection wrapper over a table base: extends the plain projection with the
+     * {@link TablePageFrameCursor} surface, delegating the table-specific methods to the typed
+     * base cursor. The factory hands this wrapper out only when the base cursor is a
+     * {@link TablePageFrameCursor}, so no cast can fail.
+     */
+    private static final class SelectedTablePageFrameCursor extends SelectedPageFrameCursor implements TablePageFrameCursor {
+        private TablePageFrameCursor tableBaseCursor;
+
+        private SelectedTablePageFrameCursor(IntList columnCrossIndex) {
+            super(columnCrossIndex);
+        }
+
+        @Override
+        public void close() {
+            tableBaseCursor = null;
+            super.close();
+        }
+
+        @Override
+        public TableReader getTableReader() {
+            return tableBaseCursor.getTableReader();
+        }
+
+        @Override
+        public boolean hasIntervalFilter() {
+            return tableBaseCursor.hasIntervalFilter();
+        }
+
+        // This wrapper is initialized via wrap(TablePageFrameCursor), not via of(PartitionFrameCursor, ...).
+        // The base factory's getPageFrameCursor() handles partition-level initialization internally,
+        // then we wrap the already-initialized result.
+        @Override
+        public TablePageFrameCursor of(SqlExecutionContext executionContext, PartitionFrameCursor partitionFrameCursor) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public void toPartition(int partitionIndex) {
+            tableBaseCursor.toPartition(partitionIndex);
+        }
+
+        private SelectedTablePageFrameCursor wrap(TablePageFrameCursor baseCursor) {
+            this.tableBaseCursor = baseCursor;
+            super.wrap(baseCursor);
+            return this;
+        }
+    }
+
+    public static final class SelectedTimeFrameCursor implements TimeFrameCursor {
+        private final IntList columnCrossIndex;
+        private final SelectedRecord recordA;
+        private final SelectedRecord recordB;
+        private final int selectedTimestampIndex;
+        private TimeFrameCursor baseCursor;
+
+        public SelectedTimeFrameCursor(IntList columnCrossIndex, boolean supportsRandomAccess, int selectedTimestampIndex) {
+            this.columnCrossIndex = columnCrossIndex;
+            this.selectedTimestampIndex = selectedTimestampIndex;
+            this.recordA = new SelectedRecord(columnCrossIndex);
+            if (supportsRandomAccess) {
+                this.recordB = new SelectedRecord(columnCrossIndex);
+            } else {
+                this.recordB = null;
+            }
+        }
+
+        @Override
+        public void close() {
+            baseCursor = Misc.free(baseCursor);
+        }
+
+        @Override
+        public IndexReader getIndexReaderForCurrentFrame(int columnIndex, int direction) {
+            return baseCursor.getIndexReaderForCurrentFrame(columnCrossIndex.getQuick(columnIndex), direction);
+        }
+
+        @Override
+        public Record getRecord() {
+            return recordA;
+        }
+
+        @Override
+        public Record getRecordB() {
+            if (recordB != null) {
+                return recordB;
+            }
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public StaticSymbolTable getSymbolTable(int columnIndex) {
+            return baseCursor.getSymbolTable(columnCrossIndex.getQuick(columnIndex));
+        }
+
+        @Override
+        public TimeFrame getTimeFrame() {
+            return baseCursor.getTimeFrame();
+        }
+
+        @Override
+        public int getTimestampIndex() {
+            return selectedTimestampIndex;
+        }
+
+        @Override
+        public void jumpTo(int frameIndex) {
+            baseCursor.jumpTo(frameIndex);
+        }
+
+        @Override
+        public SymbolTable newSymbolTable(int columnIndex) {
+            return baseCursor.newSymbolTable(columnCrossIndex.getQuick(columnIndex));
+        }
+
+        @Override
+        public boolean next() {
+            return baseCursor.next();
+        }
+
+        public SelectedTimeFrameCursor of(TimeFrameCursor baseCursor) {
+            this.baseCursor = baseCursor;
+            recordA.of(baseCursor.getRecord());
+            if (recordB != null) {
+                recordB.of(baseCursor.getRecordB());
+            }
+            return this;
+        }
+
+        @Override
+        public long open() {
+            return baseCursor.open();
+        }
+
+        @Override
+        public boolean prev() {
+            return baseCursor.prev();
+        }
+
+        @Override
+        public void recordAt(Record record, long rowId) {
+            record = ((SelectedRecord) record).getBaseRecord();
+            baseCursor.recordAt(record, rowId);
+        }
+
+        @Override
+        public void recordAt(Record record, int frameIndex, long rowIndex) {
+            record = ((SelectedRecord) record).getBaseRecord();
+            baseCursor.recordAt(record, frameIndex, rowIndex);
+        }
+
+        @Override
+        public void recordAtRowIndex(Record record, long rowIndex) {
+            record = ((SelectedRecord) record).getBaseRecord();
+            baseCursor.recordAtRowIndex(record, rowIndex);
+        }
+
+        @Override
+        public void seekEstimate(long timestamp) {
+            baseCursor.seekEstimate(timestamp);
+        }
+
+        @Override
+        public void setParquetDecodeHint(ParquetDecodeHint hint) {
+            baseCursor.setParquetDecodeHint(hint);
         }
 
         @Override

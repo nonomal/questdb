@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -24,7 +24,14 @@
 
 package io.questdb.test.cairo;
 
-import io.questdb.cairo.*;
+import io.questdb.cairo.ColumnType;
+import io.questdb.cairo.PartitionBy;
+import io.questdb.cairo.TableReader;
+import io.questdb.cairo.TableToken;
+import io.questdb.cairo.TableWriter;
+import io.questdb.cairo.TxnScoreboard;
+import io.questdb.cairo.TxnScoreboardV2;
+import io.questdb.cairo.security.AllowAllSecurityContext;
 import io.questdb.test.AbstractCairoTest;
 import org.junit.Assert;
 import org.junit.Test;
@@ -40,7 +47,7 @@ public class TableReaderTxnScoreboardInteractionTest extends AbstractCairoTest {
             try (TableReader reader = getReader(tt)) {
                 TxnScoreboard txnScoreboard = reader.getTxnScoreboard();
                 // when table is empty the "min" is set to max long
-                Assert.assertEquals(0, txnScoreboard.getMin());
+                Assert.assertEquals(0, getMin(txnScoreboard));
                 Assert.assertEquals(0, reader.getTxn());
             }
 
@@ -49,61 +56,66 @@ public class TableReaderTxnScoreboardInteractionTest extends AbstractCairoTest {
                 final TxnScoreboard txnScoreboard = w.getTxnScoreboard();
                 try (TableReader reader = getReader(tt)) {
                     Assert.assertEquals(1, reader.getTxn());
-                    Assert.assertEquals(1, txnScoreboard.getMin());
-                    Assert.assertEquals(1, txnScoreboard.getActiveReaderCount(1));
+                    Assert.assertEquals(1, getMin(txnScoreboard));
+                    Assert.assertFalse(txnScoreboard.isTxnAvailable(1));
 
                     addRow(w);
 
                     Assert.assertEquals(1, reader.getTxn());
-                    Assert.assertEquals(1, txnScoreboard.getMin());
-                    Assert.assertEquals(1, txnScoreboard.getActiveReaderCount(1));
+                    Assert.assertEquals(1, getMin(txnScoreboard));
+                    Assert.assertFalse(txnScoreboard.isTxnAvailable(1));
                 }
 
                 try (TableReader reader = getReader(tt)) {
                     Assert.assertEquals(2, reader.getTxn());
-                    Assert.assertEquals(2, txnScoreboard.getMin());
-                    Assert.assertEquals(1, txnScoreboard.getActiveReaderCount(2));
+                    Assert.assertEquals(2, getMin(txnScoreboard));
+                    Assert.assertFalse(txnScoreboard.isTxnAvailable(2));
 
                     try (TableReader reader2 = getReader(tt)) {
                         Assert.assertEquals(2, reader2.getTxn());
-                        Assert.assertEquals(2, txnScoreboard.getMin());
-                        Assert.assertEquals(2, txnScoreboard.getActiveReaderCount(2));
+                        Assert.assertEquals(2, getMin(txnScoreboard));
+                        Assert.assertFalse(txnScoreboard.isTxnAvailable(2));
 
                         addRow(w);
                         try (TableReader reader3 = getReader(tt)) {
                             Assert.assertEquals(3, reader3.getTxn());
-                            Assert.assertEquals(2, txnScoreboard.getMin());
-                            Assert.assertEquals(2, txnScoreboard.getActiveReaderCount(2));
-                            Assert.assertEquals(1, txnScoreboard.getActiveReaderCount(3));
+                            Assert.assertEquals(2, getMin(txnScoreboard));
+                            Assert.assertFalse(txnScoreboard.isTxnAvailable(2));
+                            Assert.assertFalse(txnScoreboard.isTxnAvailable(3));
                         }
-                        // expect 0, writer is released
-                        Assert.assertEquals(0, txnScoreboard.getActiveReaderCount(3));
+                        // bump max txn to new value, > 3
+                        txnScoreboard.acquireTxn(5, 4);
+                        txnScoreboard.releaseTxn(5, 4);
+
+                        // expect 0, the writer is released
+                        Assert.assertTrue(txnScoreboard.isTxnAvailable(3));
                     }
 
-                    Assert.assertEquals(0, txnScoreboard.getActiveReaderCount(3));
-                    Assert.assertEquals(1, txnScoreboard.getActiveReaderCount(2));
+                    Assert.assertTrue(txnScoreboard.isTxnAvailable(3));
+                    Assert.assertFalse(txnScoreboard.isTxnAvailable(2));
                 }
-                Assert.assertEquals(0, txnScoreboard.getActiveReaderCount(2));
-                Assert.assertEquals(0, txnScoreboard.getActiveReaderCount(3));
+                Assert.assertTrue(txnScoreboard.isTxnAvailable(2));
+                Assert.assertTrue(txnScoreboard.isTxnAvailable(3));
 
-                w.addColumn("z", ColumnType.LONG);
+                w.addColumn("z", ColumnType.LONG, AllowAllSecurityContext.INSTANCE);
 
                 try (TableReader reader = getReader(tt)) {
                     Assert.assertEquals(4, reader.getTxn());
-                    Assert.assertEquals(4, txnScoreboard.getMin());
-                    Assert.assertEquals(1, txnScoreboard.getActiveReaderCount(4));
-                    Assert.assertEquals(0, txnScoreboard.getActiveReaderCount(5));
+                    Assert.assertEquals(4, getMin(txnScoreboard));
+                    Assert.assertFalse(txnScoreboard.isTxnAvailable(4));
                 }
 
-                Assert.assertEquals(4, txnScoreboard.getMin());
-                Assert.assertEquals(0, txnScoreboard.getActiveReaderCount(4));
+                assertMin(4, txnScoreboard);
 
                 try (TableReader reader = getReader(tt)) {
                     Assert.assertEquals(4, reader.getTxn());
-                    Assert.assertEquals(4, txnScoreboard.getMin());
-                    Assert.assertEquals(1, txnScoreboard.getActiveReaderCount(4));
+                    assertMin(4, txnScoreboard);
+                    Assert.assertFalse(txnScoreboard.isTxnAvailable(4));
                 }
-                Assert.assertEquals(0, txnScoreboard.getActiveReaderCount(4));
+                // bump max txn to new value, > 4
+                txnScoreboard.acquireTxn(5, 5);
+                txnScoreboard.releaseTxn(5, 5);
+                Assert.assertTrue(txnScoreboard.isTxnAvailable(4));
             }
         });
     }
@@ -116,35 +128,36 @@ public class TableReaderTxnScoreboardInteractionTest extends AbstractCairoTest {
             try (TableReader reader = newOffPoolReader(configuration, "x")) {
                 TxnScoreboard txnScoreboard = reader.getTxnScoreboard();
                 // when table is empty the "min" is set to max long
-                Assert.assertEquals(0, txnScoreboard.getMin());
+                Assert.assertEquals(0, getMin(txnScoreboard));
                 Assert.assertEquals(0, reader.getTxn());
             }
 
-            try (TableWriter w = newOffPoolWriter(configuration, "x", metrics)) {
-                addRow(w);
+            try (TableWriter writer = newOffPoolWriter(configuration, "x")) {
+                addRow(writer);
 
-                final TxnScoreboard txnScoreboard = w.getTxnScoreboard();
+                final TxnScoreboard txnScoreboard = writer.getTxnScoreboard();
 
                 try (TableReader reader = newOffPoolReader(configuration, "x")) {
                     Assert.assertEquals(1, reader.getTxn());
-                    Assert.assertEquals(1, txnScoreboard.getMin());
-                    Assert.assertEquals(1, txnScoreboard.getActiveReaderCount(1));
+                    Assert.assertEquals(1, getMin(txnScoreboard));
+                    Assert.assertFalse(txnScoreboard.isTxnAvailable(1));
 
-                    addRow(w);
+                    addRow(writer);
 
                     Assert.assertEquals(1, reader.getTxn());
-                    Assert.assertEquals(1, txnScoreboard.getMin());
-                    Assert.assertEquals(1, txnScoreboard.getActiveReaderCount(1));
+                    Assert.assertEquals(1, getMin(txnScoreboard));
+                    Assert.assertFalse(txnScoreboard.isTxnAvailable(1));
 
                     Assert.assertTrue(reader.reload());
 
                     Assert.assertEquals(2, reader.getTxn());
-                    Assert.assertEquals(2, txnScoreboard.getMin());
-                    Assert.assertEquals(1, txnScoreboard.getActiveReaderCount(2));
+                    Assert.assertEquals(2, getMin(txnScoreboard));
+                    Assert.assertFalse(txnScoreboard.isTxnAvailable(2));
                 }
 
-                Assert.assertEquals(2, txnScoreboard.getMin());
-                Assert.assertEquals(0, txnScoreboard.getActiveReaderCount(2));
+                assertMin(2, txnScoreboard);
+                txnScoreboard.acquireTxn(0, 3);
+                Assert.assertTrue(txnScoreboard.isTxnAvailable(2));
             }
         });
     }
@@ -163,5 +176,13 @@ public class TableReaderTxnScoreboardInteractionTest extends AbstractCairoTest {
                 .col("a", ColumnType.BYTE)
                 .col("b", ColumnType.SHORT);
         return AbstractCairoTest.create(model);
+    }
+
+    private static long getMin(TxnScoreboard scoreboard) {
+        return ((TxnScoreboardV2) scoreboard).getMin();
+    }
+
+    private void assertMin(int min, TxnScoreboard txnScoreboard) {
+        Assert.assertTrue(min == ((TxnScoreboardV2) txnScoreboard).getMin() || -1 == ((TxnScoreboardV2) txnScoreboard).getMin());
     }
 }

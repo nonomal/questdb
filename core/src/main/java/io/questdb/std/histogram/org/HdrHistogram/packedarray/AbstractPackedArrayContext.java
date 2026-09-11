@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -746,8 +746,7 @@ abstract class AbstractPackedArrayContext implements Serializable {
         int eightsSizeMagnitude = sizeMagnitude - 3;
         int multipleOfFourSizeMagnitude = (int) Math.ceil(eightsSizeMagnitude / 4.0) * 4;
         multipleOfFourSizeMagnitude = Math.max(multipleOfFourSizeMagnitude, 8);
-        int topLevelShiftNeeded = (multipleOfFourSizeMagnitude - 4) + 3;
-        return topLevelShiftNeeded;
+        return (multipleOfFourSizeMagnitude - 4) + 3;
     }
 
     //
@@ -951,11 +950,7 @@ abstract class AbstractPackedArrayContext implements Serializable {
      * @return an Iterator over all non-Zero values in the array
      */
     Iterable<IterationValue> nonZeroValues() {
-        return new Iterable<IterationValue>() {
-            public Iterator<IterationValue> iterator() {
-                return new NonZeroValuesIterator();
-            }
-        };
+        return NonZeroValuesIterator::new;
     }
 
     void populateEquivalentEntriesWithZerosFromOther(final AbstractPackedArrayContext other) {

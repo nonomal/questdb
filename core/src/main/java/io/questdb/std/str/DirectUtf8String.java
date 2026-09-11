@@ -1,4 +1,4 @@
-/*******************************************************************************
+/*+*****************************************************************************
  *     ___                  _   ____  ____
  *    / _ \ _   _  ___  ___| |_|  _ \| __ )
  *   | | | | | | |/ _ \/ __| __| | | |  _ \
@@ -6,7 +6,7 @@
  *    \__\_\\__,_|\___||___/\__|____/|____/
  *
  *  Copyright (c) 2014-2019 Appsicle
- *  Copyright (c) 2019-2024 QuestDB
+ *  Copyright (c) 2019-2026 QuestDB
  *
  *  Licensed under the Apache License, Version 2.0 (the "License");
  *  you may not use this file except in compliance with the License.
@@ -29,7 +29,7 @@ import io.questdb.std.ObjectFactory;
 import org.jetbrains.annotations.NotNull;
 
 /**
- * An immutable flyweight for a UTF-8 string stored in native memory.
+ * A flyweight to an immutable UTF-8 string stored in native memory.
  */
 public class DirectUtf8String implements DirectUtf8Sequence, Mutable {
     public static final Factory FACTORY = new Factory();
@@ -37,14 +37,20 @@ public class DirectUtf8String implements DirectUtf8Sequence, Mutable {
     private boolean ascii;
     private long hi;
     private long lo;
-    private boolean stable;
 
-    public DirectUtf8String() {
-        this(false);
+    /**
+     * Trim the left by `count` bytes.
+     */
+    public void advance(int count) {
+        this.lo += count;
+        assert lo <= hi;
     }
 
-    public DirectUtf8String(boolean stableDefault) {
-        this.stable = stableDefault;
+    /**
+     * Trim left by one byte.
+     */
+    public void advance() {
+        advance(1);
     }
 
     @Override
@@ -68,11 +74,6 @@ public class DirectUtf8String implements DirectUtf8Sequence, Mutable {
         return ascii;
     }
 
-    @Override
-    public boolean isStable() {
-        return stable;
-    }
-
     public DirectUtf8String of(long lo, long hi) {
         return of(lo, hi, false);
     }
@@ -84,12 +85,8 @@ public class DirectUtf8String implements DirectUtf8Sequence, Mutable {
         return this;
     }
 
-    public DirectUtf8String of(long lo, long hi, boolean ascii, boolean stable) {
-        this.lo = lo;
-        this.hi = hi;
-        this.ascii = ascii;
-        this.stable = stable;
-        return this;
+    public DirectUtf8String of(DirectUtf8String value) {
+        return of(value.lo(), value.hi());
     }
 
     @Override
@@ -110,6 +107,10 @@ public class DirectUtf8String implements DirectUtf8Sequence, Mutable {
     public void squeeze() {
         this.lo++;
         this.hi--;
+    }
+
+    public void squeezeHi(long delta) {
+        this.hi -= delta;
     }
 
     @NotNull
